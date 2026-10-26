@@ -81,6 +81,18 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
+function queueClaudeInvocationResult(result: RunProcessResult): void {
+  runChildProcess.mockResolvedValueOnce({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "2.1.284 (Claude Code)\n",
+    stderr: "",
+    pid: 123,
+    startedAt: new Date().toISOString(),
+  }).mockResolvedValueOnce(result);
+}
+
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
 
@@ -446,7 +458,7 @@ describe("claude remote execution", () => {
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     await mkdir(workspaceDir, { recursive: true });
-    runChildProcess.mockResolvedValueOnce({
+    queueClaudeInvocationResult({
       exitCode: 0,
       signal: null,
       timedOut: false,
@@ -482,7 +494,7 @@ describe("claude remote execution", () => {
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     await mkdir(workspaceDir, { recursive: true });
-    runChildProcess.mockResolvedValueOnce({
+    queueClaudeInvocationResult({
       exitCode: 1,
       signal: null,
       timedOut: false,
@@ -534,7 +546,7 @@ describe("claude remote execution", () => {
       cleanupDirs.push(rootDir);
       const workspaceDir = path.join(rootDir, "workspace");
       await mkdir(workspaceDir, { recursive: true });
-      runChildProcess.mockResolvedValueOnce({
+      queueClaudeInvocationResult({
         exitCode: 1,
         signal: null,
         timedOut: false,

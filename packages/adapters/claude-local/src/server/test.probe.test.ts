@@ -25,14 +25,14 @@ const {
     ensureAdapterExecutionTargetDirectory: vi.fn(async () => {}),
     ensureAdapterExecutionTargetCommandResolvable: vi.fn(async () => {}),
     maybeRunSandboxInstallCommand: vi.fn(async () => null),
-    runAdapterExecutionTargetProcess: vi.fn(async () => {
+    runAdapterExecutionTargetProcess: vi.fn(async (_runId: string, _target: AdapterExecutionTarget, _command: string, args: string[]) => {
       if (probeResult.throwError) throw probeResult.throwError;
       return {
-        exitCode: probeResult.value.exitCode,
+        exitCode: args.includes("--version") ? 0 : probeResult.value.exitCode,
         signal: null,
         timedOut: false,
-        stdout: probeResult.value.stdout,
-        stderr: probeResult.value.stderr,
+        stdout: args.includes("--version") ? "2.1.284 (Claude Code)\n" : probeResult.value.stdout,
+        stderr: args.includes("--version") ? "" : probeResult.value.stderr,
         pid: 123,
         startedAt: new Date().toISOString(),
       };
