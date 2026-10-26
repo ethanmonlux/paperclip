@@ -279,6 +279,29 @@ describe("claude sandbox hello probe diagnostics", () => {
     expect(result.checks.some((check) => check.code === "claude_hello_probe_passed")).toBe(true);
   });
 
+  it("does not report missing auth for a successful probe with benign unauthorized text", async () => {
+    probeResult.value = {
+      exitCode: 0,
+      stdout: [
+        initLine,
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"A skill mentions unauthorized recipients."}]}}',
+        '{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"result":"hello","session_id":"abc"}',
+      ].join("\n"),
+      stderr: "A tool quoted please run claude login",
+    };
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "claude_local",
+      config: { engine: "cli", command: "claude" },
+      executionTarget: sandboxTarget,
+      environmentName: "Daytona",
+    });
+
+    expect(result.checks.some((check) => check.code === "adapter_auth_missing" || check.code === "claude_hello_probe_auth_required")).toBe(false);
+    expect(result.checks.some((check) => check.code === "claude_hello_probe_passed")).toBe(true);
+  });
+
   it("keeps a transient failure with an assistant token phrase off the login gate", async () => {
     // The probe fails on a 529 overload. The auth phrase appears only in the raw
     // stdout assistant event, not the parsed result, so the run stays transient

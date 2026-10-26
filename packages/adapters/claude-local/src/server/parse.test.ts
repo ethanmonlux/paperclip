@@ -116,6 +116,56 @@ describe("detectClaudeLoginRequired", () => {
     ).toBe(false);
   });
 
+  it("keeps benign unauthorized tool output off the login gate after terminal success", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { subtype: "success", is_error: false, api_error_status: null, result: "Completed" },
+      stdout: 'A skill mentions "unauthorized recipients".',
+      stderr: "",
+    })).toEqual({ requiresLogin: false, loginUrl: null });
+  });
+
+  it("keeps login-like result and stderr text off the login gate after terminal success", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { subtype: "success", is_error: false, api_error_status: null, result: "The guide says please log in." },
+      stdout: "",
+      stderr: "A tool printed authentication required. Visit https://auth.example.test/guide",
+    })).toEqual({ requiresLogin: false, loginUrl: null });
+  });
+
+  it("retains a structured auth failure even when the CLI uses the success subtype", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { subtype: "success", is_error: true, api_error_status: 401, error: "authentication_failed", result: "OAuth access token expired" },
+      stdout: "",
+      stderr: "",
+    }).requiresLogin).toBe(true);
+  });
+
+  it("classifies a failed result with a CLI login prompt only in stderr", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { subtype: "error_during_execution", is_error: true, result: "Process exited with code 1" },
+      stdout: "",
+      stderr: "Invalid API key · Please run /login",
+    }).requiresLogin).toBe(true);
+  });
+
+  it("classifies a structured 401 or 403 without auth prose", () => {
+    for (const status of [401, 403]) {
+      expect(detectClaudeLoginRequired({
+        parsed: { subtype: "success", is_error: true, api_error_status: status, result: "Request failed" },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin).toBe(true);
+    }
+  });
+
+  it("keeps bare unauthorized stderr text on a quota failure off the auth lane", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: { subtype: "error_during_execution", is_error: true, api_error_status: 429, result: "Usage limit reached" },
+      stdout: "",
+      stderr: "A tool printed unauthorized recipients",
+    }).requiresLogin).toBe(false);
+  });
+
   it("keeps a transient failure with an assistant token phrase on the transient lane", () => {
     // The run fails on a 503 transient error. The token phrase appears only in
     // the raw stdout assistant event, not the parsed result, so the run stays
@@ -132,6 +182,16 @@ describe("detectClaudeLoginRequired", () => {
     };
     expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
     expect(isClaudeTransientUpstreamError(input)).toBe(true);
+  });
+
+  it("keeps unrelated login words in raw output off a structured quota failure", () => {
+    const input = {
+      parsed: { is_error: true, subtype: "error_during_execution", api_error_status: 429, result: "You're out of extra usage. Resets at 4pm." },
+      stdout: 'A tool printed "unauthorized recipients".',
+      stderr: "",
+    };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(isClaudeProviderQuotaError(input)).toBe(true);
   });
 
   it("does not treat a bare token phrase in raw stdout with no parsed result as login required", () => {

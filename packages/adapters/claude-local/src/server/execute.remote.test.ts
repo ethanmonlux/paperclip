@@ -441,6 +441,127 @@ describe("claude remote execution", () => {
     expect(result.errorCode).toBe("duplex_channel_lost");
   });
 
+  it("returns success rather than an auth failure for benign tool text in a terminal success", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-auth-boundary-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "A skill mentions unauthorized recipients." }] } }),
+        JSON.stringify({ type: "result", subtype: "success", is_error: false, api_error_status: null, result: "Completed" }),
+      ].join("\n"),
+      stderr: "A tool quoted please run claude login",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute({
+      runId: "run-ssh-benign-auth-text",
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+  });
+
+  it("keeps a structured expired OAuth failure on the auth lane", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-expired-auth-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        api_error_status: 401,
+        error: "authentication_failed",
+        result: "Failed to authenticate. OAuth access token expired.",
+      }),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute({
+      runId: "run-ssh-expired-auth",
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: { remoteExecution: {
+        host: "127.0.0.1", port: 2222, username: "fixture",
+        remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+        privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+      } },
+      onLog: async () => {},
+    });
+
+    expect(result.errorCode).toBe("claude_auth_required");
+  });
+
+  it("keeps failed-result CLI prompts and status-only provider failures on the auth lane", async () => {
+    const cases = [
+      {
+        runId: "run-ssh-stderr-login",
+        terminal: { type: "result", subtype: "error_during_execution", is_error: true, result: "Process exited with code 1" },
+        stderr: "Invalid API key · Please run /login",
+      },
+      {
+        runId: "run-ssh-status-only-auth",
+        terminal: { type: "result", subtype: "success", is_error: true, api_error_status: 401, result: "Request failed" },
+        stderr: "",
+      },
+    ];
+    for (const testCase of cases) {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-auth-failure-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      await mkdir(workspaceDir, { recursive: true });
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        stdout: JSON.stringify(testCase.terminal),
+        stderr: testCase.stderr,
+        pid: 123,
+        startedAt: new Date().toISOString(),
+      });
+
+      const result = await execute({
+        runId: testCase.runId,
+        agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: "claude" },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: { remoteExecution: {
+          host: "127.0.0.1", port: 2222, username: "fixture",
+          remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true,
+        } },
+        onLog: async () => {},
+      });
+
+      expect(result.errorCode, testCase.runId).toBe("claude_auth_required");
+    }
+  });
+
   describe("CLI-lane model pass-through", () => {
     async function executeWithModel(prefix: string, config: Record<string, unknown>) {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), prefix));

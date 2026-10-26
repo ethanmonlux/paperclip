@@ -8,10 +8,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// asks the user to log in. Raw output is used without a terminal result;
+// explicit CLI prompts in stderr are also relevant when the result failed.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
+const CLAUDE_EXPLICIT_LOGIN_PROMPT_RE =
+  /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
 // The token-failure markers. An assistant or model event can print these same
 // words as ordinary prose, so the detector matches them only against the parsed
@@ -246,16 +248,44 @@ export function detectClaudeLoginRequired(input: {
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
+  const status = parsed === null ? 0 :
+    asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0);
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // A terminal success is stronger evidence than prompt-like words in model
+  // output, tool output, or stderr. Keep structured auth failures eligible for
+  // detection even when the CLI reports subtype=success alongside an error.
+  if (
+    parsed !== null &&
+    asString(parsed.subtype, "").trim().toLowerCase() === "success" &&
+    !claudeResultIndicatesAuthFailure(parsed)
+  ) {
+    return { requiresLogin: false, loginUrl: null };
+  }
+
+  // A provider auth status is sufficient even when the CLI supplies only a
+  // generic result message. It also wins over quota/transient text in output.
+  if (status === 401 || status === 403) {
+    return {
+      requiresLogin: true,
+      loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    };
+  }
+
+  // Raw stdout may contain assistant/tool prose even after a failed result.
+  // A failed result can still leave the CLI's actual login prompt in stderr.
+  // Require an explicit prompt there instead of a bare "unauthorized" word.
+  const promptLines = (parsed === null
+    ? [input.stdout, input.stderr]
+    : claudeResultIndicatesAuthFailure(parsed)
+    ? [resultText, asString(parsed.error, ""), ...extractClaudeErrorMessages(parsed)]
+    : [])
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
+  const stderrPrompt = parsed !== null && claudeResultIndicatesAuthFailure(parsed) &&
+    input.stderr.split(/\r?\n/).some((line) => CLAUDE_EXPLICIT_LOGIN_PROMPT_RE.test(line));
 
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
@@ -266,7 +296,7 @@ export function detectClaudeLoginRequired(input: {
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
 
   return {
-    requiresLogin: loginPrompt || tokenFailure,
+    requiresLogin: loginPrompt || stderrPrompt || tokenFailure,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
 }
