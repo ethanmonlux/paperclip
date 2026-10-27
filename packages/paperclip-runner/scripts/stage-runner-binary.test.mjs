@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -83,6 +83,41 @@ test("release metadata rejects incompatible native, harness and protocol contrac
   }
 });
 
+// Fixture executables here have to satisfy three separate requirements: dist
+// resolution rejects any staged daemon whose ELF/Mach-O header does not match
+// the host target, the staging tests execute the staged file under the
+// `paperclip-runnerd` name, and the rebuild test needs two byte-distinct ones
+// to tell fresh build output from the previous artifact.
+//
+// Borrowing /bin/sleep and /bin/echo meets none of that on an image whose
+// coreutils is a single multi-call binary: both paths are then the same bytes,
+// so "fresh build" and "previous build" are indistinguishable, and the staged
+// copy dispatches on its own filename, so it reports an unknown program and
+// exits instead of sleeping. That is a property of the host image, not of
+// staging, and it made these tests fail wherever CI runs such an image.
+//
+// The shell is not part of coreutils, so it stays a standalone host-target
+// executable that takes its behaviour from `-c` rather than from argv[0].
+// Appending a trailing marker produces a second, byte-distinct copy that the
+// ELF loader still executes, because trailing bytes sit outside every program
+// header. macOS keeps the standalone BSD utilities: it has no multi-call
+// coreutils, and stageRunnerBinary re-signs the staged Mach-O, which editing
+// bytes after signing would break.
+const FRESH_BUILD_MARKER = "\n# paperclip-runnerd test fixture: fresh source build\n";
+const hostFixture = process.platform === "darwin"
+  ? {
+      previousBuild: { source: "/bin/sleep", marker: null, longRunningArgs: ["30"], exitZeroArgs: ["0"] },
+      freshBuild: { source: "/bin/echo", marker: null, exitZeroArgs: ["rebuilt"] },
+    }
+  : {
+      previousBuild: {
+        source: "/bin/sh", marker: null,
+        // exec replaces the shell, so the staged pathname owns the live process.
+        longRunningArgs: ["-c", "exec sleep 30"], exitZeroArgs: ["-c", "exit 0"],
+      },
+      freshBuild: { source: "/bin/sh", marker: FRESH_BUILD_MARKER, exitZeroArgs: ["-c", "exit 0"] },
+    };
+
 async function withOwnedChildren(root, action) {
   const owned = [];
   const start = (command, args) => {
@@ -112,18 +147,19 @@ test("atomically publishes while the previous executable is running", { skip: pr
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    await stageRunnerBinary("/bin/sleep", destination);
+    const { source, longRunningArgs, exitZeroArgs } = hostFixture.previousBuild;
+    await stageRunnerBinary(source, destination);
     const previous = await stat(destination);
-    const old = start(destination, ["30"]);
+    const old = start(destination, longRunningArgs);
     await old.spawned;
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(source, destination);
     const published = await stat(destination);
     assert.notEqual(published.ino, previous.ino);
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
     assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
-    const next = start(destination, ["0"]);
+    const next = start(destination, exitZeroArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
@@ -137,21 +173,24 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
   const source = path.join(packageRoot, "runner", "crates", "runner-core", "src", "main.rs");
   const built = path.join(packageRoot, "runner", "target", "release", "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    const copyHostFixture = async (input, output) => {
-      await copyFile(input, output);
+    const copyHostFixture = async ({ source: fixture, marker }, output) => {
+      await copyFile(fixture, output);
       if (process.platform === "darwin") {
-        const slices = execFileSync("/usr/bin/lipo", ["-archs", input], { encoding: "utf8" }).trim().split(/\s+/);
+        const slices = execFileSync("/usr/bin/lipo", ["-archs", fixture], { encoding: "utf8" }).trim().split(/\s+/);
         const architecture = slices.find(value => process.arch === "arm64" ? value.startsWith("arm64") : value === "x86_64");
         assert.ok(architecture);
-        if (slices.length > 1) execFileSync("/usr/bin/lipo", [input, "-thin", architecture, "-output", output]);
+        if (slices.length > 1) execFileSync("/usr/bin/lipo", [fixture, "-thin", architecture, "-output", output]);
       }
+      // Trailing bytes keep the host-target header and stay outside every
+      // program header, so the copy still loads and still runs.
+      if (marker) await appendFile(output, marker);
     };
     await mkdir(path.dirname(source), { recursive: true });
     await writeFile(source, "fn main() {}\n");
     await mkdir(path.dirname(built), { recursive: true });
-    await copyHostFixture("/bin/echo", built);
+    await copyHostFixture(hostFixture.freshBuild, built);
     const previousBuild = path.join(root, "previous-build");
-    await copyHostFixture("/bin/sleep", previousBuild);
+    await copyHostFixture(hostFixture.previousBuild, previousBuild);
     await stageRunnerBinary(previousBuild, hostTarget);
     await stageRunnerBinary(built, path.join(binaryRoot, "paperclip-runnerd"));
     const platforms = {}, releaseBytes = new Map();
@@ -177,7 +216,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     const manifestPath = path.join(binaryRoot, "release-manifest.json");
     const manifest = JSON.stringify({ schema: "paperclip.runner.release-binaries.v1", sourceRevision: "a".repeat(40), platforms });
     await writeFile(manifestPath, manifest);
-    const old = start(hostTarget, ["30"]);
+    const old = start(hostTarget, hostFixture.previousBuild.longRunningArgs);
     await old.spawned;
     const requirement = { repoRoot: root, nativeRunnerRequired: true };
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), true);
@@ -197,7 +236,7 @@ test("a source rebuild selects fresh dev bytes while preserving release binaries
     assert.equal(paperclipRunnerBinaryNeedsBuild(requirement), false);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
-    const next = start(selected.binary, ["rebuilt"]);
+    const next = start(selected.binary, hostFixture.freshBuild.exitZeroArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });
