@@ -155,8 +155,16 @@ if sys.argv[1] != "completion":
     expect(await readFile(join(directory, "output.txt"), "utf8")).toBe("hello");
     const read = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/cat", args: [secret] }, authorize);
     expect(read).toMatchObject({ exitCode: 1 }); expect(String((read as any).output)).not.toContain("PRIVATE");
-    const write = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", 'printf stolen > "$1"', "sh", secret] }, authorize);
-    expect(write).toMatchObject({ exitCode: 1 }); expect(await readFile(secret, "utf8")).toBe("PRIVATE");
+    // The sandbox never binds the outside path, so the denied program reports
+    // the failure itself and the bridge surfaces that program's own status.
+    // Which non-zero status it is belongs to the program, not to this contract:
+    // a failed redirection exits 2 under dash and 1 under bash, so pinning 1
+    // asserted the host's shell rather than the denial. Assert the denial — a
+    // non-zero exit we did not cause, and the secret neither read nor written.
+    const write = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", 'printf stolen > "$1"', "sh", secret] }, authorize) as any;
+    expect(write.exitCode).toBeGreaterThan(0); expect(write.stopped).toBeNull();
+    expect(String(write.output)).not.toContain("PRIVATE");
+    expect(await readFile(secret, "utf8")).toBe("PRIVATE");
   });
   it.skipIf(!workspaceCommandSandboxAvailable())("stops its owned process on authority loss and bounds output", async () => {
     const directory = await root(); let calls = 0;
