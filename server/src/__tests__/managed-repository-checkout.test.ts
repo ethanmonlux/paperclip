@@ -42,6 +42,33 @@ describe("atomic managed repository publication", () => {
     expect(await readFile(file, "utf8")).toBe("/.paperclip-repositories/\n");
     await expect(ensureManagedRepositoriesIgnored(target)).rejects.toThrow("not a git repository");
   });
+  // Git chooses its missing-repository wording by where discovery stopped, not
+  // by anything the caller configured: a task directory under a mount point
+  // reports the filesystem-boundary form. Both forms must honor the declared
+  // plain directory, and no other Git failure may be swallowed as one.
+  it.each([
+    { label: "exhausted ancestor chain", plain: true,
+      stderr: "fatal: not a git repository (or any of the parent directories): .git\n" },
+    { label: "filesystem boundary", plain: true,
+      stderr: "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n" },
+    { label: "named inert metadata", plain: false, stderr: "fatal: not a git repository: '/task/.git'\n" },
+    { label: "permission denied", plain: false, stderr: "fatal: cannot open .git: Permission denied\n" },
+    { label: "dubious ownership", plain: false,
+      stderr: "fatal: detected dubious ownership in repository at '/task'\n" },
+  ])("honors a declared plain task directory only for a stated missing repository: $label", async ({ stderr, plain }) => {
+    const { root, target } = await fixture();
+    await mkdir(path.join(target, ".git", "info"), { recursive: true });
+    const file = path.join(target, ".git", "info", "exclude");
+    await writeFile(file, "/.paperclip-repositories/\n");
+    const bin = path.join(root, "stub-bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "git"), `#!/bin/sh\nprintf '%s' '${stderr}' >&2\nexit 128\n`, { mode: 0o755 });
+    vi.stubEnv("PATH", bin);
+    const ignored = ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true });
+    if (plain) await expect(ignored).resolves.toBeUndefined();
+    else await expect(ignored).rejects.toMatchObject({ code: 128 });
+    expect(await readFile(file, "utf8")).toBe("/.paperclip-repositories/\n");
+  });
   it("still excludes managed repositories when a task directory contains a real checkout", async () => {
     const { source } = await fixture();
     await ensureManagedRepositoriesIgnored(source, { plainTaskDirectory: true });

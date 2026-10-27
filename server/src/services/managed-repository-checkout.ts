@@ -162,6 +162,24 @@ export async function materializeManagedProjectWorkspace(
 }
 
 
+// A plain task directory holding inert Git metadata makes Git report that no
+// repository exists, and Git words that two ways depending on where discovery
+// stopped: it names the ancestor chain when it exhausted it, and names the
+// mount point when it hit a filesystem boundary first. A task directory under a
+// mount point — every ordinary host, including CI — produces the boundary form,
+// so accepting only the ancestor form rejects the declared plain-directory
+// boundary this guard exists to honor. Any other failure (missing Git,
+// permission denial, damaged or dubious metadata, I/O errors) must still throw.
+const GIT_MISSING_REPOSITORY_STDERR = [
+  /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/,
+  /^fatal: not a git repository \(or any parent up to mount point .*\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.\r?\n?$/,
+];
+
+function statesMissingGitRepository(stderr: unknown) {
+  return typeof stderr === "string"
+    && GIT_MISSING_REPOSITORY_STDERR.some(pattern => pattern.test(stderr));
+}
+
 export async function ensureManagedRepositoriesIgnored(cwd: string, options: { plainTaskDirectory?: boolean } = {}): Promise<void> {
   const gitEntry = await fs.lstat(path.join(cwd, ".git")).catch(() => null);
   if (!gitEntry) return;
@@ -175,7 +193,7 @@ export async function ensureManagedRepositoriesIgnored(cwd: string, options: { p
   } catch (error) {
     const failure = error as { code?: unknown; signal?: unknown; stderr?: unknown };
     if (options.plainTaskDirectory && failure.code === 128 && failure.signal == null &&
-        failure.stderr === "fatal: not a git repository (or any of the parent directories): .git\n" &&
+        statesMissingGitRepository(failure.stderr) &&
         !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR) return;
     throw error;
   }
