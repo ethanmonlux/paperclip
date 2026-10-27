@@ -839,6 +839,23 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
+// Git states a missing repository in one of two exact ways: it names the
+// ancestor chain when discovery exhausted it, and names the mount point when it
+// stopped at a filesystem boundary first. A workspace under a mount point —
+// which is every ordinary host, including CI — produces the boundary form, so
+// matching only the ancestor form never recognizes a plain directory. Both
+// messages mean "no repository here". Every other failure (missing Git,
+// permission denial, damaged metadata, I/O errors) must stay reportable.
+const GIT_MISSING_REPOSITORY_STDERR = [
+  /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/,
+  /^fatal: not a git repository \(or any parent up to mount point .*\)\r?\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.\r?\n?$/,
+];
+
+function statesMissingGitRepository(stderr: unknown) {
+  return typeof stderr === "string"
+    && GIT_MISSING_REPOSITORY_STDERR.some(pattern => pattern.test(stderr));
+}
+
 async function probeGitWorktreeBase(cwd: string) {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
@@ -852,8 +869,7 @@ async function probeGitWorktreeBase(cwd: string) {
     // the same message. Verify its absence too. Missing Git, permission errors,
     // corruption and I/O failures must remain reportable in Sentry.
     const notRepository = failure.code === 128 && failure.signal == null &&
-      typeof failure.stderr === "string" &&
-      /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) &&
+      statesMissingGitRepository(failure.stderr) &&
       !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR &&
       await hasNoGitMetadataInWorkspaceAncestors(cwd);
     return { isCheckout: false, notRepository };
