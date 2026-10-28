@@ -1,10 +1,54 @@
 import { readProcessStartedAt } from "./hot-restart.js";
-import { runUsedConversationAdapter } from "./conversation-continuation.js";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
+import { claimedAdapterType, isConversationAdapter, runUsedConversationAdapter } from "./conversation-continuation.js";
+import { and, eq, inArray, isNotNull, isNull, like, or, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
+import { hasNativeLocalProcessStop, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { legacyControllerBootId } from "./legacy-controller-lease.js";
+
+async function hasReconciledLegacyPreDispatchStop(db: Db, run: typeof heartbeatRuns.$inferSelect, hasCoordinator: boolean) {
+  if (run.runtimeMode !== "legacy" || run.status !== "cancelled" ||
+      run.errorCode !== "continuation_task_ownership_changed" || run.executionStage !== "preparing" ||
+      !run.startedAt || !run.finishedAt || run.processPid || run.processGroupId || run.processStartedAt ||
+      !run.controllerBootId || run.controllerBootId === legacyControllerBootId ||
+      !run.controllerLeaseExpiresAt || run.controllerLeaseExpiresAt > new Date() ||
+      run.nativeIssueId || run.nativeSessionId || run.runtimeModeResolvedAt || run.runnerInstanceId ||
+      run.externalRunId || run.sessionIdAfter || run.driverKind || run.completionContractId || run.nativePhase ||
+      run.lastOutputAt || run.lastOutputSeq > 0 || run.stdoutExcerpt || run.stderrExcerpt || hasCoordinator ||
+      !isConversationAdapter(claimedAdapterType(run) ?? "")) return false;
+  const issueId = run.contextSnapshot?.issueId;
+  if (typeof issueId !== "string" || !isUuidLike(issueId) ||
+      (run.issueId !== null && run.issueId !== issueId) ||
+      (run.contextSnapshot?.taskId !== undefined && run.contextSnapshot.taskId !== issueId)) return false;
+  const actions = await db.select({ evidence: issueRecoveryActions.evidence, resolvedAt: issueRecoveryActions.resolvedAt })
+    .from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+      eq(issueRecoveryActions.returnOwnerAgentId, run.agentId), eq(issueRecoveryActions.kind, "active_run_watchdog"),
+      eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"), eq(issueRecoveryActions.status, "resolved"),
+      eq(issueRecoveryActions.outcome, "handed_back"), sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+    ));
+  if (!actions.some(action => {
+    const decision = action.evidence.executionReconciliation as Record<string, unknown> | undefined;
+    const recordedAt = typeof decision?.recordedAt === "string" ? Date.parse(decision.recordedAt) : NaN;
+    return decision?.runId === run.id && decision.providerStopped === true && decision.actionOutcome === "not_performed" &&
+      typeof decision.outcomeEvidence === "string" && decision.outcomeEvidence.trim().length > 0 &&
+      typeof decision.actorId === "string" && decision.actorId.trim().length > 0 &&
+      Number.isFinite(recordedAt) && recordedAt >= run.finishedAt!.getTime() &&
+      action.resolvedAt !== null && action.resolvedAt.getTime() >= recordedAt;
+  })) return false;
+  const [execution] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    or(isNotNull(heartbeatRunEvents.sourceEventId), isNotNull(heartbeatRunEvents.sourceInstanceId), isNotNull(heartbeatRunEvents.sourceSeq),
+      inArray(heartbeatRunEvents.stream, ["stdout", "stderr"]),
+      inArray(heartbeatRunEvents.eventType, ["adapter.invoke", PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED]),
+      like(heartbeatRunEvents.eventType, "harness.%"), like(heartbeatRunEvents.eventType, "session.%"),
+      like(heartbeatRunEvents.eventType, "turn.%"), like(heartbeatRunEvents.eventType, "provider.%"),
+      like(heartbeatRunEvents.eventType, "tool.execution.%")),
+  )).limit(1);
+  return !execution;
+}
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -57,7 +101,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
-        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
+        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id)) &&
+        !await hasReconciledLegacyPreDispatchStop(db, run, coordinators.some(row => row.runId === run.id))) return false;
   }
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {

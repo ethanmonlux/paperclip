@@ -717,6 +717,22 @@ orphan recovery.
 pnpm exec vitest run server/src/services/heartbeat/agent-status.test.ts server/src/__tests__/heartbeat-agent-status-recovery.test.ts
 ```
 
+### Reconciled legacy continuations and agent pause
+
+A historical legacy continuation cancelled before adapter dispatch can finish
+agent pause when its existing board reconciliation records that no work was
+performed. The stop check requires a resolved receipt for the exact company,
+original agent, task and run. It also requires expired prior-controller ownership
+and rejects contradictory launch, provider, session or output evidence.
+
+Live processes, process groups, controller and finalization leases, and unfinished
+environment cleanup still block pause. The check reads the receipt without
+rewriting the cancelled run or task history. It does not replay the old task.
+
+```sh
+pnpm exec vitest run server/src/services/agent-execution-stop.test.ts
+```
+
 ## Test Commands
 
 The [feature map](../maps/feature-map/README.md) is an optional reference for user
