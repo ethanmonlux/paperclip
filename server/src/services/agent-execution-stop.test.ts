@@ -218,7 +218,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const { run } = await seed();
     if (manualHold) await db.update(agents).set({ lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, agentId));
     const effects = {
-      transaction: async (_db: Db, _companyId: string, work: (tx: Db) => Promise<unknown>) => db.transaction(tx => work(tx)),
+      transaction: async (_db: Db, _companyId: string, work: (tx: Db) => Promise<unknown>) => db.transaction(tx => work(tx as unknown as Db)),
       notifyWork: async () => {}, recordStatus: async () => {},
     } as unknown as LifecycleEffects;
     const worker = createLifecycleWorker(createLifecycleStore(db, effects), {
