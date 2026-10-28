@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   classifySilenceLevel,
+  decideStaleRunEvaluation,
   evaluateSuppression,
   isTerminalIssueStatus,
   shouldFoldTerminalSource,
   silenceAgeMs,
   silenceStartedAt,
+  type StaleRunEvaluationEvidence,
 } from "./policy.js";
 
 describe("domain", () => {
@@ -231,6 +233,103 @@ describe("domain", () => {
       expect(
         shouldFoldTerminalSource({ sourceIssueStatus: "in_progress", hasSameRunTerminalEvidence: true }),
       ).toBe(false);
+    });
+  });
+
+  describe("decideStaleRunEvaluation", () => {
+    /**
+     * A critically silent run, unsuppressed, with no evaluation yet and a live
+     * source task. Each test changes exactly one field, so every assertion
+     * isolates one clause of the decision.
+     */
+    function evaluable(
+      overrides: Partial<StaleRunEvaluationEvidence> = {},
+    ): StaleRunEvaluationEvidence {
+      return {
+        level: "critical",
+        suppression: { suppressed: false },
+        hasOpenEvaluation: false,
+        sourceIssueId: "issue-1",
+        sourceIssueStatus: "in_progress",
+        ...overrides,
+      };
+    }
+
+    it("opens an evaluation for a critically silent run that has none", () => {
+      expect(decideStaleRunEvaluation(evaluable())).toEqual({ open: true });
+    });
+
+    it("leaves a run that is no longer running alone", () => {
+      expect(decideStaleRunEvaluation(evaluable({ level: "not_applicable" }))).toEqual({
+        open: false,
+        reason: "not_running",
+      });
+    });
+
+    it.each(["ok", "suspicious", "snoozed"] as const)(
+      "waits for the critical level rather than escalating at %s",
+      (level) => {
+        // The scan finds candidates at the lower suspicion threshold. Opening
+        // board-visible work needs the critical bound, not mere suspicion.
+        expect(decideStaleRunEvaluation(evaluable({ level }))).toEqual({
+          open: false,
+          reason: "within_critical_threshold",
+        });
+      },
+    );
+
+    it("honours the scan's suppression rules at the critical level", () => {
+      expect(
+        decideStaleRunEvaluation(
+          evaluable({ suppression: { suppressed: true, reason: "recovery_origin_source" } }),
+        ),
+      ).toEqual({ open: false, reason: "suppressed" });
+    });
+
+    it("never opens a second evaluation while one is already open", () => {
+      // This is the no-duplicate-effect guarantee: an open evaluation owns the
+      // silence, so the decision declines rather than creating a rival.
+      expect(decideStaleRunEvaluation(evaluable({ hasOpenEvaluation: true }))).toEqual({
+        open: false,
+        reason: "evaluation_already_open",
+      });
+    });
+
+    it("declines a run with no source task to evaluate", () => {
+      expect(decideStaleRunEvaluation(evaluable({ sourceIssueId: null }))).toEqual({
+        open: false,
+        reason: "no_source_issue",
+      });
+    });
+
+    it.each(["done", "cancelled"] as const)("leaves a %s source task to the fold path", (status) => {
+      expect(decideStaleRunEvaluation(evaluable({ sourceIssueStatus: status }))).toEqual({
+        open: false,
+        reason: "terminal_source_issue",
+      });
+    });
+
+    it("prefers the more specific reason when several clauses apply", () => {
+      // Liveness outranks the bound, which outranks suppression, which
+      // outranks an existing evaluation.
+      expect(
+        decideStaleRunEvaluation(
+          evaluable({
+            level: "not_applicable",
+            suppression: { suppressed: true, reason: "snoozed" },
+            hasOpenEvaluation: true,
+            sourceIssueId: null,
+          }),
+        ),
+      ).toEqual({ open: false, reason: "not_running" });
+      expect(
+        decideStaleRunEvaluation(
+          evaluable({
+            suppression: { suppressed: true, reason: "snoozed" },
+            hasOpenEvaluation: true,
+          }),
+        ),
+      ).toEqual({ open: false, reason: "suppressed" });
     });
   });
 });

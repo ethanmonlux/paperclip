@@ -75,6 +75,76 @@ export function isTerminalIssueStatus(status: string | null | undefined): boolea
   return status === "done" || status === "cancelled";
 }
 
+/**
+ * One silent active run's evidence, as the scan already resolves it. Every
+ * field is a read the scan performs today; this decision adds no new query.
+ */
+export type StaleRunEvaluationEvidence = {
+  /** The silence classification for this run. */
+  level: SilenceLevel;
+  /** The first suppression rule that matched, if any. */
+  suppression: SuppressionResult;
+  /** An open evaluation already bound to this run owns the escalation. */
+  hasOpenEvaluation: boolean;
+  /** The task the run was working. Without one there is nothing to evaluate. */
+  sourceIssueId: string | null;
+  /** The source task's status, used to leave settled work alone. */
+  sourceIssueStatus: string | null;
+};
+
+export type StaleRunEvaluationSkipReason =
+  | "not_running"
+  | "within_critical_threshold"
+  | "suppressed"
+  | "evaluation_already_open"
+  | "no_source_issue"
+  | "terminal_source_issue";
+
+export type StaleRunEvaluationDecision =
+  | { open: false; reason: StaleRunEvaluationSkipReason }
+  | { open: true };
+
+/**
+ * Decides whether a silent active run has earned a fresh stale-run
+ * evaluation. The scan finds candidates at the *suspicion* threshold, which
+ * is deliberately low, and today it does nothing with one that has no open
+ * evaluation: `scanSilentActiveRuns` only ever counts an evaluation that
+ * already exists, so its `created` and `escalated` counters never move and a
+ * run that goes quiet with no prior evaluation is skipped forever.
+ *
+ * Opening an evaluation is board-visible work, so this decision is the
+ * conservative half of that repair and requires the *critical* level rather
+ * than mere suspicion. The clause order encodes the precedence: liveness
+ * first, then the bound, then the suppression rules the scan already honours,
+ * then ownership by an existing evaluation, and only then the source task.
+ *
+ * It is a pure decision and authorizes nothing by itself: the caller still
+ * owns creating at most one evaluation per run, bound to that run's identity.
+ */
+export function decideStaleRunEvaluation(
+  evidence: StaleRunEvaluationEvidence,
+): StaleRunEvaluationDecision {
+  // "not_applicable" covers a run that is no longer running and a run whose
+  // silence an operator already dismissed as a false positive.
+  if (evidence.level === "not_applicable") return { open: false, reason: "not_running" };
+  // Suspicion alone is not an escalation. Snoozed silence is also still inside
+  // a bound somebody chose, so it waits for the critical level like any other.
+  if (evidence.level !== "critical") return { open: false, reason: "within_critical_threshold" };
+  // The scan's own suppression rules keep their meaning at the critical level.
+  if (evidence.suppression.suppressed) return { open: false, reason: "suppressed" };
+  // An open evaluation is the existing owner of this run's silence. A second
+  // one would duplicate the effect this decision exists to create exactly once.
+  if (evidence.hasOpenEvaluation) return { open: false, reason: "evaluation_already_open" };
+  // A run with no source task has no work to evaluate and nowhere to return.
+  if (!evidence.sourceIssueId) return { open: false, reason: "no_source_issue" };
+  // Settled work needs no evaluation. The fold path, not this one, reconciles a
+  // terminal source whose run is still marked running.
+  if (isTerminalIssueStatus(evidence.sourceIssueStatus)) {
+    return { open: false, reason: "terminal_source_issue" };
+  }
+  return { open: true };
+}
+
 export type ShouldFoldTerminalSourceInput = {
   sourceIssueStatus: string | null | undefined;
   hasSameRunTerminalEvidence: boolean;
