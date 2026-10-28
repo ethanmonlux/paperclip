@@ -5230,7 +5230,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               timeoutMs: quietTurnTimeoutMs,
               observedEventCount: observedRuntimeEvents,
               pendingToolCount: pending.length,
-              pendingPermissionCount: pending.filter(([id]) => permissionRequestedToolCallIds.has(id)).length,
+              // A permission request can precede the tool_call event. Count
+              // unresolved requests independently, or a quiet provider with
+              // an outstanding approval would be cancelled before the tool
+              // inventory sees that call. Settled tool events clear the ID.
+              pendingPermissionCount: permissionRequestedToolCallIds.size,
               stopAlreadyRequested: turnStopRequestedAt !== null || stalledTool !== null,
               provider: readProviderLiveness(),
               channelLost:
@@ -5333,7 +5337,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   firstSeenAt: previous?.firstSeenAt ?? lastRuntimeEventAt,
                   lastUpdateAt: lastRuntimeEventAt,
                 });
-                if (event.status && !isPendingAcpTool({ status: event.status })) lastToolSettledAt = lastRuntimeEventAt;
+                if (event.status && !isPendingAcpTool({ status: event.status })) {
+                  lastToolSettledAt = lastRuntimeEventAt;
+                  permissionRequestedToolCallIds.delete(event.toolCallId);
+                }
               }
             }
             if (event.type === "text_delta" && event.stream !== "thought") {

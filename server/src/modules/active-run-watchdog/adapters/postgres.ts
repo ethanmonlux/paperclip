@@ -307,6 +307,11 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
       )).for("update").limit(1);
       if (!source || source.status === "blocked" || isTerminalIssueStatus(source.status) ||
           isRecoveryOriginKind(source.originKind)) return { kind: "skipped" as const };
+      // A stale run may remain persisted as running after reassignment or a
+      // successor. Its saved source ID does not establish current ownership.
+      if (source.executionRunId !== current.id || source.assigneeAgentId !== current.agentId) {
+        return { kind: "skipped" as const };
+      }
 
       // The current source and decision guards must still hold at mutation
       // time, not merely when an earlier scanner selected this candidate.
@@ -368,7 +373,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
         allowDuplicate: true,
         skipExecutionWorkspaceInheritance: true,
         onDeduplicated: () => { created = false; },
-        assertCanReuseIssue: (existing) => {
+        assertCanReuseIssue: async (existing) => {
           if (existing.companyId !== companyId ||
               existing.originKind !== STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND ||
               existing.originId !== input.runId || existing.parentId !== source.id) {

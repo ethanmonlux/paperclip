@@ -341,7 +341,12 @@ export function createScanSilentActiveRuns(deps: ScanSilentActiveRunsDeps) {
       now: input.now,
     });
     if (persisted.kind === "skipped") return { kind: "skipped" };
-    const woke = Boolean(persisted.assigneeAgentId && deps.enqueueEvaluationWakeup &&
+    // The native queue does not enforce this custom idempotency prefix.
+    // Never wake again on an existing evaluation: repeated scans after the
+    // first manager run would otherwise launch duplicate reviewer episodes.
+    // A lost initial wake remains a visible incomplete delivery until a
+    // durable outbox/receipt boundary is qualified, not a blind retry.
+    const woke = Boolean(persisted.kind === "created" && persisted.assigneeAgentId && deps.enqueueEvaluationWakeup &&
       await deps.enqueueEvaluationWakeup({
         companyId: input.run.companyId,
         sourceIssueId: sourceIssue.id,

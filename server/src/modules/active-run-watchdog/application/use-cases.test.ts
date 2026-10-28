@@ -146,7 +146,8 @@ describe("application", () => {
           calls.push("cleanup");
           return { attempted: false, outcome: "no_process_metadata", adapterType: "grok_local" };
         } },
-        writer: { recordDecision: async () => { throw new Error("unexpected decision"); },
+        writer: { ensureEvaluation: async () => ({ kind: "skipped" }),
+          recordDecision: async () => { throw new Error("unexpected decision"); },
           foldSourceResolvedRun: async () => { calls.push("fold"); return { kind: "folded", evaluationIssueId: null }; } },
       });
       expect(await fold({ run: makeRun({ processPid: 4242 }), runningAgentAdapterType: "grok_local",

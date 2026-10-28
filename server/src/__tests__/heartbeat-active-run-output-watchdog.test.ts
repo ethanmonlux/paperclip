@@ -255,12 +255,28 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation"),
     ));
     expect(evaluations).toHaveLength(1);
-    expect(enqueueWakeup).toHaveBeenCalledTimes(2); // same deduplication key, no successor job identity
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1); // no second wake after completion; unknown initial loss stays held
 
     // Fresh output clears the warning even on a long-running task.
     await db.update(heartbeatRuns).set({ lastOutputAt: new Date(now.getTime() + 35 * 60_000) })
       .where(eq(heartbeatRuns.id, seeded.runId));
     await expect(summaryAt(36 * 60_000)).resolves.toMatchObject({ level: "ok" });
+  });
+
+  it("refuses to open an evaluation for a superseded execution run", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedRunningRun({ now, ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000 });
+    // Source task was handed to a successor while the old run remains in the
+    // running table. A stored contextSnapshot does not prove current ownership.
+    await db.update(issues).set({ executionRunId: randomUUID() }).where(eq(issues.id, seeded.issueId));
+    const { recovery, enqueueWakeup } = createRecovery();
+    const result = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(result).toMatchObject({ created: 0, escalated: 0 });
+    const evaluations = await db.select().from(issues).where(and(
+      eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation"),
+    ));
+    expect(evaluations).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
   it.each(["stale_active_run_evaluation", "issue_productivity_review"])("keeps blocked and %s sources artifact-free", async (originKind) => {
