@@ -1,5 +1,6 @@
 import {
   classifySilenceLevel,
+  decideStaleRunEvaluation,
   evaluateSuppression,
   isTerminalIssueStatus,
   shouldFoldTerminalSource,
@@ -221,8 +222,18 @@ export function createRecordWatchdogDecision(deps: RecordWatchdogDecisionDeps) {
 
 export type ScanSilentActiveRunsDeps = {
   reader: WatchdogRunReader;
+  /** Optional only for pure read-only test fixtures. The live module always supplies it. */
+  writer?: Pick<WatchdogWriter, "ensureEvaluation">;
   foldSourceResolvedRun: ReturnType<typeof createFoldSourceResolvedRun>;
   suspicionThresholdMs: number;
+  criticalThresholdMs?: number;
+  enqueueEvaluationWakeup?: (input: {
+    companyId: string;
+    sourceIssueId: string;
+    runId: string;
+    evaluationIssueId: string;
+    agentId: string;
+  }) => Promise<boolean>;
 };
 
 export type ScanSilentActiveRunsOptions = {
@@ -233,7 +244,7 @@ export type ScanSilentActiveRunsOptions = {
 
 type InspectOutcome =
   | { kind: "skipped" }
-  | { kind: "existing"; evaluationIssueId: string }
+  | { kind: "created" | "existing"; evaluationIssueId: string; woke: boolean }
   | { kind: "folded"; evaluationIssueId: string | null };
 
 export function createScanSilentActiveRuns(deps: ScanSilentActiveRunsDeps) {
@@ -297,7 +308,48 @@ export function createScanSilentActiveRuns(deps: ScanSilentActiveRunsDeps) {
       return { kind: "skipped" };
     }
 
-    return existing ? { kind: "existing", evaluationIssueId: existing.id } : { kind: "skipped" };
+    const criticalThresholdMs = deps.criticalThresholdMs ?? deps.suspicionThresholdMs * 3;
+    const level = classifySilenceLevel({
+      isRunningRun: input.run.status === "running",
+      silenceAgeMs: silenceAgeMs(input.run, input.now),
+      dismissedFalsePositive: input.dismissedFalsePositive,
+      snoozed: false,
+      suspicionThresholdMs: deps.suspicionThresholdMs,
+      criticalThresholdMs,
+    });
+    const decision = decideStaleRunEvaluation({
+      level,
+      suppression: { suppressed: false },
+      hasOpenEvaluation: existing !== null,
+      sourceIssueId: sourceIssue?.id ?? null,
+      sourceIssueStatus: sourceIssue?.status ?? null,
+    });
+    // A prior evaluation owns the run. At the critical bound, retry only its
+    // same idempotency-keyed wake, which repairs create-success/wake-loss.
+    if (level !== "critical") return existing
+      ? { kind: "existing", evaluationIssueId: existing.id, woke: false }
+      : { kind: "skipped" };
+    if (!decision.open && !existing) return { kind: "skipped" };
+    if (!sourceIssue || !deps.writer) return existing
+      ? { kind: "existing", evaluationIssueId: existing.id, woke: false }
+      : { kind: "skipped" };
+
+    const persisted = await deps.writer.ensureEvaluation(input.run.companyId, {
+      runId: input.run.id,
+      sourceIssueId: sourceIssue.id,
+      criticalThresholdMs,
+      now: input.now,
+    });
+    if (persisted.kind === "skipped") return { kind: "skipped" };
+    const woke = Boolean(persisted.assigneeAgentId && deps.enqueueEvaluationWakeup &&
+      await deps.enqueueEvaluationWakeup({
+        companyId: input.run.companyId,
+        sourceIssueId: sourceIssue.id,
+        runId: input.run.id,
+        evaluationIssueId: persisted.evaluationIssueId,
+        agentId: persisted.assigneeAgentId,
+      }));
+    return { kind: persisted.kind, evaluationIssueId: persisted.evaluationIssueId, woke };
   }
 
   return async function scanSilentActiveRuns(opts?: ScanSilentActiveRunsOptions): Promise<ScanSilentActiveRunsResult> {
@@ -332,8 +384,10 @@ export function createScanSilentActiveRuns(deps: ScanSilentActiveRunsDeps) {
         dismissedFalsePositive: decisionState.dismissedFalsePositive,
       });
       if (outcome.kind === "existing") result.existing += 1;
+      else if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "folded") result.folded += 1;
       else result.skipped += 1;
+      if ("woke" in outcome && outcome.woke) result.escalated += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
       }

@@ -8,6 +8,18 @@ import {
   createScanSilentActiveRuns,
 } from "./application/use-cases.js";
 
+export type EvaluationWakeupInput = {
+  companyId: string;
+  sourceIssueId: string;
+  runId: string;
+  evaluationIssueId: string;
+  agentId: string;
+};
+
+export type ActiveRunWatchdogHooks = {
+  enqueueEvaluationWakeup?: (input: EvaluationWakeupInput) => Promise<boolean>;
+};
+
 export type ActiveRunWatchdogConfig = {
   suspicionThresholdMs: number;
   criticalThresholdMs: number;
@@ -19,7 +31,7 @@ export type ActiveRunWatchdogConfig = {
  * the process adapter, and the four use cases. The recovery service holds
  * the only caller.
  */
-export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig) {
+export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig, hooks: ActiveRunWatchdogHooks = {}) {
   const postgresAdapter = createPostgresWatchdogAdapter(db);
   const processController = createProcessAdapter();
 
@@ -37,8 +49,11 @@ export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig)
     }),
     scanSilentActiveRuns: createScanSilentActiveRuns({
       reader: postgresAdapter,
+      writer: postgresAdapter,
       foldSourceResolvedRun,
       suspicionThresholdMs: config.suspicionThresholdMs,
+      criticalThresholdMs: config.criticalThresholdMs,
+      enqueueEvaluationWakeup: hooks.enqueueEvaluationWakeup,
     }),
     recordWatchdogDecision: createRecordWatchdogDecision({
       reader: postgresAdapter,

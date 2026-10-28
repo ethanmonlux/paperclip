@@ -2332,6 +2332,27 @@ export function recoveryService(
     suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
     criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
     continueRearmMs: ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
+  }, {
+    enqueueEvaluationWakeup: async (input) => {
+      const context = withRecoveryContext({
+        issueId: input.evaluationIssueId,
+        sourceIssueId: input.sourceIssueId,
+        predecessorRunId: input.runId,
+        source: "heartbeat.watchdog.stale_run_evaluation",
+      }, "status_only");
+      const wake = await deps.enqueueWakeup(input.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "stale_active_run_evaluation",
+        idempotencyKey: `stale-active-run-evaluation:${input.runId}`,
+        payload: context,
+        contextSnapshot: context,
+        requestedByActorType: "system",
+        requestedByActorId: "active-run-watchdog",
+        issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: input.agentId },
+      });
+      return Boolean(wake);
+    },
   });
 
   async function buildRunOutputSilence(

@@ -1,5 +1,6 @@
 import type {
   EvaluationIssueSnapshot,
+  EnsureEvaluationResult,
   FoldOutcome,
   FoldSourceResolvedRunInput,
   RecordDecisionInput,
@@ -73,6 +74,12 @@ export interface WatchdogRunReader {
  * update inside one transaction.
  */
 export interface WatchdogWriter {
+  ensureEvaluation(companyId: string, input: {
+    runId: string;
+    sourceIssueId: string;
+    criticalThresholdMs: number;
+    now: Date;
+  }): Promise<EnsureEvaluationResult>;
   recordDecision(companyId: string, input: RecordDecisionInput): Promise<WatchdogDecisionRecord>;
   foldSourceResolvedRun(companyId: string, input: FoldSourceResolvedRunInput): Promise<FoldOutcome>;
 }

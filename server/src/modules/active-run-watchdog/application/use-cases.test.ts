@@ -166,6 +166,7 @@ describe("application", () => {
         },
       };
       const writer: WatchdogWriter = {
+        ensureEvaluation: async () => ({ kind: "skipped" }),
         recordDecision: async () => {
           throw new Error("not used in this test");
         },
@@ -204,6 +205,7 @@ describe("application", () => {
         }),
       };
       const writer: WatchdogWriter = {
+        ensureEvaluation: async () => ({ kind: "skipped" }),
         recordDecision: async () => {
           throw new Error("not used in this test");
         },
@@ -228,6 +230,7 @@ describe("application", () => {
 
   function makeDecisionWriter(overrides: Partial<WatchdogWriter> = {}): WatchdogWriter {
     return {
+      ensureEvaluation: async () => ({ kind: "skipped" }),
       recordDecision: async (companyId, input) => ({
         id: "decision-1",
         companyId,
@@ -412,6 +415,7 @@ describe("application", () => {
       }),
     };
     const writer: WatchdogWriter = {
+      ensureEvaluation: async () => ({ kind: "skipped" }),
       recordDecision: async () => {
         throw new Error("not used in this test");
       },
@@ -514,6 +518,60 @@ describe("application", () => {
       const result = await scanSilentActiveRuns({ now: new Date("2026-01-01T05:00:00.000Z") });
 
       expect(result).toMatchObject({ scanned: 1, folded: 1, skipped: 0 });
+    });
+    it("opens the same run-bound evaluation through the writer and wakes the manager", async () => {
+      const calls: string[] = [];
+      const run = makeRun({ sourceIssueId: "issue-1" });
+      const reader = makeReader({
+        findCandidateSilentRuns: async () => [run],
+        findRunningAgent: async () => ({ id: "agent-1", companyId: "company-1", adapterType: "codex_local" }),
+        findSourceIssue: async () => ({ id: "issue-1", identifier: "PAP-1", status: "in_progress",
+          originKind: "manual", isRecoveryOriginKind: false }),
+      });
+      const scan = createScanSilentActiveRuns({
+        reader,
+        writer: { ensureEvaluation: async (companyId, input) => {
+          expect(companyId).toBe("company-1");
+          expect(input).toMatchObject({ runId: "run-1", sourceIssueId: "issue-1",
+            criticalThresholdMs: CRITICAL_THRESHOLD_MS });
+          calls.push("create");
+          return { kind: "created", evaluationIssueId: "eval-1", assigneeAgentId: "manager-1" };
+        } },
+        foldSourceResolvedRun: makeScanFoldUseCase(),
+        suspicionThresholdMs: SUSPICION_THRESHOLD_MS,
+        criticalThresholdMs: CRITICAL_THRESHOLD_MS,
+        enqueueEvaluationWakeup: async (input) => {
+          expect(input).toEqual({ companyId: "company-1", sourceIssueId: "issue-1",
+            runId: "run-1", evaluationIssueId: "eval-1", agentId: "manager-1" });
+          calls.push("wake");
+          return true;
+        },
+      });
+      expect(await scan({ now: new Date("2026-01-01T05:00:00.000Z") })).toMatchObject({
+        scanned: 1, created: 1, escalated: 1, skipped: 0, evaluationIssueIds: ["eval-1"],
+      });
+      expect(calls).toEqual(["create", "wake"]);
+    });
+
+    it("does not create or wake a critical evaluation before the critical threshold", async () => {
+      const run = makeRun({ sourceIssueId: "issue-1" });
+      const reader = makeReader({
+        findCandidateSilentRuns: async () => [run],
+        findRunningAgent: async () => ({ id: "agent-1", companyId: "company-1", adapterType: "codex_local" }),
+        findSourceIssue: async () => ({ id: "issue-1", identifier: "PAP-1", status: "in_progress",
+          originKind: "manual", isRecoveryOriginKind: false }),
+      });
+      const scan = createScanSilentActiveRuns({
+        reader,
+        writer: { ensureEvaluation: async () => { throw new Error("premature creation"); } },
+        foldSourceResolvedRun: makeScanFoldUseCase(),
+        suspicionThresholdMs: SUSPICION_THRESHOLD_MS,
+        criticalThresholdMs: CRITICAL_THRESHOLD_MS,
+        enqueueEvaluationWakeup: async () => { throw new Error("premature wake"); },
+      });
+      expect(await scan({ now: new Date("2026-01-01T03:00:00.000Z") })).toMatchObject({
+        scanned: 1, created: 0, escalated: 0, skipped: 1,
+      });
     });
   });
 });

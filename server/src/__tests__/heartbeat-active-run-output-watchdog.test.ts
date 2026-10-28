@@ -214,7 +214,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(manager?.status).toBe("idle");
   }
 
-  it("warns after five silent minutes and escalates after fifteen without changing active work", async () => {
+  it("creates one run-bound evaluation at critical silence, preserves source work and queues one manager wake", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({ now, ageMs: 0 });
     const summaryAt = (elapsedMs: number) => buildSummary(seeded.runId, new Date(now.getTime() + elapsedMs));
@@ -223,11 +223,39 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await expect(summaryAt(15 * 60_000 - 1)).resolves.toMatchObject({ level: "suspicious" });
     await expect(summaryAt(15 * 60_000)).resolves.toMatchObject({ level: "critical" });
     const { recovery, enqueueWakeup } = createRecovery();
-    await recovery.scanSilentActiveRuns({ now: new Date(now.getTime() + 35 * 60_000), companyId: seeded.companyId });
+    const first = await recovery.scanSilentActiveRuns({
+      now: new Date(now.getTime() + 35 * 60_000), companyId: seeded.companyId,
+    });
+    expect(first).toMatchObject({ scanned: 1, created: 1, existing: 0, folded: 0 });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    const [source] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const [evaluation] = await db.select().from(issues).where(and(
+      eq(issues.companyId, seeded.companyId),
+      eq(issues.originKind, "stale_active_run_evaluation"),
+      eq(issues.originId, seeded.runId),
+    ));
     expect(run?.status).toBe("running");
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    await expectNoReviewArtifacts(seeded);
+    expect(source?.status).toBe("in_progress");
+    expect(source?.assigneeAgentId).toBe(seeded.coderId);
+    expect(evaluation).toMatchObject({
+      parentId: seeded.issueId, status: "todo", assigneeAgentId: seeded.managerId,
+      originKind: "stale_active_run_evaluation", originId: seeded.runId,
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(seeded.managerId, expect.objectContaining({
+      source: "automation", reason: "stale_active_run_evaluation",
+      idempotencyKey: `stale-active-run-evaluation:${seeded.runId}`,
+      issueStateGuard: { statuses: ["todo", "in_progress"], assigneeAgentId: seeded.managerId },
+    }));
+    const second = await recovery.scanSilentActiveRuns({
+      now: new Date(now.getTime() + 36 * 60_000), companyId: seeded.companyId,
+    });
+    expect(second).toMatchObject({ scanned: 1, created: 0, existing: 1 });
+    const evaluations = await db.select().from(issues).where(and(
+      eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation"),
+    ));
+    expect(evaluations).toHaveLength(1);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(2); // same deduplication key, no successor job identity
 
     // Fresh output clears the warning even on a long-running task.
     await db.update(heartbeatRuns).set({ lastOutputAt: new Date(now.getTime() + 35 * 60_000) })

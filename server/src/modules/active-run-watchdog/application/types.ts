@@ -70,6 +70,11 @@ export type ScanSilentActiveRunsResult = {
   evaluationIssueIds: string[];
 };
 
+/** A persisted, run-bound evaluation, not merely an in-memory scan verdict. */
+export type EnsureEvaluationResult =
+  | { kind: "skipped" }
+  | { kind: "created" | "existing"; evaluationIssueId: string; assigneeAgentId: string | null };
+
 export type RunProcessMetadata = {
   runId: string;
   adapterType: string;

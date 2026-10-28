@@ -22,10 +22,11 @@ import {
 } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "../../../services/recovery/origins.js";
-import { isTerminalIssueStatus } from "../domain/policy.js";
+import { isTerminalIssueStatus, silenceStartedAt } from "../domain/policy.js";
 import type { WatchdogRunReader, WatchdogWriter } from "../application/ports.js";
 import type {
   EvaluationIssueSnapshot,
+  EnsureEvaluationResult,
   FoldOutcome,
   FoldSourceResolvedRunInput,
   RecordDecisionInput,
@@ -275,6 +276,115 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
     return row ?? null;
   }
 
+  /**
+   * Opens at most one evaluation for a verified critical, still-running run.
+   * The run lock and existing partial unique origin index fence concurrent
+   * schedulers; no historical run/receipt is modified to justify recovery.
+   * Issue creation uses Paperclip's native idempotent issue service.
+   */
+  async function ensureEvaluation(companyId: string, input: {
+    runId: string;
+    sourceIssueId: string;
+    criticalThresholdMs: number;
+    now: Date;
+  }): Promise<EnsureEvaluationResult> {
+    return db.transaction(async (tx) => {
+      const [current] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.id, input.runId),
+      )).for("update").limit(1);
+      if (!current || current.status !== "running") return { kind: "skipped" as const };
+      const run = toRunSnapshot(current);
+      if (run.sourceIssueId !== input.sourceIssueId) return { kind: "skipped" as const };
+      const lastOutput = silenceStartedAt(run);
+      if (!lastOutput || input.now.getTime() - lastOutput.getTime() < input.criticalThresholdMs) {
+        return { kind: "skipped" as const };
+      }
+      const [source] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.id, input.sourceIssueId),
+        visibleIssueCondition(),
+      )).for("update").limit(1);
+      if (!source || source.status === "blocked" || isTerminalIssueStatus(source.status) ||
+          isRecoveryOriginKind(source.originKind)) return { kind: "skipped" as const };
+
+      // The current source and decision guards must still hold at mutation
+      // time, not merely when an earlier scanner selected this candidate.
+      const [suppressed] = await tx.select({ id: heartbeatRunWatchdogDecisions.id })
+        .from(heartbeatRunWatchdogDecisions).where(and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, input.runId),
+          sql`(${heartbeatRunWatchdogDecisions.decision} = 'dismissed_false_positive'
+            or (${heartbeatRunWatchdogDecisions.decision} in ('snooze','continue')
+                and ${heartbeatRunWatchdogDecisions.snoozedUntil} > ${input.now.toISOString()}::timestamptz))`,
+        )).limit(1);
+      if (suppressed) return { kind: "skipped" as const };
+
+      // Terminal evaluations are historical dispositions, not a reason to
+      // create another child or wake another reviewer for the same run.
+      const [prior] = await tx.select(selectEvaluationIssueSnapshot()).from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, input.runId),
+        )).orderBy(asc(issues.createdAt)).limit(1);
+      if (prior) {
+        return prior.hiddenAt || isTerminalIssueStatus(prior.status)
+          ? { kind: "skipped" as const }
+          : { kind: "existing" as const, evaluationIssueId: prior.id,
+              assigneeAgentId: prior.assigneeAgentId };
+      }
+
+      const [runningAgent] = await tx.select({ reportsTo: agents.reportsTo })
+        .from(agents).where(and(eq(agents.id, current.agentId), eq(agents.companyId, companyId)))
+        .limit(1);
+      if (!runningAgent) return { kind: "skipped" as const };
+      const [manager] = runningAgent.reportsTo
+        ? await tx.select({ id: agents.id, status: agents.status }).from(agents).where(and(
+            eq(agents.companyId, companyId), eq(agents.id, runningAgent.reportsTo),
+          )).limit(1)
+        : [];
+      const assigneeAgentId = manager && !["terminated", "pending_approval"].includes(manager.status)
+        ? manager.id : null;
+      let created = true;
+      const evaluation = await issuesSvc.create(companyId, {
+        title: `Evaluate silent run ${input.runId.slice(0, 8)} on ${source.identifier ?? source.title}`,
+        description: [
+          `The active-run watchdog observed a critical output-silence interval for run ${input.runId}.`,
+          `Source issue: ${source.identifier ?? source.id} (${source.id}).`,
+          `Run agent: ${current.agentId}. Last observed output: ${lastOutput.toISOString()}.`,
+          `Evaluate live process, controller lease, tool/permission waits and persisted effects before any cancellation or same-task retry.`,
+          `This child is investigative status-only recovery work, not authority to replace, replay, merge or deploy the original task.`,
+        ].join("\n\n"),
+        status: "todo",
+        priority: "high",
+        parentId: source.id,
+        projectId: source.projectId,
+        goalId: source.goalId,
+        assigneeAgentId,
+        originKind: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+        originId: input.runId,
+        idempotencyKey: `stale-active-run-evaluation:${input.runId}`,
+        allowDuplicate: true,
+        skipExecutionWorkspaceInheritance: true,
+        onDeduplicated: () => { created = false; },
+        assertCanReuseIssue: (existing) => {
+          if (existing.companyId !== companyId ||
+              existing.originKind !== STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND ||
+              existing.originId !== input.runId || existing.parentId !== source.id) {
+            throw new Error("stale-run evaluation idempotency identity mismatch");
+          }
+        },
+      }, tx);
+      if (evaluation.status === "done" || evaluation.status === "cancelled" || evaluation.hiddenAt) {
+        return { kind: "skipped" as const };
+      }
+      return { kind: created ? "created" as const : "existing" as const,
+        evaluationIssueId: evaluation.id,
+        assigneeAgentId: evaluation.assigneeAgentId };
+    });
+  }
+
   async function recordDecision(companyId: string, input: RecordDecisionInput): Promise<WatchdogDecisionRecord> {
     const [row] = await db
       .insert(heartbeatRunWatchdogDecisions)
@@ -515,6 +625,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
     findLatestSameRunTerminalEvidence,
     findSourceIssue,
     findRunningAgent,
+    ensureEvaluation,
     recordDecision,
     foldSourceResolvedRun,
   };
