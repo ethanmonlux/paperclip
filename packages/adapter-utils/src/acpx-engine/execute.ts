@@ -126,6 +126,18 @@ import {
   DEFAULT_ACP_ENGINE_TIMEOUT_SEC,
   DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS,
 } from "./constants.js";
+import {
+  ACPX_QUIET_TURN_CHECK_INTERVAL_MS,
+  ACPX_QUIET_TURN_ERROR_CODE,
+  decideQuietTurn,
+  formatQuietTurnMessage,
+  resolveQuietTurnTimeoutMs,
+  type QuietTurnCancelReason,
+  type QuietTurnDecision,
+  type QuietTurnEffects,
+  type QuietTurnHoldReason,
+  type QuietTurnProviderLiveness,
+} from "./quiet-turn-watchdog.js";
 import type {
   AcpRunContext,
   AcquiredRunResources,
@@ -407,6 +419,24 @@ export interface AcpxEngineExecutorOptions {
    */
   stalledToolTimeoutMs?: number;
   stalledToolCheckIntervalMs?: number;
+  /**
+   * Overrides {@link resolveQuietTurnTimeoutMs} and the interval at which the
+   * quiet-turn watchdog re-evaluates a silent turn. A non-positive timeout
+   * disables the watchdog. Tests inject small values to drive it without real
+   * time.
+   */
+  quietTurnTimeoutMs?: number;
+  quietTurnCheckIntervalMs?: number;
+  /**
+   * Overrides how the quiet-turn watchdog reads the provider process. The
+   * default reads the captured local child, which only exists on a lane that
+   * spawns one; tests inject a reader to drive the `alive` / `exited` /
+   * `unknown` branches without spawning a provider.
+   */
+  readProviderLiveness?: (input: {
+    pid: number | null;
+    sandboxLane: boolean;
+  }) => QuietTurnProviderLiveness;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -4035,6 +4065,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const now = deps.now ?? (() => Date.now());
   const duplexLossCancelDeadlineMs = deps.duplexLossCancelDeadlineMs ?? ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS;
   const stalledToolCheckIntervalMs = deps.stalledToolCheckIntervalMs ?? ACPX_STALLED_TOOL_CHECK_INTERVAL_MS;
+  const quietTurnCheckIntervalMs = deps.quietTurnCheckIntervalMs ?? ACPX_QUIET_TURN_CHECK_INTERVAL_MS;
   const warmHandles = deps.warmHandles ?? defaultWarmHandles;
   const stagedRuntimes = deps.stagedRuntimes ?? defaultStagedRuntimes;
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
@@ -4176,6 +4207,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       settledSameKindPermissionRequested: number;
     } | null = null;
     let stalledToolTimer: ReturnType<typeof setInterval> | undefined;
+    // The quiet-turn watchdog's finding, once it ends a turn, and the last
+    // `hold` it reported. A hold never ends the turn: it records that the turn
+    // is silent past its bound for a reason the host must not resolve on its
+    // own (an outstanding human permission prompt, or a provider process this
+    // lane cannot read), so the silence stays visible in the run diagnostics
+    // even when the turn later completes normally.
+    let quietTurn: {
+      reason: QuietTurnCancelReason;
+      silentMs: number;
+      observedEventCount: number;
+      effects: QuietTurnEffects;
+    } | null = null;
+    let quietTurnHold: { reason: QuietTurnHoldReason; silentMs: number } | null = null;
+    let quietTurnTimer: ReturnType<typeof setInterval> | undefined;
     let forcedStop = false;
     let runtimeStopConfirmed = false;
     let safeInterruptedSession = false;
@@ -5149,6 +5194,85 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           }, stalledToolCheckIntervalMs);
           stalledToolTimer.unref?.();
         }
+        // The quiet-turn watchdog. The two seams above each need a specific
+        // signal: a latched channel loss, or a pending tool call that stopped
+        // updating. A provider that accepts the prompt and then emits nothing
+        // produces neither, and `DEFAULT_ACP_ENGINE_TIMEOUT_SEC` is 0, so
+        // without this bound the turn stays open until an operator cancels it.
+        // The watchdog owns no policy of its own: it ticks `decideQuietTurn`
+        // over the evidence the relay already records and acts on the answer.
+        const quietTurnTimeoutMs = deps.quietTurnTimeoutMs
+          ?? resolveQuietTurnTimeoutMs(stalledToolTimeoutMs);
+        if (quietTurnTimeoutMs > 0) {
+          // The turn starts its own silence clock. Until the first runtime
+          // event lands, `lastRuntimeEventAt` is null and the provider has been
+          // silent since the turn began — the worst case this watchdog exists
+          // for, not an exemption from it.
+          const turnStartedAt = now();
+          // Read the provider process directly. Only a lane that owns a local
+          // child can answer; the sandbox bridge lane reports `unknown`, which
+          // holds rather than cancels.
+          const readProviderLiveness = (): QuietTurnProviderLiveness => {
+            const sandboxLane = Boolean(prepared.processSessionBridge);
+            const pid = processIdentitySink.latest?.pid ?? null;
+            if (deps.readProviderLiveness) return deps.readProviderLiveness({ pid, sandboxLane });
+            if (sandboxLane || pid === null) return "unknown";
+            const child = processIdentitySink.localProcess;
+            if (!child) return "unknown";
+            return capturedProcessExited(child) ? "exited" : "alive";
+          };
+          quietTurnTimer = setInterval(() => {
+            if (quietTurn !== null) return;
+            const checkedAt = now();
+            const pending = [...interruptionTools.entries()].filter(([, tool]) => isPendingAcpTool(tool));
+            const decision: QuietTurnDecision = decideQuietTurn({
+              silentMs: checkedAt - (lastRuntimeEventAt ?? turnStartedAt),
+              timeoutMs: quietTurnTimeoutMs,
+              observedEventCount: observedRuntimeEvents,
+              pendingToolCount: pending.length,
+              pendingPermissionCount: pending.filter(([id]) => permissionRequestedToolCallIds.has(id)).length,
+              stopAlreadyRequested: turnStopRequestedAt !== null || stalledTool !== null,
+              provider: readProviderLiveness(),
+              channelLost:
+                lossDeadlineTripped ||
+                (prepared.paperclipBridge?.readRunDisposition?.().failed ?? false),
+              toolInventoryComplete: !incompleteToolInventory,
+            });
+            if (decision.action === "wait") {
+              quietTurnHold = null;
+              return;
+            }
+            if (decision.action === "hold") {
+              // Report each distinct hold once, then keep it latched for the
+              // run diagnostics. A held turn is still running, so the watchdog
+              // stays armed: the condition can clear and the turn can finish.
+              if (quietTurnHold?.reason === decision.reason) return;
+              quietTurnHold = { reason: decision.reason, silentMs: checkedAt - (lastRuntimeEventAt ?? turnStartedAt) };
+              void ctx.onLog(
+                "stderr",
+                `[paperclip] The provider has sent no activity for ${Math.round(quietTurnHold.silentMs / 60_000)} minutes, ` +
+                  `but Paperclip is holding the turn open (${decision.reason}) rather than ending it.\n`,
+              ).catch(() => {});
+              return;
+            }
+            clearInterval(quietTurnTimer);
+            const silentMs = checkedAt - (lastRuntimeEventAt ?? turnStartedAt);
+            quietTurn = {
+              reason: decision.reason,
+              silentMs,
+              observedEventCount: observedRuntimeEvents,
+              effects: decision.effects,
+            };
+            // Claim the turn for this watchdog on the same fields the
+            // stalled-tool watchdog uses, so the two can never both cancel.
+            turnStopRequestedAt = checkedAt;
+            pendingToolsAtStop = [];
+            void ctx.onLog("stderr", `[paperclip] ${formatQuietTurnMessage(quietTurn)}\n`).catch(() => {});
+            void turn.cancel({ reason: "paperclip quiet turn watchdog" }).catch(() => {});
+            armCancelDeadline();
+          }, quietTurnCheckIntervalMs);
+          quietTurnTimer.unref?.();
+        }
         // ACP can resolve the turn before its provider exits. Keep the Stop
         // deadline armed through settlement, including provider cleanup.
         const armStopDeadline = () => {
@@ -5182,7 +5306,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // to build the reported failure and its message.
       const cancelDeadlineTerminal = (): AcpRuntimeTurnResult => ({
         status: "cancelled",
-        stopReason: stalledTool ? "paperclip_stalled_tool_deadline" : "paperclip_duplex_loss_deadline",
+        stopReason: stalledTool
+          ? "paperclip_stalled_tool_deadline"
+          : quietTurn
+            ? "paperclip_quiet_turn_deadline"
+            : "paperclip_duplex_loss_deadline",
       });
       const stepEventRelay = async (): Promise<AcpRuntimeTurnResult> => {
         const turn = activeTurn as AcpRuntimeTurn;
@@ -5242,7 +5370,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // both the close call and the drain it unblocks before this step
           // returns, so no late runtime event can still mutate shared state
           // (output segments, tool inventory) after finalization reads it.
-          await turn.closeStream({ reason: stalledTool ? "paperclip stalled tool cancel deadline" : "paperclip duplex loss cancel deadline" }).catch(() => {});
+          await turn.closeStream({ reason: stalledTool
+            ? "paperclip stalled tool cancel deadline"
+            : quietTurn
+              ? "paperclip quiet turn cancel deadline"
+              : "paperclip duplex loss cancel deadline" }).catch(() => {});
           await drainEvents.catch(() => {});
           flushOutputSegment();
           return cancelDeadlineTerminal();
@@ -5256,8 +5388,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const stepTurnFinalize = async (
         input: TurnFinalizeInput<AcpRuntimeTurnResult>,
       ): Promise<TurnCompletion> => {
-        // The turn has ended; tools left pending now cannot stall it.
+        // The turn has ended; tools left pending now cannot stall it, and a
+        // turn that is over can no longer be quiet.
         clearInterval(stalledToolTimer);
+        clearInterval(quietTurnTimer);
         // Capture runtime activity before usage reads, error logs, or cleanup
         // make an otherwise silent turn look active at its execution deadline.
         const lastEventAgeMs = lastRuntimeEventAt === null ? undefined : now() - lastRuntimeEventAt;
@@ -5269,6 +5403,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           acpPendingToolCount: pendingTools.length,
           acpToolInventoryComplete: !incompleteToolInventory,
           ...summarizeAcpStopActivity(turnStopRequestedAt, lastRuntimeEventBeforeStopAt, pendingToolsAtStop ?? pendingTools),
+          // A hold is reported even when the turn later finished on its own:
+          // it is evidence that the run spent time silent past its bound for a
+          // reason the host declined to resolve.
+          ...(quietTurnHold
+            ? {
+                acpQuietTurnHeldReason: quietTurnHold.reason,
+                acpQuietTurnHeldSilentMs: quietTurnHold.silentMs,
+              }
+            : {}),
         };
         if (input.kind === "terminal") {
         const terminal = input.terminal;
@@ -5308,6 +5451,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const toolStalledMessage = stalledTool
           ? `A pending tool call (kind ${stalledTool.kind}) received no update for ${Math.round(stalledTool.silentMs / 60_000)} minutes, so Paperclip ended the turn instead of waiting for the execution timeout.`
           : null;
+        // The quiet-turn watchdog ended the turn. It yields to every more
+        // specific explanation on the same precedence as the stalled-tool
+        // finding, and a turn that completed anyway — its completion raced the
+        // cancel — keeps its success.
+        const turnWentQuiet =
+          quietTurn !== null && !timedOut && !channelLost && !toolStalled && terminal.status !== "completed";
+        const quietTurnMessage = quietTurn ? formatQuietTurnMessage(quietTurn) : null;
         // A completed, non-timed-out turn whose channel stayed live is the one
         // success path. Every other outcome — a failed, cancelled, or timed-out
         // terminal, or a completed terminal with a lost channel — is a failure.
@@ -5360,9 +5510,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               ? "paperclip duplex channel lost cleanup"
               : toolStalled
                 ? "paperclip stalled tool cleanup"
-                : failedTurn
-                  ? `paperclip turn ${terminal.status}`
-                  : "paperclip completed turn cleanup",
+                : turnWentQuiet
+                  ? "paperclip quiet turn cleanup"
+                  : failedTurn
+                    ? `paperclip turn ${terminal.status}`
+                    : "paperclip completed turn cleanup",
           discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
           dropWarmEntry: false,
           recordCloseError: false,
@@ -5370,7 +5522,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           skipRemoteClose: channelLost,
         };
 
-        const failureDiagnostic = !timedOut && !channelLost && !toolStalled && terminal.status === "failed"
+        const failureDiagnostic = !timedOut && !channelLost && !toolStalled && !turnWentQuiet && terminal.status === "failed"
           ? terminalSessionFailure
           : null;
         const errorMessage = timedOut
@@ -5379,14 +5531,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? channelLostMessage
             : toolStalled
               ? toolStalledMessage
-              : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
+              : turnWentQuiet
+                ? quietTurnMessage
+                : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
-        const classifiedFailure = !timedOut && !channelLost && !toolStalled && terminal.status === "failed"
+        const classifiedFailure = !timedOut && !channelLost && !toolStalled && !turnWentQuiet && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
-          summary: channelLost ? "duplex_channel_lost" : toolStalled ? "tool_stalled" : terminal.status,
+          summary: channelLost
+            ? "duplex_channel_lost"
+            : toolStalled
+              ? "tool_stalled"
+              : turnWentQuiet
+                ? "turn_quiet"
+                : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
         });
@@ -5405,9 +5565,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
               : toolStalled
                 ? ACPX_TOOL_STALLED_ERROR_CODE
-                : terminal.status === "failed"
-                  ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                  : null,
+                : turnWentQuiet
+                  ? ACPX_QUIET_TURN_ERROR_CODE
+                  : terminal.status === "failed"
+                    ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
+                    : null,
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5420,8 +5582,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           costUsd: turnUsage.costUsd,
           usageComplete,
           resultJson: {
-            status: channelLost || toolStalled ? "failed" : terminal.status,
+            status: channelLost || toolStalled || turnWentQuiet ? "failed" : terminal.status,
             ...activityDiagnostics,
+            // `acpQuietTurnEffects` is the replay gate for a quiet run. It is
+            // `settled` only when the turn owed no pending tool call and every
+            // action it took was attributable, so a successor cannot repeat a
+            // half-applied effect. `unknown` means the run must hold. No
+            // `executionRecovery` is emitted on either path: that field is
+            // positive evidence for replay, and a provider that went silent
+            // supplies none.
+            ...(turnWentQuiet && quietTurn
+              ? {
+                  acpQuietTurnReason: quietTurn.reason,
+                  acpQuietTurnSilentMs: quietTurn.silentMs,
+                  acpQuietTurnObservedEventCount: quietTurn.observedEventCount,
+                  acpQuietTurnEffects: quietTurn.effects,
+                }
+              : {}),
             ...(toolStalled && stalledTool
               ? {
                   acpStalledToolKind: stalledTool.kind,
@@ -5888,6 +6065,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       removeLossListener?.();
       clearTimeout(lossDeadlineTimer);
       clearInterval(stalledToolTimer);
+      clearInterval(quietTurnTimer);
       // End the run root span exactly once, on every return and on a throw.
       runRootSpan.end(runFailed);
       // Release the per-session staging lease as the run's final act, AFTER the

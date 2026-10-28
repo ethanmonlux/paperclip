@@ -3680,6 +3680,197 @@ describe("ACP activity diagnostics", () => {
     expect(result.errorMessage).not.toContain("private");
   }, 15_000);
 
+  // The quiet-ACP reproduction. Each of these configures no `timeoutSec`, so
+  // the wall-clock backstop is the default 0 (disabled). Before the quiet-turn
+  // watchdog existed, the first test here hung until the suite timeout: the
+  // provider emits no event, owes no tool call, and keeps a healthy channel,
+  // so neither the duplex-loss seam nor the stalled-tool watchdog could see it.
+  it("ends the turn as a failure when a live provider sends no activity at all", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const cancelReasons: Array<string | undefined> = [];
+    const logs: string[] = [];
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      quietTurnTimeoutMs: 5000,
+      quietTurnCheckIntervalMs: 5,
+      readProviderLiveness: () => "alive",
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          // The provider accepted the prompt and then said nothing.
+          events: (async function* () {
+            currentNow = 9000;
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async ({ reason }: { reason?: string }) => {
+            cancelReasons.push(reason);
+            releaseTurn?.();
+          },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "quiet-turn", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async (_stream: string, text: string) => { logs.push(text); },
+    } as never);
+    expect(cancelReasons).toEqual(["paperclip quiet turn watchdog"]);
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_quiet_turn");
+    expect(result.resultJson).toMatchObject({
+      status: "failed",
+      acpQuietTurnReason: "provider_quiet",
+      acpQuietTurnSilentMs: 8000,
+      acpQuietTurnObservedEventCount: 0,
+      acpQuietTurnEffects: "settled",
+    });
+    // A provider that went silent supplies no positive evidence for replay, so
+    // the adapter emits none. Absent evidence is what holds the run.
+    expect(result.executionRecovery).toBeUndefined();
+    expect(logs.join("")).toContain("The provider stayed connected but sent no activity");
+    expect(logs.join("")).toContain("It never sent any activity this turn.");
+  }, 15_000);
+
+  it("reports unknown effects, and still refuses replay, when the quiet turn's tool inventory is incomplete", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      quietTurnTimeoutMs: 5000,
+      quietTurnCheckIntervalMs: 5,
+      readProviderLiveness: () => "alive",
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            // A flattened client-side receipt the host cannot attribute to a
+            // tool call. Nothing stays pending, but the turn's effects are no
+            // longer fully known.
+            yield { type: "status", text: "fs/write_text_file" };
+            currentNow = 9000;
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async () => { releaseTurn?.(); },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "quiet-turn-unknown-effects", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async () => {},
+    } as never);
+    expect(result.errorCode).toBe("acpx_quiet_turn");
+    expect(result.resultJson).toMatchObject({
+      acpQuietTurnEffects: "unknown",
+      acpToolInventoryComplete: false,
+    });
+    expect(result.errorMessage).toContain("holds instead of retrying automatically");
+    expect(result.executionRecovery).toBeUndefined();
+  }, 15_000);
+
+  it("holds a silent turn open, instead of ending it, when it cannot read the provider process", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    const cancelReasons: Array<string | undefined> = [];
+    const logs: string[] = [];
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      quietTurnTimeoutMs: 5000,
+      quietTurnCheckIntervalMs: 5,
+      // The sandbox lane owns no local child, so liveness is unreadable.
+      readProviderLiveness: () => "unknown",
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            currentNow = 9000;
+            // Give the watchdog many ticks to (not) fire, then finish normally.
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async ({ reason }: { reason?: string }) => { cancelReasons.push(reason); },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "quiet-turn-hold", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async (_stream: string, text: string) => { logs.push(text); },
+    } as never);
+    // Unknown liveness never ends a turn, so the turn completed on its own.
+    expect(cancelReasons).toEqual([]);
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    // The silence is still recorded, so an operator can see the turn spent
+    // time past its bound without the host resolving why.
+    expect(result.resultJson).toMatchObject({
+      acpQuietTurnHeldReason: "provider_liveness_unknown",
+      acpQuietTurnHeldSilentMs: 8000,
+    });
+    expect(result.resultJson).not.toHaveProperty("acpQuietTurnReason");
+    expect(logs.join("")).toContain("holding the turn open (provider_liveness_unknown)");
+  }, 15_000);
+
+  it("defers to the stalled-tool watchdog while a tool call is still pending", async () => {
+    const root = await makeTempRoot();
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    let currentNow = 1000;
+    let releaseTurn: (() => void) | null = null;
+    const turnCancelled = new Promise<void>((resolve) => { releaseTurn = resolve; });
+    const cancelReasons: Array<string | undefined> = [];
+    const execute = createAcpxEngineExecutor({
+      now: () => currentNow,
+      // Invert the production ordering: the quiet bound is the *shorter* of the
+      // two here, so only the precedence rule — not the constants — can keep
+      // the quiet watchdog from pre-empting the one that names the stuck call.
+      quietTurnTimeoutMs: 2000,
+      quietTurnCheckIntervalMs: 5,
+      stalledToolTimeoutMs: 5000,
+      stalledToolCheckIntervalMs: 5,
+      readProviderLiveness: () => "alive",
+      createRuntime: () => ({
+        ...buildRuntime(),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "tool_call", toolCallId: "call-1", kind: "execute", status: "in_progress" };
+            currentNow = 9000;
+            await turnCancelled;
+          })(),
+          result: turnCancelled.then(() => ({ status: "cancelled", stopReason: "cancelled" })),
+          cancel: async ({ reason }: { reason?: string }) => {
+            cancelReasons.push(reason);
+            releaseTurn?.();
+          },
+        }),
+      }) as never,
+    });
+    const result = await execute({
+      runId: "quiet-turn-defers", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async () => {},
+    } as never);
+    // Exactly one watchdog ends the turn, and it is the specific one.
+    expect(cancelReasons).toEqual(["paperclip stalled tool watchdog"]);
+    expect(result.errorCode).toBe("acpx_tool_stalled");
+    expect(result.resultJson).not.toHaveProperty("acpQuietTurnReason");
+  }, 15_000);
+
   it("ends a stalled turn within the cancel deadline when the agent ignores the cancel", async () => {
     const root = await makeTempRoot();
     const cwd = path.join(root, "worktree");
