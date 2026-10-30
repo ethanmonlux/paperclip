@@ -270,7 +270,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
   fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
   const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    gitBuildEnv({
+      PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter),
+      ...extra,
+      PAPERCLIP_BUILD_COMMIT: sha,
+      // Codeload archives have no .git. Never discover an unrelated parent repo.
+      GIT_CEILING_DIRECTORIES: stagingRoot,
+    });
   try {
     await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
@@ -278,6 +284,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // Direct bundled-package preparation bypasses prepack. Match release.sh:
+    // stage the built UI and native skills before packing their runtime owners.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], {
+      cwd: checkoutPath,
+      env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }),
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+      const skillsPath = path.join(checkoutPath, packageDir, "skills");
+      fs.rmSync(skillsPath, { recursive: true, force: true });
+      fs.cpSync(path.join(checkoutPath, "skills"), skillsPath, { recursive: true });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
