@@ -25,14 +25,17 @@ function runShard(args) {
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
 
-function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
+function assertTrustedPrCaller(caller) {
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@1b4c803816e82b0265c8422e1a804327a7ed8c54\s*$/m,
+    "pr.yml must call the reviewed upstream workflow at the immutable installed-source revision",
   );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+}
+
+function readTrustedPrWorkflow() {
+  assertTrustedPrCaller(readFileSync(prCallerWorkflow, "utf8"));
+  // Validate the matching local baseline; CI executes its immutable upstream revision.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
@@ -157,8 +160,21 @@ test("shard arguments are validated", () => {
   }
 });
 
-test("pr.yml calls the trusted PR workflow from master", () => {
+test("pr.yml calls the trusted PR workflow at the reviewed immutable revision", () => {
   assert.ok(readTrustedPrWorkflow().length > 0);
+});
+
+test("the caller rejects moving refs, arbitrary commits and alternate repositories", () => {
+  const approved = "    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@1b4c803816e82b0265c8422e1a804327a7ed8c54";
+  assert.doesNotThrow(() => assertTrustedPrCaller(approved));
+  for (const rejected of [
+    approved.replace("@1b4c803816e82b0265c8422e1a804327a7ed8c54", "@master"),
+    approved.replace("@1b4c803816e82b0265c8422e1a804327a7ed8c54", "@refs/pull/10/head"),
+    approved.replace("1b4c803816e82b0265c8422e1a804327a7ed8c54", "0000000000000000000000000000000000000000"),
+    approved.replace("paperclipai/paperclip", "other/paperclip"),
+  ]) {
+    assert.throws(() => assertTrustedPrCaller(rejected));
+  }
 });
 
 test("the trusted PR workflow keeps a stable aggregate check named e2e over the shard matrix", () => {
