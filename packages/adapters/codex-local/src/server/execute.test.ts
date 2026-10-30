@@ -118,7 +118,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; localAllowlist?: boolean }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -157,6 +157,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       config: {
         command: "codex",
         engine: "cli",
+        ...(input.localAllowlist ? { networkScope: "allowlist", networkAllowlist: ["paperclip.test"] } : {}),
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
         env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}) },
@@ -167,7 +168,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           source: "project_primary",
         },
       },
-      executionTransport: {
+      ...(input.localAllowlist ? {} : { executionTransport: {
         remoteExecution: {
           host: "127.0.0.1",
           port: 2222,
@@ -178,7 +179,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
           strictHostKeyChecking: true,
         },
-      },
+      } }),
       onLog: async () => {},
     });
 
@@ -199,11 +200,26 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).toEqual(expect.arrayContaining([
       "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
     ]));
+    expect(keys).not.toContain("HTTP_PROXY");
+    expect(keys).not.toContain("HTTPS_PROXY");
     expect(keys).not.toContain("MY_SERVICE_TOKEN");
     expect(keys).not.toContain("DATABASE_URL");
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
+  });
+
+  it("preserves the local allowlist bridge in identity-filtered Codex shells", async () => {
+    vi.stubEnv("HOST_DATABASE_PASSWORD", "host-password");
+    const { commandArgs } = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", withIdentity: true, localAllowlist: true });
+    const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));
+    const keys = JSON.parse(policy!.slice(policy!.indexOf("=") + 1));
+    expect(keys).toEqual(expect.arrayContaining([
+      "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy",
+      "PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID",
+    ]));
+    expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
+    expect(keys).not.toContain("MY_SERVICE_TOKEN");
   });
 
   it("collects stopped-provider instruction edits before a throwing remote restore", async () => {

@@ -1240,6 +1240,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // Paperclip API token used by the agent skill. Never include host env.
           ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
           ...identityNames,
+          // The outer local sandbox injects these after this command is built.
+          // Keep its bridge reachable from Codex child shells without inheriting
+          // arbitrary host environment or changing the network allowlist.
+          ...(localProcessSandbox?.networkScope === "allowlist"
+            ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+            : []),
         ])];
         args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
           "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
