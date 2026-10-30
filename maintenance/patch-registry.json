@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "status": "preparation-not-enforcement",
+  "owner": "FAC-760",
+  "upstreamRepository": "paperclipai/paperclip",
+  "upstreamRef": "master",
+  "firstCandidateUpstreamSha": "8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57",
+  "forkPatchSourceSha": "315bc90f765e1ec1e202cd749a9bfbf0f5d96ac4",
+  "automaticActivationEnabled": false,
+  "patches": [
+    {
+      "id": "provider-output-and-mounts",
+      "purpose": "Preserve child stdout/stderr, bounded drain/cancellation and merged-usr mounts.",
+      "sourceCommits": [
+        "904851063ddf5f83ae298cac97eea877b8b57771",
+        "2e6e2f4bec1225e2b3b863f04b163884184afe19",
+        "448eebdbb27af81fd4fed54728d225e623297366"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/local-process-sandbox.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "proxy-socket-error-owner",
+      "purpose": "Keep accepted proxy socket errors owned after CONNECT.",
+      "sourceCommits": [
+        "f23e05aacc24cbe66d602adc3ccba6e7981060ec"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/local-process-sandbox.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "codex-auth-provenance",
+      "purpose": "Only provider-owned error evidence may invalidate Codex authentication.",
+      "sourceCommits": [
+        "17c7b9b86aac9e90518b7b2ce989629327c149c2"
+      ],
+      "evidencePaths": [
+        "packages/adapters/codex-local/src/server/parse.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "claude-auth-provenance",
+      "purpose": "Ignore quoted task/history/model prose while preserving actual authentication/probe errors.",
+      "sourceCommits": [
+        "1233ed7dd8cfd3dcb0094cf14642431d5c122b53",
+        "315bc90f765e1ec1e202cd749a9bfbf0f5d96ac4"
+      ],
+      "evidencePaths": [
+        "packages/adapters/claude-local/src/server/parse.test.ts",
+        "packages/adapters/claude-local/src/server/acp.auth.test.ts",
+        "packages/adapters/claude-local/src/server/test.remote.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "git-install-payload",
+      "purpose": "Ship built UI/skills with exact source provenance; pack without source-only hooks and retain independent package versions.",
+      "sourceCommits": [
+        "f49409b16eaf53872343dc92fcab97696fb4507a",
+        "2899cffb1af2e80e63387616c300be70b1f020ce",
+        "0fc0c7d3fb9fe5c36d5e9202092591dee60a63bc"
+      ],
+      "evidencePaths": [
+        "cli/src/__tests__/install-command.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "installer-test-isolation",
+      "purpose": "Installer tests must not reach the real service manager.",
+      "sourceCommits": [
+        "9efa9cd8e42830ddbe3be48d8d70134e796911ab"
+      ],
+      "evidencePaths": [
+        "cli/src/__tests__/install-command.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "portable-runner-fixtures",
+      "purpose": "Runner staging tests must not depend on coreutils binary identity.",
+      "sourceCommits": [
+        "904851063ddf5f83ae298cac97eea877b8b57771"
+      ],
+      "evidencePaths": [
+        "packages/paperclip-runner/scripts/stage-runner-binary.test.mjs"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "portable-sandbox-denial",
+      "purpose": "Require protected-file denial and unchanged contents across valid shell exit codes.",
+      "sourceCommits": [
+        "288d4de96ff5af91a64b417c924ccad1e680bc93"
+      ],
+      "evidencePaths": [
+        "server/src/services/native-runtime/runner-bridge-tools.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    },
+    {
+      "id": "trusted-ci-baseline",
+      "purpose": "Current repair uses an immutable trusted CI baseline; upstream upgrade needs freshly reviewed equivalent gates.",
+      "sourceCommits": [
+        "c84f297f8e1bf1e13d04d1463268cbc4aa7bccd0"
+      ],
+      "evidencePaths": [
+        ".github/workflows/pr.yml"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+    }
+  ]
+}
