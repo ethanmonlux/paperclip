@@ -228,7 +228,7 @@ function connectProxyError(code: string, message: string): string {
   ].join("\r\n");
 }
 
-async function startNetworkAllowlistProxy(
+export async function startNetworkAllowlistProxy(
   allowlist: string[],
   trustedUrls: string[],
   socketPath: string,
@@ -293,6 +293,9 @@ async function startNetworkAllowlistProxy(
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
     sockets.add(socket);
+    // HTTP detaches its socket error handler for CONNECT. Retain an owner for
+    // client disconnects so a pipe EPIPE cannot terminate the control plane.
+    socket.on("error", () => socket.destroy());
     socket.on("close", () => sockets.delete(socket));
   });
   await new Promise<void>((resolve, reject) => {
