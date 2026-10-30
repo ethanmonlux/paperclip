@@ -270,16 +270,28 @@ function claudeAuthDiagnostics(text: string, structuredOnly = false): string[] {
   });
 }
 
+// Only the fixed, tool-free hello probe may consume the CLI's legacy
+// login-instruction result envelope. Task execution never trusts result prose.
+function claudeProbeLoginInstruction(parsed: Record<string, unknown> | null): string {
+  if (!parsed || parsed.subtype !== "error_during_execution" ||
+      !asBoolean(parsed.is_error, false) || isClaudeMaxTurnsResult(parsed)) return "";
+  const text = asString(parsed.result, "").trim();
+  return /^Please run `?claude login`?(?:[.!]| to authenticate[.!]?$)/i.test(text) ? text : "";
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
+  /** Internal fixed hello probe only; never enable for task execution. */
+  authProbe?: boolean;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
   const terminalText = parsed && claudeResultIndicatesAuthFailure(parsed)
     ? collectClaudeTerminalText(parsed) : "";
   const diagnostics = [...claudeAuthDiagnostics(input.stdout), ...claudeAuthDiagnostics(input.stderr)].join("\n");
-  const promptText = [terminalText, diagnostics].filter(Boolean).join("\n");
+  const probeInstruction = input.authProbe ? claudeProbeLoginInstruction(parsed) : "";
+  const promptText = [terminalText, diagnostics, probeInstruction].filter(Boolean).join("\n");
   const loginPrompt = CLAUDE_LOGIN_PROMPT_RE.test(promptText);
   const providerErrors = [...claudeAuthDiagnostics(input.stdout, true),
     ...claudeAuthDiagnostics(input.stderr, true)].join("\n");

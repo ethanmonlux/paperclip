@@ -147,6 +147,24 @@ describe("detectClaudeLoginRequired", () => {
   });
 });
 
+describe("fixed Claude hello probe login instructions", () => {
+  const instruction = { type: "result", subtype: "error_during_execution",
+    is_error: true, result: "Please run `claude login` to authenticate." };
+  it("trusts the legacy instruction only in the fixed hello probe", () => {
+    const input = { parsed: instruction, stdout: JSON.stringify(instruction), stderr: "" };
+    expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+    expect(detectClaudeLoginRequired({ ...input, authProbe: true }).requiresLogin).toBe(true);
+  });
+  it.each([
+    { ...instruction, result: "Historical incident: unauthorized; please run /login" },
+    { ...instruction, subtype: "error_max_turns", result: instruction.result },
+    { ...instruction, is_error: false },
+  ])("rejects task prose, turn limits and successful probe text", (parsed) => {
+    expect(detectClaudeLoginRequired({ parsed, stdout: JSON.stringify(parsed),
+      stderr: "", authProbe: true })).toEqual({ requiresLogin: false, loginUrl: null });
+  });
+});
+
 describe("Claude auth output provenance", () => {
   const stopped = { type: "result", subtype: "error_max_turns", is_error: true,
     errors: ["Reached maximum number of turns (100)"] };

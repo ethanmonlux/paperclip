@@ -402,6 +402,7 @@ export async function testEnvironment(
       const parsed = parsedStream.resultJson;
       const loginMeta = detectClaudeLoginRequired({
         parsed,
+        authProbe: true,
         stdout: probe.stdout,
         stderr: probe.stderr,
       });
