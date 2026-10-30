@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -3290,25 +3289,8 @@ export function agentRoutes(
             effectiveAdapterConfig.apiKey = req.body.testCredentials.API_SERVER_KEY;
           }
         }
-        // Revalidation is confined to the saved, unchanged Claude selection/config.
-        // Prospective/custom tests cannot reactivate an account.
-        const allowAnthropicRevalidation = Boolean(req.actor.type === "board" && savedAgent && type === "claude_local" &&
-          aiBinding?.provider === "anthropic" && aiBinding.method === "subscription" &&
-          isDeepStrictEqual(aiBinding, savedAgent.runtimeConfig?.aiConnection) &&
-          isDeepStrictEqual({ ...adapterConfigForTest, env: stripAiAuthBindings(adapterConfigForTest.env) },
-            { ...savedAgent.adapterConfig, env: stripAiAuthBindings(savedAgent.adapterConfig?.env) }) &&
-          (!adapterConfigForTest.engine || adapterConfigForTest.engine === "cli"));
-        const result = aiBinding ? await withManagedAiProbe(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowAnthropicRevalidation, allowUninstalledPersonal: !req.body.agentId, allowUninstalledShared: !req.body.agentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }, async managed => {
+        const result = aiBinding ? await withManagedAiProbe(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowUninstalledPersonal: !req.body.agentId, allowUninstalledShared: !req.body.agentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }, async managed => {
           const tested = await testManagedEnvironment(type, { companyId, adapterType: type, config: managed.config, executionTarget, environmentName }, aiBinding, managed, savedAgentId ?? undefined);
-          if (allowAnthropicRevalidation && tested.status === "pass" &&
-              !environmentEnvChecks.some(check => check.level === "error") &&
-              sandboxIdentityCheck?.level !== "error" &&
-              !tested.checks.some(check => check.level === "error") &&
-              tested.checks.some(check => check.code === "claude_hello_probe_passed" && check.level === "info")) {
-            if (await managed.restoreAuthenticationAfterProbe())
-              tested.checks.push({ code: "ai_connection_revalidated", level: "info",
-                message: "The unchanged Claude account passed its provider probe and is available again." });
-          }
           tested.checks.unshift({ code: "ai_connection_tested", level: "info", message: `Tested ${managed.accountName} — ${managed.accountOwnerUserId ? managed.accountOwnerUserId === responsibleUserForAiRequest(req) ? "your personal account" : "the owner’s account authorized for this agent" : "company-shared account"}. Responsible user: ${req.actor.type === "agent" ? responsibleUserForAiRequest(req) ?? "unavailable" : "the signed-in user"}.` });
           return tested;
         }) : await adapter.testEnvironment({ companyId, adapterType: type, config: effectiveAdapterConfig, executionTarget, environmentName });

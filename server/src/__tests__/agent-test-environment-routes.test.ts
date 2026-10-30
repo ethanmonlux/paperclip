@@ -111,7 +111,6 @@ const externalAdapter: ServerAdapterModule = {
 // validateAiApiKey — it calls the provider's real endpoint, and these tests
 // direct its verdict instead of the network.
 const mockPrepareManagedAiRuntime = vi.hoisted(() => vi.fn());
-const mockRestoreAuthentication = vi.hoisted(() => vi.fn(async () => true));
 vi.mock("../services/ai-connection-runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/ai-connection-runtime.js")>()),
   prepareManagedAiRuntime: mockPrepareManagedAiRuntime,
@@ -157,7 +156,6 @@ function mockManagedRuntime(method: "api_key" | "subscription") {
       accountName: "My Claude Account",
       accountOwnerUserId: "local-board",
       identity: "grant-1:local-board:0000000000000000",
-      restoreAuthenticationAfterProbe: mockRestoreAuthentication,
       cleanup: vi.fn(async () => {}),
     }),
   );
@@ -446,42 +444,6 @@ describe("agent test-environment route", () => {
       if (previous) registerServerAdapter(previous);
     }
   });
-
-  it.each([
-    { verdict: "pass", code: "claude_hello_probe_passed", prospective: false, restores: true },
-    { verdict: "warn", code: "claude_hello_probe_skipped_custom_command", prospective: false, restores: false },
-    { verdict: "fail", code: "claude_hello_probe_auth_required", prospective: false, restores: false },
-    { verdict: "pass", code: "claude_hello_probe_passed", prospective: true, restores: false },
-  ] as const)("revalidates only a saved Claude selection with a real hello ($verdict/$prospective)",
-    async ({ verdict, code, prospective, restores }) => {
-      mockManagedRuntime("subscription");
-      const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-      const aiConnection = { provider: "anthropic", method: "subscription", mode: "responsible_user" };
-      mockAgentService.getById.mockResolvedValue({ id: agentId, companyId: "company-1",
-        adapterType: "claude_local", adapterConfig: {}, runtimeConfig: { aiConnection } });
-      const { registerServerAdapter, getServerAdapter, unregisterServerAdapter } = await import("../adapters/index.js");
-      const previous = getServerAdapter("claude_local");
-      unregisterServerAdapter("claude_local");
-      registerServerAdapter({ ...externalAdapter, type: "claude_local", testEnvironment: async () => ({
-        adapterType: "claude_local", status: verdict,
-        checks: [{ code, level: verdict === "fail" ? "error" : verdict === "warn" ? "warn" : "info", message: "fixture" }],
-        testedAt: new Date(0).toISOString(),
-      }) });
-      try {
-        const app = await createApp();
-        const res = await request(app).post("/api/companies/company-1/adapters/claude_local/test-environment")
-          .send({ agentId, aiConnection, adapterConfig: prospective ? { model: "changed" } : {} });
-        expect(res.status, JSON.stringify(res.body)).toBe(200);
-        expect(mockPrepareManagedAiRuntime.mock.calls[0]?.[1]).toMatchObject({
-          allowAnthropicRevalidation: !prospective,
-        });
-        expect(mockRestoreAuthentication).toHaveBeenCalledTimes(restores ? 1 : 0);
-        expect(res.body.checks.some((check: { code: string }) => check.code === "ai_connection_revalidated")).toBe(restores);
-      } finally {
-        unregisterServerAdapter("claude_local");
-        if (previous) registerServerAdapter(previous);
-      }
-    });
 
   // The managed-adoption verdict, all three ways. An api_key account is
   // re-verified against the provider's endpoint at adoption — the same check
