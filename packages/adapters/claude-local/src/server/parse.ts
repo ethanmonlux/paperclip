@@ -209,13 +209,17 @@ export function extractClaudeLoginUrl(text: string): string | null {
   return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
 }
 
-// Collect the parsed terminal result fields that carry an auth failure. The
-// CLI writes the token-failure text to the result event, so the detector reads
-// the result string, the top-level error field, and the errors array. It never
-// reads the raw stdout, so an assistant event cannot inject a token marker.
+// The errors fields are CLI-owned diagnostics. The result field can also hold
+// model prose on failed stops, so read it only from the known provider-error
+// envelope or an explicit API status; a turn budget is never auth evidence.
 function collectClaudeTerminalText(parsed: Record<string, unknown>): string {
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  const status = asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0);
+  const providerResult = !isClaudeMaxTurnsResult(parsed) &&
+    (status === 401 || status === 403 ||
+      (asBoolean(parsed.is_error, false) && (subtype === "" || subtype === "success")));
   return [
-    asString(parsed.result, ""),
+    providerResult ? asString(parsed.result, "") : "",
     asString(parsed.error, ""),
     ...extractClaudeErrorMessages(parsed),
   ]

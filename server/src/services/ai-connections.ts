@@ -255,6 +255,7 @@ export function aiConnectionService(db: Db) {
     allowUninstalledPersonal?: boolean;
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
+    allowAnthropicRevalidation?: boolean;
     binding: AiConnectionBinding;
   }) {
     const { companyId, userId, agentId, binding } = input;
@@ -313,11 +314,15 @@ export function aiConnectionService(db: Db) {
       throw aiConnectionConfigurationFailure("ai_connection_incompatible", "The selected AI connection is incompatible");
     if (aiSubscriptionNeedsIsolatedLogin(connection.config))
       throw aiConnectionConfigurationFailure("ai_connection_unavailable", "Reconnect this subscription with a separate sign-in to protect your existing terminal login.", { connectionId: connection.id });
+    const authenticationProbe = input.allowAnthropicRevalidation === true &&
+      metadata.data.provider === "anthropic" && metadata.data.method === "subscription" &&
+      input.adapterType === "claude_local" &&
+      (grant.status === "active" || grant.status === "needs_reauthorization");
     if (
-      grant.status !== "active" ||
+      (grant.status !== "active" && !authenticationProbe) ||
       !connection.enabled ||
       connection.status !== "active" ||
-      (connection.healthStatus !== "ok" &&
+      (connection.healthStatus !== "ok" && !authenticationProbe &&
         !(
           input.allowLegacyValidation &&
           connection.config.aiLegacyAdoption === true
@@ -383,6 +388,14 @@ export function aiConnectionService(db: Db) {
       )
     )
       throw forbidden("This connection is not permitted for this agent");
+    if (authenticationProbe && (grant.status !== "active" || connection.healthStatus !== "ok")) {
+      const [active] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running"]),
+        sql`${heartbeatRuns.contextSnapshot}->'aiConnection'->>'grantId' = ${grant.id}`,
+      )).limit(1);
+      if (active) throw unprocessable("Wait for this account's active execution before validating it",
+        { code: "ai_connection_busy" });
+    }
     return {
       ...row,
       attribution: {
@@ -1019,6 +1032,62 @@ export function aiConnectionService(db: Db) {
         .catch(error => logger.warn({ err: error, grantId: input.attribution.grantId }, "Saved failed-run credential recovery cleanup pending"));
     });
   }
+  /** A successful native hello probe may repair the exact unchanged Claude grant.
+   * This never changes credential values, sharing, installations or revoked grants. */
+  async function restoreAnthropicAuthentication(input: {
+    selection: Awaited<ReturnType<typeof select>>;
+    identity: string;
+    userId: string | null;
+    agentId: string;
+    binding: AiConnectionBinding;
+  }) {
+    const snapshot = input.selection;
+    if (!input.userId) throw forbidden("An active responsible user is required for account validation");
+    if (snapshot.attribution.provider !== "anthropic" || snapshot.attribution.method !== "subscription")
+      throw forbidden("Only a Claude subscription probe can validate this connection");
+    return withAccountHomeSecretMutationLock(undefined, snapshot.connection.companyId, () => db.transaction(async tx => {
+      const companyId = snapshot.connection.companyId;
+      const [grant] = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, companyId), eq(connectionGrants.id, snapshot.grant.id),
+        eq(connectionGrants.connectionId, snapshot.connection.id),
+      )).for("update");
+      const [connection] = await tx.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, companyId), eq(toolConnections.id, snapshot.connection.id),
+        eq(toolConnections.connectionPurpose, "ai"),
+      )).for("update");
+      if (!grant || !connection || grant.updatedAt.getTime() !== snapshot.grant.updatedAt.getTime() ||
+          connection.updatedAt.getTime() !== snapshot.connection.updatedAt.getTime())
+        throw unprocessable("The AI account changed during validation; test it again");
+      // Recheck current membership, audience, installation, grant state and quiescence.
+      const current = await aiConnectionService(tx as unknown as Db).select({
+        companyId, userId: input.userId, agentId: input.agentId, adapterType: "claude_local",
+        binding: input.binding, allowAnthropicRevalidation: true,
+      });
+      if (current.grant.id !== grant.id) throw unprocessable("The selected AI account changed");
+      const ref = grant.credentialSecretRefs.find(candidate => candidate.configPath === "ai.credential");
+      if (!ref) throw unprocessable("The AI credential is unavailable");
+      await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, companyId), eq(companySecrets.id, ref.secretId),
+      )).for("update");
+      const value = await aiConnectionService(tx as unknown as Db).credential({ connection, grant });
+      const generation = createHash("sha256").update(value).digest("hex").slice(0, 16);
+      if (input.identity !== `${grant.id}:${input.userId ?? "shared"}:${generation}`)
+        throw unprocessable("The AI credential changed during validation; test it again");
+      if (grant.status === "active" && connection.healthStatus === "ok") return false;
+      const now = new Date();
+      await tx.update(connectionGrants).set({ status: "active", updatedAt: now })
+        .where(eq(connectionGrants.id, grant.id));
+      await tx.update(toolConnections).set({ healthStatus: "ok",
+        healthMessage: "The existing Claude account passed a native provider hello probe.", updatedAt: now })
+        .where(eq(toolConnections.id, connection.id));
+      await logActivity(tx as unknown as Db, { companyId, actorType: "user",
+        actorId: input.userId!, agentId: input.agentId,
+        action: "ai_connection.authentication_validated", entityType: "tool_connection",
+        entityId: connection.id, details: { provider: "anthropic", grantId: grant.id } });
+      return true;
+    }));
+  }
+
   /** Refresh only the selected vaulted identity, serializing rotation and reconnect. */
   async function refreshQuotaCredential(row: Parameters<typeof credential>[0], failedValue: string, signal: AbortSignal) {
     return withAccountHomeSecretMutationLock(undefined, row.connection.companyId, async () => {
@@ -1128,5 +1197,5 @@ export function aiConnectionService(db: Db) {
       return [{ ...row, summary }];
     });
   }
-  return { list, selectDecision, selectFastResponse, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, save, setDefault, membership, markAuthenticationFailed };
+  return { list, selectDecision, selectFastResponse, quotaAccounts, subscriptionAccounts: (companyId: string, userId: string) => quotaAccounts(companyId, userId, true), refreshQuotaCredential, select, credential, runtimeCredential, probeUsage, save, setDefault, membership, markAuthenticationFailed, restoreAnthropicAuthentication };
 }

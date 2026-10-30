@@ -220,6 +220,7 @@ export async function prepareManagedAiRuntime(
     allowUninstalledPersonal?: boolean;
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
+    allowAnthropicRevalidation?: boolean;
     config: Record<string, unknown>;
   },
 ) {
@@ -279,7 +280,7 @@ export async function prepareManagedAiRuntime(
       const [currentGrant] = await db.select({ refs: connectionGrants.credentialSecretRefs, status: connectionGrants.status })
         .from(connectionGrants).where(and(eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.id, selection.grant.id)));
       const currentRef = currentGrant?.refs.find(ref => ref.configPath === "ai.credential");
-      if (currentGrant?.status !== "active" || currentRef?.secretId !== credentialRef.secretId || currentRef.versionSelector !== credentialRef.versionSelector) return undefined;
+      if ((currentGrant?.status !== "active" && !(input.allowAnthropicRevalidation === true && input.binding.provider === "anthropic" && currentGrant?.status === "needs_reauthorization")) || currentRef?.secretId !== credentialRef.secretId || currentRef.versionSelector !== credentialRef.versionSelector) return undefined;
       return (await db.select({ epoch: companySecrets.aiSessionEpoch, version: companySecrets.latestVersion })
         .from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, credentialRef.secretId))).limit(1))[0];
     };
@@ -385,6 +386,11 @@ export async function prepareManagedAiRuntime(
       accountName: selection.connection.name,
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
+      restoreAuthenticationAfterProbe: async () => {
+        if (!input.allowAnthropicRevalidation) return false;
+        return service.restoreAnthropicAuthentication({ selection, identity,
+          userId: input.responsibleUserId, agentId: input.agentId, binding: input.binding });
+      },
       home,
       cleanup: async () => {
         if (subscriptionFile) {

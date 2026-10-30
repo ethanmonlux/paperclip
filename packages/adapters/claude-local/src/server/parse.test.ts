@@ -173,6 +173,27 @@ describe("Claude auth output provenance", () => {
       stdout: "", stderr: "" })).toEqual({ requiresLogin: false, loginUrl: null });
   });
 
+  it.each([true, false])("does not promote a turn-limit result's model prose (parsed=%s)", (parsed) => {
+    const terminal = { ...stopped, result: "Historical incident: unauthorized; please run /login" };
+    expect(detectClaudeLoginRequired({ parsed: parsed ? terminal : null,
+      stdout: parsed ? "" : JSON.stringify(terminal), stderr: "" }))
+      .toEqual({ requiresLogin: false, loginUrl: null });
+  });
+
+  it("does not promote a generic failed result's model prose", () => {
+    expect(detectClaudeLoginRequired({ parsed: { type: "result",
+      subtype: "error_during_execution", is_error: true,
+      result: "Historical incident: unauthorized; please run /login",
+      errors: ["Tool execution stopped"] }, stdout: "", stderr: "" }))
+      .toEqual({ requiresLogin: false, loginUrl: null });
+  });
+
+  it.each([401, 403])("retains explicit provider auth status %s without an error flag", (status) => {
+    expect(detectClaudeLoginRequired({ parsed: { type: "result", api_error_status: status,
+      result: "Failed to authenticate. Invalid bearer token" }, stdout: "", stderr: "" }).requiresLogin)
+      .toBe(true);
+  });
+
   it("retains plain CLI login diagnostics and their login URL", () => {
     expect(detectClaudeLoginRequired({ parsed: null,
       stdout: "Not logged in. Please run /login https://claude.ai/oauth/authorize",
