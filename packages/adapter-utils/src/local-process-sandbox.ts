@@ -343,7 +343,6 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
   const finish = (code, signal) => {
     if (finished) return;
     finished = true;
-    clearTimeout(drainTimer);
     // A background descendant can retain output pipes and proxy sockets.
     // Bound that drain. Exiting this bridge ends the enclosing Bubblewrap PID
     // namespace, which owns and terminates all remaining sandbox descendants.
@@ -351,14 +350,21 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
     child.stderr.destroy();
     for (const socket of connections) socket.destroy();
     server.close(() => {
-      process.removeListener("SIGTERM", onTerm);
-      process.removeListener("SIGINT", onInt);
-      if (signal) process.kill(process.pid, signal);
-      else process.exitCode = code == null ? 1 : code;
+      if (signal) exitBySignal(signal);
+      else {
+        process.exitCode = code == null ? 1 : code;
+        if (!process.stdout.writableLength && !process.stderr.writableLength) clearTimeout(drainTimer);
+      }
     });
   };
+  const exitBySignal = (signal) => {
+    process.removeListener("SIGTERM", onTerm);
+    process.removeListener("SIGINT", onInt);
+    process.kill(process.pid, signal);
+  };
   const forward = (signal) => {
-    if (exited) finish(null, signal);
+    if (exited && finished) exitBySignal(signal);
+    else if (exited) finish(null, signal);
     else if (!child.killed) child.kill(signal);
   };
   const onTerm = () => forward("SIGTERM");
@@ -367,7 +373,13 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
   process.on("SIGINT", onInt);
   child.on("exit", (code, signal) => {
     exited = true;
-    drainTimer = setTimeout(() => finish(code, signal), 5000);
+    drainTimer = setTimeout(() => {
+      // Pending destination writes can keep Node alive after source EOF.
+      // Fail closed if the consumer cannot drain; never report a successful
+      // provider result after abandoning queued output.
+      if (process.stdout.writableLength || process.stderr.writableLength) process.exit(75);
+      finish(code, signal);
+    }, 5000);
     drainTimer.unref();
   });
   // close follows output EOF. exitCode lets pending forwarded output drain.

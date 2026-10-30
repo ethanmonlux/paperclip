@@ -23,6 +23,7 @@ async function start(
   input = "",
   args: string[] = [],
   executable = process.execPath,
+  queuedTailBytes = 0,
 ) {
   const root = await fs.mkdtemp(
     path.join(os.tmpdir(), "paperclip-proxy-stdio-"),
@@ -34,7 +35,13 @@ async function start(
   // output to throw EAGAIN. This is a fixture, never a production workaround.
   await fs.writeFile(
     bridge,
-    'const cp=require("node:child_process");const originalSpawn=cp.spawn;cp.spawn=(...args)=>{const child=originalSpawn(...args);process.stdout._handle.setBlocking(false);process.stderr._handle.setBlocking(false);return child;};\n' +
+    'const cp=require("node:child_process");const originalSpawn=cp.spawn;cp.spawn=(...args)=>{const child=originalSpawn(...args);process.stdout._handle.setBlocking(false);process.stderr._handle.setBlocking(false);' +
+      (queuedTailBytes
+        ? 'child.once("exit",()=>{process.stdout.write(Buffer.alloc(' +
+          queuedTailBytes +
+          '));process.stderr.write("fixture-provider-exit");});'
+        : "") +
+      "return child;};\n" +
       (await createNetworkProxyBridge(0)),
   );
   await fs.writeFile(worker, source);
@@ -48,6 +55,7 @@ async function start(
     },
   );
   const firstData = once(child.stdout, "data");
+  const firstErrorData = once(child.stderr, "data");
   const out: Buffer[] = [],
     err: Buffer[] = [];
   child.stdout.on("data", (chunk) => out.push(chunk));
@@ -59,7 +67,7 @@ async function start(
     out: Buffer.concat(out),
     err: Buffer.concat(err),
   }));
-  return { child, closed, root, firstData };
+  return { child, closed, root, firstData, firstErrorData };
 }
 
 it.runIf(process.platform === "linux")(
@@ -202,6 +210,41 @@ it
       clearTimeout(guard);
       child.kill("SIGKILL");
       await target.cleanup?.();
+    }
+  },
+  15000,
+);
+
+it.runIf(process.platform === "linux").each(["timeout", "cancel"])(
+  "terminates after provider exit when destination writes cannot drain (%s)",
+  async (reason) => {
+    // Queue a large tail in the bridge only after the provider has exited.
+    // Keeping the outer consumer paused models blocked pending destination writes.
+    const run = await start(
+      "process.stdout.write('result');",
+      "",
+      [],
+      process.execPath,
+      2 * 1024 * 1024,
+    );
+    const exited = once(run.child, "exit");
+    run.child.stdout.pause();
+    const guard = setTimeout(() => run.child.kill("SIGKILL"), 9000);
+    try {
+      await run.firstErrorData;
+      if (reason === "cancel") run.child.kill("SIGTERM");
+      const [code, signal] = await exited;
+      if (reason === "cancel") expect(signal).toBe("SIGTERM");
+      else {
+        expect(code).toBe(75);
+        expect(signal).toBe(null);
+      }
+    } finally {
+      run.child.stdout.resume();
+      run.child.stderr.resume();
+      run.child.kill("SIGKILL");
+      await run.closed;
+      clearTimeout(guard);
     }
   },
   15000,
