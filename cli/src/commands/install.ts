@@ -301,6 +301,10 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    const workspaceVersions = new Map(workspacePackages.map((entry) => {
+      const pkg = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { version: string };
+      return [entry.name, pkg.version] as const;
+    }));
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
@@ -308,6 +312,25 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+        // Release builds often align versions; Git source trees need not.
+        // Preserve the prepared native graph, but resolve workspace edges from
+        // each dependency's actual source version before npm consumes it.
+        const stagedManifestPath = path.join(stagedPackage, "package.json");
+        const stagedManifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
+        const sourceManifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+        for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+          for (const [name, specifier] of Object.entries(sourceManifest[section] ?? {})) {
+            if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) continue;
+            const range = specifier.slice("workspace:".length);
+            const version = workspaceVersions.get(name);
+            if (!version || !EXACT_VERSION_PATTERN.test(version) || !["*", "^", "~"].includes(range)) {
+              throw new Error("Cannot resolve staged workspace dependency " + name + " from " + specifier);
+            }
+            stagedManifest[section] ??= {};
+            stagedManifest[section][name] = (range === "*" ? "" : range) + version;
+          }
+        }
+        fs.writeFileSync(stagedManifestPath, JSON.stringify(stagedManifest, null, 2) + "\n");
         await runCommand("npm", ["pack", stagedPackage, "--ignore-scripts", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
