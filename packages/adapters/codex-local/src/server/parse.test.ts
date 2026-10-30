@@ -162,6 +162,34 @@ describe("isCodexHarnessCrash", () => {
 });
 
 describe("classifyCodexAuthRefreshFailure", () => {
+  it.each(["agent_message", "mcp_tool_call", "command_execution"])(
+    "does not invalidate credentials from historical auth text in a %s item",
+    (type) => {
+      const stdout = JSON.stringify({
+        type: "item.completed",
+        item: { type, text: "Historical HTTP401 OAuth access token has expired", output: "refresh_token_invalidated" },
+      });
+      expect(classifyCodexAuthRefreshFailure({
+        stdout,
+        stderr: "failed printing to stdout: Resource temporarily unavailable (os error 11)",
+      })).toBeNull();
+    },
+  );
+
+  it("ignores auth text inside a truncated JSONL tool result after a harness crash", () => {
+    expect(classifyCodexAuthRefreshFailure({
+      stdout: '{"type":"item.completed","item":{"type":"mcp_tool_call","result":"historical HTTP 401 OAuth access token has expired',
+      stderr: "failed printing to stdout: Resource temporarily unavailable (os error 11)",
+    })).toBeNull();
+  });
+
+  it.each([
+    { type: "error", message: "OAuth failed: invalid_grant" },
+    { type: "turn.failed", error: { message: "refresh_token_expired" } },
+  ])("retains genuine protocol authentication failures: %j", (event) => {
+    expect(classifyCodexAuthRefreshFailure({ stdout: JSON.stringify(event) })).not.toBeNull();
+  });
+
   it("classifies explicit refresh-token failure messages", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "provider error: refresh_token_reused" })).toBe(
       "refresh_token_reused",
