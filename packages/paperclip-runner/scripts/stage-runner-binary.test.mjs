@@ -7,6 +7,13 @@ import path from "node:path";
 import { test } from "node:test";
 import { stageRunnerBinary } from "./stage-runner-binary.mjs";
 
+// Backport the previousBuild fixture from PR #7 for this maintenance baseline.
+// A copied multi-call coreutils binary dispatches on its new basename and exits.
+// The standalone shell keeps the old staged executable alive across publication.
+const hostFixture = process.platform === "darwin"
+  ? { source: "/bin/sleep", longRunningArgs: ["30"], exitZeroArgs: ["0"] }
+  : { source: "/bin/sh", longRunningArgs: ["-c", "exec sleep 30"], exitZeroArgs: ["-c", "exit 0"] };
+
 async function withOwnedChildren(root, action) {
   const owned = [];
   const start = (command, args) => {
@@ -36,18 +43,18 @@ test("atomically publishes while the previous executable is running", { skip: pr
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(hostFixture.source, destination);
     const previous = await stat(destination);
-    const old = start(destination, ["30"]);
+    const old = start(destination, hostFixture.longRunningArgs);
     await old.spawned;
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(hostFixture.source, destination);
     const published = await stat(destination);
     assert.notEqual(published.ino, previous.ino);
     assert.equal(published.mode & 0o777, 0o755);
     assert.equal(old.child.exitCode, null);
     assert.equal(old.child.signalCode, null);
     assert.deepEqual(await readdir(root), ["paperclip-runnerd"]);
-    const next = start(destination, ["0"]);
+    const next = start(destination, hostFixture.exitZeroArgs);
     await next.spawned; await next.closed;
     assert.equal(next.child.exitCode, 0);
   });

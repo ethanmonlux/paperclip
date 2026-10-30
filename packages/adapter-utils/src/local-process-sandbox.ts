@@ -317,8 +317,13 @@ const { spawn } = require("node:child_process");
 const socketPath = process.argv[2];
 const executable = process.argv[3];
 const args = process.argv.slice(4);
+const connections = new Set();
 const server = net.createServer((client) => {
   const upstream = net.connect(socketPath);
+  connections.add(client);
+  connections.add(upstream);
+  client.on("close", () => connections.delete(client));
+  upstream.on("close", () => connections.delete(upstream));
   client.pipe(upstream);
   upstream.pipe(client);
   const close = () => { client.destroy(); upstream.destroy(); };
@@ -332,19 +337,41 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
   const child = spawn(executable, args, { stdio: ["inherit", "pipe", "pipe"], env: process.env });
   child.stdout.pipe(process.stdout, { end: false });
   child.stderr.pipe(process.stderr, { end: false });
-  const forward = (signal) => { if (!child.killed) child.kill(signal); };
+  let exited = false;
+  let finished = false;
+  let drainTimer;
+  const finish = (code, signal) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(drainTimer);
+    // A background descendant can retain output pipes and proxy sockets.
+    // Bound that drain. Exiting this bridge ends the enclosing Bubblewrap PID
+    // namespace, which owns and terminates all remaining sandbox descendants.
+    child.stdout.destroy();
+    child.stderr.destroy();
+    for (const socket of connections) socket.destroy();
+    server.close(() => {
+      process.removeListener("SIGTERM", onTerm);
+      process.removeListener("SIGINT", onInt);
+      if (signal) process.kill(process.pid, signal);
+      else process.exitCode = code == null ? 1 : code;
+    });
+  };
+  const forward = (signal) => {
+    if (exited) finish(null, signal);
+    else if (!child.killed) child.kill(signal);
+  };
   const onTerm = () => forward("SIGTERM");
   const onInt = () => forward("SIGINT");
   process.on("SIGTERM", onTerm);
   process.on("SIGINT", onInt);
-  // close follows output EOF. exitCode lets pending output drain instead of
-  // process.exit truncating the last provider result or diagnostic frame.
-  child.on("close", (code, signal) => server.close(() => {
-    process.removeListener("SIGTERM", onTerm);
-    process.removeListener("SIGINT", onInt);
-    if (signal) process.kill(process.pid, signal);
-    else process.exitCode = code == null ? 1 : code;
-  }));
+  child.on("exit", (code, signal) => {
+    exited = true;
+    drainTimer = setTimeout(() => finish(code, signal), 5000);
+    drainTimer.unref();
+  });
+  // close follows output EOF. exitCode lets pending forwarded output drain.
+  child.on("close", finish);
 });
 `;
   return source.trimStart();

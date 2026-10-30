@@ -4,7 +4,10 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { afterEach, expect, it } from "vitest";
-import { createNetworkProxyBridge } from "./local-process-sandbox.js";
+import {
+  buildLocalProcessSandboxSpawnTarget,
+  createNetworkProxyBridge,
+} from "./local-process-sandbox.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -124,4 +127,82 @@ it.runIf(process.platform === "linux")(
     expect(result.signal).toBe("SIGTERM");
   },
   10000,
+);
+
+it
+  .runIf(
+    process.platform === "linux" && Boolean(process.env.PAPERCLIP_TEST_BWRAP),
+  )
+  .each([false, true])(
+  "ends the sandbox and its pipe-holding descendants after provider exit (cancel=%s)",
+  async (cancel) => {
+    const root = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-proxy-descendant-"),
+    );
+    roots.push(root);
+    const heartbeat = path.join(root, "heartbeat");
+    const worker = path.join(root, "worker.cjs");
+    const daemon = `
+      const fs = require("node:fs");
+      const beat = () => fs.appendFileSync(${JSON.stringify(heartbeat)}, "alive");
+      beat();
+      setInterval(beat, 50);
+      process.send("ready");
+      process.disconnect();
+      ${cancel ? 'setTimeout(() => process.kill(Number(process.argv[1]), "SIGTERM"), 200);' : ""}
+    `;
+    await fs.writeFile(
+      worker,
+      `
+      const {spawn} = require("node:child_process");
+      const daemon = spawn(process.execPath, ["-e", ${JSON.stringify(daemon)}, String(process.ppid)],
+        {stdio: ["ignore", "inherit", "inherit", "ipc"]});
+      daemon.on("message", () => {
+        process.stdout.write("provider-exited");
+        process.exit(0);
+      });
+    `,
+    );
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: [worker],
+      cwd: root,
+      options: {
+        workspaceDir: root,
+        filesystemScope: "workspace",
+        networkScope: "allowlist",
+        networkAllowlist: ["example.invalid"],
+        command: process.env.PAPERCLIP_TEST_BWRAP,
+      },
+    });
+    const child = spawn(target.command, target.args, {
+      cwd: target.cwd,
+      env: { ...process.env, ...target.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const output: Buffer[] = [],
+      errors: Buffer[] = [];
+    child.stdout.on("data", (chunk) => output.push(chunk));
+    child.stderr.on("data", (chunk) => errors.push(chunk));
+    const closed = once(child, "close");
+    const guard = setTimeout(() => child.kill("SIGKILL"), 10000);
+    try {
+      const [code, signal] = await closed;
+      expect(
+        Buffer.concat(output).toString(),
+        Buffer.concat(errors).toString(),
+      ).toContain("provider-exited");
+      if (cancel) expect(signal === "SIGTERM" || code === 143).toBe(true);
+      else expect(code, Buffer.concat(errors).toString()).toBe(0);
+      const stopped = await fs.readFile(heartbeat, "utf8");
+      expect(stopped.length).toBeGreaterThan(0);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await fs.readFile(heartbeat, "utf8")).toBe(stopped);
+    } finally {
+      clearTimeout(guard);
+      child.kill("SIGKILL");
+      await target.cleanup?.();
+    }
+  },
+  15000,
 );
