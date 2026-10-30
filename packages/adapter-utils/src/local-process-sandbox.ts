@@ -48,10 +48,11 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+// Mount /usr before its merged-usr aliases so their destinations exist.
 const SYSTEM_READ_PATHS = [
+  "/usr",
   "/bin",
   "/sbin",
-  "/usr",
   "/lib",
   "/lib64",
   "/etc/ca-certificates",
@@ -309,7 +310,7 @@ async function startNetworkAllowlistProxy(
   };
 }
 
-async function createNetworkProxyBridge(): Promise<string> {
+export async function createNetworkProxyBridge(proxyPort = SANDBOX_PROXY_PORT): Promise<string> {
   const source = `
 const net = require("node:net");
 const { spawn } = require("node:child_process");
@@ -324,14 +325,25 @@ const server = net.createServer((client) => {
   client.on("error", close);
   upstream.on("error", close);
 });
-server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
-  const child = spawn(executable, args, { stdio: "inherit", env: process.env });
+server.listen(${proxyPort}, "127.0.0.1", () => {
+  // Node may make its own output descriptors nonblocking. Do not let a
+  // synchronous native CLI inherit those descriptors: a full pipe is EAGAIN.
+  // Fresh child pipes plus Node stream backpressure preserve the byte stream.
+  const child = spawn(executable, args, { stdio: ["inherit", "pipe", "pipe"], env: process.env });
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
   const forward = (signal) => { if (!child.killed) child.kill(signal); };
-  process.on("SIGTERM", () => forward("SIGTERM"));
-  process.on("SIGINT", () => forward("SIGINT"));
-  child.on("exit", (code, signal) => server.close(() => {
+  const onTerm = () => forward("SIGTERM");
+  const onInt = () => forward("SIGINT");
+  process.on("SIGTERM", onTerm);
+  process.on("SIGINT", onInt);
+  // close follows output EOF. exitCode lets pending output drain instead of
+  // process.exit truncating the last provider result or diagnostic frame.
+  child.on("close", (code, signal) => server.close(() => {
+    process.removeListener("SIGTERM", onTerm);
+    process.removeListener("SIGINT", onInt);
     if (signal) process.kill(process.pid, signal);
-    else process.exit(code == null ? 1 : code);
+    else process.exitCode = code == null ? 1 : code;
   }));
 });
 `;
