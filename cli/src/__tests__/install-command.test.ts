@@ -27,6 +27,7 @@ import {
 } from "../install-store.js";
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
+import * as serviceManager from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -43,6 +44,16 @@ describe("managed install commands", () => {
       SHELL: "/bin/bash",
     };
     fs.mkdirSync(process.env.HOME!, { recursive: true });
+    // HOME isolates files, not the inherited systemd user bus. Never let a
+    // default uninstall path discover or mutate the developer's real service.
+    vi.spyOn(os, "homedir").mockImplementation(() => process.env.HOME!);
+    vi.spyOn(serviceManager, "detectServiceManager").mockResolvedValue({
+      supported: true,
+      manager: {
+        status: vi.fn(async () => ({ installed: false, active: false })),
+        uninstall: vi.fn(async () => { throw new Error("Unexpected service mutation in fixture"); }),
+      } as never,
+    });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
   });
 
