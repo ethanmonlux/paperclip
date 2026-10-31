@@ -164,7 +164,20 @@ export function classifyCodexAuthRefreshFailure(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): CodexAuthRefreshFailureClass | null {
-  const haystack = buildCodexErrorHaystack(input);
+  // Provider error records are authority for authentication recovery. Agent
+  // messages and tool results can quote unrelated or historical auth failures.
+  // Ignore truncated JSONL too: a harness crash can cut a tool result mid-record.
+  const authStdout = (input.stdout ?? "").split(/\r?\n/).flatMap((rawLine) => {
+    const line = rawLine.trim();
+    if (!line) return [];
+    if (!line.startsWith("{") && !line.startsWith("[")) return [line];
+    const event = parseJson(line);
+    if (!event) return [];
+    if (event.type === "error") return [asString(event.message, "")];
+    if (event.type === "turn.failed") return [asString(parseObject(event.error).message, "")];
+    return [];
+  }).join("\n");
+  const haystack = buildCodexErrorHaystack({ ...input, stdout: authStdout });
 
   if (CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)) return "refresh_token_reused";
   if (CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)) return "refresh_token_expired";

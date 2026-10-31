@@ -528,3 +528,41 @@ describe("AI subscription wait ownership", () => {
       .toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
   });
 });
+
+
+describe("addressed pending interaction participant", () => {
+  const participant = { isInReview: true, hasParticipant: true, participantIsAgent: true,
+    participantAgentId: "other-reviewer", currentStageType: "review",
+    currentParticipant: { type: "agent", agentId: "other-reviewer" } };
+  it("admits the addressed participant without replacing the source owner or reviewer", () => {
+    const q = { ...baseStalenessFacts(), issueStatus: "in_review",
+      issueAssigneeAgentId: "source-owner", reviewParticipant: participant, isPendingInteractionAddressee: true };
+    expect(decideQueuedRunStaleness(q, NOW)).toEqual({ stale: false });
+    expect(decideQueuedRunStaleness({ ...q, isPendingInteractionAddressee: false }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    const g = { ...baseGateFacts(), issueStatus: "in_review", issueAssigneeAgentId: "source-owner",
+      reviewParticipant: participant, isPendingInteractionAddressee: true };
+    expect(decideScheduledRetryGate(g, NOW)).toEqual({ allowed: true });
+    expect(decideScheduledRetryGate({ ...g, isPendingInteractionAddressee: false }, NOW))
+      .toMatchObject({ allowed: false, errorCode: "issue_reassigned" });
+  });
+  it("does not authorize source-assignee continuations or override terminal and execution locks", () => {
+    const q = { ...baseStalenessFacts(), issueAssigneeAgentId: "source-owner",
+      isPendingInteractionAddressee: true };
+    expect(decideQueuedRunStaleness({ ...q, isResolvedInteractionContinuation: true }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    expect(decideQueuedRunStaleness({ ...q, issueStatus: "done" }, NOW)).toMatchObject({ stale: true });
+    expect(decideQueuedRunStaleness({ ...q, retryReasonKind: "native_safe_replacement",
+      issueCheckoutRunId: "another-run" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
+  });
+  it("preserves budget, pause, dependency and invokability gates", () => {
+    const g = { ...baseGateFacts(), issueAssigneeAgentId: "source-owner", isPendingInteractionAddressee: true };
+    for (const overrides of [
+      { budgetBlock: { reason: "over budget", scopeType: "company", scopeId: "co-1" } },
+      { agentInvokable: false },
+      { activePauseHold: { holdId: "hold-1", rootIssueId: "root" } },
+      { dependenciesBlocked: { unresolvedBlockerIssueIds: ["blocker"], unresolvedBlockerCount: 1 } },
+    ]) expect(decideScheduledRetryGate({ ...g, ...overrides }, NOW).allowed).toBe(false);
+  });
+});

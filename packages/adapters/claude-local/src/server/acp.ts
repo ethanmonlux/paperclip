@@ -715,6 +715,7 @@ export async function probeClaudeAcpSandboxLogin(input: {
   const parsedStream = parseClaudeStreamJson(probe.stdout);
   const loginMeta = detectClaudeLoginRequired({
     parsed: parsedStream.resultJson,
+    authProbe: true,
     stdout: probe.stdout,
     stderr: probe.stderr,
   });

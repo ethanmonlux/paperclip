@@ -1577,6 +1577,21 @@ export function githubOperationLauncherDirectory(input: GitHubLauncherLocation):
     : path.join(os.tmpdir(), "paperclip-github-runtime", input.runId);
 }
 
+/** Mount only this controller-staged run directory into a local process sandbox. */
+export async function localGitHubLauncherSandboxPaths(input: {
+  runId: string; env: Record<string, string | undefined>;
+}): Promise<Array<{ path: string; access: "rw" }>> {
+  const directory = githubOperationLauncherDirectory({ runId: input.runId, target: null });
+  if (input.env.PAPERCLIP_GITHUB_LAUNCHER_DIR !== directory) return [];
+  // Never turn an arbitrary configured env path or a symlink into a host mount.
+  const resolved = await fs.realpath(directory);
+  const expected = path.join(await fs.realpath(os.tmpdir()), "paperclip-github-runtime", input.runId);
+  if (resolved !== expected || !(await fs.stat(resolved)).isDirectory()) {
+    throw new Error("Managed GitHub launcher directory is not canonical");
+  }
+  return [{ path: directory, access: "rw" }];
+}
+
 /** Call only after execution settles, before releasing its remote environment lease. */
 export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocation): Promise<void> {
   const directory = githubOperationLauncherDirectory(input);

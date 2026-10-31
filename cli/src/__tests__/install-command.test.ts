@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,6 +27,7 @@ import {
 } from "../install-store.js";
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
+import * as serviceManager from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -42,6 +44,16 @@ describe("managed install commands", () => {
       SHELL: "/bin/bash",
     };
     fs.mkdirSync(process.env.HOME!, { recursive: true });
+    // HOME isolates files, not the inherited systemd user bus. Never let a
+    // default uninstall path discover or mutate the developer's real service.
+    vi.spyOn(os, "homedir").mockImplementation(() => process.env.HOME!);
+    vi.spyOn(serviceManager, "detectServiceManager").mockResolvedValue({
+      supported: true,
+      manager: {
+        status: vi.fn(async () => ({ installed: false, active: false })),
+        uninstall: vi.fn(async () => { throw new Error("Unexpected service mutation in fixture"); }),
+      } as never,
+    });
     vi.spyOn(console, "log").mockImplementation(() => undefined);
   });
 
@@ -105,19 +117,30 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string) =>
+  const createGitCheckoutRunCommand = (sha: string, bundledServer = false, verifyProvenance = false, exercisePackScripts = false, independentVersions = false) =>
     vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
       if (file === "tar") {
         const checkout = args[args.indexOf("-C") + 1];
         const packages = [
-          { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
+          { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: independentVersions ? "1.0.0" : "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" } } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*", ...(independentVersions ? { "@paperclipai/shared": "workspace:^" } : {}) }, ...(bundledServer ? { bundleDependencies: ["acpx"], files: ["dist", "ui-dist", "skills"], ...(exercisePackScripts ? { scripts: { prepack: "exit 42" } } : {}) } : {}) } },
         ];
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
+        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "native task skill");
+        fs.mkdirSync(path.join(checkout, "ui", "dist"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "ui", "dist", "index.html"), "native UI");
+        for (const dir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+          fs.mkdirSync(path.join(checkout, dir), { recursive: true });
+        }
+        if (verifyProvenance) {
+          fs.mkdirSync(path.join(checkout, "server", "scripts"), { recursive: true });
+          fs.copyFileSync(new URL("../../../server/scripts/write-build-stamp.mjs", import.meta.url), path.join(checkout, "server", "scripts", "write-build-stamp.mjs"));
+        }
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
         for (const workspacePackage of packages) {
@@ -135,21 +158,90 @@ describe("managed install commands", () => {
         }
         return { stdout: "", stderr: "" };
       }
-      if (file === "bash") return { stdout: "", stderr: "" };
+      if (file === "bash") {
+        const checkout = String(_options?.cwd);
+        if (args[0] === "scripts/prepare-server-ui-dist.sh") {
+          fs.cpSync(path.join(checkout, "ui", "dist"), path.join(checkout, "server", "ui-dist"), { recursive: true });
+        }
+        if (verifyProvenance && args[0] === "scripts/build-npm.sh") {
+          execFileSync(process.execPath, [path.join(checkout, "server", "scripts", "write-build-stamp.mjs")], { cwd: checkout, env: _options?.env, stdio: "pipe" });
+          expect(JSON.parse(fs.readFileSync(path.join(checkout, "server", "dist", "build-info.json"), "utf8")).commit).toBe(sha);
+        }
+        return { stdout: "", stderr: "" };
+      }
       if (file === "npm" && args[0] === "pack") {
-        const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
+        const packageName = args[1]?.includes("workspace-package-") ? JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")).name.replace(/^@/, "").replace("/", "-") : "paperclipai";
+        if (independentVersions && packageName === "paperclipai-server") {
+          const manifest = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8"));
+          expect(manifest.dependencies["@paperclipai/shared"]).toBe("^1.0.0");
+          expect(manifest.dependencies["@paperclipai/db"]).toBe("0.3.1");
+        }
+        if (exercisePackScripts && packageName === "paperclipai-server") {
+          const result = await runCommandWithDiagnostics("npm", args, { ..._options, env: { ..._options?.env, PATH: [path.dirname(process.execPath), _options?.env?.PATH].join(path.delimiter) } });
+          const tarball = path.join(args[args.indexOf("--pack-destination") + 1], "paperclipai-server-0.3.1.tgz");
+          const entries = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" });
+          expect(entries).toContain("package/ui-dist/index.html");
+          expect(entries).toContain("package/skills/paperclip/SKILL.md");
+          return result;
+        }
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
+        const metadata = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8"));
+        if (bundledServer && metadata.name === "@paperclipai/server") {
+          const checkout = path.dirname(args[1]);
+          expect(fs.readFileSync(path.join(args[1], "ui-dist", "index.html"), "utf8")).toBe("native UI");
+          for (const dir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+            expect(fs.readFileSync(path.join(checkout, dir, "skills", "paperclip", "SKILL.md"), "utf8")).toBe("native task skill");
+          }
+        }
         fs.mkdirSync(args[2], { recursive: true });
-        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
+        if (independentVersions && metadata.name === "@paperclipai/server") {
+          // Reproduce the release helper's former same-version assumption.
+          metadata.dependencies["@paperclipai/shared"] = "^0.3.1";
+        }
+        fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify(metadata));
+        if (exercisePackScripts && metadata.name === "@paperclipai/server") {
+          for (const dir of ["ui-dist", "skills"]) fs.cpSync(path.join(args[1], dir), path.join(args[2], dir), { recursive: true });
+        }
         return { stdout: "", stderr: "" };
       }
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
       throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
     });
+
+  it("stages UI and native skills before preparing the bundled server package", async () => {
+    const sha = "e".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, true);
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    expect(runCommand.mock.calls.some(([file, args]) => file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && args[1]?.endsWith(path.sep + "server"))).toBe(true);
+  });
+
+  it("packs prepared server assets without rerunning source-only lifecycle hooks", async () => {
+    const sha = "9".repeat(40);
+    await expect(installGitPayload("paperclipai/paperclip", sha, createGitCheckoutRunCommand(sha, true, false, true), resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+  });
+
+  it("keeps each dependency's own workspace version in the prepared server manifest", async () => {
+    const sha = "8".repeat(40);
+    await expect(installGitPayload("paperclipai/paperclip", sha, createGitCheckoutRunCommand(sha, true, false, false, true), resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+  });
+
+  it("stamps the requested archive commit instead of stale env or an enclosing repository", async () => {
+    execFileSync("git", ["init", "--quiet", root], { stdio: "pipe" });
+    execFileSync("git", ["-C", root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "--no-gpg-sign", "--quiet", "-m", "unrelated parent"], { stdio: "pipe" });
+    const savedCommit = process.env.PAPERCLIP_BUILD_COMMIT;
+    process.env.PAPERCLIP_BUILD_COMMIT = "stale-parent-build";
+    try {
+      const sha = "f".repeat(40);
+      await expect(installGitPayload("paperclipai/paperclip", sha, createGitCheckoutRunCommand(sha, true, true), resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
+    } finally {
+      if (savedCommit === undefined) delete process.env.PAPERCLIP_BUILD_COMMIT;
+      else process.env.PAPERCLIP_BUILD_COMMIT = savedCommit;
+    }
+  });
 
   it("installs a GitHub branch through codeload and reuses the resolved SHA", async () => {
     const sha = "c".repeat(40);
@@ -170,6 +262,9 @@ describe("managed install commands", () => {
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
     process.env.NODE_ENV = "production";
+    process.env.npm_config_production = "true";
+    process.env.NPM_CONFIG_OMIT = "dev";
+    process.env.pnpm_config_only = "production";
     const sha = "d".repeat(40);
     const runCommand = createGitCheckoutRunCommand(sha);
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
@@ -178,12 +273,15 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
       expect(env, `${call[0]} ${call[1].join(" ")} must not inherit NODE_ENV`).not.toHaveProperty("NODE_ENV");
+      for (const key of ["npm_config_production", "NPM_CONFIG_OMIT", "pnpm_config_only"]) expect(env).not.toHaveProperty(key);
     }
+    const checkoutInstall = buildCalls.find(([file, args]) => file === "corepack" && args[1] === "install");
+    expect(checkoutInstall?.[1]).toContain("--prod=false");
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
   });

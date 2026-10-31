@@ -1,5 +1,6 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  MAX_CAPTURE_BYTES,
   asString,
   asNumber,
   asBoolean,
@@ -7,9 +8,8 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// The Claude CLI login-prompt markers. Only provider diagnostics can establish
+// authentication failure; source files and tool results can quote these words.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -210,13 +210,17 @@ export function extractClaudeLoginUrl(text: string): string | null {
   return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
 }
 
-// Collect the parsed terminal result fields that carry an auth failure. The
-// CLI writes the token-failure text to the result event, so the detector reads
-// the result string, the top-level error field, and the errors array. It never
-// reads the raw stdout, so an assistant event cannot inject a token marker.
+// The errors fields are CLI-owned diagnostics. The result field can also hold
+// model prose on failed stops, so read it only from the known provider-error
+// envelope or an explicit API status; a turn budget is never auth evidence.
 function collectClaudeTerminalText(parsed: Record<string, unknown>): string {
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  const status = asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0);
+  const providerResult = !isClaudeMaxTurnsResult(parsed) &&
+    (status === 401 || status === 403 ||
+      (asBoolean(parsed.is_error, false) && (subtype === "" || subtype === "success")));
   return [
-    asString(parsed.result, ""),
+    providerResult ? asString(parsed.result, "") : "",
     asString(parsed.error, ""),
     ...extractClaudeErrorMessages(parsed),
   ]
@@ -239,35 +243,66 @@ function claudeResultIndicatesAuthFailure(parsed: Record<string, unknown>): bool
   return extractClaudeErrorMessages(parsed).length > 0;
 }
 
+function claudeAuthDiagnostics(text: string, structuredOnly = false): string[] {
+  return text.split(/\r?\n/).flatMap((rawLine) => {
+    const line = rawLine.trim();
+    if (!line) return [];
+    if (!line.startsWith("{") && !line.startsWith("[")) return structuredOnly ? [] : [line];
+    // A truncated tool record is not a provider diagnostic.
+    const event = parseJson(line);
+    if (!event) return [];
+    if (event.type === "result" && claudeResultIndicatesAuthFailure(event)) {
+      return [collectClaudeTerminalText(event)];
+    }
+    if (event.type === "error") {
+      return [asString(event.message, ""), collectClaudeTerminalText(event),
+        asString(parseObject(event.error).message, ""), collectClaudeTerminalText(parseObject(event.error))];
+    }
+    // Claude also emits a typed assistant authentication error before its
+    // terminal result. Ordinary assistant and tool messages are not evidence.
+    if (event.type === "assistant" && event.error === "authentication_failed") {
+      const content = parseObject(event.message).content;
+      return ["authentication_failed", ...(Array.isArray(content) ? content.flatMap((part) => {
+        const item = parseObject(part);
+        return item.type === "text" ? [asString(item.text, "")] : [];
+      }) : [])];
+    }
+    return [];
+  });
+}
+
+// Only the fixed, tool-free hello probe may consume the CLI's legacy
+// login-instruction result envelope. Task execution never trusts result prose.
+function claudeProbeLoginInstruction(parsed: Record<string, unknown> | null): string {
+  if (!parsed || parsed.subtype !== "error_during_execution" ||
+      !asBoolean(parsed.is_error, false) || isClaudeMaxTurnsResult(parsed)) return "";
+  const text = asString(parsed.result, "").trim();
+  return /^Please run `?claude login`?(?:[.!]| to authenticate[.!]?$)/i.test(text) ? text : "";
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
+  /** Internal fixed hello probe only; never enable for task execution. */
+  authProbe?: boolean;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
-
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
-
-  // The token-failure markers match only against the parsed terminal fields of
-  // a failed run. The raw stdout is untrusted, so a model that prints a token
-  // phrase, or a successful run that repeats one, does not flip the classifier.
-  const tokenFailure =
-    parsed !== null &&
-    claudeResultIndicatesAuthFailure(parsed) &&
-    CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
+  const terminalText = parsed && claudeResultIndicatesAuthFailure(parsed)
+    ? collectClaudeTerminalText(parsed) : "";
+  const diagnostics = [...claudeAuthDiagnostics(input.stdout), ...claudeAuthDiagnostics(input.stderr)].join("\n");
+  const probeInstruction = input.authProbe ? claudeProbeLoginInstruction(parsed) : "";
+  const promptText = [terminalText, diagnostics, probeInstruction].filter(Boolean).join("\n");
+  const loginPrompt = CLAUDE_LOGIN_PROMPT_RE.test(promptText);
+  const providerErrors = [...claudeAuthDiagnostics(input.stdout, true),
+    ...claudeAuthDiagnostics(input.stderr, true)].join("\n");
+  const tokenFailure = CLAUDE_AUTH_TOKEN_FAILURE_RE.test(terminalText) ||
+    CLAUDE_AUTH_TOKEN_FAILURE_RE.test(providerErrors);
+  const requiresLogin = loginPrompt || tokenFailure;
 
   return {
-    requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    requiresLogin,
+    loginUrl: requiresLogin ? extractClaudeLoginUrl(promptText) : null,
   };
 }
 
@@ -593,4 +628,60 @@ export function isClaudeProviderQuotaError(input: {
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
+}
+
+/** Tracks the latest complete CLI turn, independently of usage's last result. */
+export function createClaudeTerminalResultTracker() {
+  let pending = "";
+  let discardingLine = false;
+  let terminal = false;
+  const resultIsSettled = (event: Record<string, unknown>) => {
+    if ("queued_turn_count" in event && event.queued_turn_count !== 0) return false;
+    if (!("subagent_stats" in event)) return true;
+    const stats = parseObject(event.subagent_stats);
+    const spawned = stats.spawned;
+    if (typeof spawned !== "number" || !Number.isInteger(spawned) || spawned < 0) return false;
+    const count = (value: unknown) => value === undefined ? 0 :
+      typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : NaN;
+    const killed = typeof stats.killed === "number" ? count(stats.killed) :
+      Object.values(parseObject(stats.killed)).reduce<number>((sum, value) => sum + count(value), 0);
+    return spawned === count(stats.completed) + count(stats.failed) + killed;
+  };
+  const consumeLine = (line: string) => {
+    if (line.length > MAX_CAPTURE_BYTES) { terminal = false; return; }
+    if (!line.trim()) return;
+    const event = parseJson(line);
+    if (!event) { terminal = false; return; }
+    if (event.type === "rate_limit_event") return;
+    terminal = event.type === "result" && resultIsSettled(event);
+  };
+  return (output: { stdout: string; stderr: string }) => {
+    if (output.stderr.trim()) terminal = false;
+    pending += output.stdout;
+    let newline: number;
+    while ((newline = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      if (!discardingLine) consumeLine(line);
+      else terminal = false;
+      discardingLine = false;
+    }
+    if (!pending.trim()) pending = "";
+    if (pending.trim()) {
+      // A partial next turn immediately invalidates the preceding result.
+      if (!discardingLine && parseJson(pending)) {
+        consumeLine(pending);
+        pending = "";
+      } else if (pending.length > MAX_CAPTURE_BYTES) {
+        terminal = false;
+        pending = "";
+        discardingLine = true;
+      }
+    }
+    return terminal && !discardingLine && !pending.trim();
+  };
+}
+
+export function hasCurrentClaudeTerminalResult(stdout: string) {
+  return createClaudeTerminalResultTracker()({ stdout, stderr: "" });
 }

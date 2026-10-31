@@ -48,10 +48,11 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+// Mount /usr before its merged-usr aliases so their destinations exist.
 const SYSTEM_READ_PATHS = [
+  "/usr",
   "/bin",
   "/sbin",
-  "/usr",
   "/lib",
   "/lib64",
   "/etc/ca-certificates",
@@ -227,7 +228,7 @@ function connectProxyError(code: string, message: string): string {
   ].join("\r\n");
 }
 
-async function startNetworkAllowlistProxy(
+export async function startNetworkAllowlistProxy(
   allowlist: string[],
   trustedUrls: string[],
   socketPath: string,
@@ -292,6 +293,9 @@ async function startNetworkAllowlistProxy(
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
     sockets.add(socket);
+    // HTTP detaches its socket error handler for CONNECT. Retain an owner for
+    // client disconnects so a pipe EPIPE cannot terminate the control plane.
+    socket.on("error", () => socket.destroy());
     socket.on("close", () => sockets.delete(socket));
   });
   await new Promise<void>((resolve, reject) => {
@@ -309,30 +313,80 @@ async function startNetworkAllowlistProxy(
   };
 }
 
-async function createNetworkProxyBridge(): Promise<string> {
+export async function createNetworkProxyBridge(proxyPort = SANDBOX_PROXY_PORT): Promise<string> {
   const source = `
 const net = require("node:net");
 const { spawn } = require("node:child_process");
 const socketPath = process.argv[2];
 const executable = process.argv[3];
 const args = process.argv.slice(4);
+const connections = new Set();
 const server = net.createServer((client) => {
   const upstream = net.connect(socketPath);
+  connections.add(client);
+  connections.add(upstream);
+  client.on("close", () => connections.delete(client));
+  upstream.on("close", () => connections.delete(upstream));
   client.pipe(upstream);
   upstream.pipe(client);
   const close = () => { client.destroy(); upstream.destroy(); };
   client.on("error", close);
   upstream.on("error", close);
 });
-server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
-  const child = spawn(executable, args, { stdio: "inherit", env: process.env });
-  const forward = (signal) => { if (!child.killed) child.kill(signal); };
-  process.on("SIGTERM", () => forward("SIGTERM"));
-  process.on("SIGINT", () => forward("SIGINT"));
-  child.on("exit", (code, signal) => server.close(() => {
-    if (signal) process.kill(process.pid, signal);
-    else process.exit(code == null ? 1 : code);
-  }));
+server.listen(${proxyPort}, "127.0.0.1", () => {
+  // Node may make its own output descriptors nonblocking. Do not let a
+  // synchronous native CLI inherit those descriptors: a full pipe is EAGAIN.
+  // Fresh child pipes plus Node stream backpressure preserve the byte stream.
+  const child = spawn(executable, args, { stdio: ["inherit", "pipe", "pipe"], env: process.env });
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+  let exited = false;
+  let finished = false;
+  let drainTimer;
+  const finish = (code, signal) => {
+    if (finished) return;
+    finished = true;
+    // A background descendant can retain output pipes and proxy sockets.
+    // Bound that drain. Exiting this bridge ends the enclosing Bubblewrap PID
+    // namespace, which owns and terminates all remaining sandbox descendants.
+    child.stdout.destroy();
+    child.stderr.destroy();
+    for (const socket of connections) socket.destroy();
+    server.close(() => {
+      if (signal) exitBySignal(signal);
+      else {
+        process.exitCode = code == null ? 1 : code;
+        if (!process.stdout.writableLength && !process.stderr.writableLength) clearTimeout(drainTimer);
+      }
+    });
+  };
+  const exitBySignal = (signal) => {
+    process.removeListener("SIGTERM", onTerm);
+    process.removeListener("SIGINT", onInt);
+    process.kill(process.pid, signal);
+  };
+  const forward = (signal) => {
+    if (exited && finished) exitBySignal(signal);
+    else if (exited) finish(null, signal);
+    else if (!child.killed) child.kill(signal);
+  };
+  const onTerm = () => forward("SIGTERM");
+  const onInt = () => forward("SIGINT");
+  process.on("SIGTERM", onTerm);
+  process.on("SIGINT", onInt);
+  child.on("exit", (code, signal) => {
+    exited = true;
+    drainTimer = setTimeout(() => {
+      // Pending destination writes can keep Node alive after source EOF.
+      // Fail closed if the consumer cannot drain; never report a successful
+      // provider result after abandoning queued output.
+      if (process.stdout.writableLength || process.stderr.writableLength) process.exit(75);
+      finish(code, signal);
+    }, 5000);
+    drainTimer.unref();
+  });
+  // close follows output EOF. exitCode lets pending forwarded output drain.
+  child.on("close", finish);
 });
 `;
   return source.trimStart();

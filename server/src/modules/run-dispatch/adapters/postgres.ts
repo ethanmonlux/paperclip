@@ -1,3 +1,4 @@
+import { pendingAgentInteractionAddressee } from "../../../services/pending-agent-interaction.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
@@ -367,6 +368,10 @@ export function createPostgresRunDispatchAdapter(
     facts.issueAssigneeAgentId = issue.assigneeAgentId;
     facts.issueExecutionRunId = issue.executionRunId;
     facts.issueCheckoutRunId = issue.checkoutRunId;
+    facts.isPendingInteractionAddressee = await pendingAgentInteractionAddressee(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId,
+      contextSnapshot: input.contextSnapshot,
+    });
     if (input.conversationContinuation) {
       facts.pendingResponse = await connectionContinuationPendingResponse(dbOrTx as unknown as Db,
         issue, input.responsibleUserId, input.runId);
@@ -605,6 +610,10 @@ export function createPostgresRunDispatchAdapter(
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
       issueExecutionRunId: issue?.executionRunId ?? null,
       issueCheckoutRunId: issue?.checkoutRunId ?? null,
+      isPendingInteractionAddressee: issue ? await pendingAgentInteractionAddressee(dbOrTx, {
+        companyId: input.companyId, issueId, agentId: input.agentId,
+        contextSnapshot: context,
+      }) : false,
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",

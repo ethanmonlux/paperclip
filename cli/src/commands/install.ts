@@ -239,6 +239,9 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
   // makes pnpm/npm omit them, so the checkout build must not inherit it.
   delete env.NODE_ENV;
+  for (const key of Object.keys(env)) {
+    if (/^(npm|pnpm)_config_(production|only|omit)$/i.test(key)) delete env[key];
+  }
   return env;
 }
 
@@ -270,16 +273,38 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   const pnpmShimDir = path.join(stagingRoot, "pnpm-bin");
   fs.mkdirSync(pnpmShimDir, { recursive: true, mode: 0o700 });
   const buildEnv = (extra: NodeJS.ProcessEnv = {}) =>
-    gitBuildEnv({ PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter), ...extra });
+    gitBuildEnv({
+      PATH: [pnpmShimDir, process.env.PATH].filter(Boolean).join(path.delimiter),
+      ...extra,
+      PAPERCLIP_BUILD_COMMIT: sha,
+      // Codeload archives have no .git. Never discover an unrelated parent repo.
+      GIT_CEILING_DIRECTORIES: stagingRoot,
+    });
   try {
     await runGitHubCurl(["--fail", "--silent", "--show-error", "--location", "--output", archivePath, `https://codeload.github.com/${repo}/tar.gz/${sha}`], runCommand, { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("tar", ["-xzf", archivePath, "--strip-components=1", "-C", checkoutPath], { maxBuffer: 4 * 1024 * 1024 });
     await runCommand("corepack", ["enable", "pnpm", "--install-directory", pnpmShimDir], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
-    await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile", "--prod=false"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // Direct bundled-package preparation bypasses prepack. Match release.sh:
+    // stage the built UI and native skills before packing their runtime owners.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], {
+      cwd: checkoutPath,
+      env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }),
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    for (const packageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+      const skillsPath = path.join(checkoutPath, packageDir, "skills");
+      fs.rmSync(skillsPath, { recursive: true, force: true });
+      fs.cpSync(path.join(checkoutPath, "skills"), skillsPath, { recursive: true });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    const workspaceVersions = new Map(workspacePackages.map((entry) => {
+      const pkg = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { version: string };
+      return [entry.name, pkg.version] as const;
+    }));
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
@@ -287,7 +312,26 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // Release builds often align versions; Git source trees need not.
+        // Preserve the prepared native graph, but resolve workspace edges from
+        // each dependency's actual source version before npm consumes it.
+        const stagedManifestPath = path.join(stagedPackage, "package.json");
+        const stagedManifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
+        const sourceManifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+        for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+          for (const [name, specifier] of Object.entries(sourceManifest[section] ?? {})) {
+            if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) continue;
+            const range = specifier.slice("workspace:".length);
+            const version = workspaceVersions.get(name);
+            if (!version || !EXACT_VERSION_PATTERN.test(version) || !["*", "^", "~"].includes(range)) {
+              throw new Error("Cannot resolve staged workspace dependency " + name + " from " + specifier);
+            }
+            stagedManifest[section] ??= {};
+            stagedManifest[section][name] = (range === "*" ? "" : range) + version;
+          }
+        }
+        fs.writeFileSync(stagedManifestPath, JSON.stringify(stagedManifest, null, 2) + "\n");
+        await runCommand("npm", ["pack", stagedPackage, "--ignore-scripts", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
