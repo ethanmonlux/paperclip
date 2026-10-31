@@ -55,3 +55,15 @@ test("failures that are not assertions (missing exports, type errors, timeouts) 
   const silent = { fullName: "d", status: "failed", failureMessages: [] };
   assert.equal(classifyVitestReport({ report: suite([silent]), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
 });
+
+test("a rejected `resolves` counts as an assertion only when the rejection is an AssertionError", () => {
+  const rejected = (reason) => ({ fullName: "x", status: "failed", failureMessages: [`Error: promise rejected "${reason}… { …(4) }" instead of resolving`] });
+  assert.equal(classifyVitestReport({ report: suite([rejected("AssertionError: expected 'aa' to be 'ff'")]), exitCode: 1, root, testFiles: [file] }).outcome, "upstream-fails");
+  for (const reason of ["Error: ENOENT: no such file or directory,", "TypeError: x is not a function", "Error: AssertionError lookalike"]) {
+    const result = classifyVitestReport({ report: suite([rejected(reason)]), exitCode: 1, root, testFiles: [file] });
+    assert.equal(result.outcome, "unknown", reason);
+  }
+  // One non-assertion failure among assertion failures still makes the test unknown.
+  const mixed = { fullName: "x", status: "failed", failureMessages: ["AssertionError: expected null to be 'native UI'", "Error: promise rejected \"Error: Command failed: npm pack\" instead of resolving"] };
+  assert.equal(classifyVitestReport({ report: suite([mixed]), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
+});

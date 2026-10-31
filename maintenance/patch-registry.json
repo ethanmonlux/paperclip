@@ -5,9 +5,9 @@
   "upstreamRepository": "paperclipai/paperclip",
   "upstreamRef": "master",
   "firstCandidateUpstreamSha": "8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57",
-  "forkPatchSourceSha": "975bc8d75c767b391bab7035401295495f45a4eb",
-  "evidenceSourceSha": "d52bf38475d14257336ff206e5370bcd67eb6fe5",
-  "evidenceSourceNote": "d52bf384 is 315bc90f plus maintenance docs only (GitHub commit stats: 2 added doc files), so its test blobs equal 315bc90f. 975bc8d7 adds only the Codex shell-proxy patch; its evidence is fetched from that commit and is unknown until that object is available locally.",
+  "forkPatchSourceSha": "5305f21c97a2dd3a77e529fb10778be48e8eeb02",
+  "evidenceSourceSha": "5305f21c97a2dd3a77e529fb10778be48e8eeb02",
+  "evidenceSourceNote": "5305f21c is the current PR #10 repair head, installed live per FAC-760. All original regressions are read from that commit. Ported regressions are read from the committed blob under maintenance/upgrade/ports/ at the harness commit, and each receipt binds both blobs.",
   "automaticActivationEnabled": false,
   "patches": [
     {
@@ -28,7 +28,7 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Merged-usr mount handling has no dedicated fork regression test (local-process-sandbox.test.ts is unchanged from stable); that part needs independent manual review.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Merged-usr mount handling has no dedicated fork regression test (local-process-sandbox.test.ts is unchanged from stable); that part needs independent manual review. Upstream 8595efc2 local-process-sandbox.ts is byte-identical to stable 1b4c8038 (blob 95f6227a); the bridge stays module-private there, so the run exports it with an export-only shim. The upstream bridge listens on fixed port 31337, so tests run in a private network namespace.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
@@ -39,6 +39,14 @@
           "retains stdin, argv, cwd, environment and nonzero provider exit",
           "forwards cancellation and preserves signal termination",
           "terminates after provider exit when destination writes cannot drain"
+        ],
+        "exportShim": [
+          {
+            "file": "packages/adapter-utils/src/local-process-sandbox.ts",
+            "symbols": [
+              "createNetworkProxyBridge"
+            ]
+          }
         ]
       }
     },
@@ -57,7 +65,7 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Upstream keeps startNetworkAllowlistProxy module-private (file identical to stable), so the run exports it with an export-only shim.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
@@ -65,6 +73,14 @@
         ],
         "requiredTests": [
           "owns accepted proxy socket errors after CONNECT"
+        ],
+        "exportShim": [
+          {
+            "file": "packages/adapter-utils/src/local-process-sandbox.ts",
+            "symbols": [
+              "startNetworkAllowlistProxy"
+            ]
+          }
         ]
       }
     },
@@ -143,7 +159,7 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. The original fixture crashed with ENOENT on upstream; see maintenance/upgrade/ports/git-install-payload/PORT.md for the observation-only port.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
@@ -153,6 +169,12 @@
           "stages UI and native skills before preparing the bundled server package",
           "keeps each dependency's own workspace version in the prepared server manifest",
           "stamps the requested archive commit instead of stale env or an enclosing repository"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/git-install-payload/install-command.test.ts",
+            "target": "cli/src/__tests__/install-command.test.ts"
+          }
         ]
       }
     },
@@ -262,7 +284,6 @@
       ],
       "upstreamOnly": {
         "kind": "vitest",
-        "sourceSha": "975bc8d75c767b391bab7035401295495f45a4eb",
         "testFiles": [
           "packages/adapters/codex-local/src/server/execute.test.ts"
         ],
@@ -270,7 +291,78 @@
           "preserves the local allowlist bridge in identity-filtered Codex shells"
         ]
       },
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10 head 975bc8d7 per founder receipt; the 975bc8d7 commit object is not in this checkout yet."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10; evidence is read from 5305f21c, which also contains the later launcher test in the same file."
+    },
+    {
+      "id": "github-launcher-run-scope",
+      "purpose": "Mount only this run's canonical managed GitHub launcher directory into the local sandbox and keep the Codex broker capability.",
+      "sourceCommits": [
+        "22765b53a949fc164c5bbfd3be51a1f3c22b00ea"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/github-launcher-sandbox.test.ts",
+        "packages/adapters/codex-local/src/server/execute.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. The bwrap broker test only runs with PAPERCLIP_TEST_BWRAP and is not a required discriminator.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapter-utils/src/github-launcher-sandbox.test.ts",
+          "packages/adapters/codex-local/src/server/execute.test.ts"
+        ],
+        "requiredTests": [
+          "does not mount arbitrary configured directories or another run",
+          "rejects a symlink instead of mounting a different host directory",
+          "returns only the canonical run-scoped launcher directory",
+          "passes this run's managed GitHub launchers into the local sandbox"
+        ]
+      }
+    },
+    {
+      "id": "claude-terminal-cleanup",
+      "purpose": "Bind Claude terminal-result cleanup to the latest settled turn and keep unproven cleanup in reconciliation rather than inferring success or failure.",
+      "sourceCommits": [
+        "fe157b23de7e1833729b930df2fdcbe78087c85f",
+        "bfd4f26a622ed57b66014889b074708903f47de3",
+        "7f187cea1816d623d36ff6ca592c791c00ac580d",
+        "5305f21c97a2dd3a77e529fb10778be48e8eeb02"
+      ],
+      "evidencePaths": [
+        "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
+        "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. Every test in both files is evidence.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
+          "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+        ]
+      }
     }
+  ],
+  "requiredCiJobsNote": "Reviewed for the current fork CI shape: the pinned trusted PR workflow plus the maintenance toolkit job. Every check on the head must also succeed; this list only guarantees that these lanes ran rather than being skipped or absent. A combined candidate that changes the CI shape needs this list re-reviewed.",
+  "requiredCiJobs": [
+    "ci / Select trusted runner",
+    "ci / policy",
+    "ci / Typecheck + Release Registry",
+    "ci / Build",
+    "ci / Docker context integrity",
+    "ci / Canary Dry Run",
+    "ci / e2e",
+    "ci / verify",
+    "maintenance upgrade toolkit"
   ]
 }

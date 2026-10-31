@@ -13,3 +13,36 @@ jobs:
     # Keep this maintenance baseline on its reviewed immutable upstream workflow.
     # The runner gate falls back to GitHub-hosted runners outside upstream master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@1b4c803816e82b0265c8422e1a804327a7ed8c54
+
+  maintenance_upgrade:
+    # Guarded-upgrade toolkit suite (maintenance/upgrade). It is dependency-free,
+    # so it runs on plain Node without installing the workspace. The required
+    # private-network isolation test must run here, never skip.
+    name: maintenance upgrade toolkit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Allow unprivileged user namespaces for the isolation test
+        run: |
+          if ! unshare --user --map-root-user --net sh -c 'ip link set lo up'; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --net sh -c 'ip link set lo up'
+
+      - name: Validate patch registry
+        run: node maintenance/upgrade/cli.mjs validate
+
+      - name: Run toolkit tests
+        env:
+          UPGRADE_TOOLKIT_REQUIRE_ISOLATION: "1"
+        run: node --test maintenance/upgrade/__tests__/*.test.mjs

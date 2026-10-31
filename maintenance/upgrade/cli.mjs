@@ -2,6 +2,7 @@
 // Guarded upstream upgrade tooling. Dependency-free on purpose: it must run
 // before a candidate's dependencies exist. Nothing here installs, restarts or
 // activates a live service.
+import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +16,8 @@ const defaultRegistry = path.join(repoRoot, "maintenance", "patch-registry.json"
 
 const usage = `Usage:
   node maintenance/upgrade/cli.mjs validate [--registry FILE]
-  node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD] [--registry FILE]
+  node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD]
+      [--ports-sha SHA] [--isolation private-network|none] [--registry FILE]
   node maintenance/upgrade/cli.mjs admission --evidence FILE [--registry FILE]`;
 
 function readJson(file) {
@@ -33,6 +35,8 @@ function main(argv) {
       upstream: { type: "string" },
       fork: { type: "string" },
       install: { type: "string" },
+      "ports-sha": { type: "string" },
+      isolation: { type: "string", default: "private-network" },
       evidence: { type: "string" },
     },
   });
@@ -48,6 +52,9 @@ function main(argv) {
     if (errors.length > 0) throw new Error(`Invalid registry: ${errors.join("; ")}`);
     const selected = values.patch?.length ? registry.patches.filter((patch) => values.patch.includes(patch.id)) : registry.patches;
     if (values.patch?.length && selected.length !== values.patch.length) throw new Error("Unknown --patch id");
+    // Ported regressions run from a committed blob: default to this checkout's HEAD.
+    const head = spawnSync("git", ["-C", repoRoot, "rev-parse", "HEAD"], { encoding: "utf8" });
+    const portSourceSha = values["ports-sha"] ?? (head.status === 0 ? head.stdout.trim() : null);
     const outDir = path.resolve(values.out);
     mkdirSync(outDir, { recursive: true });
     const receipts = selected.map((patch) => {
@@ -58,6 +65,8 @@ function main(argv) {
         forkSha: values.fork ?? registry.evidenceSourceSha ?? registry.forkPatchSourceSha,
         workDir: path.join(outDir, "work"),
         installArgv: values.install ? values.install.split(" ").filter(Boolean) : null,
+        testIsolation: values.isolation,
+        portSourceSha,
       });
       // One file per attempt; an earlier receipt is never overwritten.
       writeFileSync(path.join(outDir, `${patch.id}-${receipt.attemptId}.receipt.json`), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });

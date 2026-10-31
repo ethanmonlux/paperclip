@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 export const PATCH_DECISIONS = Object.freeze(["unassessed", "keep", "adapt", "retire"]);
 const SHA = /^[0-9a-f]{40}$/;
 const TEST_FILE = /\.test\.(?:ts|tsx|mts|js|mjs)$/;
+const SOURCE_FILE = /\.(?:ts|tsx|mts|js|mjs|cjs)$/;
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+const PORT_ROOT = "maintenance/upgrade/ports/";
+const safeRelative = (file) => !file.startsWith("/") && !file.split("/").includes("..");
 
 export function loadRegistry(file) {
   return JSON.parse(readFileSync(file, "utf8"));
@@ -48,6 +52,20 @@ export function validateRegistry(registry) {
     if (upstreamOnly.sourceSha !== undefined && !SHA.test(upstreamOnly.sourceSha)) fail(`${where}: upstreamOnly.sourceSha must be a full SHA`);
     if (!Array.isArray(upstreamOnly.testFiles) || upstreamOnly.testFiles.length === 0) fail(`${where}: upstreamOnly.testFiles are required`);
     else for (const file of upstreamOnly.testFiles) if (!TEST_FILE.test(file)) fail(`${where}: ${file} is not a test file`);
+    if (upstreamOnly.exportShim !== undefined) {
+      if (!Array.isArray(upstreamOnly.exportShim) || upstreamOnly.exportShim.length === 0) fail(`${where}: exportShim must be a non-empty array`);
+      else for (const shim of upstreamOnly.exportShim) {
+        if (typeof shim?.file !== "string" || !SOURCE_FILE.test(shim.file) || TEST_FILE.test(shim.file) || !safeRelative(shim.file)) fail(`${where}: exportShim file must be a relative non-test source path`);
+        if (!Array.isArray(shim?.symbols) || shim.symbols.length === 0 || shim.symbols.some((name) => !IDENTIFIER.test(name ?? ""))) fail(`${where}: exportShim symbols must be identifiers`);
+      }
+    }
+    if (upstreamOnly.ports !== undefined) {
+      if (!Array.isArray(upstreamOnly.ports) || upstreamOnly.ports.length === 0) fail(`${where}: ports must be a non-empty array`);
+      else for (const port of upstreamOnly.ports) {
+        if (typeof port?.port !== "string" || !port.port.startsWith(PORT_ROOT) || !TEST_FILE.test(port.port) || !safeRelative(port.port)) fail(`${where}: port must be a test file under ${PORT_ROOT}`);
+        if (!Array.isArray(upstreamOnly.testFiles) || !upstreamOnly.testFiles.includes(port?.target)) fail(`${where}: port target must be a declared test file`);
+      }
+    }
     if (upstreamOnly.requiredTests !== undefined && (!Array.isArray(upstreamOnly.requiredTests) || upstreamOnly.requiredTests.some((t) => typeof t !== "string" || !t))) {
       fail(`${where}: requiredTests must be non-empty strings`);
     }

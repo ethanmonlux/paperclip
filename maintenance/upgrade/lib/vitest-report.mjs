@@ -9,7 +9,10 @@ import path from "node:path";
  */
 export const OUTCOMES = Object.freeze(["upstream-passes", "upstream-fails", "unknown"]);
 
-const ASSERTION_FAILURE = /^\s*AssertionError\b/;
+// `expect(promise).resolves` reports a rejection as `Error: promise rejected
+// "<reason>"`. Only a rejection whose reason is itself an AssertionError is an
+// assertion; ENOENT, TypeError and other rejections stay non-assertion.
+const ASSERTION_FAILURE = /^\s*(?:AssertionError\b|(?:Assertion)?Error: promise rejected "AssertionError\b)/;
 
 function isAssertionFailure(assertion) {
   const messages = Array.isArray(assertion.failureMessages) ? assertion.failureMessages : [];

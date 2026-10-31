@@ -19,6 +19,15 @@ const INSTALL_ENV_ALLOWLIST = [
 ];
 const PROXY_KEY = /^(?:https?_proxy)$/i;
 const DEFAULT_TEST_ARGV = ["pnpm", "exec", "vitest", "run", "--reporter=json", "--outputFile={report}", "{testFiles}"];
+const PORT_ROOT = "maintenance/upgrade/ports/";
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+// Tests run in a fresh user and network namespace with only loopback up, so a
+// fixed port held by the host (for example a sandbox proxy) cannot turn a
+// listen failure into a fake behavioral result, and tests reach no network.
+export const TEST_ISOLATION = Object.freeze({
+  "private-network": (argv) => ["unshare", "--user", "--map-root-user", "--net", "sh", "-c", 'ip link set lo up && exec "$@"', "sh", ...argv],
+  none: (argv) => argv,
+});
 
 function git(repo, args, options = {}) {
   const result = spawnSync("git", ["-C", repo, ...args], { encoding: options.encoding ?? "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -33,6 +42,37 @@ function blob(repo, sha, file) {
 
 /** The identity a review cites; any change to a retained receipt changes it. */
 export const receiptDigest = (receipt) => canonicalDigest(receipt);
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Export module-private declarations so an original regression can import
+ * them. Only the `export ` keyword is added; the declaration and every other
+ * byte stay upstream's. A symbol that is already exported is left alone.
+ */
+export function applyExportShim(source, symbols) {
+  let text = source;
+  const applied = [];
+  for (const symbol of symbols) {
+    if (!IDENTIFIER.test(symbol)) throw new Error(`Invalid shim symbol ${symbol}`);
+    const name = escapeRegExp(symbol);
+    const exported = text.match(new RegExp(`^export\\s+(?:async\\s+)?function\\*?\\s+${name}\\s*[(<]`, "gm")) ?? [];
+    const local = text.match(new RegExp(`^(?:async\\s+)?function\\*?\\s+${name}\\s*[(<]`, "gm")) ?? [];
+    if (exported.length === 1 && local.length === 0) { applied.push({ symbol, action: "already-exported" }); continue; }
+    if (local.length !== 1 || exported.length !== 0) throw new Error(`Shim symbol ${symbol} must have exactly one top-level declaration`);
+    text = text.replace(new RegExp(`^((?:async\\s+)?function\\*?\\s+${name}\\s*[(<])`, "m"), "export $1");
+    applied.push({ symbol, action: "exported" });
+  }
+  return { text, applied };
+}
+
+/** Prove a shimmed file differs from its source only by added `export ` keywords. */
+export function verifyExportOnlyDiff(before, after) {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  if (a.length !== b.length) return false;
+  return a.every((line, index) => line === b[index] || b[index] === `export ${line}`);
+}
 
 export function minimalEnv(source = process.env) {
   const env = { CI: "1" };
@@ -91,6 +131,8 @@ export function evaluateUpstreamOnly({
   workDir,
   installArgv = null,
   testArgv = DEFAULT_TEST_ARGV,
+  testIsolation = "private-network",
+  portSourceSha = null,
   timeoutMs = 20 * 60_000,
   env = minimalEnv(),
   installEnvironment = installEnv(),
@@ -109,6 +151,9 @@ export function evaluateUpstreamOnly({
     startedAt: now().toISOString(),
     nodeVersion: process.version,
     overlay: [],
+    shim: [],
+    testIsolation,
+    portSourceSha: null,
     install: null,
     test: null,
     report: null,
@@ -121,7 +166,14 @@ export function evaluateUpstreamOnly({
     return finish();
   }
   if (!SHA.test(upstreamSha) || !SHA.test(sourceSha)) throw new Error("upstreamSha and the fork source SHA must be full SHAs");
-  for (const sha of [upstreamSha, sourceSha]) {
+  if (!Object.hasOwn(TEST_ISOLATION, testIsolation)) throw new Error(`Unknown test isolation ${testIsolation}`);
+  const ports = spec.ports ?? [];
+  const shims = spec.exportShim ?? [];
+  if (ports.length > 0) {
+    if (!SHA.test(portSourceSha ?? "")) throw new Error("ports need a full portSourceSha");
+    receipt.portSourceSha = portSourceSha;
+  }
+  for (const sha of [upstreamSha, sourceSha, ...(ports.length > 0 ? [portSourceSha] : [])]) {
     if (spawnSync("git", ["-C", repo, "cat-file", "-e", `${sha}^{commit}`]).status !== 0) {
       receipt.reasons.push(`commit-unavailable:${sha}`);
     }
@@ -134,16 +186,29 @@ export function evaluateUpstreamOnly({
     if (!TEST_FILE.test(file) || path.isAbsolute(file) || file.split("/").includes("..")) {
       throw new Error(`Refusing to overlay non-test path ${file}`);
     }
-    const content = blob(repo, sourceSha, file);
-    if (content === null) { receipt.reasons.push(`fork-test-missing:${file}`); continue; }
+    const original = blob(repo, sourceSha, file);
+    if (original === null) { receipt.reasons.push(`fork-test-missing:${file}`); continue; }
     const upstream = blob(repo, upstreamSha, file);
-    overlay.push({ file, content });
-    receipt.overlay.push({
+    const entry = {
       file,
       forkBlob: git(repo, ["rev-parse", `${sourceSha}:${file}`]).trim(),
-      forkSha256: sha256(content),
+      forkSha256: sha256(original),
       upstreamSha256: upstream ? sha256(upstream) : null,
-    });
+    };
+    // A reviewed port of the original regression replaces it; its committed
+    // blob, never a working-tree file, is what runs and what the receipt binds.
+    const port = ports.find((candidate) => candidate.target === file);
+    let content = original;
+    if (port) {
+      content = blob(repo, portSourceSha, port.port);
+      if (content === null) { receipt.reasons.push(`port-missing:${port.port}`); continue; }
+      entry.port = { path: port.port, blob: git(repo, ["rev-parse", `${portSourceSha}:${port.port}`]).trim(), sha256: sha256(content) };
+    }
+    overlay.push({ file, content });
+    receipt.overlay.push(entry);
+  }
+  for (const port of ports) {
+    if (!spec.testFiles.includes(port.target)) throw new Error(`Port target ${port.target} is not a declared test file`);
   }
   if (receipt.reasons.length > 0) return finish();
 
@@ -164,9 +229,19 @@ export function evaluateUpstreamOnly({
       mkdirSync(path.dirname(target), { recursive: true });
       writeFileSync(target, content);
     }
-    // Prove the only difference from upstream is the declared test overlay.
+    for (const { file, symbols } of shims) {
+      const target = path.join(tree, file);
+      const before = readFileSync(target, "utf8");
+      const { text, applied } = applyExportShim(before, symbols);
+      if (!verifyExportOnlyDiff(before, text)) throw new Error(`Shim of ${file} changed more than export keywords`);
+      writeFileSync(target, text);
+      receipt.shim.push({ file, upstreamSha256: sha256(Buffer.from(before)), shimmedSha256: sha256(Buffer.from(text)), applied });
+    }
+    // Prove the only differences from upstream are the declared test overlay
+    // and export-only shims.
+    const allowed = new Set([...spec.testFiles, ...shims.filter((_, i) => receipt.shim[i].applied.some((a) => a.action === "exported")).map((s) => s.file)]);
     const changed = git(tree, ["status", "--porcelain", "--untracked-files=all"]).split("\n").filter(Boolean).map((line) => line.slice(3));
-    const unexpected = changed.filter((file) => !spec.testFiles.includes(file));
+    const unexpected = changed.filter((file) => !allowed.has(file));
     if (unexpected.length > 0) throw new Error(`Unexpected upstream tree changes: ${unexpected.join(", ")}`);
     receipt.overlayChangedFiles = changed;
 
@@ -178,7 +253,7 @@ export function evaluateUpstreamOnly({
       }
     }
     if (existsSync(reportPath)) throw new Error(`Report ${reportPath} exists before the test run`);
-    receipt.test = run(expand(testArgv, { report: reportPath, testFiles: spec.testFiles }), tree, timeoutMs, env);
+    receipt.test = run(TEST_ISOLATION[testIsolation](expand(testArgv, { report: reportPath, testFiles: spec.testFiles })), tree, timeoutMs, env);
     if (receipt.test.spawnError) receipt.reasons.push(`runner-spawn-failed:${receipt.test.spawnError}`);
     const reportBytes = existsSync(reportPath) ? readFileSync(reportPath) : null;
     let report = null;

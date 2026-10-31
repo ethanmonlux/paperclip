@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { evaluateUpstreamOnly, installEnv, minimalEnv, receiptDigest } from "../lib/upstream-only.mjs";
+import { applyExportShim, evaluateUpstreamOnly, installEnv, minimalEnv, receiptDigest, verifyExportOnlyDiff } from "../lib/upstream-only.mjs";
 
 // Hermetic identity: hosts may export empty GIT_AUTHOR_* variables.
 const identity = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
@@ -52,7 +52,7 @@ function fixture(upstreamFixed) {
   const run = (overrides = {}) => evaluateUpstreamOnly({
     repo, patch, upstreamSha: upstream, forkSha: fork, workDir: path.join(dir, "work"),
     testArgv: [process.execPath, "-e", runner, "{report}", "{testFiles}"],
-    keepWorktree: true, ...overrides,
+    testIsolation: "none", keepWorktree: true, ...overrides,
   });
   return { dir, repo, fork, upstream, patch, run, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -187,4 +187,105 @@ test("refuses to overlay non-test paths", () => {
     assert.throws(() => f.run({ patch: { id: "bad", upstreamOnly: { kind: "vitest", testFiles: ["src/impl.js"] } } }), /non-test path/);
     assert.throws(() => f.run({ patch: { id: "bad2", upstreamOnly: { kind: "vitest", testFiles: ["../x.test.ts"] } } }), /non-test path/);
   } finally { f.cleanup(); }
+});
+
+test("export shims add only the export keyword and leave exported symbols alone", () => {
+  const source = "const a = 1;\nasync function hidden(port) {\n  return port;\n}\nexport function shown() {}\nfunction other() {}\n";
+  const { text, applied } = applyExportShim(source, ["hidden", "shown"]);
+  assert.equal(text, source.replace("async function hidden", "export async function hidden"));
+  assert.deepEqual(applied, [{ symbol: "hidden", action: "exported" }, { symbol: "shown", action: "already-exported" }]);
+  assert.ok(verifyExportOnlyDiff(source, text));
+  assert.ok(!verifyExportOnlyDiff(source, text.replace("return port", "return 0")));
+  assert.throws(() => applyExportShim(source, ["missing"]), /exactly one top-level declaration/);
+  assert.throws(() => applyExportShim("function x() {}\nfunction x() {}\n", ["x"]), /exactly one/);
+  assert.throws(() => applyExportShim(source, ["a;b"]), /Invalid shim symbol/);
+  // An indented (nested) declaration is not a module-level symbol.
+  assert.throws(() => applyExportShim("{\n  function nested() {}\n}\n", ["nested"]), /exactly one/);
+});
+
+test("an export shim reaches upstream's own private code and is recorded", () => {
+  const f = fixture(false);
+  try {
+    const hidden = commit(f.repo, { "src/impl.js": "function hidden() { return 'upstream rewrite'; }\n" }, "upstream private");
+    const shimRunner = `
+const fs = require("node:fs");
+const [report, ...files] = process.argv.slice(1);
+const source = fs.readFileSync("src/impl.js", "utf8");
+const exported = source.startsWith("export function hidden(");
+fs.writeFileSync(report, JSON.stringify({ testResults: [{ name: require("node:path").resolve(files[0]), status: "failed", message: "",
+  assertionResults: [{ fullName: "impl keeps output", status: exported ? "failed" : "failed",
+    failureMessages: [exported ? "AssertionError: expected 'upstream rewrite' to contain 'FIXED'" : "TypeError: hidden is not a function"] }] }] }));
+process.exit(1);
+`;
+    const patch = { ...f.patch, upstreamOnly: { ...f.patch.upstreamOnly, exportShim: [{ file: "src/impl.js", symbols: ["hidden"] }] } };
+    const receipt = f.run({ patch, upstreamSha: hidden, testArgv: [process.execPath, "-e", shimRunner, "{report}", "{testFiles}"] });
+    assert.equal(receipt.outcome, "upstream-fails");
+    assert.deepEqual(receipt.shim[0].applied, [{ symbol: "hidden", action: "exported" }]);
+    assert.match(receipt.shim[0].upstreamSha256, /^[0-9a-f]{64}$/);
+    assert.notEqual(receipt.shim[0].upstreamSha256, receipt.shim[0].shimmedSha256);
+    assert.deepEqual([...receipt.overlayChangedFiles].sort(), ["src/impl.js", "src/impl.test.ts"]);
+    // Without the shim the same regression cannot reach upstream's code.
+    const plain = f.run({ upstreamSha: hidden, testArgv: [process.execPath, "-e", shimRunner, "{report}", "{testFiles}"] });
+    assert.equal(plain.outcome, "unknown");
+  } finally { f.cleanup(); }
+});
+
+test("a committed port replaces the original regression and is bound to its blob", () => {
+  const f = fixture(false);
+  try {
+    const portPath = "maintenance/upgrade/ports/p1/impl.test.ts";
+    git(f.repo, "checkout", "-q", "--detach", f.fork);
+    const portSha = commit(f.repo, { [portPath]: "ported regression test\n" }, "port");
+    const patch = { ...f.patch, upstreamOnly: { ...f.patch.upstreamOnly, ports: [{ port: portPath, target: "src/impl.test.ts" }] } };
+    assert.throws(() => f.run({ patch }), /portSourceSha/);
+    const receipt = f.run({ patch, portSourceSha: portSha });
+    assert.equal(receipt.outcome, "upstream-fails");
+    assert.equal(receipt.portSourceSha, portSha);
+    assert.equal(receipt.overlay[0].port.blob, git(f.repo, "rev-parse", `${portSha}:${portPath}`));
+    assert.equal(receipt.overlay[0].forkBlob, git(f.repo, "rev-parse", `${f.fork}:src/impl.test.ts`), "original stays recorded");
+    const observed = JSON.parse(readFileSync(path.join(receipt.attemptDir, "upstream", "observed.json"), "utf8"));
+    assert.equal(observed.test, "ported regression test\n");
+    // A working-tree edit is never what runs: only the committed port blob.
+    writeFileSync(path.join(f.repo, portPath), "uncommitted edit\n");
+    const again = f.run({ patch, portSourceSha: portSha });
+    assert.equal(JSON.parse(readFileSync(path.join(again.attemptDir, "upstream", "observed.json"), "utf8")).test, "ported regression test\n");
+    const missing = f.run({ patch: { ...patch, upstreamOnly: { ...patch.upstreamOnly, ports: [{ port: "maintenance/upgrade/ports/p1/absent.test.ts", target: "src/impl.test.ts" }] } }, portSourceSha: portSha });
+    assert.equal(missing.outcome, "unknown");
+    assert.deepEqual(missing.reasons, ["port-missing:maintenance/upgrade/ports/p1/absent.test.ts"]);
+    assert.throws(() => f.run({ patch: { ...patch, upstreamOnly: { ...patch.upstreamOnly, ports: [{ port: portPath, target: "src/other.test.ts" }] } }, portSourceSha: portSha }), /not a declared test file/);
+  } finally { f.cleanup(); }
+});
+
+const canIsolate = spawnSync("unshare", ["--user", "--map-root-user", "--net", "sh", "-c", "ip link set lo up"]).status === 0;
+// CI sets this so the isolation proof can never silently skip there.
+const requireIsolation = process.env.UPGRADE_TOOLKIT_REQUIRE_ISOLATION === "1";
+
+test("private-network isolation frees host-held ports and is recorded", { skip: canIsolate || requireIsolation ? false : "user/network namespaces unavailable on this host" }, async () => {
+  assert.ok(canIsolate, "user/network namespaces are required but unavailable");
+  const net = await import("node:net");
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const f = fixture(true);
+  try {
+    // The runner must bind the port the host holds; it reports pass only if it can.
+    const bindRunner = `
+const fs = require("node:fs"); const net = require("node:net");
+const [report, ...files] = process.argv.slice(1);
+const s = net.createServer();
+const done = (ok, msg) => { fs.writeFileSync(report, JSON.stringify({ testResults: [{ name: require("node:path").resolve(files[0]), status: ok ? "passed" : "failed", message: "",
+  assertionResults: [{ fullName: "impl keeps output", status: ok ? "passed" : "failed", failureMessages: ok ? [] : [msg] }] }] })); process.exit(ok ? 0 : 1); };
+s.on("error", (e) => done(false, "Error: " + e.code));
+s.listen(${port}, "127.0.0.1", () => s.close(() => done(true)));
+`;
+    const argv = [process.execPath, "-e", bindRunner, "{report}", "{testFiles}"];
+    const host = f.run({ testArgv: argv, testIsolation: "none" });
+    assert.equal(host.outcome, "unknown");
+    assert.deepEqual(host.reasons, ["non-assertion-failure:impl keeps output"]);
+    const isolated = f.run({ testArgv: argv, testIsolation: "private-network" });
+    assert.equal(isolated.outcome, "upstream-passes");
+    assert.equal(isolated.testIsolation, "private-network");
+    assert.equal(isolated.test.argv[0], "unshare");
+    assert.throws(() => f.run({ testIsolation: "bogus" }), /Unknown test isolation/);
+  } finally { server.close(); f.cleanup(); }
 });
