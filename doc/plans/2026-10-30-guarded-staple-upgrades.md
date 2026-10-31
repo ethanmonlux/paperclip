@@ -62,9 +62,27 @@ Stage 4 (STA-22 finding R4, expected CI coverage):
 - **CI.** The toolkit job fetches the PR head, base branch and pinned reusable workflow, and fails if the committed graph differs from what they produce.
 - **Serialized shard 1/9 on `e5decf9f`.** One test failed: `heartbeat-process-recovery.test.ts` "keeps an explicit local-path/worktree conflict blocked…" (missing `configurationReason`). It ran on runner image `ubuntu-26.04` `20261018.50.1`; the passing run on `acfcfae3` used `20261025.179.1`. `server/` is identical between the two heads. The flag requires `probeGitWorktreeBase` to match Git's exact "not a git repository (or any of the parent directories)" stderr and find no Git metadata in any ancestor. Both conditions depend on the host: Git prints a different message when it stops at a filesystem boundary (for example a separate `/tmp` mount). The test also fails deterministically in the engineer sandbox (`/tmp` is its own tmpfs and `git` is a run-scoped wrapper), but setting `GIT_DISCOVERY_ACROSS_FILESYSTEM=1` there does not make it pass, so neither the local nor the CI cause is isolated. Attribution remains unknown. The code is inherited repair-base code, not changed by this branch; no assertion was weakened and no rerun was made.
 
+Stage 5 (repair base `b2385913`, harness `113b51bf`):
+
+- **Base sync.** PR #11 merged its moved base `b2385913` (merge `9679079f`). The upgrade diff is byte-identical to the one reviewed before the merge, so the CI lane graph and its digest are unchanged.
+- **Registry.** Evidence and fork patch source move to `b2385913`. Two new groups bring the total to 14:
+  - `native-handoff-admission` (`a0809c5c`, `00d786b6`, `2a34dfba`, `b2385913`) with policy and real-Postgres dispatch regressions;
+  - `recovery-fixture-isolation` (`83f770b3`), manual review.
+- **Harness.** The opt-in `private-network-user` isolation keeps the private network namespace but runs tests as the caller's own uid/gid. Embedded Postgres refuses to run as namespace root and would otherwise skip, which is unknown.
+- **Receipts.** Every group was re-run against upstream `8595efc2` and, as the control, against `b2385913`:
+  - The 12 earlier groups reproduce their stage-3 outcomes.
+  - `native-handoff-admission` is `unknown` upstream: 7 of 9 required tests fail, 5 with assertions and 2 with timeouts. Its control passes 9/9 (121/121 in the file, nothing skipped).
+  - Every automatable control passes.
+  - Proposals for all 14 groups are in the proposals document.
+- **CI on `9679079f`.** It failed 47/50:
+  - `review` failed on the missing key.
+  - `ci / e2e shard (1/8)` failed at `chat-adapters-ui-messaging.spec.ts:217`: the `Paperclip announcements` aside, fed from the live remote announcements feed, intercepted a click. Attribution is unproven. No e2e configuration disables that feed, and neither this branch nor the base change touches UI, announcement or e2e files.
+  - `ci / e2e` failed as the aggregate of that shard.
+  - `ci / verify` does not need the e2e lanes, so it passed. Admission still fails, because every lane must succeed.
+
 Remaining gates, none satisfied yet:
-- Independent review of the twelve proposed decisions, and of the two `unknown` receipts that rest on source evidence.
-- Owner action on the failing `review` check, and triage of the serialized-shard failure above. After that, exact-head CI on the published head.
+- Independent review of the fourteen proposed decisions, and of the three `unknown` receipts that rest on source evidence (`github-launcher-run-scope`, `claude-terminal-cleanup`, `native-handoff-admission`).
+- Owner action on the failing `review` check, and attribution of the e2e shard 1/8 announcements failure. Serialized shard 1/9 has passed since base commit `83f770b3`. After that, exact-head CI on the published head.
 - Independent review of the expected-lane graph and its reader (R4).
 - Build the combined candidate from accepted decisions: upstream `8595efc2` plus kept and adapted patches, with `pr.yml` re-pinned. Then its exact-head CI, package provenance and isolated install/boot/assets. No combined candidate exists yet.
 - Isolated migration of a private database copy, run with the previous payload against the migrated schema. Until then, an incompatible schema means the owner-controlled recovery stop.
