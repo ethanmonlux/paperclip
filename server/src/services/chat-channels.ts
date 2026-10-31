@@ -369,9 +369,11 @@ import {
 import { chatProviderConversationUrl } from "./chat-provider-links.js";
 import {
   acknowledgeFounderEpisode,
+  authorizeFounderNotificationPublication,
   FOUNDER_NOTIFICATION_ACK_KIND,
   founderPublicationKey,
   isFounderAckPayload,
+  isFounderNotificationPublicationKey,
 } from "./founder-notifications.js";
 import { classifyChatPublicationError } from "./chat-publication-errors.js";
 import {
@@ -34472,6 +34474,19 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   } | null> {
     return db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
+      // Founder notifications re-prove their route and recipient authority at
+      // this durable pre-I/O claim, for the first send, retries and notices.
+      // This runs before the publication and conversation locks below, so the
+      // identity locks it takes keep the order acknowledgement and inbound
+      // chat paths use (identity, then conversation).
+      if (
+        isFounderNotificationPublicationKey(input.publication.idempotencyKey) &&
+        !(await authorizeFounderNotificationPublication(
+          tx as unknown as Db,
+          input.publication,
+        ))
+      )
+        return null;
       const currentPublication = await tx
         .select({ id: chatPublications.id })
         .from(chatPublications)
@@ -38058,8 +38073,11 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     .set({
                       state: "cancelled",
                       nextAttemptAt: null,
-                      redactedError:
-                        "Task control requester or destination is no longer authorized",
+                      redactedError: isFounderNotificationPublicationKey(
+                        publication.idempotencyKey,
+                      )
+                        ? "Founder notification route or recipient is no longer authorized"
+                        : "Task control requester or destination is no longer authorized",
                       updatedAt: new Date(),
                     })
                     .where(

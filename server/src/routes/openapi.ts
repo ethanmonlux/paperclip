@@ -302,6 +302,8 @@ import {
   githubChatConfigurationSchema,
   githubReviewAssessmentSchema,
   updateGitHubChatConfigurationSchema,
+  updateFounderNotificationRouteSchema,
+  upsertFounderNotificationRouteSchema,
   chatDeliveryStateSchema,
   chatEndpointStatusSchema,
   chatIdentityLinkStatusSchema,
@@ -1369,6 +1371,10 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "GET /api/companies/{companyId}/founder-notifications",
+  "PUT /api/companies/{companyId}/founder-notifications/routes",
+  "PATCH /api/companies/{companyId}/founder-notifications/routes/{routeId}",
+  "POST /api/companies/{companyId}/founder-notifications/episodes/{episodeId}/acknowledge",
   "GET /api/companies/{companyId}/fast-response",
   "PUT /api/companies/{companyId}/fast-response",
   "GET /api/companies/{companyId}/fast-response/models",
@@ -5970,6 +5976,147 @@ registry.registerPath({
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+// ─── Founder notifications ──────────────────────────────────────────────────
+
+const founderNotificationRouteUnavailableReasonSchema = z.enum([
+  "endpoint_unavailable",
+  "conversation_unavailable",
+  "not_direct_message",
+  "recipient_not_linked",
+  "foreign_participant",
+  "recipient_not_member",
+]);
+
+const founderNotificationDeliveryStateSchema = z.union([z.literal("not_sent"), chatPublicationStateSchema]);
+
+const founderNotificationRouteSchema = z
+  .object({
+    id: z.string().uuid(),
+    companyId: z.string().uuid(),
+    recipientUserId: z.string(),
+    endpointId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    enabled: z.boolean(),
+    stallAfterMs: z.number().int(),
+    lastUnavailableReason: founderNotificationRouteUnavailableReasonSchema.nullable(),
+    binding: z.union([
+      z.object({ verified: z.literal(true) }).strict(),
+      z.object({ verified: z.literal(false), reason: founderNotificationRouteUnavailableReasonSchema }).strict(),
+    ]),
+    createdAt: z.string().datetime(),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+const founderNotificationEpisodeSchema = z
+  .object({
+    id: z.string().uuid(),
+    routeId: z.string().uuid(),
+    recipientUserId: z.string(),
+    attentionItemId: z.string(),
+    sourceKind: z.string(),
+    notificationClass: z.enum(["decision", "stall"]),
+    occurrence: z.number().int().positive(),
+    issueId: z.string().uuid(),
+    issueIdentifier: z.string().nullable(),
+    state: z.enum(["observing", "open", "resolved"]),
+    firstObservedAt: z.string().datetime(),
+    lastObservedAt: z.string().datetime(),
+    observations: z.number().int().nonnegative(),
+    notifiedAt: z.string().datetime().nullable(),
+    acknowledgedAt: z.string().datetime().nullable(),
+    resolvedAt: z.string().datetime().nullable(),
+    delivery: z
+      .object({
+        state: founderNotificationDeliveryStateSchema,
+        attempts: z.number().int().nonnegative(),
+        redactedError: z.string().nullable(),
+        publishedAt: z.string().datetime().nullable(),
+      })
+      .strict(),
+    resolutionDelivery: z.object({ state: founderNotificationDeliveryStateSchema }).strict().nullable(),
+  })
+  .strict();
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/founder-notifications",
+  tags: ["founder-notifications"],
+  summary: "List founder notification routes and episodes",
+  description:
+    "Board members of the company read every founder notification route with its current binding proof, and the latest episodes with delivery state read from the linked outbox row. No token or credential is returned.",
+  request: { params: z.object({ companyId: z.string().uuid() }) },
+  responses: {
+    200: r.ok(
+      z
+        .object({ routes: z.array(founderNotificationRouteSchema), episodes: z.array(founderNotificationEpisodeSchema) })
+        .strict(),
+    ),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/founder-notifications/routes",
+  tags: ["founder-notifications"],
+  summary: "Create or replace a founder notification route",
+  description:
+    "Requires tools:manage_connections (or instance admin). Binds one recipient to an existing direct-message conversation. A route can only be enabled when its binding verifies now; routes default to disabled.",
+  request: {
+    params: z.object({ companyId: z.string().uuid() }),
+    body: jsonBody(upsertFounderNotificationRouteSchema),
+  },
+  responses: {
+    200: r.ok(founderNotificationRouteSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/founder-notifications/routes/{routeId}",
+  tags: ["founder-notifications"],
+  summary: "Enable, disable or tune a founder notification route",
+  description:
+    "Requires tools:manage_connections (or instance admin). Disabling cancels every card not yet handed to the provider, expires its buttons and closes active episodes silently.",
+  request: {
+    params: z.object({ companyId: z.string().uuid(), routeId: z.string().uuid() }),
+    body: jsonBody(updateFounderNotificationRouteSchema),
+  },
+  responses: {
+    200: r.ok(founderNotificationRouteSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/founder-notifications/episodes/{episodeId}/acknowledge",
+  tags: ["founder-notifications"],
+  summary: "Acknowledge a founder notification",
+  description:
+    "Only the notified recipient may acknowledge an open episode. Acknowledgement records that the card was seen; it never answers the decision or changes the task.",
+  request: { params: z.object({ companyId: z.string().uuid(), episodeId: z.string().uuid() }) },
+  responses: {
+    200: r.ok(z.object({ acknowledged: z.boolean(), acknowledgedAt: z.string().datetime().nullable() }).strict()),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 // ─── Decisions ──────────────────────────────────────────────────────────────

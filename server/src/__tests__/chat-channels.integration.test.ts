@@ -1,5 +1,5 @@
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
-import { listFounderRoutes, reconcileFounderRoute, upsertFounderRoute } from "../services/founder-notifications.js";
+import { acknowledgeFounderEpisode, listFounderRoutes, reconcileFounderRoute, upsertFounderRoute } from "../services/founder-notifications.js";
 import type { AttentionItem } from "@paperclipai/shared";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { registerChatDeliveryWork } from "../services/chat-delivery-work.js";
@@ -43092,13 +43092,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(stillPending.status).toBe("pending");
   });
 
-  it("delivers a founder notification for another task into the linked Telegram DM and accepts only the recipient's acknowledgement", async () => {
+  async function founderTelegramFixture(externalUserId: string) {
     const fixture = await seedCompany();
-    const { callbacks, endpoint, service } =
-      await configuredTelegramEndpoint(fixture);
-    if (!callbacks.onAction)
-      throw new Error("Telegram action callback was not registered");
-    const externalUserId = "771234590";
+    const context = await configuredTelegramEndpoint(fixture);
+    const { callbacks, endpoint, service } = context;
     const dm = makeThread({
       channelId: externalUserId,
       id: `telegram:${externalUserId}`,
@@ -43180,21 +43177,33 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
     expect(route.binding).toEqual({ verified: true });
     const [routeRow] = await listFounderRoutes(db, fixture.companyId, { enabledOnly: true });
-    const interactionId = randomUUID();
-    const item = {
-      id: `issue_thread_interaction:interaction:${interactionId}`,
-      companyId: fixture.companyId,
-      sourceKind: "issue_thread_interaction",
-      dedupKey: `interaction:${interactionId}`,
-      subject: { kind: "interaction", id: interactionId, companyId: fixture.companyId, title: "Approve the canary?", identifier: null, status: "pending", href: null, metadata: { kind: "request_confirmation" } },
-      relatedIssue: { kind: "issue", id: task.id, companyId: fixture.companyId, title: task.title, identifier: task.identifier, status: task.status, href: null },
-      archivedAt: null,
-      snoozedUntil: null,
-      dismissal: null,
-    } as unknown as AttentionItem;
+    const decisionItem = () => {
+      const interactionId = randomUUID();
+      return {
+        id: `issue_thread_interaction:interaction:${interactionId}`,
+        companyId: fixture.companyId,
+        sourceKind: "issue_thread_interaction",
+        dedupKey: `interaction:${interactionId}`,
+        subject: { kind: "interaction", id: interactionId, companyId: fixture.companyId, title: "Approve the canary?", identifier: null, status: "pending", href: null, metadata: { kind: "request_confirmation" } },
+        relatedIssue: { kind: "issue", id: task.id, companyId: fixture.companyId, title: task.title, identifier: task.identifier, status: task.status, href: null },
+        archivedAt: null,
+        snoozedUntil: null,
+        dismissal: null,
+      } as unknown as AttentionItem;
+    };
+    return { ...context, fixture, dm, conversation, founderUserId, principal, task, routeRow: routeRow!, decisionItem };
+  }
 
-    await reconcileFounderRoute(db, routeRow!, [item], new Date());
-    await reconcileFounderRoute(db, routeRow!, [item], new Date());
+  it("delivers a founder notification for another task into the linked Telegram DM and accepts only the recipient's acknowledgement", async () => {
+    const { callbacks, endpoint, service, fixture, dm, conversation, founderUserId, task, routeRow, decisionItem } =
+      await founderTelegramFixture("771234590");
+    if (!callbacks.onAction)
+      throw new Error("Telegram action callback was not registered");
+    const externalUserId = "771234590";
+    const item = decisionItem();
+
+    await reconcileFounderRoute(db, routeRow, [item], new Date());
+    await reconcileFounderRoute(db, routeRow, [item], new Date());
     await service.processPendingPublications();
     const founderPublications = await db
       .select()
@@ -43273,6 +43282,104 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect(taskAfter).toMatchObject({ status: "blocked", assigneeAgentId: fixture.assignedAgentId });
     const [conversationAfter] = await db.select().from(chatConversations).where(eq(chatConversations.id, conversation.id));
     expect(conversationAfter.issueId).toBe(conversation.issueId);
+  });
+
+  it("re-proves founder recipient authority at the transport claim for first sends, retries and notices", async () => {
+    const { endpoint, service, runtime, fixture, founderUserId, principal, task, routeRow, decisionItem } =
+      await founderTelegramFixture("771234591");
+    const posts = () => runtime.endpoints.get(endpoint.id)!.posts.length;
+    const founderRows = (prefix: string) =>
+      db
+        .select()
+        .from(chatPublications)
+        .where(
+          and(
+            eq(chatPublications.endpointId, endpoint.id),
+            sql`${chatPublications.idempotencyKey} like ${`${prefix}%`}`,
+          ),
+        );
+    const setLink = (values: Partial<typeof chatIdentityLinks.$inferInsert>) =>
+      db
+        .update(chatIdentityLinks)
+        .set(values)
+        .where(and(eq(chatIdentityLinks.endpointId, endpoint.id), eq(chatIdentityLinks.principalId, principal.id)));
+    const setMembership = (status: "active" | "suspended") =>
+      db
+        .update(companyMemberships)
+        .set({ status })
+        .where(and(eq(companyMemberships.companyId, fixture.companyId), eq(companyMemberships.principalId, founderUserId)));
+    const expectUnsent = (row: typeof chatPublications.$inferSelect) =>
+      expect(row).toMatchObject({
+        state: "cancelled",
+        providerMessageId: null,
+        redactedError: "Founder notification route or recipient is no longer authorized",
+      });
+
+    // First send: the link is revoked after enqueue and before transport.
+    const first = decisionItem();
+    await reconcileFounderRoute(db, routeRow, [first], new Date());
+    await setLink({ status: "revoked" });
+    let before = posts();
+    await service.processPendingPublications();
+    expect(posts()).toBe(before);
+    const [firstCard] = await founderRows("founder-notification:");
+    expectUnsent(firstCard!);
+    await setLink({ status: "linked" });
+
+    // Retry: membership is suspended while the card waits in backoff.
+    const second = decisionItem();
+    await reconcileFounderRoute(db, routeRow, [first, second], new Date());
+    const secondCard = (await founderRows("founder-notification:")).find((row) => row.state === "pending")!;
+    await db
+      .update(chatPublications)
+      .set({ state: "retry", attempts: 1, nextAttemptAt: new Date(0), redactedError: "Provider timed out" })
+      .where(eq(chatPublications.id, secondCard.id));
+    await setMembership("suspended");
+    before = posts();
+    await service.processPendingPublications();
+    expect(posts()).toBe(before);
+    const [secondAfter] = await db.select().from(chatPublications).where(eq(chatPublications.id, secondCard.id));
+    expectUnsent(secondAfter!);
+    await setMembership("active");
+
+    // Notices: a delivered card, then the identity is relinked to another
+    // user before its acknowledgement and resolution notices go out.
+    const third = decisionItem();
+    await reconcileFounderRoute(db, routeRow, [first, second, third], new Date());
+    before = posts();
+    await service.processPendingPublications();
+    expect(posts()).toBe(before + 1);
+    const thirdCard = (await founderRows("founder-notification:")).find((row) => row.state === "published")!;
+    expect(thirdCard.issueId).toBe(task.id);
+    const [thirdEpisode] = await db
+      .select()
+      .from(chatActions)
+      .where(and(eq(chatActions.endpointId, endpoint.id), sql`${chatActions.payload}->>'publicationId' = ${thirdCard.id}`));
+    await db.transaction((tx) =>
+      acknowledgeFounderEpisode(tx, { companyId: fixture.companyId, episodeId: thirdEpisode!.id, userId: founderUserId, via: "board" }),
+    );
+    await reconcileFounderRoute(db, routeRow, [], new Date());
+    expect(await founderRows("founder-notification-ack:")).toEqual([expect.objectContaining({ state: "pending" })]);
+    expect(await founderRows("founder-notification-resolution:")).toEqual([expect.objectContaining({ state: "pending" })]);
+    const otherUserId = `other-${randomUUID()}`;
+    await db.insert(authUsers).values({
+      id: otherUserId,
+      name: "Someone else",
+      email: `${otherUserId}@example.com`,
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await setLink({ paperclipUserId: otherUserId });
+    before = posts();
+    await service.processPendingPublications();
+    expect(posts()).toBe(before);
+    for (const notice of [
+      ...(await founderRows("founder-notification-ack:")),
+      ...(await founderRows("founder-notification-resolution:")),
+    ]) {
+      expectUnsent(notice);
+    }
   });
 
   it("renders safe Telegram confirmations as opaque one-use buttons and wakes the resolved task", async () => {

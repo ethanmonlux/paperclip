@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq, like } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   authUsers,
   chatActions,
@@ -16,6 +17,8 @@ import {
   companies,
   companyMemberships,
   createDb,
+  issueRelations,
+  issueThreadInteractions,
   issues,
   toolApplications,
   toolConnections,
@@ -23,17 +26,24 @@ import {
 import type { AttentionItem } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
 import { founderNotificationRoutes } from "../routes/founder-notifications.js";
+import { issueRoutes } from "../routes/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
-import { founderNotificationAttentionSource } from "../services/founder-notification-attention.js";
+import {
+  founderNotificationAttentionSource,
+  withFounderOccurrenceFingerprints,
+} from "../services/founder-notification-attention.js";
 import {
   FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN,
 } from "../services/founder-notification-policy.js";
 import {
   acknowledgeFounderEpisode,
+  authorizeFounderNotificationPublication,
+  type FounderEpisodeRow,
   founderNotificationService,
   listFounderEpisodeViews,
   listFounderRoutes,
   reconcileFounderRoute,
+  reportFounderDeliveryState,
   resolveFounderRouteTarget,
   upsertFounderRoute,
   updateFounderRoute,
@@ -42,6 +52,24 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+
+// Records the continuation wake the real interaction-resolution route asks
+// the heartbeat for. Run execution itself is outside this source stage; the
+// live same-task runtime canary stays with the activation gate.
+const recordedWakeups = vi.hoisted(() => [] as Array<{ agentId: string; options: Record<string, any> }>);
+vi.mock("../services/heartbeat.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/heartbeat.js")>();
+  return {
+    ...actual,
+    heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => ({
+      ...actual.heartbeatService(...args),
+      wakeup: async (agentId: string, options: Record<string, any>) => {
+        recordedWakeups.push({ agentId, options });
+        return null;
+      },
+    }),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -442,6 +470,202 @@ describeEmbeddedPostgres("founder notifications", () => {
     expect(rows.map((row) => [row.payload.occurrence, row.status])).toEqual([[1, "resolved"], [2, "open"]]);
   });
 
+  it("refuses a founder publication at transport once its route, episode or destination no longer matches", async () => {
+    const fixture = await seed();
+    const route = await enabledRoute(fixture);
+    const item = attentionItem(fixture, { sourceKind: "approval", dedupKey: `approval:${randomUUID()}` });
+    await reconcileFounderRoute(db, route, [item], new Date());
+    const [card] = await founderPublications(fixture.companyId);
+    const authorize = (publication: typeof card) =>
+      db.transaction((tx) => authorizeFounderNotificationPublication(tx as never, publication!));
+    expect(await authorize(card)).toBe(true);
+
+    expect(await authorize({ ...card!, conversationId: randomUUID() })).toBe(false);
+    expect(await authorize({ ...card!, issueId: fixture.chatTask.id })).toBe(false);
+    expect(await authorize({ ...card!, idempotencyKey: "founder-notification:not-an-episode" })).toBe(false);
+
+    // A route flipped off without its quiesce step is still refused.
+    await db.update(chatActions).set({ status: "disabled" }).where(eq(chatActions.id, route.id));
+    expect(await authorize(card)).toBe(false);
+    await db.update(chatActions).set({ status: "enabled" }).where(eq(chatActions.id, route.id));
+    expect(await authorize(card)).toBe(true);
+
+    const [episode] = await episodes(fixture.companyId);
+    await db.update(chatActions).set({ status: "resolved" }).where(eq(chatActions.id, episode!.id));
+    expect(await authorize(card)).toBe(false);
+  });
+
+  it("writes nothing when the route is disabled while a sweep's attention read is in flight", async () => {
+    const fixture = await seed();
+    const route = await enabledRoute(fixture, FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN);
+    const decision = attentionItem(fixture, { sourceKind: "approval", dedupKey: `approval:${randomUUID()}` });
+    let entered!: () => void;
+    let release!: () => void;
+    const inRead = new Promise<void>((resolve) => (entered = resolve));
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const service = founderNotificationService(db, {
+      listAttention: async (companyId) => {
+        if (companyId !== fixture.companyId) return [];
+        entered();
+        await gate;
+        return [decision];
+      },
+    });
+    const sweeping = service.sweep();
+    await inRead;
+    await updateFounderRoute(db, fixture.companyId, route.id, { enabled: false }, "owner-user");
+    release();
+    await sweeping;
+    expect(await episodes(fixture.companyId)).toHaveLength(0);
+    expect(await founderPublications(fixture.companyId, "founder-notification")).toHaveLength(0);
+
+    // The open step has the same fence: a due episode is never published from
+    // a stale route snapshot, even before disable's quiesce step reaches it.
+    await updateFounderRoute(db, fixture.companyId, route.id, { enabled: true }, "owner-user");
+    const [live] = await listFounderRoutes(db, fixture.companyId, { enabledOnly: true });
+    const start = Date.parse("2026-10-31T12:00:00Z");
+    const stall = attentionItem(fixture, {
+      sourceKind: "failed_run",
+      dedupKey: `run:${randomUUID()}`,
+      subject: { kind: "run", id: randomUUID(), companyId: fixture.companyId, title: "Run failed", identifier: null, status: "failed", href: null },
+    });
+    await reconcileFounderRoute(db, live!, [stall], new Date(start));
+    await db.update(chatActions).set({ status: "disabled" }).where(eq(chatActions.id, route.id));
+    const result = await reconcileFounderRoute(db, live!, [stall], new Date(start + FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN));
+    expect(result).toMatchObject({ opened: 0, routeChanged: true });
+    expect(await founderPublications(fixture.companyId, "founder-notification")).toHaveLength(0);
+    expect((await episodes(fixture.companyId)).map((row) => row.status)).toEqual(["observing"]);
+  });
+
+  it("never lets a stale delivery-state write erase an acknowledgement or a resolution", async () => {
+    const fixture = await seed();
+    const route = await enabledRoute(fixture);
+    const acknowledged = attentionItem(fixture, { sourceKind: "approval", dedupKey: `approval:${randomUUID()}` });
+    const resolved = attentionItem(fixture, { sourceKind: "decision", dedupKey: `decision:${randomUUID()}` });
+    await reconcileFounderRoute(db, route, [acknowledged, resolved], new Date());
+    const staleRows = (await episodes(fixture.companyId)) as FounderEpisodeRow[];
+    const stale = (dedupKey: string) => staleRows.find((row) => row.payload.dedupKey === dedupKey)!;
+    for (const row of staleRows) {
+      await db.update(chatPublications).set({ state: "published", providerMessageId: `m-${row.id}` }).where(eq(chatPublications.id, row.payload.publicationId!));
+    }
+
+    // Acknowledgement commits after this pass read the episode.
+    await db.transaction((tx) =>
+      acknowledgeFounderEpisode(tx, { companyId: fixture.companyId, episodeId: stale(acknowledged.dedupKey).id, userId: fixture.founderUserId, via: "board" }),
+    );
+    await reportFounderDeliveryState(db, stale(acknowledged.dedupKey));
+    const [ackAfter] = await db.select().from(chatActions).where(eq(chatActions.id, stale(acknowledged.dedupKey).id));
+    expect(ackAfter!.payload).toMatchObject({
+      acknowledgedByUserId: fixture.founderUserId,
+      acknowledgedVia: "board",
+      acknowledgedAt: expect.any(String),
+      reportedDeliveryState: "published",
+    });
+
+    // Resolution commits after this pass read the episode.
+    await reconcileFounderRoute(db, route, [acknowledged], new Date());
+    await reportFounderDeliveryState(db, stale(resolved.dedupKey));
+    const [resolvedAfter] = await db.select().from(chatActions).where(eq(chatActions.id, stale(resolved.dedupKey).id));
+    expect(resolvedAfter).toMatchObject({
+      status: "resolved",
+      payload: { resolutionReason: "item_cleared", resolvedAt: expect.any(String), resolutionPublicationId: expect.any(String) },
+    });
+  });
+
+  it("opens a new episode when a review clears and reopens between polls or across a restart", async () => {
+    const fixture = await seed();
+    await enabledRoute(fixture);
+    const [review] = await db
+      .insert(issues)
+      .values({
+        companyId: fixture.companyId,
+        title: "Review the canary plan",
+        status: "in_review",
+        assigneeUserId: fixture.founderUserId,
+        executionState: { status: "pending", currentStageId: "stage-review", lastDecisionId: null, changesRequestedCount: 0 },
+      })
+      .returning();
+    const onlyThisCompany = (source: ReturnType<typeof founderNotificationAttentionSource>) =>
+      (async (companyId, recipientUserId, actor) =>
+        companyId === fixture.companyId ? source(companyId, recipientUserId, actor) : []) as typeof source;
+    const reviewEpisodes = async () =>
+      (await episodes(fixture.companyId))
+        .filter((row) => row.payload.dedupKey === `review:${review!.id}`)
+        .sort((a, b) => a.payload.occurrence - b.payload.occurrence)
+        .map((row) => [row.payload.occurrence, row.status]);
+
+    let service = founderNotificationService(db, { listAttention: onlyThisCompany(founderNotificationAttentionSource(db)) });
+    await service.sweep();
+    await service.sweep();
+    expect(await reviewEpisodes()).toEqual([[1, "open"]]);
+
+    // Changes were requested and the review reopened between two polls; no
+    // poll ever observed it absent.
+    const reopenAt = new Date(Date.now() + 1_000);
+    await db.insert(activityLog).values({
+      companyId: fixture.companyId,
+      actorType: "user",
+      actorId: fixture.founderUserId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: review!.id,
+      details: { status: "in_review", _previous: { status: "in_progress" } },
+      createdAt: reopenAt,
+    });
+    await service.sweep();
+    expect(await reviewEpisodes()).toEqual([[1, "resolved"], [2, "open"]]);
+    // A status echo while still in review is not a reopening.
+    await db.insert(activityLog).values({
+      companyId: fixture.companyId,
+      actorType: "user",
+      actorId: fixture.founderUserId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: review!.id,
+      details: { status: "in_review" },
+      createdAt: new Date(reopenAt.getTime() + 1_000),
+    });
+    await service.sweep();
+    await service.sweep();
+    expect(await reviewEpisodes()).toEqual([[1, "resolved"], [2, "open"]]);
+
+    // The server is down while the review is sent back and reopened at a new
+    // gate; the restarted sweep sees only the reopened review.
+    await db
+      .update(issues)
+      .set({ executionState: { status: "pending", currentStageId: "stage-review", lastDecisionId: randomUUID(), changesRequestedCount: 1 } })
+      .where(eq(issues.id, review!.id));
+    service = founderNotificationService(db, { listAttention: onlyThisCompany(founderNotificationAttentionSource(db)) });
+    await service.sweep();
+    await service.sweep();
+    expect(await reviewEpisodes()).toEqual([[1, "resolved"], [2, "resolved"], [3, "open"]]);
+    // One card per occurrence; the superseded unsent cards were cancelled.
+    expect(
+      (await founderPublications(fixture.companyId))
+        .filter((row) => row.issueId === review!.id)
+        .map((row) => row.state)
+        .sort(),
+    ).toEqual(["cancelled", "cancelled", "pending"]);
+  });
+
+  it("fingerprints a blocker occurrence by its blocking transition", async () => {
+    const fixture = await seed();
+    const first = new Date("2026-10-31T10:00:00Z");
+    await db.update(issues).set({ blockedTransitionAt: first }).where(eq(issues.id, fixture.task.id));
+    const item = attentionItem(fixture, { sourceKind: "blocker_attention", dedupKey: `blocker:${fixture.task.id}` });
+    const other = attentionItem(fixture, { sourceKind: "approval", dedupKey: `approval:${randomUUID()}` });
+    const fingerprintOf = async () => {
+      const facts = await withFounderOccurrenceFingerprints(db, fixture.companyId, [item, other]);
+      expect(facts[1]!.founderOccurrenceFingerprint).toBeUndefined();
+      return facts[0]!.founderOccurrenceFingerprint;
+    };
+    const original = await fingerprintOf();
+    expect(original).toMatch(/^[0-9a-f]{24}$/);
+    expect(await fingerprintOf()).toBe(original);
+    await db.update(issues).set({ blockedTransitionAt: new Date(first.getTime() + 60_000) }).where(eq(issues.id, fixture.task.id));
+    expect(await fingerprintOf()).not.toBe(original);
+  });
+
   it("never resolves facts when the attention snapshot fails", async () => {
     const fixture = await seed();
     const route = await enabledRoute(fixture);
@@ -545,6 +769,107 @@ describeEmbeddedPostgres("founder notifications", () => {
     const notices = await founderPublications(fixture.companyId, "founder-notification-resolution:");
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ issueId: fixture.task.id });
+  });
+
+  it("resumes the same original task exactly once when the founder answers, never on acknowledgement", async () => {
+    const fixture = await seed();
+    await enabledRoute(fixture);
+    // A protected hold: the task is also blocked by unrelated open work.
+    const [holder] = await db
+      .insert(issues)
+      .values({ companyId: fixture.companyId, title: "Unrelated prerequisite", status: "in_progress", assigneeAgentId: fixture.reviewerId })
+      .returning();
+    await db.insert(issueRelations).values({ companyId: fixture.companyId, issueId: holder!.id, relatedIssueId: fixture.task.id, type: "blocks" });
+    const card = await issueThreadInteractionService(db).create(
+      { id: fixture.task.id, companyId: fixture.companyId },
+      {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee",
+        title: "Canary go/no-go",
+        payload: { version: 1, prompt: "Proceed with the phone canary?" },
+      },
+      { agentId: fixture.agentId },
+    );
+    const source = founderNotificationAttentionSource(db);
+    const sweepService = () =>
+      founderNotificationService(db, {
+        listAttention: async (companyId, userId, actor) => (companyId === fixture.companyId ? source(companyId, userId, actor) : []),
+      });
+    await sweepService().sweep();
+    const [notification] = (await founderPublications(fixture.companyId)).filter((row) => row.issueId === fixture.task.id);
+    expect(notification).toBeDefined();
+    await db.update(chatPublications).set({ state: "published", providerMessageId: "m-1" }).where(eq(chatPublications.id, notification!.id));
+    const episode = (await episodes(fixture.companyId)).find((row) => row.payload.dedupKey === `interaction:${card.id}`)!;
+
+    const founder = {
+      type: "board",
+      source: "session",
+      userId: fixture.founderUserId,
+      companyIds: [fixture.companyId],
+      memberships: [{ companyId: fixture.companyId, membershipRole: "owner", status: "active" }],
+      isInstanceAdmin: false,
+    };
+    const testApp = express();
+    testApp.use(express.json());
+    testApp.use((req, _res, next) => {
+      (req as any).actor = founder;
+      next();
+    });
+    testApp.use("/api", founderNotificationRoutes(db, sweepService()));
+    testApp.use("/api", issueRoutes(db, {} as never, {}));
+    testApp.use(errorHandler);
+    const wakesForTask = () => recordedWakeups.filter((wake) => wake.options.payload?.issueId === fixture.task.id);
+    const holdIntact = async () => {
+      const relations = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, fixture.task.id));
+      expect(relations.map((row) => row.issueId)).toEqual([holder!.id]);
+    };
+
+    // Acknowledgement alone leaves the wait in place and queues nothing.
+    await request(testApp)
+      .post(`/api/companies/${fixture.companyId}/founder-notifications/episodes/${episode.id}/acknowledge`)
+      .expect(200);
+    expect(wakesForTask()).toEqual([]);
+    const [stillPending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id));
+    expect(stillPending).toMatchObject({ status: "pending", issueId: fixture.task.id });
+    await holdIntact();
+
+    // The founder's answer through the real resolution route queues exactly
+    // one continuation for the original task and its assignee.
+    const accepted = await request(testApp)
+      .post(`/api/issues/${fixture.task.id}/interactions/${card.id}/accept`)
+      .send({})
+      .expect(200);
+    expect(accepted.body).toMatchObject({ id: card.id, issueId: fixture.task.id, status: "accepted", resolvedByUserId: fixture.founderUserId });
+    expect(wakesForTask()).toHaveLength(1);
+    const [wake] = wakesForTask();
+    expect(wake!.agentId).toBe(fixture.agentId);
+    expect(wake!.options).toMatchObject({
+      source: "automation",
+      reason: "issue_commented",
+      payload: { issueId: fixture.task.id, interactionId: card.id, interactionStatus: "accepted", mutation: "interaction" },
+    });
+    expect(wake!.options.idempotencyKey).toEqual(expect.any(String));
+    expect(recordedWakeups.some((other) => other.options.payload?.issueId === fixture.chatTask.id)).toBe(false);
+    await holdIntact();
+
+    // A repeated answer and restarted sweeps add no continuation.
+    const repeated = await request(testApp)
+      .post(`/api/issues/${fixture.task.id}/interactions/${card.id}/accept`)
+      .send({})
+      .expect(409);
+    expect(repeated.body).toMatchObject({ code: "interaction_already_resolved" });
+    expect(wakesForTask()).toHaveLength(1);
+    await sweepService().sweep();
+    await sweepService().sweep();
+    expect(wakesForTask()).toHaveLength(1);
+    const [episodeAfter] = await db.select().from(chatActions).where(eq(chatActions.id, episode.id));
+    expect(episodeAfter).toMatchObject({ status: "resolved", payload: { resolutionReason: "item_cleared" } });
+    expect(
+      (await founderPublications(fixture.companyId, "founder-notification-resolution:")).filter((row) => row.issueId === fixture.task.id),
+    ).toHaveLength(1);
+    const [taskAfter] = await db.select().from(issues).where(eq(issues.id, fixture.task.id));
+    expect(taskAfter).toMatchObject({ assigneeAgentId: fixture.agentId });
+    await holdIntact();
   });
 
   it("lets board members read state, only connection managers change routes, and only the recipient acknowledge", async () => {

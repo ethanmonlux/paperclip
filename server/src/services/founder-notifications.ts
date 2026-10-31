@@ -75,6 +75,12 @@ export type FounderNotificationEpisodePayload = {
   sourceKind: string;
   notificationClass: FounderNotificationClass;
   dedupKey: string;
+  /**
+   * Opaque hash of the attributable occurrence (review gate, blocking
+   * transition) for facts whose attention dedupKey survives a clear/reopen.
+   * Null when the dedupKey alone already identifies the occurrence.
+   */
+  occurrenceFingerprint: string | null;
   occurrence: number;
   issueId: string;
   issueIdentifier: string | null;
@@ -168,6 +174,27 @@ export function isFounderAckPayload(value: unknown): value is FounderNotificatio
   );
 }
 
+/**
+ * An attention item as the founder sweep sees it. The adapter may attach an
+ * occurrence fingerprint for a fact whose dedupKey is stable across a clear
+ * and reopen, so a reopening missed between polls or across downtime is
+ * still a distinct episode.
+ */
+export type FounderAttentionFact = AttentionItem & { founderOccurrenceFingerprint?: string | null };
+
+function factEpisodeKey(dedupKey: string, fingerprint: string | null | undefined): string {
+  return fingerprint ? `${dedupKey}#${fingerprint}` : dedupKey;
+}
+
+function episodeKey(episode: FounderEpisodeRow): string {
+  return factEpisodeKey(episode.payload.dedupKey, episode.payload.occurrenceFingerprint);
+}
+
+/** Partial JSON merge on the current row, never a stale whole-payload write. */
+function mergeEpisodePayload(patch: Partial<FounderNotificationEpisodePayload>) {
+  return sql`${chatActions.payload} || ${JSON.stringify(patch)}::jsonb`;
+}
+
 // ---------------------------------------------------------------------------
 // Route target and binding
 
@@ -179,7 +206,13 @@ type ConversationRow = typeof chatConversations.$inferSelect;
 type EndpointRow = typeof chatEndpoints.$inferSelect;
 
 export type FounderRouteTarget =
-  | { binding: { verified: true }; endpoint: EndpointRow; conversation: ConversationRow }
+  | {
+      binding: { verified: true };
+      endpoint: EndpointRow;
+      conversation: ConversationRow;
+      /** Every human principal that wrote into the thread; all linked to the recipient. */
+      principalIds: string[];
+    }
   | { binding: { verified: false; reason: FounderNotificationRouteUnavailableReason } };
 
 /** Mirrors dispatch: a delivered `/new` or `/close` retires that generation. */
@@ -315,9 +348,173 @@ export async function resolveFounderRouteTarget(
   for (const conversation of generations) {
     if (conversation.state === "unavailable" || conversation.state === "endpoint_removed") continue;
     if (conversation.state === "completed" && (await conversationClosedByTaskControl(db, conversation.id))) continue;
-    return { binding: { verified: true }, endpoint, conversation };
+    return {
+      binding: { verified: true },
+      endpoint,
+      conversation,
+      principalIds: [...new Set(humans.map((row) => row.principalId))].sort(),
+    };
   }
   return unavailable("conversation_unavailable");
+}
+
+/**
+ * Locks and re-reads the recipient authority a route target relied on, in the
+ * same order and under the same identity key as the chat authorization path,
+ * so a concurrent unlink or membership change linearizes before or after this
+ * transaction instead of slipping between the proof and provider I/O.
+ */
+async function lockFounderRecipientAuthority(
+  tx: Pick<Db, "select" | "execute">,
+  input: { companyId: string; endpointId: string; recipientUserId: string; principalIds: string[] },
+): Promise<boolean> {
+  if (input.principalIds.length === 0) return false;
+  for (const principalId of input.principalIds) {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${input.companyId}:${principalId}`}, 0))`,
+    );
+    const link = await tx
+      .select({ status: chatIdentityLinks.status, userId: chatIdentityLinks.paperclipUserId })
+      .from(chatIdentityLinks)
+      .where(
+        and(
+          eq(chatIdentityLinks.companyId, input.companyId),
+          eq(chatIdentityLinks.endpointId, input.endpointId),
+          eq(chatIdentityLinks.principalId, principalId),
+        ),
+      )
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (link?.status !== "linked" || link.userId !== input.recipientUserId) return false;
+  }
+  const membership = await tx
+    .select({ status: companyMemberships.status })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, input.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, input.recipientUserId),
+      ),
+    )
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  return membership?.status === "active";
+}
+
+type FounderPublicationRole = "card" | "resolution" | "ack";
+const FOUNDER_PUBLICATION_PREFIXES: Array<[string, FounderPublicationRole]> = [
+  ["founder-notification:", "card"],
+  ["founder-notification-resolution:", "resolution"],
+  ["founder-notification-ack:", "ack"],
+];
+
+export function isFounderNotificationPublicationKey(idempotencyKey: string): boolean {
+  return idempotencyKey.startsWith("founder-notification");
+}
+
+function parseFounderPublicationKey(idempotencyKey: string): { episodeId: string; role: FounderPublicationRole } | null {
+  for (const [prefix, role] of FOUNDER_PUBLICATION_PREFIXES) {
+    if (!idempotencyKey.startsWith(prefix)) continue;
+    const episodeId = idempotencyKey.slice(prefix.length);
+    return /^[0-9a-f-]{36}$/i.test(episodeId) ? { episodeId, role } : null;
+  }
+  return null;
+}
+
+/**
+ * Transport-time proof for every founder publication: the original card, its
+ * retries, and resolution and acknowledgement notices. Runs inside the
+ * durable pre-I/O claim. A false result cancels the claimed row before any
+ * provider call, so the message is definitely unsent; a send that already
+ * reached streaming or delivery_unknown is never replayed by this path.
+ *
+ * Lock order is route, then recipient authority; the claim takes both before
+ * it locks the publication and conversation. Disable takes the route first
+ * and acknowledgement takes recipient authority first, so neither can
+ * deadlock with this claim. The episode is read without a lock: a resolution
+ * or acknowledgement that commits after this read finds the card streaming
+ * and sends its notice, which is the designed visible-card outcome.
+ */
+export async function authorizeFounderNotificationPublication(
+  tx: Pick<Db, "select" | "selectDistinct" | "execute">,
+  publication: Pick<
+    typeof chatPublications.$inferSelect,
+    "companyId" | "endpointId" | "conversationId" | "issueId" | "idempotencyKey" | "id"
+  >,
+): Promise<boolean> {
+  const parsed = parseFounderPublicationKey(publication.idempotencyKey);
+  if (!parsed) return false;
+  const episodeWhere = and(
+    eq(chatActions.companyId, publication.companyId),
+    eq(chatActions.endpointId, publication.endpointId),
+    eq(chatActions.id, parsed.episodeId),
+    eq(chatActions.kind, FOUNDER_NOTIFICATION_EPISODE_KIND),
+  );
+  const routeOf = await tx
+    .select()
+    .from(chatActions)
+    .where(episodeWhere)
+    .then((rows) => rows[0] ?? null);
+  if (!routeOf || !isFounderEpisodeRow(routeOf)) return false;
+  const route = await tx
+    .select()
+    .from(chatActions)
+    .where(
+      and(
+        eq(chatActions.companyId, publication.companyId),
+        eq(chatActions.endpointId, publication.endpointId),
+        eq(chatActions.id, routeOf.payload.routeId),
+        eq(chatActions.kind, FOUNDER_NOTIFICATION_ROUTE_KIND),
+      ),
+    )
+    .for("share")
+    .then((rows) => rows[0] ?? null);
+  if (
+    !route ||
+    !isFounderRouteRow(route) ||
+    route.status !== "enabled" ||
+    route.payload.recipientUserId !== routeOf.payload.recipientUserId
+  ) {
+    return false;
+  }
+  const target = await resolveFounderRouteTarget(tx, {
+    companyId: route.companyId,
+    endpointId: route.endpointId,
+    conversationId: route.conversationId!,
+    recipientUserId: route.payload.recipientUserId,
+  });
+  if (!target.binding.verified) return false;
+  const { conversation, principalIds } = target as Extract<FounderRouteTarget, { principalIds: string[] }>;
+  if (conversation.id !== publication.conversationId) return false;
+  if (
+    !(await lockFounderRecipientAuthority(tx, {
+      companyId: route.companyId,
+      endpointId: route.endpointId,
+      recipientUserId: route.payload.recipientUserId,
+      principalIds,
+    }))
+  ) {
+    return false;
+  }
+  // Re-read after the authority locks for the freshest committed state.
+  const episode = await tx
+    .select()
+    .from(chatActions)
+    .where(episodeWhere)
+    .then((rows) => rows[0] ?? null);
+  if (
+    !episode ||
+    !isFounderEpisodeRow(episode) ||
+    episode.payload.routeId !== route.id ||
+    episode.payload.recipientUserId !== route.payload.recipientUserId ||
+    episode.payload.issueId !== publication.issueId
+  ) {
+    return false;
+  }
+  if (parsed.role === "card") return episode.status === "open" && episode.payload.publicationId === publication.id;
+  if (parsed.role === "resolution") return episode.payload.resolutionPublicationId === publication.id;
+  return episode.payload.acknowledgedAt !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +764,7 @@ async function quiesceFounderRoute(db: Pick<Db, "select" | "update">, route: Fou
       .update(chatActions)
       .set({
         status: "resolved",
-        payload: { ...episode.payload, resolvedAt: now.toISOString(), resolutionReason: "route_disabled" },
+        payload: mergeEpisodePayload({ resolvedAt: now.toISOString(), resolutionReason: "route_disabled" }),
         updatedAt: now,
       })
       .where(and(eq(chatActions.id, episode.id), inArray(chatActions.status, ["observing", "open"])));
@@ -702,6 +899,29 @@ export async function listFounderEpisodeViews(
   });
 }
 
+/**
+ * The fence shared with disable: a share lock on the route row, which disable
+ * updates under an exclusive lock. Any episode or publication write made under
+ * this lock either commits before disable (and is quiesced by it) or sees the
+ * route disabled and writes nothing.
+ */
+async function lockEnabledRoute(tx: Pick<Db, "select">, route: FounderRouteRow): Promise<boolean> {
+  const current = await tx
+    .select()
+    .from(chatActions)
+    .where(and(eq(chatActions.id, route.id), eq(chatActions.kind, FOUNDER_NOTIFICATION_ROUTE_KIND)))
+    .for("share")
+    .then((rows) => rows[0] ?? null);
+  return (
+    !!current &&
+    isFounderRouteRow(current) &&
+    current.status === "enabled" &&
+    current.endpointId === route.endpointId &&
+    current.conversationId === route.conversationId &&
+    current.payload.recipientUserId === route.payload.recipientUserId
+  );
+}
+
 async function nextOccurrences(
   db: Pick<Db, "select">,
   route: FounderRouteRow,
@@ -733,6 +953,8 @@ export type FounderReconcileResult = {
   resolved: number;
   resolutionNotices: number;
   routeUnavailable: FounderNotificationRouteUnavailableReason | null;
+  /** The route was disabled or rebound while this pass was in flight. */
+  routeChanged: boolean;
 };
 
 /**
@@ -744,43 +966,62 @@ export type FounderReconcileResult = {
 export async function reconcileFounderRoute(
   db: FounderDb,
   route: FounderRouteRow,
-  items: AttentionItem[],
+  items: FounderAttentionFact[],
   now: Date,
 ): Promise<FounderReconcileResult> {
-  const result: FounderReconcileResult = { observed: 0, opened: 0, resolved: 0, resolutionNotices: 0, routeUnavailable: null };
+  const result: FounderReconcileResult = {
+    observed: 0,
+    opened: 0,
+    resolved: 0,
+    resolutionNotices: 0,
+    routeUnavailable: null,
+    routeChanged: false,
+  };
   const nowMs = now.getTime();
   const nowIso = now.toISOString();
   const stallAfterMs = boundedStallAfterMs(route.payload.stallAfterMs);
 
-  const present = new Map<string, AttentionItem>();
-  const actionable = new Map<string, { item: AttentionItem; kind: FounderNotificationClass; taskIssueId: string }>();
+  // Episodes are keyed by the attention dedupKey plus, where the adapter
+  // supplies one, the occurrence fingerprint. A changed fingerprint means the
+  // fact cleared and reopened even if no poll observed it absent.
+  const present = new Set<string>();
+  const actionable = new Map<
+    string,
+    { item: FounderAttentionFact; kind: FounderNotificationClass; taskIssueId: string; fingerprint: string | null }
+  >();
   for (const item of items) {
-    present.set(item.dedupKey, item);
+    const fingerprint = item.founderOccurrenceFingerprint ?? null;
+    const key = factEpisodeKey(item.dedupKey, fingerprint);
+    present.add(key);
     const classification = classifyFounderNotification(item, nowMs);
     if (classification.notify) {
-      actionable.set(item.dedupKey, { item, kind: classification.kind, taskIssueId: classification.taskIssueId });
+      actionable.set(key, { item, kind: classification.kind, taskIssueId: classification.taskIssueId, fingerprint });
     }
   }
 
   const active = await routeEpisodes(db, route, ["observing", "open"]);
-  const activeByKey = new Map(active.map((episode) => [episode.payload.dedupKey, episode]));
+  const activeByKey = new Map(active.map((episode) => [episodeKey(episode), episode]));
 
   // Resolution: an episode whose fact left the complete snapshot. Facts that
   // remain present but are now quiet (snoozed/dismissed) are not resolved.
   for (const episode of active) {
-    if (present.has(episode.payload.dedupKey)) continue;
+    if (present.has(episodeKey(episode))) continue;
     const resolved = await resolveEpisode(db, route, episode, nowIso);
     if (resolved.resolved) result.resolved += 1;
     if (resolved.notice) result.resolutionNotices += 1;
   }
 
-  const missing = [...actionable.keys()].filter((key) => !activeByKey.has(key));
-  const occurrences = await nextOccurrences(db, route, missing);
-  for (const [dedupKey, fact] of actionable) {
+  const missing = [...actionable.entries()].filter(([key]) => !activeByKey.has(key)).map(([, fact]) => fact.item.dedupKey);
+  const occurrences = await nextOccurrences(db, route, [...new Set(missing)]);
+  for (const [key, fact] of actionable) {
     result.observed += 1;
-    let episode = activeByKey.get(dedupKey) ?? null;
+    const dedupKey = fact.item.dedupKey;
+    let episode = activeByKey.get(key) ?? null;
     if (!episode) {
       const occurrence = occurrences.get(dedupKey) ?? 1;
+      // Two fingerprints of one dedupKey in one snapshot cannot happen; if a
+      // producer ever did that, the second waits for the next pass.
+      occurrences.set(dedupKey, occurrence + 1);
       const payload: FounderNotificationEpisodePayload = {
         version: 1,
         routeId: route.id,
@@ -789,6 +1030,7 @@ export async function reconcileFounderRoute(
         sourceKind: fact.item.sourceKind,
         notificationClass: fact.kind,
         dedupKey,
+        occurrenceFingerprint: fact.fingerprint,
         occurrence,
         issueId: fact.taskIssueId,
         issueIdentifier: taskSubject(fact.item).identifier,
@@ -806,19 +1048,26 @@ export async function reconcileFounderRoute(
         resolutionReason: null,
         resolutionPublicationId: null,
       };
-      const inserted = await db
-        .insert(chatActions)
-        .values({
-          companyId: route.companyId,
-          endpointId: route.endpointId,
-          conversationId: null,
-          kind: FOUNDER_NOTIFICATION_EPISODE_KIND,
-          providerActionId: founderEpisodeActionId(route.id, dedupKey, occurrence),
-          payload,
-          status: "observing",
-        })
-        .onConflictDoNothing()
-        .returning();
+      const inserted = await db.transaction(async (tx) => {
+        if (!(await lockEnabledRoute(tx, route))) return null;
+        return tx
+          .insert(chatActions)
+          .values({
+            companyId: route.companyId,
+            endpointId: route.endpointId,
+            conversationId: null,
+            kind: FOUNDER_NOTIFICATION_EPISODE_KIND,
+            providerActionId: founderEpisodeActionId(route.id, dedupKey, occurrence),
+            payload,
+            status: "observing",
+          })
+          .onConflictDoNothing()
+          .returning();
+      });
+      if (!inserted) {
+        result.routeChanged = true;
+        return result;
+      }
       episode = (inserted[0] as FounderEpisodeRow | undefined) ?? null;
       if (!episode) continue; // A concurrent pass created it; the next pass continues.
     } else if (episode.status === "observing") {
@@ -826,7 +1075,7 @@ export async function reconcileFounderRoute(
       const [updated] = await db
         .update(chatActions)
         .set({
-          payload: { ...episode.payload, observations, lastObservedAt: nowIso },
+          payload: mergeEpisodePayload({ observations, lastObservedAt: nowIso }),
           updatedAt: now,
         })
         .where(and(eq(chatActions.id, episode.id), eq(chatActions.status, "observing")))
@@ -846,9 +1095,12 @@ export async function reconcileFounderRoute(
       if (!due) continue;
       const opened = await openEpisode(db, route, episode, fact.item, fact.kind, now);
       if (opened === "opened") result.opened += 1;
-      else if (opened) result.routeUnavailable = opened;
+      else if (opened === "route_changed") {
+        result.routeChanged = true;
+        return result;
+      } else if (opened) result.routeUnavailable = opened;
     } else {
-      await reportDeliveryState(db, episode);
+      await reportFounderDeliveryState(db, episode);
     }
   }
   return result;
@@ -861,7 +1113,7 @@ async function openEpisode(
   item: AttentionItem,
   kind: FounderNotificationClass,
   now: Date,
-): Promise<"opened" | FounderNotificationRouteUnavailableReason | null> {
+): Promise<"opened" | "route_changed" | FounderNotificationRouteUnavailableReason | null> {
   const target = await resolveFounderRouteTarget(db, {
     companyId: route.companyId,
     endpointId: route.endpointId,
@@ -903,6 +1155,7 @@ async function openEpisode(
     interaction: { id: episode.id, card: { kind: "status", title: message.title, body: message.body, actions } },
   });
   return db.transaction(async (tx) => {
+    if (!(await lockEnabledRoute(tx, route))) return "route_changed" as const;
     const current = await tx
       .select()
       .from(chatActions)
@@ -1079,8 +1332,13 @@ async function resolveEpisode(
 
 const VISIBLE_FAILURE_STATES = new Set(["failed", "cancelled", "delivery_unknown"]);
 
-/** Transport failures stay visible: log each new failure state exactly once. */
-async function reportDeliveryState(db: Pick<Db, "select" | "update">, episode: FounderEpisodeRow) {
+/**
+ * Transport failures stay visible: log each new failure state exactly once.
+ * Writes only `reportedDeliveryState`, atomically on the current open row, so
+ * a concurrent acknowledgement or resolution is never overwritten by the
+ * episode snapshot this pass read earlier.
+ */
+export async function reportFounderDeliveryState(db: Pick<Db, "select" | "update">, episode: FounderEpisodeRow) {
   if (!episode.payload.publicationId) return;
   const publication = await db
     .select({ state: chatPublications.state, attempts: chatPublications.attempts, redactedError: chatPublications.redactedError })
@@ -1089,6 +1347,20 @@ async function reportDeliveryState(db: Pick<Db, "select" | "update">, episode: F
     .then((rows) => rows[0] ?? null);
   const state: string = publication?.state ?? "missing";
   if (state === episode.payload.reportedDeliveryState) return;
+  const changed = await db
+    .update(chatActions)
+    .set({
+      payload: sql`jsonb_set(${chatActions.payload}, '{reportedDeliveryState}', to_jsonb(${state}::text), true)`,
+    })
+    .where(
+      and(
+        eq(chatActions.id, episode.id),
+        eq(chatActions.status, "open"),
+        sql`${chatActions.payload}->>'reportedDeliveryState' is distinct from ${state}`,
+      ),
+    )
+    .returning({ id: chatActions.id });
+  if (changed.length === 0) return;
   if (VISIBLE_FAILURE_STATES.has(state) || state === "missing") {
     logger.warn(
       {
@@ -1101,10 +1373,6 @@ async function reportDeliveryState(db: Pick<Db, "select" | "update">, episode: F
       "founder notification delivery needs attention",
     );
   }
-  await db
-    .update(chatActions)
-    .set({ payload: { ...episode.payload, reportedDeliveryState: state } })
-    .where(eq(chatActions.id, episode.id));
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,7 +1465,11 @@ export async function acknowledgeFounderEpisode(
 
 export type FounderNotificationSweepDeps = {
   /** Complete, recipient-scoped attention snapshot. Must throw on failure. */
-  listAttention: (companyId: string, recipientUserId: string, actor: AuthorizationActor) => Promise<AttentionItem[]>;
+  listAttention: (
+    companyId: string,
+    recipientUserId: string,
+    actor: AuthorizationActor,
+  ) => Promise<FounderAttentionFact[]>;
   now?: () => Date;
 };
 
@@ -1260,7 +1532,8 @@ export function founderNotificationService(db: Db, deps: FounderNotificationSwee
         if (!actor) continue;
         const items = await deps.listAttention(route.companyId, route.payload.recipientUserId, actor);
         const result = await reconcileFounderRoute(db, route, items, deps.now?.() ?? new Date());
-        await recordRouteAvailability(route, result);
+        // A route disabled or rebound mid-pass belongs to its new owner state.
+        if (!result.routeChanged) await recordRouteAvailability(route, result);
         results.push(result);
       } catch (err) {
         logger.warn({ err, routeId: route.id, companyId: route.companyId }, "founder notification sweep failed for route");

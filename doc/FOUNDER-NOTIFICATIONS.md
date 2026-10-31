@@ -45,6 +45,18 @@ the same episode and the same outbox idempotency key, so a delivered episode
 is never sent twice. If the same fact clears and later reappears, for example
 a review reopened on an unchanged head, a new occurrence opens a new episode.
 
+Review (`review:<issue>`) and stalled-blocker (`blocker:<issue>`) facts keep
+the same dedup key when they clear and reopen. For these the founder adapter
+adds an opaque occurrence fingerprint, so a reopening is a new episode even
+when no tick saw the fact absent, including while the server was down:
+
+- review: current stage, last decision and changes-requested round, plus the
+  issue's latest recorded change into `in_review`;
+- blocker: the earliest blocking transition among the issues it holds.
+
+Repeated observations of one occurrence keep one fingerprint. The shared
+attention producer and its dedup keys are unchanged.
+
 When the fact leaves the snapshot:
 
 - A card that was never handed to the provider is cancelled.
@@ -70,14 +82,24 @@ and keeps the episode due until it can be sent.
 ## Routes
 
 A route binds one recipient (a Paperclip user) to one existing direct-message
-thread on one chat endpoint. Before every send the server re-proves that:
+thread on one chat endpoint. The server proves the binding when it creates a
+card, and again inside the outbox's durable pre-I/O transport claim for every
+founder publication: first send, each retry, and resolution and
+acknowledgement notices. It checks that:
 
+- the route is still enabled for the same recipient;
 - the endpoint is active, in `automatic` publication mode and allows DMs;
 - the conversation is a DM and every human who wrote into that thread is
-  linked to the recipient;
-- the recipient is still an active company member.
+  linked to the recipient (the identity links and membership are locked for
+  the claim, under the same identity lock as chat authorization);
+- the recipient is still an active company member;
+- the publication targets the route's current thread generation and belongs
+  to that route's episode and original task.
 
-Any failure blocks sending and is reported as the route's binding reason.
+If any check fails at the claim, the row is cancelled before any provider
+call, so it was definitely not sent. A send already handed to the provider
+(`streaming` or `delivery_unknown`) is never replayed. When a card cannot be
+created, the failure is reported as the route's binding reason.
 The route follows the thread's newest sendable generation, so `/new` does
 not strand notifications.
 
@@ -112,8 +134,12 @@ review, merge, deployment or release.
 `PUT` body: `{ recipientUserId, endpointId, conversationId, enabled?, stallAfterMs? }`.
 A route can only be enabled when its binding verifies. Disabling a route
 cancels every card not yet handed to the provider, expires its buttons and
-closes active episodes silently. Re-enabling sends each still-present fact
+closes active episodes silently. Episode and card writes take a share lock on
+the route row, so a sweep that was already running when the route was
+disabled writes nothing afterwards. Re-enabling sends each still-present fact
 once, as a new occurrence.
+
+These endpoints are in the OpenAPI document under `founder-notifications`.
 
 ## Activation
 
