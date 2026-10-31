@@ -648,6 +648,7 @@ export function createClaudeTerminalResultTracker() {
     return spawned === count(stats.completed) + count(stats.failed) + killed;
   };
   const consumeLine = (line: string) => {
+    if (line.length > MAX_CAPTURE_BYTES) { terminal = false; return; }
     if (!line.trim()) return;
     const event = parseJson(line);
     if (!event) { terminal = false; return; }
@@ -662,14 +663,17 @@ export function createClaudeTerminalResultTracker() {
       const line = pending.slice(0, newline);
       pending = pending.slice(newline + 1);
       if (!discardingLine) consumeLine(line);
+      else terminal = false;
       discardingLine = false;
     }
+    if (!pending.trim()) pending = "";
     if (pending.trim()) {
       // A partial next turn immediately invalidates the preceding result.
       if (!discardingLine && parseJson(pending)) {
         consumeLine(pending);
         pending = "";
       } else if (pending.length > MAX_CAPTURE_BYTES) {
+        terminal = false;
         pending = "";
         discardingLine = true;
       }
@@ -678,6 +682,6 @@ export function createClaudeTerminalResultTracker() {
   };
 }
 
-export function hasCurrentClaudeTerminalResult(stdout: string, stderr = "") {
-  return createClaudeTerminalResultTracker()({ stdout, stderr });
+export function hasCurrentClaudeTerminalResult(stdout: string) {
+  return createClaudeTerminalResultTracker()({ stdout, stderr: "" });
 }

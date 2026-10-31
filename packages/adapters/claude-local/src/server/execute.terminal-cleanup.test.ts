@@ -19,9 +19,10 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 import { execute } from "./execute.js";
+import { createClaudeTerminalResultTracker } from "./parse.js";
 
 const success = { type: "result", subtype: "success", is_error: false, session_id: "cleanup-session", result: "Work recorded", usage: { input_tokens: 1, output_tokens: 2 } };
-const cleanup = { kind: "terminal_result_cleanup", stopped: true, terminalResultSeen: true, stopReason: "unmanaged_background_task_stopped", reason: "unmanaged background task stopped; no durable live path", signal: "SIGTERM", forceKilled: false } as const;
+const cleanup = { kind: "terminal_result_cleanup", stopped: true, terminalResultSeen: true, orderedOutputObserved: true, stopReason: "unmanaged_background_task_stopped", reason: "unmanaged background task stopped; no durable live path", signal: "SIGTERM", forceKilled: false } as const;
 const dirs: string[] = [];
 afterEach(async () => {
   vi.clearAllMocks();
@@ -51,7 +52,7 @@ describe("Claude terminal-result cleanup disposition", () => {
       "process.stdout.write(JSON.stringify(" + JSON.stringify(success) + ")+ '\\n');setInterval(()=>{},1000);"
     ], {
       cwd: os.tmpdir(), env: {}, timeoutSec: 5, graceSec: 1, onLog: async () => {},
-      terminalResultCleanup: { graceMs: 50, hasTerminalResult: ({ stdout }) => stdout.includes('"subtype":"success"') },
+      terminalResultCleanup: { graceMs: 50, hasTerminalResult: () => false, observeOutput: createClaudeTerminalResultTracker() },
     });
     expect(proc.signal).toBe("SIGTERM");
     expect(proc.terminalResultCleanup?.terminalResultSeen).toBe(true);
@@ -69,6 +70,7 @@ describe("Claude terminal-result cleanup disposition", () => {
   });
   it.each([
     ["no controller cleanup", { terminalResultCleanup: null }],
+    ["no ordered observation through close", { terminalResultCleanup: { ...cleanup, orderedOutputObserved: undefined } }],
     ["no observed terminal result", { terminalResultCleanup: { ...cleanup, terminalResultSeen: false } }],
     ["different actual signal", { signal: "SIGKILL" }],
     ["independent nonzero exit", { exitCode: 2 }],
@@ -153,6 +155,41 @@ describe("Claude terminal-result cleanup disposition", () => {
     expect(proc.signal).toBe("SIGTERM");
     expect(proc.stdout).toContain("second complete");
     expect(await adapt(proc)).toMatchObject({ exitCode: 0, signal: null, summary: "second complete" });
+  });
+
+  it.skipIf(process.platform === "win32")("preserves failure for stderr after cleanup SIGTERM and escalation", async () => {
+    const observe = createClaudeTerminalResultTracker();
+    const proc = await runChildProcess(randomUUID(), process.execPath, ["-e", [
+      "process.on('SIGTERM',()=>process.stderr.write('unfinished activity after SIGTERM\\n'));",
+      "process.stdout.write(JSON.stringify(" + JSON.stringify(success) + ")+'\\n');",
+      "setInterval(()=>{},1000);",
+    ].join("")], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 4, graceSec: 1, onLog: async () => {},
+      terminalResultCleanup: { graceMs: 50, hasTerminalResult: () => false, observeOutput: observe },
+    });
+    expect(proc.signal).toBe("SIGKILL");
+    expect(proc.stderr).toContain("unfinished activity after SIGTERM");
+    const result = await adapt(proc);
+    expect(result.signal).toBe("SIGKILL");
+    expect(proc.terminalResultCleanup).toMatchObject({ orderedOutputObserved: true, terminalResultSeen: false, forceKilled: true });
+    expect(result.resultJson?.adapterCompletion).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("does not accept a clean process exit after interrupted cleanup activity", async () => {
+    const proc = await runChildProcess(randomUUID(), process.execPath, ["-e", [
+      "process.on('SIGTERM',()=>{process.stderr.write('new unfinished activity\\n');process.exit(0);});",
+      "process.stdout.write(JSON.stringify(" + JSON.stringify(success) + ")+'\\n');",
+      "setInterval(()=>{},1000);",
+    ].join("")], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 3, graceSec: 1, onLog: async () => {},
+      terminalResultCleanup: { graceMs: 50, hasTerminalResult: () => false, observeOutput: createClaudeTerminalResultTracker() },
+    });
+    expect(proc).toMatchObject({ exitCode: 0, signal: null });
+    expect(proc.terminalResultCleanup).toMatchObject({ orderedOutputObserved: true, terminalResultSeen: false });
+    const result = await adapt(proc);
+    expect(result.errorCode).toBe("unmanaged_background_task_stopped");
+    expect(result.errorMessage).toContain("completion is unproven");
+    expect(result.resultJson?.adapterCompletion).toBeUndefined();
   });
 
 });

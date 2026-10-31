@@ -28,4 +28,19 @@ describe("latest Claude terminal turn", () => {
   expect(observe({ stdout: "", stderr: "later error" })).toBe(false);
   expect(observe({ stdout: JSON.stringify(result)+"\n", stderr: "" })).toBe(true);
  });
+ it("keeps fragmented oversized activity invalid after its discarded newline", () => {
+  const observe = createClaudeTerminalResultTracker();
+  expect(observe({ stdout: JSON.stringify(result)+"\n", stderr: "" })).toBe(true);
+  expect(observe({ stdout: '{"type":"assistant","message":{"text":"'+ "x".repeat(4*1024*1024+1), stderr: "" })).toBe(false);
+  expect(observe({ stdout: '"}}\n', stderr: "" })).toBe(false);
+  expect(observe({ stdout: "\n", stderr: "" })).toBe(false);
+  expect(observe({ stdout: JSON.stringify(result)+"\n", stderr: "" })).toBe(true);
+ });
+ it("does not retain unbounded whitespace as a pending record", () => {
+  const observe = createClaudeTerminalResultTracker();
+  expect(observe({ stdout: JSON.stringify(result)+"\n", stderr: "" })).toBe(true);
+  for (let n=0;n<3;n++) expect(observe({ stdout: " ".repeat(4*1024*1024), stderr: "" })).toBe(true);
+  expect(observe({ stdout: '{"type":"assistant"}\n', stderr: "" })).toBe(false);
+ });
+
 });

@@ -85,6 +85,8 @@ export interface TerminalResultCleanupEvidence {
   stopReason: typeof UNMANAGED_BACKGROUND_TASK_STOP_REASON;
   reason: typeof UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON;
   terminalResultSeen: boolean;
+  /** Latest ordered stdout/stderr eligibility was observed through close. */
+  orderedOutputObserved?: boolean;
   signal: NodeJS.Signals | null;
   forceKilled: boolean;
 }
@@ -4803,7 +4805,7 @@ export async function runChildProcess(
 
         const observeTerminalOutput = (output: { stdout: string; stderr: string }) => {
           const observer = opts.terminalResultCleanup?.observeOutput;
-          if (!observer || terminalCleanupStarted) return;
+          if (!observer) return;
           try { terminalResultSeen = observer(output); }
           catch (err) {
             terminalResultSeen = false;
@@ -4978,6 +4980,7 @@ export async function runChildProcess(
                           stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
                           reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
                           terminalResultSeen,
+                          ...(opts.terminalResultCleanup?.observeOutput ? { orderedOutputObserved: true } : {}),
                           signal: terminalCleanupSignal,
                           forceKilled: terminalCleanupForceKilled,
                         }
