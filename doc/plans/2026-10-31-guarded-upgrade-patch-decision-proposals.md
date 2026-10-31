@@ -13,6 +13,9 @@ Inputs:
   `github-launcher-run-scope`, `claude-terminal-cleanup` and
   `native-handoff-admission` through new observation-only ports at
   `875e99abdbd395117a83973cf3d480cf321e57bc`; their rows cite those receipts.
+  Stage 7 re-ran `native-handoff-admission` alone with the R6 dispatch-first
+  case added, ports at `8e8c2d36b424072ca464826c6f9ef804412966dd`; its row
+  cites those receipts.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -45,7 +48,7 @@ Meaning of the decisions:
 | codex-shell-proxy-allowlist | **upstream-fails** 1/1 (`4b1d6975`) | passes 1/1 | `execute.ts` changed | **adapt** |
 | github-launcher-run-scope | **upstream-fails** 2/6 (`9fd01346`), port `875e99ab` | passes 6/6 (`5e36f24f`) | `execution-target.ts`/`execute.ts` changed; helper absent | **adapt** |
 | claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
-| native-handoff-admission | **upstream-fails** 7/9 (`157ced83`), port `875e99ab` | passes 9/9, file 121/121 (`a86b41e7`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
+| native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
@@ -110,7 +113,22 @@ upstream covers any of these behaviors.
     with test-held Postgres row locks instead. Upstream now fails all 7 by
     assertion: no lock wait on the invitation row during cancellation, and
     `update "issues"` instead of an issue-first `select` lock in the
-    expiry ordering. The receipt is `upstream-fails` (`157ced83`).
+    expiry ordering. The stage 6 receipt was `upstream-fails` (`157ced83`).
+  - STA-22 round 7 (R6) found the stage 6 cancellation case too weak: it
+    starts the revocation before the gate, so an early-unlock mutation
+    passed it while the `b2385913` original failed. Stage 7 adds a
+    dispatch-first case through a test-only `Db` seam (see PORT.md). It
+    pauses after the gate's locked invitation read, requires the
+    cancellation to wait on that reading backend, and requires dispatch
+    while that transaction is still open, before the revocation. Upstream
+    fails it by assertion at `reached`: its gate never makes a locked read
+    of the invitation. The fresh receipt is `upstream-fails` (`e54579c3`),
+    8 of 10 required failing, all by assertion, no timeouts. The control
+    passes 10/10 and 122/122 in the file (`e4b7fb00`).
+  - Under the reviewer's early-unlock mutation, applied in memory to the
+    control, the new case fails by assertion, the `b2385913` original also
+    fails, and the cancellation-first case still passes. Unmodified, the
+    new case and the original both pass.
   - The port's own mutation check (each fix reverted in a scratch tree of
     `b2385913`, only the matching test fails) ran in stage 6's first
     sandbox, whose receipts were lost. It has not been re-run.

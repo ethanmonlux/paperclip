@@ -89,8 +89,14 @@ Stage 6 (ports `875e99ab`, card `4206f0e6`):
   - `native-handoff-admission`: **upstream-fails**, 7 of 9 required by assertion, no timeouts. Control 9/9, file 121/121.
 - Proposals for all three stay **adapt**.
 
+Stage 7 (ports `8e8c2d36`, card `be840d6f`, STA-22 finding R6):
+
+- **Port.** The `native-handoff-admission` cancellation case started the revocation before the gate, so it never showed the invitation lock is held from the gate's read until the provider handoff. A new dispatch-first case pauses the gate's own transaction after that read through a test-only `Db` seam, and requires dispatch while that transaction is still open, before the revocation. The other cases, the production code and the timeouts are unchanged. The registry adds the case to the required tests and stays `unassessed`.
+- **Receipts** (upstream `8595efc2`, control `b2385913`, this group only): **upstream-fails**, 8 of 10 required by assertion, no timeouts (`e54579c3`). Control 10/10, file 122/122 (`e4b7fb00`).
+- **Negative control.** Under STA-22's early-unlock mutation, applied in memory, the new case fails and the cancellation-first case still passes, as R6 described. The proposal stays **adapt**.
+
 Remaining gates, none satisfied yet:
-- Independent review of the fourteen proposed decisions, including the stage-6 ports and receipts for `github-launcher-run-scope`, `claude-terminal-cleanup` and `native-handoff-admission`.
+- Independent review of the fourteen proposed decisions, including the stage-6 ports and receipts for `github-launcher-run-scope` and `claude-terminal-cleanup`, and the stage-7 `native-handoff-admission` port and receipts (R6).
 - Owner action on the failing `review` check, and attribution of the e2e shard 1/8 announcements failure. Serialized shard 1/9 has passed since base commit `83f770b3`. After that, exact-head CI on the published head.
 - Independent review of the expected-lane graph and its reader (R4).
 - Build the combined candidate from accepted decisions: upstream `8595efc2` plus kept and adapted patches, with `pr.yml` re-pinned. Then its exact-head CI, package provenance and isolated install/boot/assets. No combined candidate exists yet.
