@@ -85,11 +85,14 @@ function evaluateCandidateReview({ registry, candidate, reviews, implementers })
 /**
  * `ci.jobs` must be every check run reported for the head across all
  * workflows, fully paged. There are no exemptions: any terminal non-success
- * fails, anything not yet terminal is unknown, and the registry's reviewed
- * required-job set must be present.
+ * fails, anything not yet terminal is unknown. `ciGraph` is the verified
+ * expected-lane graph regenerated from the candidate's own workflow blobs
+ * (R4): the reviewed required set must name every lane in it, so an absent
+ * lane can never pass because only aggregates or a short list were checked.
  */
-function evaluateCi(candidateSha, ci, requiredJobs) {
+function evaluateCi(candidateSha, ci, registry, ciGraph) {
   const id = "candidate-ci";
+  const requiredJobs = registry?.requiredCiJobs;
   if (!ci) return gate(id, UNKNOWN, "no exact-head CI evidence");
   if (ci.acceptedNonSuccessJobs !== undefined) return gate(id, FAIL, "CI exemptions are not accepted; every check must succeed");
   if (ci.headSha !== candidateSha) return gate(id, FAIL, `CI ran ${ci.headSha}, not ${candidateSha}`);
@@ -102,9 +105,18 @@ function evaluateCi(candidateSha, ci, requiredJobs) {
   const pending = jobs.filter((job) => job.status !== "completed");
   if (pending.length > 0) return gate(id, UNKNOWN, `checks not terminal: ${pending.map((job) => `${job.name}=${job.status}`).join(", ")}`);
   if (!Array.isArray(requiredJobs) || requiredJobs.length === 0) return gate(id, UNKNOWN, "registry declares no required CI check set");
+  if (!ciGraph) return gate(id, UNKNOWN, "expected CI graph was not verified against the candidate's workflows");
+  if (ciGraph.status !== PASS || !ciGraph.graph) return gate(id, ciGraph.status === FAIL ? FAIL : UNKNOWN, ciGraph.detail ?? "CI graph not verified");
+  const graphDigest = canonicalDigest(ciGraph.graph);
+  if (registry.ciGraphDigest !== graphDigest) return gate(id, UNKNOWN, `registry reviewed CI graph ${registry.ciGraphDigest ?? "none"}, candidate graph is ${graphDigest}`);
+  const expected = ciGraph.graph.checks.map((check) => check.name);
+  const uncovered = expected.filter((name) => !requiredJobs.includes(name));
+  if (uncovered.length > 0) return gate(id, FAIL, `required set omits expected lanes: ${uncovered.join(", ")}`);
+  const unexpected = requiredJobs.filter((name) => !expected.includes(name));
+  if (unexpected.length > 0) return gate(id, FAIL, `required checks not produced by the reviewed graph: ${unexpected.join(", ")}`);
   const missing = requiredJobs.filter((name) => !jobs.some((job) => job.name === name));
   if (missing.length > 0) return gate(id, FAIL, `required checks absent: ${missing.join(", ")}`);
-  return gate(id, PASS, `${jobs.length} checks succeeded on exact head, including ${requiredJobs.length} required`);
+  return gate(id, PASS, `${jobs.length} checks succeeded on exact head, covering all ${expected.length} expected lanes`);
 }
 
 function evaluateMigration(candidateSha, migration) {
@@ -124,7 +136,7 @@ function evaluateMigration(candidateSha, migration) {
  * pass; `unknown` never admits. This evaluates recorded evidence only; it does
  * not create any evidence.
  */
-export function evaluateAdmission({ registry, candidate, receipts = [], reviews = [], implementers = [], ci = null, migration = null, isolatedRuntime = null }) {
+export function evaluateAdmission({ registry, candidate, receipts = [], reviews = [], implementers = [], ci = null, ciGraph = null, migration = null, isolatedRuntime = null }) {
   const gates = [];
   const registryErrors = validateRegistry(registry);
   gates.push(registryErrors.length === 0 ? gate("registry", PASS, "valid") : gate("registry", FAIL, registryErrors.join("; ")));
@@ -140,7 +152,7 @@ export function evaluateAdmission({ registry, candidate, receipts = [], reviews 
   const context = { registry, candidate: candidate ?? {}, receipts, reviews: Array.isArray(reviews) ? reviews : [], implementers: knownImplementers ? implementers : [] };
   for (const patch of registry?.patches ?? []) gates.push(evaluatePatch(patch, context));
   gates.push(evaluateCandidateReview(context));
-  gates.push(evaluateCi(candidate?.sha, ci, registry?.requiredCiJobs));
+  gates.push(evaluateCi(candidate?.sha, ci, registry, ciGraph));
   gates.push(...evaluateMigration(candidate?.sha, migration));
   if (!isolatedRuntime) gates.push(gate("isolated-runtime", UNKNOWN, "no isolated install/boot/assets/continuation evidence"));
   else {

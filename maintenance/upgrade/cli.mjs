@@ -8,18 +8,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { evaluateAdmission } from "./lib/admission.mjs";
+import { verifyCiGraph } from "./lib/ci-graph.mjs";
+import { ciGraphFromGit } from "./lib/ci-graph-git.mjs";
 import { inventoryMigrations } from "./lib/migration-inventory.mjs";
 import { loadRegistry, validateRegistry } from "./lib/registry.mjs";
 import { evaluateUpstreamOnly, receiptDigest } from "./lib/upstream-only.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const defaultRegistry = path.join(repoRoot, "maintenance", "patch-registry.json");
+const defaultCiGraph = path.join(repoRoot, "maintenance", "ci-graph.json");
 
 const usage = `Usage:
   node maintenance/upgrade/cli.mjs validate [--registry FILE]
   node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD]
       [--ports-sha SHA] [--isolation private-network|none] [--registry FILE]
-  node maintenance/upgrade/cli.mjs admission --evidence FILE [--registry FILE]
+  node maintenance/upgrade/cli.mjs ci-graph --base-context REV [--candidate REV] [--check] [--ci-graph FILE]
+  node maintenance/upgrade/cli.mjs admission --evidence FILE --base-context REV [--registry FILE] [--ci-graph FILE]
   node maintenance/upgrade/cli.mjs migration-inventory --base SHA --candidate SHA [--dir packages/db/src/migrations]`;
 
 function gitText(args) {
@@ -54,6 +58,9 @@ function main(argv) {
       base: { type: "string" },
       candidate: { type: "string" },
       dir: { type: "string", default: "packages/db/src/migrations" },
+      "base-context": { type: "string" },
+      "ci-graph": { type: "string", default: defaultCiGraph },
+      check: { type: "boolean", default: false },
     },
   });
   if (command === "migration-inventory") {
@@ -65,6 +72,20 @@ function main(argv) {
     const candidateMigrations = migrationsAt(candidate, values.dir).filter(({ name }) => !known.has(name));
     console.log(JSON.stringify({ base, candidate, dir: values.dir, ...inventoryMigrations({ baseMigrations, candidateMigrations }) }, null, 2));
     return 0;
+  }
+  if (command === "ci-graph" || command === "admission") {
+    // pull_request_target workflows run from the PR's base branch, never the head.
+    if (!values["base-context"]) throw new Error("--base-context (the PR base branch, e.g. origin/master) is required");
+  }
+  if (command === "ci-graph") {
+    const regenerated = ciGraphFromGit(repoRoot, { candidate: values.candidate ?? "HEAD", baseContext: values["base-context"] });
+    if (!values.check) {
+      console.log(JSON.stringify(regenerated, null, 2));
+      return regenerated.unsupported ? 2 : 0;
+    }
+    const verified = verifyCiGraph({ committed: readJson(values["ci-graph"]), regenerated });
+    console.log(JSON.stringify({ status: verified.status, detail: verified.detail }, null, 2));
+    return verified.status === "pass" ? 0 : 2;
   }
   const registry = loadRegistry(values.registry);
   if (command === "validate") {
@@ -104,7 +125,12 @@ function main(argv) {
   }
   if (command === "admission") {
     if (!values.evidence) throw new Error("--evidence is required");
-    const decision = evaluateAdmission({ registry, ...readJson(values.evidence) });
+    const evidence = readJson(values.evidence);
+    // The expected-lane graph is derived from the candidate's workflow blobs here, never taken from evidence.
+    if (evidence.ciGraph !== undefined) throw new Error("ciGraph is derived from the candidate's workflows, not accepted as evidence");
+    const regenerated = ciGraphFromGit(repoRoot, { candidate: evidence.candidate?.sha ?? "", baseContext: values["base-context"] });
+    const ciGraph = verifyCiGraph({ committed: readJson(values["ci-graph"]), regenerated });
+    const decision = evaluateAdmission({ registry, ...evidence, ciGraph });
     console.log(JSON.stringify(decision, null, 2));
     return decision.admit ? 0 : 3;
   }

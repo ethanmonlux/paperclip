@@ -42,7 +42,28 @@ jobs:
       - name: Validate patch registry
         run: node maintenance/upgrade/cli.mjs validate
 
+      # The expected CI lane graph is regenerated from the exact workflow blobs:
+      # this head's pull_request workflows, the base branch's
+      # pull_request_target workflows and each pinned reusable workflow.
+      - name: Fetch workflow sources for the CI lane graph
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$HEAD_SHA" "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          git show "$HEAD_SHA:.github/workflows/pr.yml" \
+            | grep -oE 'uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+@[0-9a-f]{40}' \
+            | sed -E 's#^uses: ([^/]+/[^/]+)/.*@([0-9a-f]{40})$#\1 \2#' | sort -u \
+            | while read -r repository sha; do git fetch --no-tags --depth=1 "https://github.com/$repository.git" "$sha"; done
+
+      - name: Verify the reviewed CI lane graph
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: node maintenance/upgrade/cli.mjs ci-graph --check --candidate "$HEAD_SHA" --base-context "origin/$BASE_REF"
+
       - name: Run toolkit tests
         env:
           UPGRADE_TOOLKIT_REQUIRE_ISOLATION: "1"
+          UPGRADE_TOOLKIT_CI_GRAPH_CANDIDATE: ${{ github.event.pull_request.head.sha }}
         run: node --test maintenance/upgrade/__tests__/*.test.mjs

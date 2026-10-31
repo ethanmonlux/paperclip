@@ -27,6 +27,7 @@ export function validateRegistry(registry) {
     || registry.requiredCiJobs.some((name) => typeof name !== "string" || !name))) {
     fail("requiredCiJobs must be a non-empty array of check names");
   }
+  if (registry.ciGraphDigest !== undefined && !/^[0-9a-f]{64}$/.test(registry.ciGraphDigest)) fail("ciGraphDigest must be a sha256 digest");
   if (!Array.isArray(registry.patches) || registry.patches.length === 0) {
     fail("patches must be a non-empty array");
     return errors;

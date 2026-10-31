@@ -3,6 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { evaluateAdmission } from "../lib/admission.mjs";
+import { CI_GRAPH_SCHEMA } from "../lib/ci-graph.mjs";
 import { canonicalDigest } from "../lib/digest.mjs";
 import { RECEIPT_SCHEMA, receiptDigest } from "../lib/upstream-only.mjs";
 import { loadRegistry, validateRegistry } from "../lib/registry.mjs";
@@ -14,9 +15,13 @@ const CAND = "a".repeat(40);
 const AUTHORITY = "FAC-760";
 const SOURCE = "b".repeat(40);
 
+// A verified one-lane CI graph; the real graph is exercised in ci-graph.test.mjs.
+const GRAPH = { schema: CI_GRAPH_SCHEMA, workflows: [], calls: [], checks: [{ name: "verify", workflow: "pr.yml", job: "verify" }], aggregates: [] };
+
 function minimalRegistry(decision = "keep") {
   return {
-    schemaVersion: 1, firstCandidateUpstreamSha: UP, forkPatchSourceSha: SOURCE, automaticActivationEnabled: false, requiredCiJobs: ["verify"],
+    schemaVersion: 1, firstCandidateUpstreamSha: UP, forkPatchSourceSha: SOURCE, automaticActivationEnabled: false,
+    requiredCiJobs: ["verify"], ciGraphDigest: canonicalDigest(GRAPH),
     patches: [{ id: "p", decision, sourceCommits: ["c".repeat(40)], evidencePaths: ["x.test.ts"], upstreamOnly: { kind: "vitest", testFiles: ["x.test.ts"] } }],
   };
 }
@@ -35,6 +40,7 @@ function goodEvidence(registry = minimalRegistry(), outcome = "upstream-fails") 
       { ...bound, scope: "candidate", registryDigest: canonicalDigest(registry) },
     ],
     ci: { headSha: CAND, jobsComplete: true, jobs: [{ name: "verify", status: "completed", conclusion: "success" }] },
+    ciGraph: { status: "pass", detail: "1 expected lane", graph: GRAPH },
     migration: { candidateSha: CAND, isolatedCopy: true, result: "applied", appliedCount: 89, previousPayloadCompatible: true },
     isolatedRuntime: { candidateSha: CAND, install: true, boot: true, assets: true, continuation: true, recoveryAfterRestart: true },
   };
