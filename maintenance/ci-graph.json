@@ -1,6 +1,208 @@
 {
   "schema": "staple.ci-graph.v1",
   "baseContext": "origin/fix/network-proxy-child-stdio",
+  "files": [
+    {
+      "path": ".github/workflows/agent-runtime-images.yml",
+      "context": "base",
+      "blob": "02b68fce9a20d32888ad833c896fb2c868e937dc"
+    },
+    {
+      "path": ".github/workflows/cloud-migrator-artifacts.yml",
+      "context": "base",
+      "blob": "5c698230938683f41648026c60296788c626087f"
+    },
+    {
+      "path": ".github/workflows/cloud-readiness.yml",
+      "context": "base",
+      "blob": "6c709ade0ed44307af7778fcf9edf5a98f0ab8fe"
+    },
+    {
+      "path": ".github/workflows/commitperclip-review.yml",
+      "context": "base",
+      "blob": "4078244d79413144c24b1a95bab9929379a6f772"
+    },
+    {
+      "path": ".github/workflows/docker-runner-check.yml",
+      "context": "base",
+      "blob": "d6a2115efb9d634ea3ace10175625005d0aaf89f"
+    },
+    {
+      "path": ".github/workflows/docker.yml",
+      "context": "base",
+      "blob": "ed52dfa700d4d98b01f3ae4c39aa5ac8dcdd7de0"
+    },
+    {
+      "path": ".github/workflows/e2e.yml",
+      "context": "base",
+      "blob": "11a6efc045d87249452ac6291f4158b0412834f3"
+    },
+    {
+      "path": ".github/workflows/pr-trusted.yml",
+      "context": "base",
+      "blob": "228ac3bd4b70f8593822bc898861921bc36c643b"
+    },
+    {
+      "path": ".github/workflows/pr.yml",
+      "context": "base",
+      "blob": "a8c8b2666da41d7f28119d6f3b3cc212ee523c72"
+    },
+    {
+      "path": ".github/workflows/refresh-lockfile.yml",
+      "context": "base",
+      "blob": "ecc0c73ebeef2b09ad1eefee93dca57bb0dcca89"
+    },
+    {
+      "path": ".github/workflows/release-smoke.yml",
+      "context": "base",
+      "blob": "e0aae6d1a74e98f0979b317bcded0ac5e797621e"
+    },
+    {
+      "path": ".github/workflows/release-verify.yml",
+      "context": "base",
+      "blob": "3fd321edb68dfcd01e459af53316dc25bf98ee06"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "context": "base",
+      "blob": "a2c51dbc7471ef01dc7d0b71e52155e30417a24a"
+    },
+    {
+      "path": ".github/workflows/runner-chaos-evals.yml",
+      "context": "base",
+      "blob": "91438bec3a85b89a74edbf3e5bffe52fb1843458"
+    },
+    {
+      "path": ".github/workflows/runner-full-stack-e2e.yml",
+      "context": "base",
+      "blob": "97afd34eadc4c10e5fccd72cf45788a770d30651"
+    },
+    {
+      "path": ".github/workflows/runner-live-evals.yml",
+      "context": "base",
+      "blob": "d830e00c010e7c6f22820f3bd18c4cce6d83c206"
+    },
+    {
+      "path": ".github/workflows/runner-protocol-live-evals.yml",
+      "context": "base",
+      "blob": "850d30ba5c7616b1d4ea7956fe6fb5f4c07f9cfc"
+    },
+    {
+      "path": ".github/workflows/sentry-contract.yml",
+      "context": "base",
+      "blob": "87515150a0eb53d6bd6a1a7d7e6bcc95343b019d"
+    },
+    {
+      "path": ".github/workflows/storybook-deploy.yml",
+      "context": "base",
+      "blob": "1f440d0adc2ab47f99ebdfe29414baecb21a335a"
+    },
+    {
+      "path": ".github/workflows/storybook-visual.yml",
+      "context": "base",
+      "blob": "69862f3884c85a270c6c011b2b7960564f71d18e"
+    },
+    {
+      "path": ".github/workflows/agent-runtime-images.yml",
+      "context": "head",
+      "blob": "02b68fce9a20d32888ad833c896fb2c868e937dc"
+    },
+    {
+      "path": ".github/workflows/cloud-migrator-artifacts.yml",
+      "context": "head",
+      "blob": "5c698230938683f41648026c60296788c626087f"
+    },
+    {
+      "path": ".github/workflows/cloud-readiness.yml",
+      "context": "head",
+      "blob": "6c709ade0ed44307af7778fcf9edf5a98f0ab8fe"
+    },
+    {
+      "path": ".github/workflows/commitperclip-review.yml",
+      "context": "head",
+      "blob": "4078244d79413144c24b1a95bab9929379a6f772"
+    },
+    {
+      "path": ".github/workflows/docker-runner-check.yml",
+      "context": "head",
+      "blob": "d6a2115efb9d634ea3ace10175625005d0aaf89f"
+    },
+    {
+      "path": ".github/workflows/docker.yml",
+      "context": "head",
+      "blob": "ed52dfa700d4d98b01f3ae4c39aa5ac8dcdd7de0"
+    },
+    {
+      "path": ".github/workflows/e2e.yml",
+      "context": "head",
+      "blob": "11a6efc045d87249452ac6291f4158b0412834f3"
+    },
+    {
+      "path": ".github/workflows/pr-trusted.yml",
+      "context": "head",
+      "blob": "228ac3bd4b70f8593822bc898861921bc36c643b"
+    },
+    {
+      "path": ".github/workflows/pr.yml",
+      "context": "head",
+      "blob": "7cf18752f4fbf3719c28da48bf91b0a0edd750ab"
+    },
+    {
+      "path": ".github/workflows/refresh-lockfile.yml",
+      "context": "head",
+      "blob": "ecc0c73ebeef2b09ad1eefee93dca57bb0dcca89"
+    },
+    {
+      "path": ".github/workflows/release-smoke.yml",
+      "context": "head",
+      "blob": "e0aae6d1a74e98f0979b317bcded0ac5e797621e"
+    },
+    {
+      "path": ".github/workflows/release-verify.yml",
+      "context": "head",
+      "blob": "3fd321edb68dfcd01e459af53316dc25bf98ee06"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "context": "head",
+      "blob": "a2c51dbc7471ef01dc7d0b71e52155e30417a24a"
+    },
+    {
+      "path": ".github/workflows/runner-chaos-evals.yml",
+      "context": "head",
+      "blob": "91438bec3a85b89a74edbf3e5bffe52fb1843458"
+    },
+    {
+      "path": ".github/workflows/runner-full-stack-e2e.yml",
+      "context": "head",
+      "blob": "97afd34eadc4c10e5fccd72cf45788a770d30651"
+    },
+    {
+      "path": ".github/workflows/runner-live-evals.yml",
+      "context": "head",
+      "blob": "d830e00c010e7c6f22820f3bd18c4cce6d83c206"
+    },
+    {
+      "path": ".github/workflows/runner-protocol-live-evals.yml",
+      "context": "head",
+      "blob": "850d30ba5c7616b1d4ea7956fe6fb5f4c07f9cfc"
+    },
+    {
+      "path": ".github/workflows/sentry-contract.yml",
+      "context": "head",
+      "blob": "87515150a0eb53d6bd6a1a7d7e6bcc95343b019d"
+    },
+    {
+      "path": ".github/workflows/storybook-deploy.yml",
+      "context": "head",
+      "blob": "1f440d0adc2ab47f99ebdfe29414baecb21a335a"
+    },
+    {
+      "path": ".github/workflows/storybook-visual.yml",
+      "context": "head",
+      "blob": "69862f3884c85a270c6c011b2b7960564f71d18e"
+    }
+  ],
   "workflows": [
     {
       "path": ".github/workflows/commitperclip-review.yml",

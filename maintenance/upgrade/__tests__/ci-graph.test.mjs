@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { evaluateAdmission } from "../lib/admission.mjs";
 import { buildCiGraph, verifyCiGraph } from "../lib/ci-graph.mjs";
-import { ciGraphFromGit } from "../lib/ci-graph-git.mjs";
+import { ciGraphFromGit, workflowsAt } from "../lib/ci-graph-git.mjs";
 import { canonicalDigest } from "../lib/digest.mjs";
 import { loadRegistry } from "../lib/registry.mjs";
 
@@ -138,6 +139,96 @@ test("a changed workflow blob or lane set is unknown until the new graph is revi
   assert.equal(verifyCiGraph({ committed: null, regenerated: reviewed }).status, "unknown");
 });
 
+// --- R5: trigger syntax is decoded exactly or rejected ---------------------
+
+// The reviewer's reproduction: a valid YAML flow mapping that once vanished.
+const FLOW_PR = `on: {pull_request: {}}
+jobs:
+  required_security:
+    runs-on: ubuntu-latest
+`;
+const job = "jobs:\n  x:\n    runs-on: ubuntu-latest\n";
+
+test("R5: a flow-mapping pull_request trigger is unsupported, not dropped", () => {
+  const graph = graphOf({ head: [file("pr.yml", PR), file("security.yml", FLOW_PR)], base: [] });
+  assert.match(graph.unsupported ?? "", /security\.yml:on: trigger "\{pull_request: \{\}\}" is not a plain event name/);
+  assert.equal(graph.checks, undefined);
+});
+
+test("R5: a flow-mapping pull_request_target trigger in the base context is unsupported", () => {
+  const target = FLOW_PR.replace("pull_request", "pull_request_target");
+  assert.match(graphOf({ base: [file("review.yml", REVIEW), file("t.yml", target)] }).unsupported ?? "", /t\.yml:on: trigger/);
+  // The head's copy never runs for pull_request_target, but its trigger must still be decodable.
+  assert.match(graphOf({ head: [file("pr.yml", PR), file("t.yml", target)], base: [file("review.yml", REVIEW)] }).unsupported ?? "", /t\.yml:on: trigger/);
+});
+
+test("R5: every structurally undecoded trigger form is unsupported", () => {
+  const cases = {
+    "flow mapping of a non-PR event": "on: {push: {}}\n",
+    "flow mapping inside a flow list": "on: [push, {pull_request: {}}]\n",
+    "inline pull_request configuration": "on:\n  pull_request: {types: [opened]}\n",
+    "inline pull_request_target configuration": "on:\n  pull_request_target: {branches: [master]}\n",
+    "inline value and a block": "on:\n  pull_request: {}\n    branches: [master]\n",
+    "quoted event key": "on:\n  \"pull_request\":\n",
+    "non-plain event name": "on: pull-request\n",
+    "unknown pull_request key": "on:\n  pull_request:\n    tags: [v1]\n",
+    "flow mapping as a filter value": "on:\n  pull_request:\n    branches: {master: x}\n",
+    "nested flow filter": "on:\n  pull_request:\n    branches: [{a: b}]\n",
+    "expression in types": "on:\n  pull_request:\n    types: [\"${{ x }}\"]\n",
+    "filter list not a list": "on:\n  pull_request:\n    paths:\n      a: b\n",
+    "event mapping is a list": "on:\n  - pull_request\n",
+    "inline on and a block": "on: push\n  pull_request:\n",
+    "empty on block": "on:\n",
+    "missing on": "",
+    "duplicate on key": "on: push\non: pull_request\n",
+    "duplicate event key": "on:\n  push:\n  push:\n  pull_request:\n",
+    "duplicate trigger in flow list": "on: [pull_request, pull_request]\n",
+    "block scalar trigger": "on: >\n  pull_request\n",
+    "anchor in trigger": "on:\n  pull_request: &pr\n",
+    "tab-led line": "on:\n\tpull_request:\n",
+    "top-level flow document": "{on: pull_request, jobs: {x: {runs-on: a}}}\n",
+    "second YAML document": "on: push\n---\non: pull_request\n",
+  };
+  for (const [label, trigger] of Object.entries(cases)) {
+    const text = label === "top-level flow document" ? trigger : `${trigger}${job}`;
+    assert.ok(graphOf({ head: [file("pr.yml", PR), file("w.yml", text)], base: [] }).unsupported, label);
+  }
+});
+
+test("R5: the decoded trigger forms keep their meaning", () => {
+  const lanes = (trigger) => names(graphOf({ head: [file("pr.yml", PR), file("w.yml", `${trigger}${job}`)], base: [] }));
+  for (const trigger of ["on: pull_request\n", "on: [push, pull_request]\n", "on:  # comment\n  pull_request: {}\n", "on:\n  pull_request: null\n", "on:\n  push:\n  pull_request:\n    types: [opened, synchronize]\n"]) {
+    assert.ok(lanes(trigger).includes("x"), trigger);
+  }
+  for (const trigger of ["on: push\n", "on:\n  workflow_dispatch:\n    inputs:\n      a: {type: string}\n", "on:\n  pull_request:\n    paths: [a/**]\n"]) {
+    assert.ok(!lanes(trigger).includes("x"), trigger);
+  }
+});
+
+test("R5: symlinked or unreadable workflow files are unsupported", () => {
+  assert.match(graphOf({ head: [file("pr.yml", PR), { ...file("l.yml", "x"), mode: "120000" }], base: [] }).unsupported ?? "", /mode 120000/);
+  assert.match(graphOf({ head: [file("pr.yml", PR), { path: ".github/workflows/u.yaml", blob: "b".repeat(40) }], base: [] }).unsupported ?? "", /text unavailable/);
+});
+
+test("R5: every workflow file is pinned, so an added, changed or removed one is never invisible", () => {
+  const reviewed = graphOf();
+  const scheduled = `on:\n  schedule:\n    - cron: "0 0 * * *"\n${job}`;
+  const variants = {
+    "added non-PR workflow": graphOf({ head: [file("pr.yml", PR), file("review.yml", REVIEW), file("s.yml", scheduled)] }),
+    "changed non-PR workflow (head copy of review.yml)": graphOf({ head: [file("pr.yml", PR), file("review.yml", `${REVIEW}  more:\n    runs-on: x\n`)] }),
+    "removed workflow": graphOf({ head: [file("pr.yml", PR)] }),
+    "added base-context workflow": graphOf({ base: [file("review.yml", REVIEW), file("s.yml", scheduled)] }),
+    "non-YAML file in the workflow directory": graphOf({ head: [file("pr.yml", PR), file("review.yml", REVIEW), file("README.md", "x")] }),
+  };
+  for (const [label, regenerated] of Object.entries(variants)) {
+    assert.equal(regenerated.unsupported, undefined, label);
+    assert.deepEqual(names(regenerated), names(reviewed), `${label}: same lanes, so only the file pins can catch it`);
+    const verified = verifyCiGraph({ committed: reviewed, regenerated });
+    assert.equal(verified.status, "unknown", label);
+    assert.match(verified.detail, /workflow (now|was) (head|base):\.github\/workflows\//, label);
+  }
+});
+
 // --- The real, pinned graph of this repository ---------------------------
 
 test("the committed graph is exactly what this head's workflow blobs produce", () => {
@@ -147,6 +238,35 @@ test("the committed graph is exactly what this head's workflow blobs produce", (
   const verified = verifyCiGraph({ committed: committedGraph, regenerated });
   assert.equal(verified.status, "pass", verified.detail);
   assert.equal(registry.ciGraphDigest, canonicalDigest(committedGraph));
+});
+
+test("R5: adding a workflow to this repository's real inputs never leaves the reviewed graph passing", () => {
+  const candidate = process.env.UPGRADE_TOOLKIT_CI_GRAPH_CANDIDATE || "HEAD";
+  const head = workflowsAt(repoRoot, candidate);
+  const base = workflowsAt(repoRoot, committedGraph.baseContext);
+  const resolveCall = (_repository, sha, target) => {
+    const reviewedCall = committedGraph.calls.find((call) => call.uses.endsWith(`${target}@${sha}`));
+    const blob = reviewedCall?.blob;
+    const text = blob ? spawnSync("git", ["-C", repoRoot, "cat-file", "blob", blob], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).stdout : null;
+    return text ? { blob, text } : null;
+  };
+  const rebuild = (extraHead = [], extraBase = []) => verifyCiGraph({
+    committed: committedGraph,
+    regenerated: buildCiGraph({ head: [...head, ...extraHead], base: [...base, ...extraBase], baseContext: committedGraph.baseContext, resolveCall }),
+  });
+  assert.equal(rebuild().status, "pass", "unchanged inputs reproduce the committed graph");
+  const flow = rebuild([file("security.yml", FLOW_PR)]);
+  assert.equal(flow.status, "unknown");
+  assert.match(flow.detail, /unsupported workflow graph: .*security\.yml/);
+  const flowTarget = rebuild([], [file("t.yml", FLOW_PR.replace("pull_request", "pull_request_target"))]);
+  assert.equal(flowTarget.status, "unknown");
+  assert.match(flowTarget.detail, /unsupported workflow graph/);
+  const block = rebuild([file("security.yml", FLOW_PR.replace("on: {pull_request: {}}", "on:\n  pull_request:"))]);
+  assert.equal(block.status, "unknown");
+  assert.match(block.detail, /new lane required_security/);
+  const silent = rebuild([file("nightly.yml", `on:\n  schedule:\n    - cron: "0 0 * * *"\n${job}`)]);
+  assert.equal(silent.status, "unknown");
+  assert.match(silent.detail, /workflow now head:\.github\/workflows\/nightly\.yml@/);
 });
 
 test("the reviewed graph expects the serialized server shards, review and every matrix lane", () => {

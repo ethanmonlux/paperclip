@@ -6,15 +6,25 @@ import { canonicalDigest } from "./digest.mjs";
  * derived from the exact workflow blobs, not from a list of checks that
  * happened to succeed. This reads a deliberately small YAML subset; any shape
  * it cannot expand exactly (dynamic matrices, anchors, unnamed matrix jobs,
- * mutable reusable-workflow refs, ...) makes the graph unsupported, which the
- * admission gate treats as unknown.
+ * mutable reusable-workflow refs, flow-mapping triggers, ...) makes the graph
+ * unsupported, which the admission gate treats as unknown. Trigger syntax is
+ * positively validated, never filtered by guesswork (R5), and the graph also
+ * pins every workflow file's blob, so a workflow the reader skipped still
+ * makes a changed candidate differ from the reviewed graph.
  */
 export const CI_GRAPH_SCHEMA = "staple.ci-graph.v1";
 
 // Pull-request activity types that make a workflow run for every new head.
 const EVERY_HEAD = "synchronize";
 const FILTER_KEYS = new Set(["paths", "paths-ignore", "branches", "branches-ignore"]);
+const PR_EVENTS = new Set(["pull_request", "pull_request_target"]);
+const PR_CONFIG_KEYS = new Set([...FILTER_KEYS, "types"]);
+// An inline value on a pull-request event that still means "no configuration".
+const EMPTY_EVENT_VALUES = new Set(["{}", "null", "~"]);
+const EVENT_NAME = /^[a-z_]+$/;
 const FULL_SHA = /^[0-9a-f]{40}$/;
+// GitHub reads only these files in .github/workflows/.
+export const WORKFLOW_FILE = /\.ya?ml$/i;
 
 export class UnsupportedGraph extends Error {}
 const unsupported = (message) => { throw new UnsupportedGraph(message); };
@@ -92,6 +102,7 @@ function childKeys(block, where) {
     if (line.indent !== indent) continue;
     const entry = keyValue(line);
     if (!entry) unsupported(`${where}:${line.number}: expected a mapping key`);
+    if (children.some((child) => child.key === entry.key)) unsupported(`${where}:${line.number}: duplicate key ${entry.key}`);
     children.push({ ...entry, line, body: blockAfter(block, index) });
   }
   return children;
@@ -109,32 +120,69 @@ function listValue(entry, where) {
   return blockList(entry.body, where);
 }
 
-/** `on:` triggers relevant to pull requests. */
+function eventName(raw, where) {
+  const name = scalar(raw, where);
+  if (!EVENT_NAME.test(name)) unsupported(`${where}: trigger ${JSON.stringify(name)} is not a plain event name`);
+  return name;
+}
+
+/** A filter or types list on a pull-request event: plain scalars only. */
+function triggerList(entry, where) {
+  const values = listValue(entry, where);
+  for (const value of values) if (/^[[{]/.test(value) || value.includes("${{")) unsupported(`${where}: ${entry.key} value ${JSON.stringify(value)} is not a plain scalar`);
+  return values;
+}
+
+/**
+ * `on:` triggers relevant to pull requests. Every accepted form is decoded
+ * exactly: a plain event name, a flow list of names, or a block mapping whose
+ * pull-request events carry only the filters and types they document. Anything
+ * else is unsupported, so a workflow can never drop out of the graph because
+ * its trigger was not understood.
+ */
 export function parseTriggers(text, where) {
-  // Only the trigger block is read here: workflows that never run for a pull
-  // request may use YAML this reader does not follow.
-  const top = childKeys(meaningfulLines(text).filter((line) => line.indent === 0 || line.raw.startsWith(" ")), where);
-  const on = top.find((entry) => entry.key === "on");
-  if (!on) return {};
+  const lines = meaningfulLines(text);
+  // A tab-led line is not YAML indentation this reader can place in a block.
+  const tabbed = lines.find((line) => line.raw.startsWith("\t"));
+  if (tabbed) unsupported(`${where}:${tabbed.number}: tab indentation`);
+  const on = childKeys(lines, where).find((entry) => entry.key === "on");
+  if (!on) unsupported(`${where}: no on: trigger`);
+  // Only the trigger block is checked for anchors here: workflows that never
+  // run for a pull request may use YAML this reader does not follow.
   assertPlain([on.line, ...on.body], where);
-  const triggers = {};
-  if (on.value) {
-    for (const name of flowList(on.value, where) ?? [scalar(on.value, where)]) triggers[name] = { filters: [] };
+  const inlineOn = stripComment(on.value).trim();
+  if (inlineOn) {
+    if (on.body.length) unsupported(`${where}:${on.line.number}: on: has both an inline value and a block`);
+    const names = flowList(inlineOn, `${where}:on`) ?? [inlineOn];
+    const triggers = {};
+    for (const raw of names) {
+      const name = eventName(raw, `${where}:on`);
+      if (triggers[name]) unsupported(`${where}:on: duplicate trigger ${name}`);
+      triggers[name] = { filters: [] };
+    }
     return pick(triggers);
   }
-  for (const event of childKeys(on.body, where)) {
-    if (event.key !== "pull_request" && event.key !== "pull_request_target") continue;
-    const config = event.value ? [] : childKeys(event.body, `${where}:on.${event.key}`);
-    const filters = config.filter((entry) => FILTER_KEYS.has(entry.key)).map((entry) => `${entry.key}=${listValue(entry, where).join(",")}`);
+  const events = childKeys(on.body, `${where}:on`);
+  if (events.length === 0) unsupported(`${where}: empty on: trigger`);
+  const triggers = {};
+  for (const event of events) {
+    const at = `${where}:on.${event.key}`;
+    if (!EVENT_NAME.test(event.key)) unsupported(`${at}: not a plain event name`);
+    if (!PR_EVENTS.has(event.key)) continue;
+    const inline = stripComment(event.value).trim();
+    if (inline && (!EMPTY_EVENT_VALUES.has(inline) || event.body.length)) unsupported(`${at}: inline configuration ${JSON.stringify(inline)}`);
+    const config = childKeys(event.body, at);
+    for (const entry of config) if (!PR_CONFIG_KEYS.has(entry.key)) unsupported(`${at}: unsupported key ${entry.key}`);
+    const filters = config.filter((entry) => FILTER_KEYS.has(entry.key)).map((entry) => `${entry.key}=${triggerList(entry, at).join(",")}`);
     const types = config.find((entry) => entry.key === "types");
-    if (types && !listValue(types, where).includes(EVERY_HEAD)) filters.push(`types=${listValue(types, where).join(",")}`);
+    if (types && !triggerList(types, at).includes(EVERY_HEAD)) filters.push(`types=${triggerList(types, at).join(",")}`);
     triggers[event.key] = { filters };
   }
   return pick(triggers);
 }
 
 function pick(triggers) {
-  return Object.fromEntries(Object.entries(triggers).filter(([name]) => name === "pull_request" || name === "pull_request_target"));
+  return Object.fromEntries(Object.entries(triggers).filter(([name]) => PR_EVENTS.has(name)));
 }
 
 function parseMatrix(strategy, where) {
@@ -271,11 +319,13 @@ const compare = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
 const byName = (left, right) => compare(left.name ?? left.check ?? left.path, right.name ?? right.check ?? right.path);
 
 /**
- * Build the expected PR check graph. `head` lists every workflow file at the
- * candidate head (pull_request runs those); `base` lists the base-context
- * branch's files (pull_request_target runs those, never the head's). Each entry
- * is `{ path, blob, text }`; `baseContext` names that branch. `resolveCall(repo, sha, path)` returns the pinned
- * reusable workflow's `{ blob, text }` or null.
+ * Build the expected PR check graph. `head` lists every file in the candidate
+ * head's .github/workflows/ (pull_request runs those); `base` lists the
+ * base-context branch's (pull_request_target runs those, never the head's).
+ * Each entry is `{ path, blob, text, mode? }`; `baseContext` names that branch.
+ * `resolveCall(repo, sha, path)` returns the pinned reusable workflow's
+ * `{ blob, text }` or null. Every listed file is pinned in `files`, whether or
+ * not it runs for a pull request.
  */
 export function buildCiGraph({ head, base, baseContext, resolveCall }) {
   try {
@@ -283,8 +333,13 @@ export function buildCiGraph({ head, base, baseContext, resolveCall }) {
     const checks = [];
     const aggregates = [];
     const calls = [];
-    const consider = (files, context, event) => {
-      for (const file of files) {
+    const files = [];
+    const consider = (listed, context, event) => {
+      for (const file of listed) {
+        files.push({ path: file.path, context, blob: file.blob });
+        if (!WORKFLOW_FILE.test(file.path)) continue;
+        if (file.mode && file.mode !== "100644" && file.mode !== "100755") unsupported(`${file.path}: workflow file mode ${file.mode} (symlink or non-file)`);
+        if (typeof file.text !== "string") unsupported(`${file.path}: workflow text unavailable`);
         const trigger = parseTriggers(file.text, file.path)[event];
         if (!trigger) continue;
         const required = trigger.filters.length === 0;
@@ -304,6 +359,7 @@ export function buildCiGraph({ head, base, baseContext, resolveCall }) {
     return {
       schema: CI_GRAPH_SCHEMA,
       baseContext,
+      files: files.sort((left, right) => compare(`${left.context}:${left.path}`, `${right.context}:${right.path}`)),
       workflows: workflows.sort(byName),
       calls: calls.sort((left, right) => compare(left.uses, right.uses)),
       checks: checks.sort(byName),
@@ -324,11 +380,16 @@ export function verifyCiGraph({ committed, regenerated }) {
   if (!regenerated || regenerated.unsupported) return { status: "unknown", detail: `unsupported workflow graph: ${regenerated?.unsupported ?? "not generated"}` };
   if (!committed || committed.schema !== CI_GRAPH_SCHEMA) return { status: "unknown", detail: "no reviewed CI graph committed" };
   if (canonicalDigest(committed) !== canonicalDigest(regenerated)) {
-    const blobs = (graph) => new Set([...(graph.workflows ?? []).map((entry) => `${entry.path}@${entry.blob}`), ...(graph.calls ?? []).map((entry) => `${entry.uses}#${entry.blob}`)]);
+    const blobs = (graph) => new Set([
+      ...(graph.files ?? []).map((entry) => `${entry.context}:${entry.path}@${entry.blob}`),
+      ...(graph.workflows ?? []).map((entry) => `${entry.path}@${entry.blob}`),
+      ...(graph.calls ?? []).map((entry) => `${entry.uses}#${entry.blob}`),
+    ]);
     const names = (graph) => new Set((graph.checks ?? []).map((check) => check.name));
     const delta = (from, to) => [...from].filter((entry) => !to.has(entry));
     const changes = [
       ...delta(blobs(regenerated), blobs(committed)).map((entry) => `workflow now ${entry}`),
+      ...delta(blobs(committed), blobs(regenerated)).map((entry) => `workflow was ${entry}`),
       ...delta(names(regenerated), names(committed)).map((entry) => `new lane ${entry}`),
       ...delta(names(committed), names(regenerated)).map((entry) => `lane gone ${entry}`),
     ];

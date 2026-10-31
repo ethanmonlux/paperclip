@@ -354,7 +354,7 @@
     }
   ],
   "requiredCiJobsNote": "Every lane of the reviewed expected CI graph (maintenance/ci-graph.json), regenerated from the candidate's exact workflow blobs: its pull_request workflows, the PR base branch's pull_request_target workflows and each immutable reusable workflow. Admission requires this set to equal the graph's lanes (R4: an aggregate such as `ci / verify` does not prove the lanes it does not need), and every observed check must also succeed. Path- or branch-filtered workflows are recorded as conditional: their checks must succeed when present but are not expected. Any change to a workflow blob changes the graph and needs fresh review.",
-  "ciGraphDigest": "422b4e9868c6ce9cbe0d9db3c205a0e49aab5adc77cff61a0fd1bfcfc97cd66a",
+  "ciGraphDigest": "98bf4d66231bc281c611e1238cb583b5b0db68b42a792a66c9a4177a637aecda",
   "requiredCiJobs": [
     "ci / Build",
     "ci / Canary Dry Run",
