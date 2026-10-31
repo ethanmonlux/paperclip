@@ -26,14 +26,16 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { issueThreadInteractionService } from "../../../services/issue-thread-interactions.js";
 
 // Pause only after the real invitation query; keep the production lock/read.
-const invitationBoundary = vi.hoisted(() => ({ afterRead: null as null | (() => Promise<void>) }));
+const invitationBoundary = vi.hoisted(() => ({ beforeRead: null as null | (() => Promise<void>), afterRead: null as null | (() => Promise<void>) }));
 vi.mock("../../../services/pending-agent-interaction.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../services/pending-agent-interaction.js")>();
   return { ...actual, pendingAgentInteractionAddressee: async (
     ...args: Parameters<typeof actual.pendingAgentInteractionAddressee>
   ) => {
+    await invitationBoundary.beforeRead?.();
     const allowed = await actual.pendingAgentInteractionAddressee(...args);
     await invitationBoundary.afterRead?.();
     return allowed;
@@ -67,6 +69,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
 
   afterEach(async () => {
     invitationBoundary.afterRead = null;
+    invitationBoundary.beforeRead = null;
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(issueDocuments);
@@ -257,6 +260,63 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     }
     expect(dispatch).toHaveBeenCalledOnce();
     expect(order).toEqual(["dispatch", "revoked"]);
+  });
+
+  it("orders stale-target expiry issue-first against final invitation dispatch", async () => {
+    const f = await seedAddressedHandoff("running");
+    const documentId = randomUUID(), oldRevisionId = randomUUID(), revisionId = randomUUID();
+    await db.insert(documents).values({ id: documentId, companyId: f.companyId,
+      title: "Handoff", format: "markdown", latestBody: "revised handoff",
+      latestRevisionId: revisionId, latestRevisionNumber: 2, createdByAgentId: f.ownerId });
+    await db.insert(documentRevisions).values([
+      { id: oldRevisionId, companyId: f.companyId, documentId, revisionNumber: 1,
+        title: "Handoff", format: "markdown", body: "original handoff", createdByAgentId: f.ownerId },
+      { id: revisionId, companyId: f.companyId, documentId, revisionNumber: 2,
+        title: "Handoff", format: "markdown", body: "revised handoff", createdByAgentId: f.ownerId },
+    ]);
+    await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: f.issueId,
+      documentId, key: "handoff" });
+    await db.update(issueThreadInteractions).set({ payload: { version: 1, prompt: "Route handoff",
+      target: { type: "issue_document", issueId: f.issueId, documentId, key: "handoff",
+        revisionId: oldRevisionId, revisionNumber: 1 } } }).where(eq(issueThreadInteractions.id, f.interactionId));
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    let atRead!: () => void, release!: () => void;
+    const readReached = new Promise<void>(resolve => { atRead = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    invitationBoundary.beforeRead = async () => { atRead(); await released; };
+    const dispatch = vi.fn(async () => "recipient started");
+    const gate = createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    await readReached;
+    // Exercise the real human rejection path, including stale-target expiry.
+    const expiry = issueThreadInteractionService(db).rejectInteraction(
+      { id: f.issueId, companyId: f.companyId, status: "in_review" }, f.interactionId,
+      { reason: "The handoff changed" }, { userId: "local-board" },
+    ).then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+    try {
+      let waitingQuery = "";
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const rows = await db.execute<{ query: string }>(sql`
+          select query from pg_stat_activity
+          where datname = current_database() and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock' and query like '%"issues"%'`);
+        waitingQuery = rows[0]?.query ?? "";
+        if (waitingQuery) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      // The old path first locked the invitation, then blocked updating the
+      // issue, which would deadlock when the dispatch query is released.
+      expect(waitingQuery).toMatch(/^select /i);
+    } finally {
+      release();
+      await Promise.allSettled([gate, expiry]);
+    }
+    expect((await gate).dispatched).toBe(true);
+    expect(dispatch).toHaveBeenCalledOnce();
+    const expired = await expiry;
+    expect(expired.ok).toBe(false);
+    expect((await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, f.interactionId)))[0]?.status).toBe("expired");
   });
 
   it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
