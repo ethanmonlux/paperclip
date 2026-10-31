@@ -1251,6 +1251,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : claudeRefusal
       ? "model_refusal"
       : null;
+    // The process controller deliberately stops a lingering CLI after a terminal
+    // frame. Its signal is cleanup evidence, not a provider execution failure.
+    // Only normalize that exact, successful cleanup; real signals, timeouts,
+    // error frames, refusals and transport failures retain their disposition.
+    const successfulTerminalCleanup =
+      parsedSucceeded &&
+      !failed &&
+      !claudeRefusal &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !resolvedErrorCode &&
+      !proc.timedOut &&
+      proc.exitCode === null &&
+      (proc.signal === "SIGTERM" || proc.signal === "SIGKILL") &&
+      proc.terminalResultCleanup?.kind === "terminal_result_cleanup" &&
+      proc.terminalResultCleanup.stopped === true &&
+      proc.terminalResultCleanup.terminalResultSeen === true &&
+      proc.terminalResultCleanup.signal === proc.signal;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -1261,11 +1279,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...(successfulTerminalCleanup
+        ? { adapterCompletion: {
+            reason: "successful_terminal_result_cleanup",
+            processExitCode: proc.exitCode,
+            processSignal: proc.signal,
+          } }
+        : {}),
     };
 
     return {
-      exitCode: proc.exitCode,
-      signal: proc.signal,
+      exitCode: successfulTerminalCleanup ? 0 : proc.exitCode,
+      signal: successfulTerminalCleanup ? null : proc.signal,
       timedOut: false,
       usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,
