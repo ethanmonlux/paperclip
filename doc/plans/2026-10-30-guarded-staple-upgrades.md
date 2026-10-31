@@ -19,3 +19,16 @@ Check upstream daily. Coalesce new commits into one candidate instead of updatin
 ## Ownership and acceptance
 This work stays under FAC-760. The other chat owns the existing Facette task and product review; do not wake/reassign it or restart its live worker. PR10 remains the current repair candidate. This preparation branch is not a second repair PR.
 PASS requires actual upstream-only patch tests, independent patch decisions, exact candidate CI, migration compatibility evidence, owned quiescent cutover, live verification and a verified recurring native invocation. A registry or Linear link alone enforces none of these.
+
+## Implementation status (STA-21)
+Tooling lives in `maintenance/upgrade/` and runs with plain Node, no install: `node maintenance/upgrade/cli.mjs validate | upstream-only --out DIR | admission --evidence FILE`. Tests: `node --test maintenance/upgrade/__tests__/*.test.mjs`.
+- Steps 1-2: each registry patch declares an `upstreamOnly` spec. The harness checks out the exact upstream SHA in a temporary worktree, overlays only the fork's test files, proves nothing else differs, runs Vitest with a minimal environment and classifies strictly. Receipts never set a decision. Three patches are `manual-review` (test-harness isolation, fixture portability, CI pin).
+- Steps 3-5: `admission` fails closed unless every patch has an independently reviewed decision (retire needs a cited upstream-only pass), exact-head CI is complete and green, an isolated migration applied and the previous payload is schema-compatible, and isolated install/boot/assets/continuation/restart recovery are proved.
+- Step 6: the barrier client holds the existing authenticated, owner-scoped `/api/instance/task-drain` (idle purpose answers 503 to all non-control ingress and suppresses scheduling), requires consecutive quiet reads with a positive persisted-work inventory, runs activation, and always releases its own drain. Health must be the authenticated view (serverVersion, serverInfo, startupRecovery ready) at the exact commit. `paperclipai update` now verifies git payload restarts by exact commit, since anonymous health on authenticated deployments carries `commit` but no version.
+
+Remaining gates, none satisfied yet:
+- Execute upstream-only runs where dependencies install (this sandbox has no pnpm/node_modules or registry access; all automated receipts are `unknown` with `runner-spawn-failed:ENOENT`). `975bc8d7` must be fetched for the Codex shell-proxy patch.
+- Independent keep/adapt/retire review per patch, then build the combined candidate and run exact-head CI.
+- Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility evidence.
+- Server: the only persisted-work inventory today is `idleSleepSafety`, which treats any open issue, routine or API key as work, so a real instance will not pass it. A narrower upgrade inventory (in-flight runs, wakes, leases, effects, recovery obligations) is needed. Task drain is in memory, so it does not hold across the restart into the new payload.
+- Wire the barrier and admission into the native update path, prove one controlled upgrade and recovery, and only then add a recurring native invocation. `automaticActivationEnabled` stays false.
