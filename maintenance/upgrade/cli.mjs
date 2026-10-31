@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { evaluateAdmission } from "./lib/admission.mjs";
+import { inventoryMigrations } from "./lib/migration-inventory.mjs";
 import { loadRegistry, validateRegistry } from "./lib/registry.mjs";
 import { evaluateUpstreamOnly, receiptDigest } from "./lib/upstream-only.mjs";
 
@@ -18,7 +19,19 @@ const usage = `Usage:
   node maintenance/upgrade/cli.mjs validate [--registry FILE]
   node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD]
       [--ports-sha SHA] [--isolation private-network|none] [--registry FILE]
-  node maintenance/upgrade/cli.mjs admission --evidence FILE [--registry FILE]`;
+  node maintenance/upgrade/cli.mjs admission --evidence FILE [--registry FILE]
+  node maintenance/upgrade/cli.mjs migration-inventory --base SHA --candidate SHA [--dir packages/db/src/migrations]`;
+
+function gitText(args) {
+  const result = spawnSync("git", ["-C", repoRoot, ...args], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.trim()}`);
+  return result.stdout;
+}
+
+function migrationsAt(sha, dir) {
+  return gitText(["ls-tree", "--name-only", `${sha}:${dir}`]).split("\n").filter((name) => name.endsWith(".sql")).sort()
+    .map((name) => ({ name, sql: gitText(["show", `${sha}:${dir}/${name}`]) }));
+}
 
 function readJson(file) {
   return JSON.parse(readFileSync(file, "utf8"));
@@ -38,8 +51,21 @@ function main(argv) {
       "ports-sha": { type: "string" },
       isolation: { type: "string", default: "private-network" },
       evidence: { type: "string" },
+      base: { type: "string" },
+      candidate: { type: "string" },
+      dir: { type: "string", default: "packages/db/src/migrations" },
     },
   });
+  if (command === "migration-inventory") {
+    if (!values.base || !values.candidate) throw new Error("--base and --candidate are required");
+    const base = gitText(["rev-parse", `${values.base}^{commit}`]).trim();
+    const candidate = gitText(["rev-parse", `${values.candidate}^{commit}`]).trim();
+    const baseMigrations = migrationsAt(base, values.dir);
+    const known = new Set(baseMigrations.map(({ name }) => name));
+    const candidateMigrations = migrationsAt(candidate, values.dir).filter(({ name }) => !known.has(name));
+    console.log(JSON.stringify({ base, candidate, dir: values.dir, ...inventoryMigrations({ baseMigrations, candidateMigrations }) }, null, 2));
+    return 0;
+  }
   const registry = loadRegistry(values.registry);
   if (command === "validate") {
     const errors = validateRegistry(registry);
