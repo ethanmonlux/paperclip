@@ -43354,7 +43354,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const [thirdEpisode] = await db
       .select()
       .from(chatActions)
-      .where(and(eq(chatActions.endpointId, endpoint.id), sql`${chatActions.payload}->>'publicationId' = ${thirdCard.id}`));
+      .where(
+        and(
+          eq(chatActions.endpointId, endpoint.id),
+          eq(chatActions.kind, "founder_notification_episode"),
+          sql`${chatActions.payload}->>'publicationId' = ${thirdCard.id}`,
+        ),
+      );
     await db.transaction((tx) =>
       acknowledgeFounderEpisode(tx, { companyId: fixture.companyId, episodeId: thirdEpisode!.id, userId: founderUserId, via: "board" }),
     );

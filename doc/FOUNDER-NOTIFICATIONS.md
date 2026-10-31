@@ -46,16 +46,37 @@ is never sent twice. If the same fact clears and later reappears, for example
 a review reopened on an unchanged head, a new occurrence opens a new episode.
 
 Review (`review:<issue>`) and stalled-blocker (`blocker:<issue>`) facts keep
-the same dedup key when they clear and reopen. For these the founder adapter
-adds an opaque occurrence fingerprint, so a reopening is a new episode even
-when no tick saw the fact absent, including while the server was down:
+the same dedup key when they clear and reopen. A route has at most one active
+episode per dedup key, and the founder adapter attaches occurrence identity so
+a reopening is a new episode even when no tick saw the fact absent, including
+while the server was down:
 
-- review: current stage, last decision and changes-requested round, plus the
-  issue's latest recorded change into `in_review`;
-- blocker: the earliest blocking transition among the issues it holds.
+- review: an opaque fingerprint of the current stage, last decision and
+  changes-requested round, the issue's latest recorded change into
+  `in_review`, and the head under review where the issue's primary work
+  product records one (`metadata.sha`). A different fingerprint is a new
+  occurrence. Native execution state has no head field, so for an issue
+  without such a work product a new head under an unchanged gate is not
+  told apart.
+- blocker: a continuity anchor, the earliest blocking transition among the
+  issues the blocker currently holds. The set of held issues changes during
+  one stall, so this is not an equality fingerprint. The episode continues
+  while the anchor is no later than its last observation, that is while some
+  hold has lasted since then; releasing or adding individual dependents does
+  not change it. Only when every current hold began after the last
+  observation is it a new occurrence. If one hold is released and another
+  formed between two ticks with no gap seen, that also counts as a new
+  occurrence.
 
-Repeated observations of one occurrence keep one fingerprint. The shared
-attention producer and its dedup keys are unchanged.
+Every tick records the observation on the active episode, so continuity
+survives restarts. The shared attention producer and its dedup keys are
+unchanged.
+
+When a fact is still present but as a new occurrence, the old episode
+resolves as `superseded`: its unsent card is cancelled, its buttons expire,
+and a card already sent or UNKNOWN keeps its identity and is never replayed.
+It gets no "no longer needs you" notice, because the founder is still needed;
+the new episode's card follows.
 
 When the fact leaves the snapshot:
 
@@ -118,6 +139,20 @@ also acknowledge from Paperclip.
 The founder answers the decision in Paperclip. The existing interaction
 resolution then continues the **same** original task (for example
 `wake_assignee`). The episode then resolves and sends its resolution notice.
+
+The continuation is the native one, with no founder-specific admission. The
+continuation suite drives the real routes, wake requests, dependency
+admission and run queue with only the agent adapter faked:
+
+- an answer becomes exactly one run on the original task for its assignee;
+  acknowledgement, a repeated answer and further sweeps add nothing;
+- an answer behind a busy assignee stays queued and runs exactly once after
+  a restart;
+- an answer on a task held by an unrelated blocker starts no run while the
+  hold lasts; once it clears, the native blockers-resolved wake runs the same
+  task once.
+
+A live phone and installed-runtime canary is part of activation, below.
 
 Notification state is never an input to dispatch, assignment, recovery,
 review, merge, deployment or release.

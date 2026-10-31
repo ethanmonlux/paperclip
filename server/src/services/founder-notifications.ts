@@ -96,7 +96,12 @@ export type FounderNotificationEpisodePayload = {
   acknowledgedByUserId: string | null;
   acknowledgedVia: "chat" | "board" | null;
   resolvedAt: string | null;
-  resolutionReason: "item_cleared" | "cleared_before_notification" | "route_disabled" | null;
+  /**
+   * `superseded`: the fact is still present but as a new occurrence, so the
+   * founder is still needed and gets the new episode's card instead of a
+   * "no longer needs you" notice.
+   */
+  resolutionReason: "item_cleared" | "cleared_before_notification" | "superseded" | "route_disabled" | null;
   resolutionPublicationId: string | null;
 };
 
@@ -175,19 +180,30 @@ export function isFounderAckPayload(value: unknown): value is FounderNotificatio
 }
 
 /**
- * An attention item as the founder sweep sees it. The adapter may attach an
- * occurrence fingerprint for a fact whose dedupKey is stable across a clear
- * and reopen, so a reopening missed between polls or across downtime is
- * still a distinct episode.
+ * An attention item as the founder sweep sees it. For a fact whose dedupKey
+ * is stable across a clear and reopen, the adapter attaches occurrence
+ * identity so a reopening missed between polls or across downtime is still a
+ * distinct episode:
+ * - `founderOccurrenceFingerprint`: equality identity of one occurrence (a
+ *   review gate); a different value is a new occurrence.
+ * - `founderContinuityAnchorAt`: the start of the oldest condition currently
+ *   sustaining the fact (a blocker's longest current hold). The occurrence
+ *   continues while it is no later than the episode's last observation.
  */
-export type FounderAttentionFact = AttentionItem & { founderOccurrenceFingerprint?: string | null };
+export type FounderAttentionFact = AttentionItem & {
+  founderOccurrenceFingerprint?: string | null;
+  founderContinuityAnchorAt?: string | null;
+};
 
-function factEpisodeKey(dedupKey: string, fingerprint: string | null | undefined): string {
-  return fingerprint ? `${dedupKey}#${fingerprint}` : dedupKey;
-}
-
-function episodeKey(episode: FounderEpisodeRow): string {
-  return factEpisodeKey(episode.payload.dedupKey, episode.payload.occurrenceFingerprint);
+/**
+ * Whether a present fact is the occurrence an active episode tracks. A
+ * missing anchor cannot prove a discontinuity, so it continues.
+ */
+function isSameOccurrence(episode: FounderEpisodeRow, fact: FounderAttentionFact): boolean {
+  if ((episode.payload.occurrenceFingerprint ?? null) !== (fact.founderOccurrenceFingerprint ?? null)) return false;
+  const anchor = fact.founderContinuityAnchorAt ? Date.parse(fact.founderContinuityAnchorAt) : Number.NaN;
+  if (Number.isNaN(anchor)) return true;
+  return anchor <= Date.parse(episode.payload.lastObservedAt);
 }
 
 /** Partial JSON merge on the current row, never a stale whole-payload write. */
@@ -981,47 +997,66 @@ export async function reconcileFounderRoute(
   const nowIso = now.toISOString();
   const stallAfterMs = boundedStallAfterMs(route.payload.stallAfterMs);
 
-  // Episodes are keyed by the attention dedupKey plus, where the adapter
-  // supplies one, the occurrence fingerprint. A changed fingerprint means the
-  // fact cleared and reopened even if no poll observed it absent.
-  const present = new Set<string>();
-  const actionable = new Map<
-    string,
-    { item: FounderAttentionFact; kind: FounderNotificationClass; taskIssueId: string; fingerprint: string | null }
-  >();
+  // At most one active episode per attention dedupKey. A present fact that
+  // is a new occurrence (see isSameOccurrence) supersedes it, even if no poll
+  // observed the fact absent.
+  const present = new Map<string, FounderAttentionFact>();
+  const actionable = new Map<string, { item: FounderAttentionFact; kind: FounderNotificationClass; taskIssueId: string }>();
   for (const item of items) {
-    const fingerprint = item.founderOccurrenceFingerprint ?? null;
-    const key = factEpisodeKey(item.dedupKey, fingerprint);
-    present.add(key);
+    present.set(item.dedupKey, item);
     const classification = classifyFounderNotification(item, nowMs);
     if (classification.notify) {
-      actionable.set(key, { item, kind: classification.kind, taskIssueId: classification.taskIssueId, fingerprint });
+      actionable.set(item.dedupKey, { item, kind: classification.kind, taskIssueId: classification.taskIssueId });
     }
   }
 
   const active = await routeEpisodes(db, route, ["observing", "open"]);
-  const activeByKey = new Map(active.map((episode) => [episodeKey(episode), episode]));
-
-  // Resolution: an episode whose fact left the complete snapshot. Facts that
-  // remain present but are now quiet (snoozed/dismissed) are not resolved.
-  for (const episode of active) {
-    if (present.has(episodeKey(episode))) continue;
-    const resolved = await resolveEpisode(db, route, episode, nowIso);
+  const activeByKey = new Map<string, FounderEpisodeRow | null>();
+  for (const episode of [...active].sort((a, b) => b.payload.occurrence - a.payload.occurrence)) {
+    const fact = present.get(episode.payload.dedupKey);
+    // Resolution: an episode whose fact left the complete snapshot. Facts
+    // that remain present but are now quiet (snoozed/dismissed) are not
+    // resolved.
+    const reason = !fact
+      ? ("item_cleared" as const)
+      : activeByKey.has(episode.payload.dedupKey) || !isSameOccurrence(episode, fact)
+        ? ("superseded" as const)
+        : null;
+    if (!reason) {
+      activeByKey.set(episode.payload.dedupKey, episode);
+      continue;
+    }
+    const resolved = await resolveEpisode(db, route, episode, nowIso, reason);
     if (resolved.resolved) result.resolved += 1;
     if (resolved.notice) result.resolutionNotices += 1;
   }
 
-  const missing = [...actionable.entries()].filter(([key]) => !activeByKey.has(key)).map(([, fact]) => fact.item.dedupKey);
-  const occurrences = await nextOccurrences(db, route, [...new Set(missing)]);
-  for (const [key, fact] of actionable) {
+  // Every continuing occurrence records this observation, quiet ones too, so
+  // continuity survives a restart. Partial merge on the current row only.
+  for (const [dedupKey, episode] of activeByKey) {
+    if (!episode) continue;
+    const counted = episode.status === "observing" && actionable.has(dedupKey);
+    const observations = counted ? episode.payload.observations + 1 : episode.payload.observations;
+    const [updated] = await db
+      .update(chatActions)
+      .set({
+        payload: mergeEpisodePayload(counted ? { observations, lastObservedAt: nowIso } : { lastObservedAt: nowIso }),
+        updatedAt: now,
+      })
+      .where(and(eq(chatActions.id, episode.id), eq(chatActions.status, episode.status)))
+      .returning();
+    // A concurrent pass moved it on; the next pass continues from there.
+    activeByKey.set(dedupKey, (updated as FounderEpisodeRow | undefined) ?? null);
+  }
+
+  const missing = [...actionable.keys()].filter((key) => !activeByKey.has(key));
+  const occurrences = await nextOccurrences(db, route, missing);
+  for (const [dedupKey, fact] of actionable) {
     result.observed += 1;
-    const dedupKey = fact.item.dedupKey;
-    let episode = activeByKey.get(key) ?? null;
+    if (activeByKey.get(dedupKey) === null) continue;
+    let episode = activeByKey.get(dedupKey) ?? null;
     if (!episode) {
       const occurrence = occurrences.get(dedupKey) ?? 1;
-      // Two fingerprints of one dedupKey in one snapshot cannot happen; if a
-      // producer ever did that, the second waits for the next pass.
-      occurrences.set(dedupKey, occurrence + 1);
       const payload: FounderNotificationEpisodePayload = {
         version: 1,
         routeId: route.id,
@@ -1030,7 +1065,7 @@ export async function reconcileFounderRoute(
         sourceKind: fact.item.sourceKind,
         notificationClass: fact.kind,
         dedupKey,
-        occurrenceFingerprint: fact.fingerprint,
+        occurrenceFingerprint: fact.item.founderOccurrenceFingerprint ?? null,
         occurrence,
         issueId: fact.taskIssueId,
         issueIdentifier: taskSubject(fact.item).identifier,
@@ -1070,18 +1105,6 @@ export async function reconcileFounderRoute(
       }
       episode = (inserted[0] as FounderEpisodeRow | undefined) ?? null;
       if (!episode) continue; // A concurrent pass created it; the next pass continues.
-    } else if (episode.status === "observing") {
-      const observations = episode.payload.observations + 1;
-      const [updated] = await db
-        .update(chatActions)
-        .set({
-          payload: mergeEpisodePayload({ observations, lastObservedAt: nowIso }),
-          updatedAt: now,
-        })
-        .where(and(eq(chatActions.id, episode.id), eq(chatActions.status, "observing")))
-        .returning();
-      if (!updated) continue;
-      episode = updated as FounderEpisodeRow;
     }
 
     if (episode.status === "observing") {
@@ -1223,15 +1246,19 @@ async function openEpisode(
 }
 
 /**
- * Settles an episode whose fact cleared. A never-sent card is cancelled; a
- * possibly provider-visible one (streaming, unknown or published) gets one
- * resolution notice so the phone never shows a stale actionable prompt.
+ * Settles an episode whose fact cleared or was superseded by a new
+ * occurrence. A never-sent card is cancelled. When the fact cleared, a
+ * possibly provider-visible card (streaming, unknown or published) gets one
+ * resolution notice so the phone never shows a stale actionable prompt. A
+ * superseded card gets none: the founder is still needed and the new
+ * episode's card follows. A sent or UNKNOWN card is never replayed.
  */
 async function resolveEpisode(
   db: FounderDb,
   route: FounderRouteRow,
   episode: FounderEpisodeRow,
   nowIso: string,
+  reason: "item_cleared" | "superseded",
 ): Promise<{ resolved: boolean; notice: boolean }> {
   return db.transaction(async (tx) => {
     const current = await tx
@@ -1249,7 +1276,11 @@ async function resolveEpisode(
         .update(chatActions)
         .set({
           status: "resolved",
-          payload: { ...payload, resolvedAt: nowIso, resolutionReason: "cleared_before_notification" },
+          payload: {
+            ...payload,
+            resolvedAt: nowIso,
+            resolutionReason: reason === "superseded" ? "superseded" : "cleared_before_notification",
+          },
           updatedAt: new Date(nowIso),
         })
         .where(eq(chatActions.id, episode.id));
@@ -1297,7 +1328,7 @@ async function resolveEpisode(
       )
       .then((rows) => rows[0] ?? null);
     let resolutionPublicationId: string | null = null;
-    if (original && ["streaming", "published", "delivery_unknown"].includes(original.state)) {
+    if (reason === "item_cleared" && original && ["streaming", "published", "delivery_unknown"].includes(original.state)) {
       const name = payload.issueIdentifier ?? "The task";
       const [notice] = await tx
         .insert(chatPublications)
@@ -1322,7 +1353,7 @@ async function resolveEpisode(
       .update(chatActions)
       .set({
         status: "resolved",
-        payload: { ...payload, resolvedAt: nowIso, resolutionReason: "item_cleared", resolutionPublicationId },
+        payload: { ...payload, resolvedAt: nowIso, resolutionReason: reason, resolutionPublicationId },
         updatedAt: new Date(nowIso),
       })
       .where(eq(chatActions.id, episode.id));
