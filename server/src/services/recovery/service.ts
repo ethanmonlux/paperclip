@@ -13,6 +13,7 @@ import {
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { hasLiveLegacyController } from "../legacy-controller-lease.js";
+import { runRecordedDispositionBeforeCurrentStage } from "../issue-stage-boundary.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { isWaitingConversation, settleConversationTurn, deliverConversationComments } from "../agent-conversations.js";
 import {
@@ -3734,6 +3735,9 @@ export function recoveryService(
     return decideLegacyContinuation({
       run, issue, agent, episode,
       gates: {
+        newerStage: await runRecordedDispositionBeforeCurrentStage(db, {
+          companyId: issue.companyId, issueId: issue.id, runId: run.id, currentStatus: issue.status,
+        }),
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
         pendingWait: state.hasDurableWaitingPath || durableWait || parseIssueExecutionState(issue.executionState)?.status === "pending" || Boolean(issue.monitorNextCheckAt),
@@ -3746,6 +3750,24 @@ export function recoveryService(
         agentInvokable: Boolean(agent && await isAgentInvokable(agent) && isHeartbeatWakeOnDemandEnabled(agent)),
       },
     });
+  }
+
+  /** The latest run, or the repair source it retried, recorded a disposition before the current stage opened. */
+  async function latestRunClosedPreviousStage(
+    issue: typeof issues.$inferSelect,
+    latestRun: NonNullable<LatestIssueRun>,
+  ) {
+    const context = parseObject(latestRun.contextSnapshot);
+    const runIds = [
+      latestRun.id,
+      readNonEmptyString(context.dispositionRepairSourceRunId),
+    ].filter((id): id is string => Boolean(id));
+    for (const runId of new Set(runIds)) {
+      if (await runRecordedDispositionBeforeCurrentStage(db, {
+        companyId: issue.companyId, issueId: issue.id, runId, currentStatus: issue.status,
+      })) return true;
+    }
+    return false;
   }
 
   async function legacyRepairDispatchBlock(runId: string): Promise<string | null> {
@@ -4503,7 +4525,15 @@ export function recoveryService(
         continue;
       }
 
-      if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
+      // A run that recorded Done/In Review/Blocked owns no missing disposition
+      // once someone else reopens the task. That active state is a new stage:
+      // retire any stale repair notice and use ordinary recovery for it.
+      const newerStage = issue.status !== "in_review" && latestRun
+        ? await latestRunClosedPreviousStage(issue, latestRun)
+        : false;
+      if (newerStage) await resolveDispositionRepairActionAsCovered(issue, "newer_stage");
+
+      if (latestRun?.status === "succeeded" && issue.status !== "in_review" && !newerStage) {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
           const outcome = await reconcileLegacyContinuation(latestRun.id);
@@ -5274,7 +5304,7 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
-      if (readDispositionRepairAttempt(latestRun)) {
+      if (readDispositionRepairAttempt(latestRun) && !newerStage) {
         const outcome = await reconcileDispositionRepair(issue, latestRun);
         if (outcome === "queued") {
           result.continuationRequeued += 1;
@@ -5367,7 +5397,7 @@ export function recoveryService(
           continue;
         }
 
-        if (isRepeatedProductiveContinuationRecovery(successfulRun)) {
+        if (isRepeatedProductiveContinuationRecovery(successfulRun) && !newerStage) {
           // GGU-809: skip escalation if the assignee has shown visible progress
           // (comment or attachment) within the exemption window. Falling
           // through here lets the normal continuation-retry path enqueue the

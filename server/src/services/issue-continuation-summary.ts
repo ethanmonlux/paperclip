@@ -100,9 +100,18 @@ function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
   return "implementation";
 }
 
+// Generated for one status only. Carrying them into another status would let
+// an earlier stage's wording park or misdirect the current stage.
+const STATUS_NEXT_ACTIONS: Record<string, string> = {
+  done: "Review the completed issue output and close any remaining follow-up comments.",
+  in_review: "Wait for reviewer feedback or approval before continuing executor work.",
+};
+const GENERATED_STATUS_NEXT_ACTIONS = new Set(Object.values(STATUS_NEXT_ACTIONS));
+
 function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previousNextAction: string | null) {
-  if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
-  if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
+  const statusNextAction = STATUS_NEXT_ACTIONS[issue.status];
+  if (statusNextAction) return statusNextAction;
+  if (previousNextAction && GENERATED_STATUS_NEXT_ACTIONS.has(previousNextAction)) previousNextAction = null;
   if (run.status === "failed" || run.status === "timed_out") {
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }

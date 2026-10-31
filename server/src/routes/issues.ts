@@ -15335,6 +15335,14 @@ export function issueRoutes(
         isClosedIssueStatus(existing.status) &&
         issue.status === "todo" &&
         req.body.status !== undefined;
+      // Reopening straight to in_progress opens a new stage for the same
+      // assignee just like todo does. Without a wake, recovery later replays
+      // the previous stage's run instead of starting this one.
+      const statusChangedFromClosedToInProgress =
+        isClosedIssueStatus(existing.status) &&
+        issue.status === "in_progress" &&
+        req.body.status !== undefined &&
+        !(actor.actorType === "agent" && actor.actorId === issue.assigneeAgentId);
       const userResumedFromReviewToTodo =
         actor.actorType === "user" &&
         existing.status === "in_review" &&
@@ -15482,6 +15490,7 @@ export function issueRoutes(
           (statusChangedFromBacklog ||
             statusChangedFromBlockedToTodo ||
             statusChangedFromClosedToTodo ||
+            statusChangedFromClosedToInProgress ||
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
         ) {

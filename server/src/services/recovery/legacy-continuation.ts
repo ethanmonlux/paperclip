@@ -7,6 +7,8 @@ export interface LegacyContinuationInput {
   agent: { id: string; companyId: string; status: string } | null;
   episode: LegacyDispositionEpisode;
   gates: {
+    /** The run recorded a non-active disposition and a later stage reopened the task. */
+    newerStage?: boolean;
     stopped: boolean;
     paused: boolean;
     budgetBlocked: boolean;
@@ -69,6 +71,7 @@ export function decideLegacyContinuation(input: LegacyContinuationInput):
   if (!issue || !agent || issue.companyId !== run.companyId || agent.companyId !== run.companyId || agent.id !== run.agentId) return { kind: "skip", reason: "invalid_binding" };
   if (issue.assigneeAgentId !== run.agentId || issue.assigneeUserId) return { kind: "skip", reason: "owner_changed" };
   if (!["todo", "in_progress"].includes(issue.status)) return { kind: "skip", reason: "recorded_disposition" };
+  if (gates.newerStage) return { kind: "skip", reason: "newer_stage" };
   for (const [blocked, reason] of [
     [gates.stopped, "stopped"], [gates.paused, "paused"],
     [gates.budgetBlocked, "budget_blocked"], [gates.pendingWait, "durable_wait"],
