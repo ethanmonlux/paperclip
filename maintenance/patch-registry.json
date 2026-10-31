@@ -437,6 +437,52 @@
         "kind": "manual-review",
         "reason": "Fixture isolation with no behavior assertion to reproduce; its failure depends on other fixtures sharing /tmp. Review whether upstream's version of the test still uses a shared temporary ancestor."
       }
+    },
+    {
+      "id": "native-task-bound-continuation",
+      "purpose": "Give a reopened task a normal task-bound stage: wake the same assignee on a closed -> in_progress reopen, never treat a previous stage run that recorded Done/In Review/Blocked as an undisposed run, and never let a summary written before the current stage park it.",
+      "sourceCommits": [
+        "53373965bfe5a24c8cc461bb775d6e7a464edaf3"
+      ],
+      "evidencePaths": [
+        "server/src/__tests__/native-task-bound-continuation.test.ts",
+        "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Carried on maintenance/guarded-upgrade-setup, not on the repair line fix/network-proxy-child-stdio; 53373965 is one self-contained server commit (code plus regressions) so it can be selected onto the repair line for a later qualified installation. Reproduced from STA-22 round 8 native records: comment cd8268d7 landed on a Done task, a separate PATCH reopened it done -> in_progress with no wake, and the stranded sweep dispatched issue_disposition_repair run 9dab77f6 against previous-stage run 0bf7baf2 (recovery action 774502e5). Stage boundaries come from structured issue.updated audit rows (run_id, details.status, details.changes.status or details._previous.status), not summary prose. The route regression runs from a port of upstream's own harness file; see maintenance/upgrade/ports/native-task-bound-continuation/PORT.md. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. Run with --isolation private-network-user.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "sourceSha": "53373965bfe5a24c8cc461bb775d6e7a464edaf3",
+        "testFiles": [
+          "server/src/__tests__/native-task-bound-continuation.test.ts",
+          "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
+        ],
+        "requiredTests": [
+          "wakes the same assignee when another actor reopens done work directly to in_progress",
+          "wakes the same assignee when another actor reopens cancelled work directly to in_progress",
+          "does not repair a previous stage run that recorded done once another actor opens a new stage",
+          "does not repair a previous stage run that recorded in_review once another actor opens a new stage",
+          "does not repair a previous stage run that recorded blocked once another actor opens a new stage",
+          "gives the new stage an ordinary task-bound continuation through the sweep, retaining prior findings",
+          "keeps the new stage on an ordinary path across repeated reopen rounds",
+          "cancels an already-queued previous-stage repair before dispatch once a new stage opens",
+          "does not let a summary written before the current stage park the fresh assignment",
+          "does not let a queued previous-stage summary snapshot park the fresh assignment",
+          "does not carry a generated status-specific next action (Wait for reviewer feedback or approval before continuing executor work.) into a different status",
+          "does not carry a generated status-specific next action (Review the completed issue output and close any remaining follow-up comments.) into a different status"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/native-task-bound-continuation/issue-update-comment-wakeup-routes.test.ts",
+            "target": "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
+          }
+        ]
+      }
     }
   ],
   "requiredCiJobsNote": "Every lane of the reviewed expected CI graph (maintenance/ci-graph.json), regenerated from the candidate's exact workflow blobs: its pull_request workflows, the PR base branch's pull_request_target workflows and each immutable reusable workflow. Admission requires this set to equal the graph's lanes (R4: an aggregate such as `ci / verify` does not prove the lanes it does not need), and every observed check must also succeed. Path- or branch-filtered workflows are recorded as conditional: their checks must succeed when present but are not expected. Any change to a workflow blob changes the graph and needs fresh review.",
