@@ -35,20 +35,20 @@ Tooling lives in `maintenance/upgrade/` and runs with plain Node, no install: `n
 
 A failed evidence test counts as `upstream-fails` only when every failure is an assertion; missing exports, type errors and timeouts are `unknown`. Install steps get the egress proxy and private caches; tests get neither. The barrier client uses a direct agent so environment proxies never carry the instance credential.
 
-Upstream-only run against `8595efc2` (harness at `04d73211`, `--install` mirroring upstream `test:run:general` preparation). Fork baselines in the same environment pass every evidence file (HEAD for nine patches, `975bc8d7` for the Codex shell-proxy test):
+Upstream-only run against `8595efc2` (harness at `3dceff56`, receipt schema v2, `--install` mirroring upstream `test:run:general` preparation). Outcomes match the earlier run with harness `04d73211`. Raw receipts, Vitest reports, the install script and fork baselines are retained as an attached evidence bundle with a SHA-256 manifest. With the same harness and install, all seven automatable evidence files pass on the fork itself (`3dceff56`, and `975bc8d7` for the Codex shell-proxy test), so a failure against upstream comes from upstream, not from the test or the environment. Reviews cite a receipt by its digest:
 
-| Patch | Upstream-only outcome | Evidence |
-| --- | --- | --- |
-| provider-output-and-mounts | unknown | upstream has no `createNetworkProxyBridge`; the fork test cannot run as written |
-| proxy-socket-error-owner | unknown | upstream has no `startNetworkAllowlistProxy` |
-| codex-auth-provenance | upstream-fails | 4 assertions: historical auth text still yields `refresh_token_invalidated` |
-| claude-auth-provenance | upstream-fails | 11 of 15 assertions: quoted login prose still yields `requiresLogin: true` |
-| git-install-payload | unknown | ENOENT during server package preparation; one wrapped assertion |
-| installer-test-isolation | unknown | manual review by design |
-| portable-runner-fixtures | unknown | manual review by design |
-| portable-sandbox-denial | upstream-passes | required test passes; one unrelated containment test skips in this sandbox, as on the fork |
-| trusted-ci-baseline | unknown | manual review by design |
-| codex-shell-proxy-allowlist | upstream-fails | identity-filtered Codex shell env lacks the allowlist bridge |
+| Patch | Upstream-only outcome | Receipt digest (prefix) | Evidence |
+| --- | --- | --- | --- |
+| provider-output-and-mounts | unknown | `52b26b60` | 5/5 non-assertion failures: upstream has no `createNetworkProxyBridge`; the fork test cannot run as written |
+| proxy-socket-error-owner | unknown | `a8881b6f` | 2/2 non-assertion failures: upstream has no `startNetworkAllowlistProxy` |
+| codex-auth-provenance | upstream-fails | `87c11861` | 4 of 6 assertions fail: historical auth text still yields `refresh_token_invalidated` |
+| claude-auth-provenance | upstream-fails | `a6b71c9f` | 11 of 15 assertions fail: quoted login prose still yields `requiresLogin: true` |
+| git-install-payload | unknown | `69b8fb92` | 3/3 non-assertion failures during server package preparation |
+| installer-test-isolation | unknown | `47bf79d1` | manual review by design |
+| portable-runner-fixtures | unknown | `0f024948` | manual review by design |
+| portable-sandbox-denial | upstream-passes | `a91f7832` | the required test passes |
+| trusted-ci-baseline | unknown | `9811ba47` | manual review by design |
+| codex-shell-proxy-allowlist | upstream-fails | `eb70db5d` | 1 of 1 assertion fails: identity-filtered Codex shell env lacks the allowlist bridge |
 
 These are receipts, not decisions. `upstream-passes` supports retirement only with an independent review.
 
@@ -56,6 +56,6 @@ Remaining gates, none satisfied yet:
 - Declare `requiredCiJobs` for the combined candidate in the reviewed registry; until then the CI gate stays unknown. The pinned trusted CI does not yet run the `maintenance/upgrade` Node suite, so green CI is not toolkit verification. The inherited `commitperclip PR Review` failure (missing `COMMITPERCLIP_KEY`) is a failed check and blocks admission.
 - Independent keep/adapt/retire review per patch. `unknown` patches need an adapted upstream test or direct review before any decision.
 - Build the combined candidate from those decisions and run exact-head CI. No combined candidate exists yet.
-- Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility.
+- Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility evidence.
 - Server: the only persisted-work inventory today is `idleSleepSafety`, which treats any open issue, routine or API key as work, so a real instance will not pass it. A narrower upgrade inventory (in-flight runs, wakes, leases, effects, recovery obligations) is needed. Task drain is in memory, so it does not hold across the restart into the new payload.
 - Wire the barrier and admission into the native update path, prove one controlled upgrade and recovery, and only then add a recurring native invocation. `automaticActivationEnabled` stays false.
