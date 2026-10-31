@@ -16,6 +16,8 @@ Inputs:
   Stage 7 re-ran `native-handoff-admission` alone with the R6 dispatch-first
   case added, ports at `8e8c2d36b424072ca464826c6f9ef804412966dd`; its row
   cites those receipts.
+  Stage 8 added `native-task-bound-continuation` (fix `53373965`, port
+  `cf1c70a6`); its row cites those receipts, with control = the fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -50,6 +52,7 @@ Meaning of the decisions:
 | claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
 | native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
+| native-task-bound-continuation | **upstream-fails** 12/12 (`9b60e519`), port `cf1c70a6` | passes 12/12, files 26/26 (`d9a5ed46`) | `legacy-continuation.ts`, `issue-continuation-summary.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts` changed; `issue-stage-boundary.ts` new | **adapt** |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
 upstream covers any of these behaviors.
@@ -139,6 +142,38 @@ upstream covers any of these behaviors.
     test is evidence but cannot discriminate upstream. The shipped
     `skills/paperclip/references/api-reference.md` changed upstream; the
     stage-handoff guidance must be merged into it, not replace it.
+- **native-task-bound-continuation.** (stage 8, founder comment `19a7f568`)
+  - Reproduced from STA-22 round 8 native records. Coordinator comment
+    `cd8268d7` landed while the task was Done, so by design it woke nobody.
+    A separate PATCH reopened it `done -> in_progress` with the same
+    assignee, which also woke nobody: only `closed -> todo` did. The
+    stranded sweep then dispatched `issue_disposition_repair` run
+    `9dab77f6` (recovery action `774502e5`) against the previous stage's
+    run `0bf7baf2`, saying it ended without a recorded disposition although
+    it had recorded Done. The reviewer's hand-back of that notice got 409.
+  - The fix takes the stage boundary from the structured issue audit trail:
+    the run's own last `issue.updated` row (`run_id`, `details.status`)
+    and later status transitions (`details.changes.status` or
+    `details._previous.status`). It does not read summary prose for this.
+  - Upstream fails all 12 required tests, all by assertion. The upstream
+    passes include every negative control: a run that left its own stage
+    active is still repaired, a pending human question still parks, a
+    summary written within the current stage still parks.
+  - The real-Postgres file loads unchanged on upstream. The route cases run
+    through a port of upstream's own harness (`ports/native-task-bound-continuation/PORT.md`).
+    The first port kept upstream's whole file; two upstream-only tests in it
+    failed in the fork control (`62a6a6d4`, unknown), so the port was
+    narrowed in `cf1c70a6`. That first attempt's upstream receipt was also
+    `upstream-fails`, 12 of 12 (`947437c3`).
+  - Not reproduced, so not changed: the 404 loop on settled recovery
+    actions, and success reported from an unbound heartbeat. STA-38 run
+    `912dd07d` was a caller-supplied `POST /agents/:id/wakeup`
+    (`on_demand`, `triggerDetail: recovery_handoff`) with no task; the
+    server made it company-scoped and denied its task writes, which is the
+    fail-closed outcome. Review Done waking the same Engineer works natively
+    (`issue_children_completed` on STA-21) and has existing coverage.
+  - Carried on this branch as one self-contained server commit, so it can be
+    selected onto the repair line for a later qualified installation.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
