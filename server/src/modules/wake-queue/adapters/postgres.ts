@@ -16,6 +16,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  issueThreadInteractions,
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
@@ -283,6 +284,19 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
       return { liveNonSelfCommentIds, containedSelfAuthoredComment };
+    },
+
+    async getAddressedInteraction({ companyId, issueId, interactionId }) {
+      const [row] = await tx
+        .select({ status: issueThreadInteractions.status })
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+        ))
+        .limit(1);
+      return row ?? null;
     },
 
     async cancelDeferredWake({ companyId, wakeId, reason, now }) {
@@ -1104,7 +1118,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          legacyExecutionNeedsReconciliation: await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
+          // A run the dispatch gate cancelled while still queued, never started on
+          // any attempt, ran no provider: it has no unknown effects to reconcile.
+          // A same-run retry keeps its earlier attempt's startedAt and stays held.
+          legacyExecutionNeedsReconciliation:
+            input.undispatchedGateCancellation === true && run.status === "cancelled" && run.startedAt == null
+              ? false
+              : await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
@@ -1172,7 +1192,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           };
         }
 
-        if (await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
+        // A gate-cancelled run never started, so it is not a native failure to recover.
+        if (!input.undispatchedGateCancellation && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 

@@ -1,5 +1,6 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import {
+  decideAddressedInteractionWake,
   decideQueuedCommentAction,
   decideReleaseRecovery,
   decideWakeAdmission,
@@ -8,8 +9,10 @@ import {
 } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+  INTERACTION_NO_LONGER_PENDING_CODE,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
+  readAddressedInteractionWakeId,
   readNonEmptyString,
   parseObject,
 } from "../domain/values.js";
@@ -120,6 +123,12 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /**
+   * The run never reached a provider: the dispatch gate cancelled it. Its
+   * release only re-drains the deferred queue it was promoted from, so the
+   * next live wake is not stranded. It plans no recovery for itself.
+   */
+  undispatchedGateCancellation?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -167,6 +176,27 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    // An addressed wake is a receipt for its invitation. Retire it once the
+    // invitation left `pending`, so it never spends the promotion that the
+    // live card's wake behind it needs.
+    const addressedInteractionId = readAddressedInteractionWakeId(candidate.deferredContextSeed);
+    if (addressedInteractionId) {
+      const interaction = await ports.transaction.getAddressedInteraction({
+        companyId: run.companyId, issueId: issue.id, interactionId: addressedInteractionId,
+      });
+      if (decideAddressedInteractionWake({ interaction }) === "retire") {
+        await ports.transaction.cancelDeferredWake({
+          companyId: run.companyId,
+          wakeId: candidate.id,
+          reason: `${INTERACTION_NO_LONGER_PENDING_CODE}: the addressed interaction is ${
+            interaction?.status ?? "missing"
+          }; its deferred wake was retired before promotion`,
+          now: input.now,
+        });
+        continue;
+      }
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -309,6 +339,8 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  // A gate-cancelled run never started, so it owns no recovery of its own.
+  if (input.undispatchedGateCancellation) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -962,7 +994,10 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      {
+        companyId: input.companyId, runId: input.runId, now: input.now,
+        ...(input.undispatchedGateCancellation ? { undispatchedGateCancellation: true } : {}),
+      },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

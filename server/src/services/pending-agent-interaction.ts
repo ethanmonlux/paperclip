@@ -61,3 +61,23 @@ export async function pendingAgentInteractionAddressee(db: Db, input: {
   )).limit(1).for("update").then(rows => rows[0] ?? null);
   return isPendingAgentInteractionAddressee({ ...input, interaction });
 }
+
+/**
+ * Names the invitation an addressed-card wake was created for, and its current
+ * persisted status, so the dispatch gate can report a lost invitation as what it
+ * is. Null for every other wake. This is a classification read, not authority:
+ * `pendingAgentInteractionAddressee` remains the only admission check.
+ */
+export async function readAddressedInteractionStatus(db: Db, input: {
+  companyId: string; issueId: string; contextSnapshot: Record<string, unknown>;
+}): Promise<{ interactionId: string; status: string | null } | null> {
+  const context = input.contextSnapshot;
+  if (context.source !== "issue.interaction.created" || context.wakeReason !== "interaction_pending" ||
+      typeof context.interactionId !== "string" || !UUID.test(context.interactionId)) return null;
+  const [row] = await db.select({ status: issueThreadInteractions.status }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.id, context.interactionId),
+    eq(issueThreadInteractions.companyId, input.companyId),
+    eq(issueThreadInteractions.issueId, input.issueId),
+  )).limit(1);
+  return { interactionId: context.interactionId, status: row?.status ?? null };
+}

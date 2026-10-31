@@ -197,7 +197,11 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
   getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
   executeRun: (runId: string) => Promise<void>;
-  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
+  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: {
+    suppressImmediateRecovery?: boolean;
+    undispatchedGateCancellation?: boolean;
+    deferredPostCommitEffects?: WakeQueuePostCommitEffect[];
+  }) => Promise<unknown>;
   applyWakeQueuePostCommitEffects: (effects: WakeQueuePostCommitEffect[]) => Promise<void>;
   publishRunLifecyclePluginEvent: (run: HeartbeatRun) => void;
   cancelRunInternal: (runId: string, reason?: string, options?: { errorCode?: string }) => Promise<unknown>;
@@ -1108,6 +1112,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled") {
+          // The gate cleared the lock this run was promoted into. Re-drain the
+          // same deferred queue so a live wake behind it is not stranded. The
+          // run never started: drain only, with no recovery of its own.
+          await releaseIssueExecutionAndPromote(run, {
+            suppressImmediateRecovery: true, undispatchedGateCancellation: true, deferredPostCommitEffects,
+          });
+        }
         logger.info(
           {
             runId: run.id,

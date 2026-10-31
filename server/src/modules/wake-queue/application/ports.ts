@@ -119,6 +119,12 @@ export interface WakeQueueTransaction {
     finishingRunAgentId: string;
     queuedCommentIds: string[];
   }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  /** Reads the invitation an addressed wake names, scoped to this company and issue; null when it is not there. */
+  getAddressedInteraction(input: {
+    companyId: string;
+    issueId: string;
+    interactionId: string;
+  }): Promise<{ status: string } | null>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
     companyId: string;
@@ -235,7 +241,17 @@ export interface WakeQueueTransaction {
  */
 export interface IssueLockWriter {
   withIssueExecutionLock(
-    input: { companyId: string; runId: string; now: Date },
+    input: {
+      companyId: string;
+      runId: string;
+      now: Date;
+      /**
+       * The run was cancelled at the dispatch gate before any provider work.
+       * Drain the deferred queue only: it is not a failed attempt, so it never
+       * projects the task to blocked or records terminal recovery.
+       */
+      undispatchedGateCancellation?: boolean;
+    },
     fn: (
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },

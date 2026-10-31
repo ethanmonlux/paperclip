@@ -1,4 +1,4 @@
-import { pendingAgentInteractionAddressee } from "../../../services/pending-agent-interaction.js";
+import { pendingAgentInteractionAddressee, readAddressedInteractionStatus } from "../../../services/pending-agent-interaction.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
@@ -617,6 +617,9 @@ export function createPostgresRunDispatchAdapter(
         companyId: input.companyId, issueId, agentId: input.agentId,
         contextSnapshot: context,
       }) : false,
+      addressedInteraction: issue ? await readAddressedInteractionStatus(dbOrTx, {
+        companyId: input.companyId, issueId, contextSnapshot: context,
+      }) : null,
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",

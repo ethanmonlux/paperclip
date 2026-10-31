@@ -195,6 +195,21 @@ export function decideWakeOutcome(facts: DeferredWakeOutcomeFacts): DeferredWake
   return { kind: "promote" };
 }
 
+export type AddressedInteractionWakeFacts = {
+  /** The persisted invitation the wake names, read under the release lock, or null when it is missing from this issue. */
+  interaction: { status: string } | null;
+};
+
+/**
+ * An addressed wake is only a receipt for its invitation. Once that invitation
+ * has left `pending`, promoting the wake would spend the one promotion on a run
+ * the dispatch gate must cancel. A pending invitation stays queued even when
+ * the gate may still reject it; the gate owns that decision.
+ */
+export function decideAddressedInteractionWake(facts: AddressedInteractionWakeFacts): "live" | "retire" {
+  return facts.interaction?.status === "pending" ? "live" : "retire";
+}
+
 /** Shared between the review-participant and immediate branches; the caller derives every field from the same expression regardless of which branch applies. */
 export type ReleaseRecoverySharedFacts = {
   hasExistingExecutionPath: boolean;
