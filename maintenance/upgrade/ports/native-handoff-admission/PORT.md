@@ -32,6 +32,29 @@ Postgres. Both implementations' gates (`withIssueThenRunLocks` /
   `select ... "issues"` lock. The old order (`2a34dfba^`) instead blocks on
   `update "issues"` after locking the invitation, which deadlocks once the gate
   continues. After release, the original outcome assertions are unchanged.
+- **Dispatch first** (added for STA-22 finding R6): the cancellation case above
+  starts the revocation before the gate, so it shows the read waits, but not
+  that the lock stays held from the read until the provider handoff. This case
+  restores the original's schedule without the fork-only mock. A test-only seam
+  wraps the `Db` passed to `createPostgresRunDispatchAdapter`. For every
+  transaction opened through it, including savepoints, it observes each query
+  after its result returns, and records whether that transaction is still open.
+  Both trees use drizzle-orm 0.45.2, so the seam works the same on each. Only
+  the adapter's public constructor and drizzle transactions are touched.
+  - The seam pauses once, right after the locked (`for update`) read of this
+    invitation, and records that transaction's backend pid.
+  - The test then starts a cancellation of the invitation on the plain `Db`. It
+    must wait on a `Lock` held by that pid, before anything is revoked.
+  - After release, `dispatch` runs once, while the reading transaction is still
+    open, and the order is `["dispatch", "revoked"]`.
+  - A gate that never makes that read finishes, and the test fails on
+    `reached`.
+
+  Negative control: STA-22's early-unlock mutation (bundle `1db45340`) runs
+  the same locked read in a separate root-`Db` transaction that commits before
+  the decision returns. It is applied in memory by a Vite transform, with no
+  repository bytes changed. Under it the lock-wait checks still pass, but the
+  reading transaction is closed at dispatch, so this case fails by assertion.
 
 The waits are bounded: each polls `pg_stat_activity` at most 300 times, 10 ms
 apart, and returns early once the gate or the rejection settles. A gate that
@@ -47,3 +70,8 @@ pause, dependency. Matching is now on blocking pids rather than query text,
 because Postgres truncates long queries in `pg_stat_activity`.
 
 The same port must pass against the fork source as the control.
+
+Limit: the cases cover these finite schedules and the mutations named here. They
+are not proof of every interleaving. For example, a lock released early by
+rolling back a savepoint would leave the transaction open; there, only the
+order assertion would catch it, and that depends on timing.

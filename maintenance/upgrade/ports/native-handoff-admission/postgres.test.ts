@@ -289,6 +289,132 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     }
   });
 
+  // Test-only seam for the dispatch-first schedule. It wraps the Db handed to
+  // the adapter and observes, after each result returns, every query run by a
+  // transaction opened through it, including savepoints. Both implementations
+  // use drizzle 0.45.2 transactions, and nothing fork-only is mocked. Each
+  // transaction records whether it is still open, so the test can tell a lock
+  // kept until the provider handoff from one taken and released earlier.
+  type SeamTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+  type SeamRecord = { open: boolean };
+  type SeamQuery = { sql: string; params: unknown[] };
+  type SeamSession = { prepareQuery: (query: SeamQuery, ...rest: unknown[]) => Record<string, unknown> };
+  function transactionSeam(onQuery: (tx: SeamTx, record: SeamRecord, query: SeamQuery) => Promise<void>) {
+    const instrument = (tx: SeamTx, record: SeamRecord) => {
+      const session = (tx as unknown as { session: SeamSession }).session;
+      const prepare = session.prepareQuery;
+      session.prepareQuery = function (this: SeamSession, query, ...rest) {
+        const prepared = prepare.call(this, query, ...rest);
+        for (const method of ["execute", "all"] as const) {
+          const run = prepared[method] as ((...args: unknown[]) => Promise<unknown>) | undefined;
+          if (typeof run !== "function") continue;
+          prepared[method] = async function (this: unknown, ...args: unknown[]) {
+            const result = await run.apply(this, args);
+            await onQuery(tx, record, query);
+            return result;
+          };
+        }
+        return prepared;
+      };
+      const savepoint = tx.transaction;
+      tx.transaction = function (this: SeamTx, work: (inner: SeamTx) => Promise<unknown>, ...rest: unknown[]) {
+        return (savepoint as (...args: unknown[]) => Promise<unknown>).call(this, (inner: SeamTx) => {
+          instrument(inner, record);
+          return work(inner);
+        }, ...rest);
+      } as typeof tx.transaction;
+    };
+    return new Proxy(db, {
+      get(target, key) {
+        if (key !== "transaction") return Reflect.get(target, key);
+        return (work: (tx: SeamTx) => Promise<unknown>, ...rest: unknown[]) => {
+          const record: SeamRecord = { open: true };
+          return (target.transaction as (...args: unknown[]) => Promise<unknown>).call(target, (tx: SeamTx) => {
+            instrument(tx, record);
+            return work(tx);
+          }, ...rest).finally(() => { record.open = false; });
+        };
+      },
+    }) as typeof db;
+  }
+
+  it("keeps the gate's invitation lock from its read through the provider handoff", async () => {
+    const f = await seedAddressedHandoff("running");
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    let atRead!: () => void, release!: () => void;
+    const readReached = new Promise<void>(resolve => { atRead = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    // Assigned from callbacks, so kept on an object rather than in narrowed lets.
+    const seen = { reader: null as { record: SeamRecord; pid: number } | null, readerOpenAtDispatch: null as boolean | null };
+    // Pause once, right after the gate's locked read of this invitation returns.
+    const seamDb = transactionSeam(async (tx, record, query) => {
+      if (seen.reader || !/from "issue_thread_interactions"/i.test(query.sql) || !/\bfor update\b/i.test(query.sql)
+        || !query.params.includes(f.interactionId)) return;
+      const reader = { record, pid: 0 };
+      seen.reader = reader;
+      const rows = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      reader.pid = Number(rows[0]!.pid);
+      atRead();
+      await released;
+    });
+    const order: string[] = [];
+    const dispatch = vi.fn(async () => {
+      order.push("dispatch");
+      seen.readerOpenAtDispatch = seen.reader?.record.open ?? false;
+      return "recipient started";
+    });
+    const gate = track(createPostgresRunDispatchAdapter(seamDb)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch }));
+    // Bounded by the gate settling: a gate that never takes this read finishes.
+    const reached = await Promise.race([readReached.then(() => true), gate.promise.then(() => false, () => false)]);
+    let cancellation: Promise<void> | null = null;
+    let waitingOn: number[] | null = null;
+    let orderWhileWaiting: string[] | null = null;
+    try {
+      if (reached) {
+        let cancelPid!: (pid: number) => void;
+        const pidReady = new Promise<number>(resolve => { cancelPid = resolve; });
+        cancellation = db.transaction(async ctx => {
+          const rows = await ctx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+          cancelPid(Number(rows[0]!.pid));
+          await ctx.update(issueThreadInteractions).set({ status: "cancelled" })
+            .where(eq(issueThreadInteractions.id, f.interactionId));
+          order.push("revoked");
+        });
+        const pid = await pidReady;
+        // Observe a real lock wait, rather than using a timing-only assertion.
+        for (let attempt = 0; attempt < 300; attempt++) {
+          const rows = await db.execute<{ wait_event_type: string | null; blockers: number[] | null }>(sql`
+            select wait_event_type, pg_blocking_pids(pid) as blockers from pg_stat_activity where pid = ${pid}`);
+          if (rows[0]?.wait_event_type === "Lock") {
+            waitingOn = (rows[0].blockers ?? []).map(Number);
+            orderWhileWaiting = [...order];
+            break;
+          }
+          if (order.includes("revoked") || gate.settled()) break;
+          await sleep(10);
+        }
+      }
+    } finally {
+      release();
+      await Promise.allSettled([gate.promise, cancellation]);
+    }
+    // The gate itself read the persisted invitation under a row lock.
+    expect(reached).toBe(true);
+    // The cancellation queued behind the transaction that made that read, and
+    // could not revoke the invitation before the gate decided.
+    expect(waitingOn).toContain(seen.reader?.pid);
+    expect(orderWhileWaiting).toEqual([]);
+    // That same transaction was still open when the provider handoff ran, so
+    // the cancellation committed only afterwards.
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(seen.readerOpenAtDispatch).toBe(true);
+    expect(order).toEqual(["dispatch", "revoked"]);
+    expect((await gate.promise).dispatched).toBe(true);
+    expect((await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, f.interactionId)))[0]?.status).toBe("cancelled");
+  });
+
   it("orders stale-target expiry issue-first against final invitation dispatch", async () => {
     const f = await seedAddressedHandoff("running");
     const documentId = randomUUID(), oldRevisionId = randomUUID(), revisionId = randomUUID();
