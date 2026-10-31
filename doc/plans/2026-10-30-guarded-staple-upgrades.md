@@ -26,9 +26,28 @@ Tooling lives in `maintenance/upgrade/` and runs with plain Node, no install: `n
 - Steps 3-5: `admission` fails closed unless every patch has an independently reviewed decision (retire needs a cited upstream-only pass), exact-head CI is complete and green, an isolated migration applied and the previous payload is schema-compatible, and isolated install/boot/assets/continuation/restart recovery are proved.
 - Step 6: the barrier client holds the existing authenticated, owner-scoped `/api/instance/task-drain` (idle purpose answers 503 to all non-control ingress and suppresses scheduling), requires consecutive quiet reads with a positive persisted-work inventory, runs activation, and always releases its own drain. Health must be the authenticated view (serverVersion, serverInfo, startupRecovery ready) at the exact commit. `paperclipai update` now verifies git payload restarts by exact commit, since anonymous health on authenticated deployments carries `commit` but no version.
 
+A failed evidence test counts as `upstream-fails` only when every failure is an assertion; missing exports, type errors and timeouts are `unknown`. Install steps get the egress proxy and private caches; tests get neither. The barrier client uses a direct agent so environment proxies never carry the instance credential.
+
+Upstream-only run against `8595efc2` (harness at `04d73211`, `--install` mirroring upstream `test:run:general` preparation). Fork baselines in the same environment pass every evidence file (HEAD for nine patches, `975bc8d7` for the Codex shell-proxy test):
+
+| Patch | Upstream-only outcome | Evidence |
+| --- | --- | --- |
+| provider-output-and-mounts | unknown | upstream has no `createNetworkProxyBridge`; the fork test cannot run as written |
+| proxy-socket-error-owner | unknown | upstream has no `startNetworkAllowlistProxy` |
+| codex-auth-provenance | upstream-fails | 4 assertions: historical auth text still yields `refresh_token_invalidated` |
+| claude-auth-provenance | upstream-fails | 11 of 15 assertions: quoted login prose still yields `requiresLogin: true` |
+| git-install-payload | unknown | ENOENT during server package preparation; one wrapped assertion |
+| installer-test-isolation | unknown | manual review by design |
+| portable-runner-fixtures | unknown | manual review by design |
+| portable-sandbox-denial | upstream-passes | required test passes; one unrelated containment test skips in this sandbox, as on the fork |
+| trusted-ci-baseline | unknown | manual review by design |
+| codex-shell-proxy-allowlist | upstream-fails | identity-filtered Codex shell env lacks the allowlist bridge |
+
+These are receipts, not decisions. `upstream-passes` supports retirement only with an independent review.
+
 Remaining gates, none satisfied yet:
-- Execute upstream-only runs where dependencies install (this sandbox has no pnpm/node_modules or registry access; all automated receipts are `unknown` with `runner-spawn-failed:ENOENT`). `975bc8d7` must be fetched for the Codex shell-proxy patch.
-- Independent keep/adapt/retire review per patch, then build the combined candidate and run exact-head CI.
+- Independent keep/adapt/retire review per patch. `unknown` patches need an adapted upstream test or direct review before any decision.
+- Build the combined candidate from those decisions and run exact-head CI. No combined candidate exists yet.
 - Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility evidence.
 - Server: the only persisted-work inventory today is `idleSleepSafety`, which treats any open issue, routine or API key as work, so a real instance will not pass it. A narrower upgrade inventory (in-flight runs, wakes, leases, effects, recovery obligations) is needed. Task drain is in memory, so it does not hold across the restart into the new payload.
 - Wire the barrier and admission into the native update path, prove one controlled upgrade and recovery, and only then add a recurring native invocation. `automaticActivationEnabled` stays false.
