@@ -166,6 +166,7 @@ async function runReleaseDrain(
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
       ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
+      ...(locked.drainOnlyWakeIds ? { onlyWakeIds: locked.drainOnlyWakeIds } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {

@@ -1109,15 +1109,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         runId: run.id,
         companyId: run.companyId,
         expectedStatus: "queued",
+        // The cancellation commits with a durable drain intent for the queue below.
+        recordDrainIntent: true,
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
         if (staleness.outcome === "cancelled") {
           // The gate cleared the lock this run was promoted into. Re-drain the
           // same deferred queue so a live wake behind it is not stranded. The
-          // run never started: drain only, with no recovery of its own.
+          // run never started: drain only, with no recovery of its own. The
+          // committed intent settles only with this drain's persisted outcome;
+          // if it fails or this process stops, the restart sweep consumes it.
           await releaseIssueExecutionAndPromote(run, {
             suppressImmediateRecovery: true, undispatchedGateCancellation: true, deferredPostCommitEffects,
+          }).catch((err) => {
+            logger.warn({ err, runId: run.id, issueId }, "gate cancellation drain deferred to the restart sweep");
           });
         }
         logger.info(
@@ -1849,6 +1855,30 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }).catch((err) => {
         logger.error({ err, runId: run.id }, "failed to retry interrupted comment queue");
       });
+    }
+
+    // A claim-gate cancellation commits a drain intent for the deferred queue
+    // it left behind. Consume each still-pending intent through the same release
+    // admission, whoever the wakes belong to (an addressed Coordinator is not the
+    // assignee). The release settles the intent only from its persisted outcome;
+    // a held intent stays pending and is revisited here.
+    const pendingGateDrains = await db
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(and(
+        eq(heartbeatRuns.status, "cancelled"),
+        sql`${heartbeatRuns.resultJson}->'gateCancellationDrain'->>'state' = 'pending'`,
+        eq(companies.status, "active"),
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.updatedAt))
+      .limit(50);
+    for (const run of pendingGateDrains) {
+      await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, undispatchedGateCancellation: true })
+        .catch((err) => {
+          logger.warn({ err, runId: run.id }, "failed to consume gate cancellation drain intent");
+        });
     }
 
     const queuedRuns = await db

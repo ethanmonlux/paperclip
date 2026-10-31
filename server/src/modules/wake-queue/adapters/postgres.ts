@@ -3,6 +3,11 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import {
+  GATE_CANCELLATION_DRAIN_KEY,
+  readGateCancellationDrainIntent,
+  type GateCancellationDrainIntent,
+} from "../../../services/gate-cancellation-drain.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
@@ -202,7 +207,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return { id: agent.id, companyId: agent.companyId, name: agent.name, invokable: invokability.invokable };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, onlyWakeIds }) {
       while (true) {
         const row = await tx
           .select()
@@ -212,6 +217,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
+              onlyWakeIds ? (onlyWakeIds.length ? inArray(agentWakeupRequests.id, onlyWakeIds) : sql`false`) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
@@ -1096,141 +1102,277 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
 
-        // A queue interrupt authorizes only its original pending queue. Replays
-        // after dispatch or deleting the final message cannot launch other work.
-        const interruptQueueId = run.runtimeMode !== "native"
-          ? readNonEmptyString(run.resultJson?.queuedCommentInterruptQueueId)
+        // A claim-gate cancellation's drain intent, read again under the issue
+        // lock so concurrent consumers (post-commit drain, restart sweep, a
+        // replay) serialize: only the first sees it pending.
+        const gateDrain = input.undispatchedGateCancellation
+          ? await readLockedGateDrain(tx, input.companyId, run.id)
           : null;
-        const [interruptedQueue] = interruptQueueId && issueRow
-          ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-              eq(agentWakeupRequests.id, interruptQueueId),
-              eq(agentWakeupRequests.companyId, run.companyId),
-              eq(agentWakeupRequests.agentId, run.agentId),
-              eq(agentWakeupRequests.status, "deferred_issue_execution"),
-              sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
-            )).limit(1)
-          : [];
-        const preDrainFacts: PreDrainFacts = {
-          issueRowPresent: issueRow !== null,
-          executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
-          isWorkspaceValidationFailedRun: isWorkspaceValidationFailedRun(run),
-          isConfigurationIncompleteFailedRun: isConfigurationIncompleteFailedRun(run),
-          issueStatus: issueRow?.status ?? "",
-          hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
-          assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
-          // A run the dispatch gate cancelled while still queued, never started on
-          // any attempt, ran no provider: it has no unknown effects to reconcile.
-          // A same-run retry keeps its earlier attempt's startedAt and stays held.
-          legacyExecutionNeedsReconciliation:
-            input.undispatchedGateCancellation === true && run.status === "cancelled" && run.startedAt == null
-              ? false
-              : await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
-          // An operator stop never promotes old queued work by itself. The
-          // next explicit wake adopts those messages atomically when it
-          // queues a run.
-          executionCancellationAcknowledged:
-            isAcknowledgedNativeReassignmentStop(run) ||
-            (run.status === "cancelled" &&
-            (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue),
-        };
-        const preDrain = decidePreDrain(preDrainFacts);
-
-        if (preDrain.kind === "released") {
+        if (gateDrain && gateDrain.kind !== "consume") {
+          if (gateDrain.kind === "settle") await writeGateDrain(tx, gateDrain.run, gateDrain.intent, input.now);
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
-
-        // decidePreDrain only returns "blocked" or "proceed" when the issue row is present.
-        if (!issueRow) {
-          throw new Error(`wake-queue: pre-drain decision ${preDrain.kind} reached without an issue row`);
+        const pendingIntent = gateDrain?.kind === "consume" ? gateDrain.intent : null;
+        if (pendingIntent) {
+          // Another execution owns this queue now; its own release drains it.
+          // Never clear or bypass that holder's lock.
+          if (issueRow?.executionRunId && issueRow.executionRunId !== run.id) {
+            await writeGateDrain(tx, gateDrain!.run, {
+              ...pendingIntent, state: "superseded", outcome: "lock_holder",
+              supersededByRunId: issueRow.executionRunId, settledAt: input.now.toISOString(),
+            }, input.now);
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+          if ((await stillDeferredWakeIds(tx, input.companyId, pendingIntent.deferredWakeIds)).length === 0) {
+            await writeGateDrain(tx, gateDrain!.run, {
+              ...pendingIntent, state: "settled", outcome: "exhausted", settledAt: input.now.toISOString(),
+            }, input.now);
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
         }
 
-        // Enqueue does not stamp executionRunId until dispatch. A concurrent
-        // queued successor still owns the next turn, including during a late
-        // finalization/stranded-queue retry under this issue lock. Another
-        // agent's review participation retains its separate recovery path.
-        const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, input.companyId),
-          eq(heartbeatRuns.agentId, run.agentId),
-          sql`${heartbeatRuns.id} <> ${run.id}`,
-          or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
-            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
-          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
-        )).limit(1);
-        if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        const result = await releaseLockedIssue();
+        if (pendingIntent) {
+          await writeGateDrain(tx, gateDrain!.run,
+            await settleGateDrain(tx, input.companyId, issueRow?.id ?? null, run.id, pendingIntent, result.outcome, input.now),
+            input.now);
+        }
+        return result;
 
-        if (preDrain.kind === "blocked") {
-          return {
-            outcome: {
-              kind: "blocked",
-              issue: toIssueSnapshot(issueRow),
-              previousStatus: issueRow.status as "todo" | "in_progress",
-              noticeKind: preDrain.noticeKind,
-            },
-            postCommitEffects: [],
-            run: runSnapshot,
+        async function releaseLockedIssue(): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
+
+          // A queue interrupt authorizes only its original pending queue. Replays
+          // after dispatch or deleting the final message cannot launch other work.
+          const interruptQueueId = run.runtimeMode !== "native"
+            ? readNonEmptyString(run.resultJson?.queuedCommentInterruptQueueId)
+            : null;
+          const [interruptedQueue] = interruptQueueId && issueRow
+            ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.id, interruptQueueId),
+                eq(agentWakeupRequests.companyId, run.companyId),
+                eq(agentWakeupRequests.agentId, run.agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
+              )).limit(1)
+            : [];
+          const preDrainFacts: PreDrainFacts = {
+            issueRowPresent: issueRow !== null,
+            executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
+            isWorkspaceValidationFailedRun: isWorkspaceValidationFailedRun(run),
+            isConfigurationIncompleteFailedRun: isConfigurationIncompleteFailedRun(run),
+            issueStatus: issueRow?.status ?? "",
+            hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
+            assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
+            // A run the dispatch gate cancelled while still queued, never started on
+            // any attempt, ran no provider: it has no unknown effects to reconcile.
+            // A same-run retry keeps its earlier attempt's startedAt and stays held.
+            // The exemption derives from the persisted gate cancellation, never
+            // from the caller's flag alone. A same-run retry keeps its earlier
+            // attempt's startedAt and stays held.
+            legacyExecutionNeedsReconciliation:
+              pendingIntent && !pendingIntent.providerWorkStarted && run.status === "cancelled" && run.startedAt == null
+                ? false
+                : await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
+            // An operator stop never promotes old queued work by itself. The
+            // next explicit wake adopts those messages atomically when it
+            // queues a run.
+            executionCancellationAcknowledged:
+              isAcknowledgedNativeReassignmentStop(run) ||
+              (run.status === "cancelled" &&
+              (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+              !interruptedQueue),
           };
-        }
+          const preDrain = decidePreDrain(preDrainFacts);
 
-        // The durable external answer owns the sole successor of this retired
-        // question source; release locks without creating another incident.
-        if (
-          run.runtimeMode === "native" &&
-          run.status === "cancelled" &&
-          run.errorCode === "external_chat_continuation" &&
-          (await isRetiredExternalChatQuestionSource(tx, {
-            companyId: run.companyId,
-            issueId: issueRow.id,
-            agentId: run.agentId,
-            runId: run.id,
-          }))
-        ) {
-          return {
-            outcome: { kind: "released" },
-            postCommitEffects: [],
-            run: runSnapshot,
+          if (preDrain.kind === "released") {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+
+          // decidePreDrain only returns "blocked" or "proceed" when the issue row is present.
+          if (!issueRow) {
+            throw new Error(`wake-queue: pre-drain decision ${preDrain.kind} reached without an issue row`);
+          }
+
+          // Enqueue does not stamp executionRunId until dispatch. A concurrent
+          // queued successor still owns the next turn, including during a late
+          // finalization/stranded-queue retry under this issue lock. Another
+          // agent's review participation retains its separate recovery path.
+          const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, input.companyId),
+            eq(heartbeatRuns.agentId, run.agentId),
+            sql`${heartbeatRuns.id} <> ${run.id}`,
+            or(eq(heartbeatRuns.nativeIssueId, issueRow.id),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRow.id}`),
+            inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+          )).limit(1);
+          if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+
+          if (preDrain.kind === "blocked") {
+            return {
+              outcome: {
+                kind: "blocked",
+                issue: toIssueSnapshot(issueRow),
+                previousStatus: issueRow.status as "todo" | "in_progress",
+                noticeKind: preDrain.noticeKind,
+              },
+              postCommitEffects: [],
+              run: runSnapshot,
+            };
+          }
+
+          // The durable external answer owns the sole successor of this retired
+          // question source; release locks without creating another incident.
+          if (
+            run.runtimeMode === "native" &&
+            run.status === "cancelled" &&
+            run.errorCode === "external_chat_continuation" &&
+            (await isRetiredExternalChatQuestionSource(tx, {
+              companyId: run.companyId,
+              issueId: issueRow.id,
+              agentId: run.agentId,
+              runId: run.id,
+            }))
+          ) {
+            return {
+              outcome: { kind: "released" },
+              postCommitEffects: [],
+              run: runSnapshot,
+            };
+          }
+
+          // A gate-cancelled run never started, so it is not a native failure to recover.
+          if (!input.undispatchedGateCancellation && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+
+          // A release must leave deferred messages intact while execution is held.
+          // The finishing conversation may still own its lease until finally cleanup.
+          // Allow only bounded retry planning in that case; admission stays gated.
+          const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
+          const recoveryOnly = Boolean(executionBlocker &&
+            executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
+            runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
+          if (executionBlocker && !recoveryOnly) {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+
+          // Releases still settle while Agent Chat is disabled, but no deferred
+          // turn or recovery successor may be created. Check here in the shared
+          // transaction so cleanup retries and restart sweeps use the same gate.
+          if (issueRow.conversationAgentId && !(await instanceSettingsService(tx).getExperimental()).enableAgentChat) {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
+
+          const locked: LockedIssueExecution = {
+            primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly,
+            ...(pendingIntent ? { drainOnlyWakeIds: pendingIntent.deferredWakeIds } : {}),
           };
+          const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+          // Explicit retry admission requires the exact source's task claim.
+          // Preserve it only when the existing queue-first recovery policy
+          // requests that retry. The clear/restore stays inside this task lock.
+          if (run.runtimeMode === "legacy" && ["failed", "timed_out"].includes(run.status) &&
+              run.contextSnapshot?.explicitUserContinuation && issueRow.executionRunId === run.id &&
+              result.postCommitEffects.some(effect => effect.kind === "conversation_retry_requested" && effect.runId === run.id)) {
+            await tx.update(issues).set({ executionRunId: run.id,
+              executionAgentNameKey: issueRow.executionAgentNameKey,
+              executionLockedAt: issueRow.executionLockedAt,
+            }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
+              sql`${issues.executionRunId} is null`));
+          }
+          return { ...result, run: runSnapshot };
         }
-
-        // A gate-cancelled run never started, so it is not a native failure to recover.
-        if (!input.undispatchedGateCancellation && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
-        }
-
-        // A release must leave deferred messages intact while execution is held.
-        // The finishing conversation may still own its lease until finally cleanup.
-        // Allow only bounded retry planning in that case; admission stays gated.
-        const executionBlocker = await getExecutionBlocker(tx, issueRow.companyId, issueRow.id);
-        const recoveryOnly = Boolean(executionBlocker &&
-          executionBlocker.cause === "execution_owner_active" && executionBlocker.runId === run.id &&
-          runSnapshot.conversationContinuation && ["failed", "timed_out", "interrupted"].includes(run.status));
-        if (executionBlocker && !recoveryOnly) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
-        }
-
-        // Releases still settle while Agent Chat is disabled, but no deferred
-        // turn or recovery successor may be created. Check here in the shared
-        // transaction so cleanup retries and restart sweeps use the same gate.
-        if (issueRow.conversationAgentId && !(await instanceSettingsService(tx).getExperimental()).enableAgentChat) {
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
-        }
-
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
-        // Explicit retry admission requires the exact source's task claim.
-        // Preserve it only when the existing queue-first recovery policy
-        // requests that retry. The clear/restore stays inside this task lock.
-        if (run.runtimeMode === "legacy" && ["failed", "timed_out"].includes(run.status) &&
-            run.contextSnapshot?.explicitUserContinuation && issueRow.executionRunId === run.id &&
-            result.postCommitEffects.some(effect => effect.kind === "conversation_retry_requested" && effect.runId === run.id)) {
-          await tx.update(issues).set({ executionRunId: run.id,
-            executionAgentNameKey: issueRow.executionAgentNameKey,
-            executionLockedAt: issueRow.executionLockedAt,
-          }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
-            sql`${issues.executionRunId} is null`));
-        }
-        return { ...result, run: runSnapshot };
       });
     },
   };
+}
+
+type LockedGateDrain =
+  | { kind: "consume"; run: typeof heartbeatRuns.$inferSelect; intent: GateCancellationDrainIntent }
+  | { kind: "settle"; run: typeof heartbeatRuns.$inferSelect; intent: Record<string, unknown> }
+  | { kind: "done" };
+
+/** Issue lock is held: lock the run row next (issue -> run order) and read its intent. */
+async function readLockedGateDrain(tx: Db, companyId: string, runId: string): Promise<LockedGateDrain | null> {
+  const [locked] = await tx.select().from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+    .for("update");
+  if (!locked) return { kind: "done" };
+  const read = readGateCancellationDrainIntent({
+    status: locked.status,
+    resultJson: locked.resultJson ?? null,
+    contextSnapshot: locked.contextSnapshot ?? null,
+  });
+  // A run cancelled by an older build carries no intent: release normally,
+  // with no never-started exemption.
+  if (read.kind === "none") return null;
+  if (read.kind === "malformed") {
+    const raw = read.raw && typeof read.raw === "object" && !Array.isArray(read.raw) ? read.raw as Record<string, unknown> : {};
+    // Unknown identity carries no authority: record it and never drain from it.
+    return raw.state === "invalid"
+      ? { kind: "done" }
+      : { kind: "settle", run: locked, intent: { ...raw, state: "invalid", outcome: "malformed" } };
+  }
+  if (read.intent.state !== "pending") return { kind: "done" };
+  return { kind: "consume", run: locked, intent: read.intent };
+}
+
+async function writeGateDrain(
+  tx: Db,
+  run: typeof heartbeatRuns.$inferSelect,
+  intent: GateCancellationDrainIntent | Record<string, unknown>,
+  now: Date,
+) {
+  const evaluated: Record<string, unknown> = { ...intent, evaluations: Number((intent as { evaluations?: number }).evaluations ?? 0) + 1 };
+  if (evaluated.state !== "pending" && evaluated.settledAt === undefined) evaluated.settledAt = now.toISOString();
+  // Merge into the row read under the lock: a concurrent Stop or diagnostic write is preserved.
+  await tx.update(heartbeatRuns).set({
+    resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(${GATE_CANCELLATION_DRAIN_KEY}::text, ${JSON.stringify(evaluated)}::jsonb)`,
+    updatedAt: now,
+  }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+}
+
+async function stillDeferredWakeIds(tx: Db, companyId: string, wakeIds: string[]) {
+  if (wakeIds.length === 0) return [];
+  return tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId),
+    inArray(agentWakeupRequests.id, wakeIds),
+    eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+  )).then(rows => rows.map(row => row.id));
+}
+
+/**
+ * Settles a consumed intent from what this transaction actually persisted.
+ * A `released` outcome is not proof of a drain: the pre-drain refusal, a
+ * successor, an execution blocker and an exhausted drain all return it.
+ */
+async function settleGateDrain(
+  tx: Db,
+  companyId: string,
+  issueId: string | null,
+  runId: string,
+  intent: GateCancellationDrainIntent,
+  outcome: ReleaseTransactionResult["outcome"],
+  now: Date,
+): Promise<GateCancellationDrainIntent> {
+  const settledAt = now.toISOString();
+  if (outcome.kind === "promoted") {
+    return {
+      ...intent, state: "settled", outcome: "promoted", successorRunId: outcome.run.id,
+      ...(outcome.run.wakeupRequestId ? { successorWakeId: outcome.run.wakeupRequestId } : {}), settledAt,
+    };
+  }
+  if ((await stillDeferredWakeIds(tx, companyId, intent.deferredWakeIds)).length === 0) {
+    return { ...intent, state: "settled", outcome: "exhausted", settledAt };
+  }
+  const [issue] = issueId
+    ? await tx.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+    : [];
+  if (issue?.executionRunId && issue.executionRunId !== runId) {
+    return { ...intent, state: "superseded", outcome: "lock_holder", supersededByRunId: issue.executionRunId, settledAt };
+  }
+  // Held by an admission gate (Stop, unknown effects, a successor, an execution
+  // blocker, a disabled surface): still owed, revisited by the restart sweep.
+  return { ...intent, state: "pending", heldAt: settledAt, heldReason: outcome.kind };
 }

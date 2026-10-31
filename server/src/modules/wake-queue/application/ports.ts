@@ -16,6 +16,11 @@ export type LockedIssueExecution = {
   recoveryOnly?: boolean;
   primaryIssue: IssueSnapshot;
   run: RunSnapshot;
+  /**
+   * Consuming a claim-gate drain intent: drain only the deferred wakes that
+   * existed when the cancellation committed, never later or unrelated work.
+   */
+  drainOnlyWakeIds?: string[];
 };
 
 export type ReleaseTransactionResult = {
@@ -110,7 +115,13 @@ export type PromoteDeferredWakeInput = {
  */
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
-  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
+  findNextDeferredWake(input: {
+    companyId: string;
+    issueId: string;
+    excludedWakeIds?: string[];
+    /** When present, only these wakes are eligible. */
+    onlyWakeIds?: string[];
+  }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     issueId: string;
