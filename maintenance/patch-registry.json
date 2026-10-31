@@ -309,18 +309,25 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe. The bwrap broker test only runs with PAPERCLIP_TEST_BWRAP and is not a required discriminator.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe. The bwrap broker test only runs with PAPERCLIP_TEST_BWRAP and is not a required discriminator. github-launcher-sandbox.test.ts calls the fork-only localGitHubLauncherSandboxPaths helper, so upstream cannot run it; its behaviours are ported to the Codex execute() boundary in maintenance/upgrade/ports/github-launcher-run-scope/PORT.md. The Claude adapter's launcher mount has no evidence file and stays a combined-candidate item.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
-          "packages/adapter-utils/src/github-launcher-sandbox.test.ts",
           "packages/adapters/codex-local/src/server/execute.test.ts"
         ],
         "requiredTests": [
-          "does not mount arbitrary configured directories or another run",
-          "rejects a symlink instead of mounting a different host directory",
-          "returns only the canonical run-scoped launcher directory",
-          "passes this run's managed GitHub launchers into the local sandbox"
+          "does not mount an arbitrary configured launcher directory through execute()",
+          "does not mount another run's launcher directory through execute()",
+          "never mounts a symlinked own-run launcher directory or its target through execute()",
+          "mounts this run's canonical launcher directory read-write through execute()",
+          "passes this run's managed GitHub launchers into the local sandbox",
+          "keeps this run's GitHub broker capability name in Codex shells without its value in argv"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/github-launcher-run-scope/execute.test.ts",
+            "target": "packages/adapters/codex-local/src/server/execute.test.ts"
+          }
         ]
       }
     },
@@ -343,12 +350,22 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe. Every test in both files is evidence.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe. Every test in both files is evidence. The originals call the fork-only latest-turn tracker directly; the ports run the same scripted provider output as real child processes through execute(); see maintenance/upgrade/ports/claude-terminal-cleanup/PORT.md.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
           "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
           "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/claude-terminal-cleanup/execute.terminal-cleanup.test.ts",
+            "target": "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts"
+          },
+          {
+            "port": "maintenance/upgrade/ports/claude-terminal-cleanup/parse.terminal-cleanup.test.ts",
+            "target": "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+          }
         ]
       }
     },
@@ -373,7 +390,7 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe. pending-agent-interaction.ts and its unit test are fork-only (absent upstream), so that test cannot load there and is not an upstream-only discriminator. Upstream policy.ts is byte-identical to stable; upstream postgres.ts and issue-thread-interactions.ts changed. b2385913 changes only documentation: the shipped skills/paperclip/references/api-reference.md carries the stage-handoff guidance (doc/ is not packaged); upstream's api-reference.md changed and must be re-merged, not replaced. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe. pending-agent-interaction.ts and its unit test are fork-only (absent upstream), so that test cannot load there and is not an upstream-only discriminator. Upstream policy.ts is byte-identical to stable; upstream postgres.ts and issue-thread-interactions.ts changed. b2385913 changes only documentation: the shipped skills/paperclip/references/api-reference.md carries the stage-handoff guidance (doc/ is not packaged); upstream's api-reference.md changed and must be re-merged, not replaced. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. The two concurrency regressions paused inside a vi.mock of the fork-only helper, which upstream never reaches, so they timed out; the port pauses the real gate with test-held Postgres row locks and bounded waits instead; see maintenance/upgrade/ports/native-handoff-admission/PORT.md. Run with --isolation private-network-user.",
       "upstreamOnly": {
         "kind": "vitest",
         "testFiles": [
@@ -390,6 +407,12 @@
           "orders stale-target expiry issue-first against final invitation dispatch",
           "revalidates recipient changes and issue-scoped provenance instead of trusting wake flags",
           "revalidates the pending invitation during scheduled retry admission"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/native-handoff-admission/postgres.test.ts",
+            "target": "server/src/modules/run-dispatch/adapters/postgres.test.ts"
+          }
         ]
       }
     },
