@@ -440,14 +440,16 @@
     },
     {
       "id": "native-task-bound-continuation",
-      "purpose": "Give a reopened task a normal task-bound stage: wake the same assignee on a closed -> in_progress reopen, never treat a previous stage run that recorded Done/In Review/Blocked as an undisposed run, and never let a summary written before the current stage park it, reading every summary representation from one identified revision so its writer's own status write cannot unpark it.",
+      "purpose": "Give a reopened task a normal task-bound stage: wake the same assignee on a closed -> in_progress reopen, never treat a previous stage run that recorded Done/In Review/Blocked as an undisposed run, and never let a summary written before the current stage park it, reading every summary representation from one identified revision so its writer's own status write cannot unpark it; and keep an addressed Coordinator wake from being stranded: re-drain the deferred queue after a dispatch-gate cancellation, retire a deferred addressed-card wake whose invitation left pending, and report that cancellation as interaction_no_longer_pending instead of a reassignment.",
       "sourceCommits": [
         "53373965bfe5a24c8cc461bb775d6e7a464edaf3",
-        "6e5f6590ea42c5e261a06237b468f1b7f4469ba6"
+        "6e5f6590ea42c5e261a06237b468f1b7f4469ba6",
+        "37b2bf5b68b3bd1525d2031b532488ebb425a394"
       ],
       "evidencePaths": [
         "server/src/__tests__/native-task-bound-continuation.test.ts",
-        "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
+        "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts",
+        "server/src/__tests__/native-addressed-wake-drain.test.ts"
       ],
       "decision": "unassessed",
       "retirementRequires": [
@@ -455,13 +457,14 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Carried on maintenance/guarded-upgrade-setup, not on the repair line fix/network-proxy-child-stdio; 53373965 and its R7 follow-up 6e5f6590 are self-contained server commits (code plus regressions), selected together onto the repair line for a later qualified installation. Reproduced from STA-22 round 8 native records: comment cd8268d7 landed on a Done task, a separate PATCH reopened it done -> in_progress with no wake, and the stranded sweep dispatched issue_disposition_repair run 9dab77f6 against previous-stage run 0bf7baf2 (recovery action 774502e5). Stage boundaries come from structured issue.updated audit rows (run_id, details.status, details.changes.status or details._previous.status), not summary prose. The route regression runs from a port of upstream's own harness file; see maintenance/upgrade/ports/native-task-bound-continuation/PORT.md. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. Run with --isolation private-network-user. R7 (STA-22 round 9): queued summary snapshots now name their revision, and live and queued summaries share one predicate that takes body, time and writer from that revision; missing or invalid provenance keeps the park.",
+      "notes": "Carried on maintenance/guarded-upgrade-setup, not on the repair line fix/network-proxy-child-stdio; 53373965 and its R7 follow-up 6e5f6590 are self-contained server commits (code plus regressions), selected together onto the repair line for a later qualified installation. Reproduced from STA-22 round 8 native records: comment cd8268d7 landed on a Done task, a separate PATCH reopened it done -> in_progress with no wake, and the stranded sweep dispatched issue_disposition_repair run 9dab77f6 against previous-stage run 0bf7baf2 (recovery action 774502e5). Stage boundaries come from structured issue.updated audit rows (run_id, details.status, details.changes.status or details._previous.status), not summary prose. The route regression runs from a port of upstream's own harness file; see maintenance/upgrade/ports/native-task-bound-continuation/PORT.md. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. Run with --isolation private-network-user. R7 (STA-22 round 9): queued summary snapshots now name their revision, and live and queued summaries share one predicate that takes body, time and writer from that revision; missing or invalid provenance keeps the park. Stage 9 (FAC-760 STA-43, founder 3b8f05fe; card eb807dc7): 37b2bf5b re-drains the deferred queue in a drain-only mode when the claim gate cancels a run (no recovery, no blocked projection, no legacy hold when that run row never started), retires a deferred interaction_pending wake whose invitation is no longer pending, and cancels such a run as interaction_no_longer_pending. The Postgres file drives the real wake-queue release and the real heartbeat claimQueuedRun gate; it needs embedded Postgres.",
       "upstreamOnly": {
         "kind": "vitest",
-        "sourceSha": "6e5f6590ea42c5e261a06237b468f1b7f4469ba6",
+        "sourceSha": "37b2bf5b68b3bd1525d2031b532488ebb425a394",
         "testFiles": [
           "server/src/__tests__/native-task-bound-continuation.test.ts",
-          "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
+          "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts",
+          "server/src/__tests__/native-addressed-wake-drain.test.ts"
         ],
         "requiredTests": [
           "wakes the same assignee when another actor reopens done work directly to in_progress",
@@ -476,7 +479,14 @@
           "does not let a queued previous-stage summary snapshot park the fresh assignment",
           "does not carry a generated status-specific next action (Wait for reviewer feedback or approval before continuing executor work.) into a different status",
           "does not carry a generated status-specific next action (Review the completed issue output and close any remaining follow-up comments.) into a different status",
-          "continuation summary provenance (R7)"
+          "continuation summary provenance (R7)",
+          "claims the live card's addressee run when the earlier card was",
+          "retires a stale card's deferred wake at the release so it never spends the promotion",
+          "claims the live card after two stale cards (three-card sequence)",
+          "claims the live card when the releasing Engineer run failed before provider work",
+          "re-drains after the gate cancels the stale card's run, so the live card's addressee is claimed",
+          "cancels the stale card's run with a typed reason and no new-owner claim",
+          "keeps the live card claimable across a restart between the gate cancellation and the claim"
         ],
         "ports": [
           {
