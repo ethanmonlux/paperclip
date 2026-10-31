@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { evaluateAdmission } from "./lib/admission.mjs";
 import { loadRegistry, validateRegistry } from "./lib/registry.mjs";
-import { evaluateUpstreamOnly } from "./lib/upstream-only.mjs";
+import { evaluateUpstreamOnly, receiptDigest } from "./lib/upstream-only.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const defaultRegistry = path.join(repoRoot, "maintenance", "patch-registry.json");
@@ -59,8 +59,10 @@ function main(argv) {
         workDir: path.join(outDir, "work"),
         installArgv: values.install ? values.install.split(" ").filter(Boolean) : null,
       });
-      writeFileSync(path.join(outDir, `${patch.id}.receipt.json`), `${JSON.stringify(receipt, null, 2)}\n`);
-      console.log(`${patch.id}: ${receipt.outcome}${receipt.reasons.length ? ` (${receipt.reasons.join(", ")})` : ""}`);
+      // One file per attempt; an earlier receipt is never overwritten.
+      writeFileSync(path.join(outDir, `${patch.id}-${receipt.attemptId}.receipt.json`), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx" });
+      const reasons = receipt.reasons.length ? ` (${receipt.reasons.join(", ")})` : "";
+      console.log(`${patch.id}: ${receipt.outcome}${reasons} receipt=${receiptDigest(receipt)} report=${receipt.report?.sha256 ?? "none"}`);
       return receipt;
     });
     return receipts.every((receipt) => receipt.outcome !== "unknown") ? 0 : 2;

@@ -22,8 +22,15 @@ PASS requires actual upstream-only patch tests, independent patch decisions, exa
 
 ## Implementation status (STA-21)
 Tooling lives in `maintenance/upgrade/` and runs with plain Node, no install: `node maintenance/upgrade/cli.mjs validate | upstream-only --out DIR | admission --evidence FILE`. Tests: `node --test maintenance/upgrade/__tests__/*.test.mjs`.
-- Steps 1-2: each registry patch declares an `upstreamOnly` spec. The harness checks out the exact upstream SHA in a temporary worktree, overlays only the fork's test files, proves nothing else differs, runs Vitest with a minimal environment and classifies strictly. Receipts never set a decision. Three patches are `manual-review` (test-harness isolation, fixture portability, CI pin).
-- Steps 3-5: `admission` fails closed unless every patch has an independently reviewed decision (retire needs a cited upstream-only pass), exact-head CI is complete and green, an isolated migration applied and the previous payload is schema-compatible, and isolated install/boot/assets/continuation/restart recovery are proved.
+- Steps 1-2: each registry patch declares an `upstreamOnly` spec. The harness checks out the exact upstream SHA in a temporary worktree, overlays only the fork's test files, proves nothing else differs, runs Vitest with a minimal environment and classifies strictly. Every attempt runs in its own fresh directory (worktree and report), so a runner that writes no report is `unknown` and can never inherit an earlier attempt's pass. Receipts (schema v2) record the attempt ID, upstream tree, the fork test blobs and the report hash; reviews cite a receipt by its canonical digest. Receipts never set a decision. Three patches are `manual-review` (test-harness isolation, fixture portability, CI pin).
+- Steps 3-5: `admission` fails closed unless:
+  - the evidence names the candidate head, its upstream, the authority and a non-empty implementer list;
+  - every patch decision has a clean, independent review of that exact head, upstream and authority, citing the upstream-only receipt for the registry's fork source (retire needs that receipt to be an upstream-only pass);
+  - a separate clean, independent review covers the combined candidate head and the exact registry state (by digest);
+  - every check run on the exact head, across all workflows and fully paged, completed with success, including the registry's reviewed `requiredCiJobs`. There are no exemptions; pending checks are unknown;
+  - an isolated migration applied and the previous payload is schema-compatible, and isolated install/boot/assets/continuation/restart recovery are proved.
+
+  A review of any other head is stale, so every candidate change needs fresh review. Any non-clean or verdict-less current review blocks.
 - Step 6: the barrier client holds the existing authenticated, owner-scoped `/api/instance/task-drain` (idle purpose answers 503 to all non-control ingress and suppresses scheduling), requires consecutive quiet reads with a positive persisted-work inventory, runs activation, and always releases its own drain. Health must be the authenticated view (serverVersion, serverInfo, startupRecovery ready) at the exact commit. `paperclipai update` now verifies git payload restarts by exact commit, since anonymous health on authenticated deployments carries `commit` but no version.
 
 A failed evidence test counts as `upstream-fails` only when every failure is an assertion; missing exports, type errors and timeouts are `unknown`. Install steps get the egress proxy and private caches; tests get neither. The barrier client uses a direct agent so environment proxies never carry the instance credential.
@@ -46,8 +53,9 @@ Upstream-only run against `8595efc2` (harness at `04d73211`, `--install` mirrori
 These are receipts, not decisions. `upstream-passes` supports retirement only with an independent review.
 
 Remaining gates, none satisfied yet:
+- Declare `requiredCiJobs` for the combined candidate in the reviewed registry; until then the CI gate stays unknown. The pinned trusted CI does not yet run the `maintenance/upgrade` Node suite, so green CI is not toolkit verification. The inherited `commitperclip PR Review` failure (missing `COMMITPERCLIP_KEY`) is a failed check and blocks admission.
 - Independent keep/adapt/retire review per patch. `unknown` patches need an adapted upstream test or direct review before any decision.
 - Build the combined candidate from those decisions and run exact-head CI. No combined candidate exists yet.
-- Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility evidence.
+- Isolated migration on a private database copy (89 SQL migration paths) and rollback compatibility.
 - Server: the only persisted-work inventory today is `idleSleepSafety`, which treats any open issue, routine or API key as work, so a real instance will not pass it. A narrower upgrade inventory (in-flight runs, wakes, leases, effects, recovery obligations) is needed. Task drain is in memory, so it does not hold across the restart into the new payload.
 - Wire the barrier and admission into the native update path, prove one controlled upgrade and recovery, and only then add a recurring native invocation. `automaticActivationEnabled` stays false.

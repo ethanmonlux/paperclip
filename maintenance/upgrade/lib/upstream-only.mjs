@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { canonicalDigest, sha256 } from "./digest.mjs";
 import { classifyVitestReport } from "./vitest-report.mjs";
 
-export const RECEIPT_SCHEMA = "staple.upgrade.upstream-only.v1";
+export const RECEIPT_SCHEMA = "staple.upgrade.upstream-only.v2";
 const SHA = /^[0-9a-f]{40}$/;
 const TEST_FILE = /\.test\.(?:ts|tsx|mts|js|mjs)$/;
 // Tests get a fixed, minimal environment: no host credentials or tokens.
@@ -30,7 +31,8 @@ function blob(repo, sha, file) {
   return result.status === 0 ? result.stdout : null;
 }
 
-const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex");
+/** The identity a review cites; any change to a retained receipt changes it. */
+export const receiptDigest = (receipt) => canonicalDigest(receipt);
 
 export function minimalEnv(source = process.env) {
   const env = { CI: "1" };
@@ -99,8 +101,10 @@ export function evaluateUpstreamOnly({
   const sourceSha = spec?.sourceSha ?? forkSha;
   const receipt = {
     schema: RECEIPT_SCHEMA,
+    attemptId: randomUUID(),
     patchId: patch.id,
     upstreamSha,
+    upstreamTree: null,
     forkSourceSha: sourceSha,
     startedAt: now().toISOString(),
     nodeVersion: process.version,
@@ -123,6 +127,7 @@ export function evaluateUpstreamOnly({
     }
   }
   if (receipt.reasons.length > 0) return finish();
+  receipt.upstreamTree = git(repo, ["rev-parse", `${upstreamSha}^{tree}`]).trim();
 
   const overlay = [];
   for (const file of spec.testFiles) {
@@ -133,13 +138,23 @@ export function evaluateUpstreamOnly({
     if (content === null) { receipt.reasons.push(`fork-test-missing:${file}`); continue; }
     const upstream = blob(repo, upstreamSha, file);
     overlay.push({ file, content });
-    receipt.overlay.push({ file, forkSha256: sha256(content), upstreamSha256: upstream ? sha256(upstream) : null });
+    receipt.overlay.push({
+      file,
+      forkBlob: git(repo, ["rev-parse", `${sourceSha}:${file}`]).trim(),
+      forkSha256: sha256(content),
+      upstreamSha256: upstream ? sha256(upstream) : null,
+    });
   }
   if (receipt.reasons.length > 0) return finish();
 
+  // Every attempt gets its own fresh directory for the worktree and the report,
+  // so output from an earlier attempt can never be read as this attempt's
+  // result. The report and the receipt stay there after the worktree is removed.
   mkdirSync(workDir, { recursive: true });
-  const tree = path.join(workDir, `upstream-${patch.id}`);
-  if (existsSync(tree)) throw new Error(`Refusing to reuse existing worktree path ${tree}`);
+  const attemptDir = mkdtempSync(path.join(workDir, `attempt-${patch.id}-`));
+  receipt.attemptDir = attemptDir;
+  const tree = path.join(attemptDir, "upstream");
+  const reportPath = path.join(attemptDir, "report.json");
   git(repo, ["worktree", "add", "--detach", tree, upstreamSha]);
   try {
     const head = git(tree, ["rev-parse", "HEAD"]).trim();
@@ -162,11 +177,12 @@ export function evaluateUpstreamOnly({
         return finish();
       }
     }
-    const reportPath = path.join(workDir, `report-${patch.id}.json`);
+    if (existsSync(reportPath)) throw new Error(`Report ${reportPath} exists before the test run`);
     receipt.test = run(expand(testArgv, { report: reportPath, testFiles: spec.testFiles }), tree, timeoutMs, env);
     if (receipt.test.spawnError) receipt.reasons.push(`runner-spawn-failed:${receipt.test.spawnError}`);
+    const reportBytes = existsSync(reportPath) ? readFileSync(reportPath) : null;
     let report = null;
-    try { report = JSON.parse(readFileSync(reportPath, "utf8")); } catch { report = null; }
+    try { report = reportBytes ? JSON.parse(reportBytes.toString("utf8")) : null; } catch { report = null; }
     const classified = classifyVitestReport({
       report,
       exitCode: receipt.test.timedOut ? null : receipt.test.exitCode,
@@ -174,7 +190,7 @@ export function evaluateUpstreamOnly({
       testFiles: spec.testFiles,
       requiredTests: spec.requiredTests ?? [],
     });
-    receipt.report = report ? { path: reportPath, sha256: sha256(readFileSync(reportPath)), counts: classified.counts } : null;
+    receipt.report = report ? { path: reportPath, sha256: sha256(reportBytes), bytes: reportBytes.length, counts: classified.counts } : null;
     receipt.outcome = receipt.test.timedOut || receipt.test.signal ? "unknown" : classified.outcome;
     receipt.reasons.push(...classified.reasons);
     if (receipt.test.timedOut) receipt.reasons.push("timed-out");

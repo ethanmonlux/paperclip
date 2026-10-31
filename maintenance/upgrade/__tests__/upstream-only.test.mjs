@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { evaluateUpstreamOnly, installEnv, minimalEnv } from "../lib/upstream-only.mjs";
+import { evaluateUpstreamOnly, installEnv, minimalEnv, receiptDigest } from "../lib/upstream-only.mjs";
 
 // Hermetic identity: hosts may export empty GIT_AUTHOR_* variables.
 const identity = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
@@ -65,10 +65,12 @@ test("runs the fork's test against upstream source without the patch source", ()
     assert.equal(receipt.upstreamSha, f.upstream);
     assert.equal(receipt.forkSourceSha, f.fork);
     assert.deepEqual(receipt.overlayChangedFiles, ["src/impl.test.ts"]);
-    const observed = JSON.parse(readFileSync(path.join(f.dir, "work", "upstream-p1", "observed.json"), "utf8"));
+    const observed = JSON.parse(readFileSync(path.join(receipt.attemptDir, "upstream", "observed.json"), "utf8"));
     assert.equal(observed.source, "upstream rewrite\n", "patch source must not be copied");
     assert.equal(observed.test, "fork regression test\n");
     assert.match(receipt.overlay[0].forkSha256, /^[0-9a-f]{64}$/);
+    assert.equal(receipt.overlay[0].forkBlob, git(f.repo, "rev-parse", `${f.fork}:src/impl.test.ts`));
+    assert.equal(receipt.upstreamTree, git(f.repo, "rev-parse", `${f.upstream}^{tree}`));
   } finally { f.cleanup(); }
 });
 
@@ -86,8 +88,8 @@ test("runs tests with a minimal allowlisted environment, not host credentials", 
   const f = fixture(true);
   process.env.UPSTREAM_ONLY_TEST_SECRET_TOKEN = "must-not-leak";
   try {
-    f.run();
-    const observed = JSON.parse(readFileSync(path.join(f.dir, "work", "upstream-p1", "observed.json"), "utf8"));
+    const receipt = f.run();
+    const observed = JSON.parse(readFileSync(path.join(receipt.attemptDir, "upstream", "observed.json"), "utf8"));
     assert.ok(!observed.envKeys.includes("UPSTREAM_ONLY_TEST_SECRET_TOKEN"));
     assert.ok(!observed.envKeys.includes("PAPERCLIP_API_KEY"));
     assert.ok(observed.envKeys.includes("CI"));
@@ -111,7 +113,7 @@ test("install gets proxy and cache settings but never credentials; tests do not"
       env: { CI: "1", PATH: process.env.PATH },
     });
     assert.equal(receipt.outcome, "upstream-passes");
-    const work = path.join(f.dir, "work", "upstream-p1");
+    const work = path.join(receipt.attemptDir, "upstream");
     assert.ok(JSON.parse(readFileSync(path.join(work, "install-env.json"), "utf8")).includes("HTTPS_PROXY"));
     assert.ok(!JSON.parse(readFileSync(path.join(work, "observed.json"), "utf8")).envKeys.includes("HTTPS_PROXY"));
   } finally { f.cleanup(); }
@@ -130,6 +132,44 @@ test("missing fork tests, unavailable commits, failed installs and missing runne
     assert.equal(noRunner.outcome, "unknown");
     assert.equal(noRunner.test.spawnError, "ENOENT");
     assert.deepEqual(noRunner.reasons, ["runner-spawn-failed:ENOENT", "report-missing-or-malformed"]);
+  } finally { f.cleanup(); }
+});
+
+test("a later attempt that writes no report is unknown, never an earlier attempt's pass", () => {
+  const f = fixture(true);
+  try {
+    const first = f.run({ keepWorktree: false });
+    assert.equal(first.outcome, "upstream-passes");
+    assert.ok(existsSync(first.report.path), "the first attempt's report is retained");
+    // Same patch, same output directory; the runner exits 0 without a report.
+    const second = f.run({ keepWorktree: false, testArgv: [process.execPath, "-e", "process.exit(0)"] });
+    assert.equal(second.outcome, "unknown");
+    assert.deepEqual(second.reasons, ["report-missing-or-malformed"]);
+    assert.equal(second.report, null);
+    assert.notEqual(second.attemptId, first.attemptId);
+    assert.notEqual(second.attemptDir, first.attemptDir);
+    assert.notEqual(receiptDigest(second), receiptDigest(first));
+    assert.equal(git(f.repo, "worktree", "list").split("\n").length, 1, "worktrees are removed");
+  } finally { f.cleanup(); }
+});
+
+test("a report naming another attempt's worktree does not count", () => {
+  const f = fixture(true);
+  try {
+    const first = f.run({ keepWorktree: false });
+    // The runner copies the first attempt's passing report into this attempt's slot.
+    const copy = `require("node:fs").copyFileSync(${JSON.stringify(first.report.path)}, process.argv[1])`;
+    const second = f.run({ keepWorktree: false, testArgv: [process.execPath, "-e", copy, "{report}"] });
+    assert.equal(second.outcome, "unknown");
+  } finally { f.cleanup(); }
+});
+
+test("receipt digests are stable across a JSON round trip and change with content", () => {
+  const f = fixture(false);
+  try {
+    const receipt = f.run({ keepWorktree: false });
+    assert.equal(receiptDigest(JSON.parse(JSON.stringify(receipt, null, 2))), receiptDigest(receipt));
+    assert.notEqual(receiptDigest({ ...receipt, outcome: "upstream-passes" }), receiptDigest(receipt));
   } finally { f.cleanup(); }
 });
 

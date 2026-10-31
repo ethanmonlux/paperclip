@@ -19,6 +19,10 @@ export function validateRegistry(registry) {
   if (registry.automaticActivationEnabled !== false && !registry.controlledUpgradeProof) {
     fail("automaticActivationEnabled must stay false until a controlled upgrade proof is recorded");
   }
+  if (registry.requiredCiJobs !== undefined && (!Array.isArray(registry.requiredCiJobs) || registry.requiredCiJobs.length === 0
+    || registry.requiredCiJobs.some((name) => typeof name !== "string" || !name))) {
+    fail("requiredCiJobs must be a non-empty array of check names");
+  }
   if (!Array.isArray(registry.patches) || registry.patches.length === 0) {
     fail("patches must be a non-empty array");
     return errors;
