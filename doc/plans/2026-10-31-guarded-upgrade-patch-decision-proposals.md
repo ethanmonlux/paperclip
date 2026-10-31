@@ -9,7 +9,10 @@ Inputs:
 - Upstream candidate `8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57` (tree `772753c6`).
 - Fork source: live PR #10 head and PR #11 base `b2385913e0f2048af05a3a60a0e4515528c7cb07`
   (stage 3 used `5305f21c`; the receipts below were re-run against `b2385913`).
-- Harness and ports at commit `113b51bf66110d83c22262b66ddc914a0c615a07`.
+- Harness and ports at commit `113b51bf66110d83c22262b66ddc914a0c615a07`. Stage 6 re-ran
+  `github-launcher-run-scope`, `claude-terminal-cleanup` and
+  `native-handoff-admission` through new observation-only ports at
+  `875e99abdbd395117a83973cf3d480cf321e57bc`; their rows cite those receipts.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -40,9 +43,9 @@ Meaning of the decisions:
 | portable-sandbox-denial | upstream-passes 1/1 (`4be8d10e`) | passes 1/1 | test identical to stable | **keep** (test-only, not retire) |
 | trusted-ci-baseline | unknown, manual (`eac37fea`) | n/a | `pr.yml` changed | **adapt** |
 | codex-shell-proxy-allowlist | **upstream-fails** 1/1 (`4b1d6975`) | passes 1/1 | `execute.ts` changed | **adapt** |
-| github-launcher-run-scope | unknown 4/4 non-assertion (`a31e7c0b`) | passes 4/4 | `execution-target.ts`/`execute.ts` changed; helper absent | **adapt** |
-| claude-terminal-cleanup | unknown 19/35 non-assertion (`aca9475c`) | passes 35/35 | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
-| native-handoff-admission | unknown: 7/9 fail, 5 assertions and 2 timeouts (`c1f0e898`) | passes 9/9 (file 121/121) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
+| github-launcher-run-scope | **upstream-fails** 2/6 (`9fd01346`), port `875e99ab` | passes 6/6 (`5e36f24f`) | `execution-target.ts`/`execute.ts` changed; helper absent | **adapt** |
+| claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
+| native-handoff-admission | **upstream-fails** 7/9 (`157ced83`), port `875e99ab` | passes 9/9, file 121/121 (`a86b41e7`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
@@ -75,21 +78,42 @@ upstream covers any of these behaviors.
     assertion, but upstream's own test file is unchanged from stable, so
     retiring the patch would restore the non-portable assertion.
   - Keep the fork's test version. Retirement is not proposed.
-- **github-launcher-run-scope / claude-terminal-cleanup.**
-  - Both receipts are `unknown` because the unit tests import helpers that
-    exist only in the fork (`localGitHubLauncherSandboxPaths` and the
-    latest-turn parser).
-  - In the same run, the Codex-level assertion "passes this run's managed
-    GitHub launchers into the local sandbox" fails on upstream.
-  - A reviewer should accept or reject the source evidence explicitly.
-    Admission still requires a cited receipt for each decision.
+- **github-launcher-run-scope** (stage 6, port `ports/github-launcher-run-scope/PORT.md`).
+  - Stage 5 was `unknown` because the helper tests import the fork-only
+    `localGitHubLauncherSandboxPaths`. The port observes the same behaviours
+    through the Codex adapter's real `execute()`.
+  - Upstream fails 2 of 6 required tests, both by assertion: it does not mount
+    this run's canonical launcher directory, and does not pass the managed
+    launchers into the sandbox.
+  - The three denial tests (arbitrary directory, another run, symlink) pass
+    upstream only because upstream mounts no launcher directory at all. They
+    do not show that upstream enforces run scope.
+  - The Claude adapter's launcher mount still has no evidence file; it stays
+    a combined-candidate item.
+- **claude-terminal-cleanup** (stage 6, ports `ports/claude-terminal-cleanup/PORT.md`).
+  - Stage 5 was `unknown` because the tests call the fork-only latest-turn
+    tracker. The ports run the same scripted provider output as real child
+    processes through `execute()`.
+  - Upstream fails 19 of 35, all by assertion: lingering processes after a
+    terminal result are not finalized as success, stale results are not
+    cancelled, and the cleanup disposition is not recorded. The 16 upstream
+    passes are the unchanged mocked-process tests.
+  - One capture-internal assertion was dropped from the port because
+    `execute()` does not expose it; see PORT.md.
 - **native-handoff-admission.**
   - Upstream fails 5 of the 9 required tests with assertions: the policy
     still reports the addressed participant's wake as stale, the Postgres
     adapter cancels the persisted handoff and denies the pending-invitation
-    retry. The other two required failures are 15 s timeouts in the
-    concurrent cancellation and stale-expiry ordering tests, so the strict
-    classifier reports `unknown`, not `upstream-fails`.
+    retry. In stage 5 the other two required failures were 15 s timeouts,
+    because they paused inside a mock of the fork-only helper. The stage 6
+    port (`ports/native-handoff-admission/PORT.md`) pauses the real gate
+    with test-held Postgres row locks instead. Upstream now fails all 7 by
+    assertion: no lock wait on the invitation row during cancellation, and
+    `update "issues"` instead of an issue-first `select` lock in the
+    expiry ordering. The receipt is `upstream-fails` (`157ced83`).
+  - The port's own mutation check (each fix reverted in a scratch tree of
+    `b2385913`, only the matching test fails) ran in stage 6's first
+    sandbox, whose receipts were lost. It has not been re-run.
   - Three tests outside the required set fail only upstream, on a
     `budget_reservations ... for update` query. They pass in the fork control
     and do not decide the outcome.

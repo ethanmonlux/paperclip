@@ -80,8 +80,17 @@ Stage 5 (repair base `b2385913`, harness `113b51bf`):
   - `ci / e2e` failed as the aggregate of that shard.
   - `ci / verify` does not need the e2e lanes, so it passed. Admission still fails, because every lane must succeed.
 
+Stage 6 (ports `875e99ab`, card `4206f0e6`):
+
+- **Ports.** STA-22 round 6 left `github-launcher-run-scope`, `claude-terminal-cleanup` and `native-handoff-admission` `unknown`: their originals call fork-only helpers or pause inside a mock of one. Observation-only ports in `maintenance/upgrade/ports/<group>/` now observe the same behaviours through boundaries upstream and the fork share (Codex and Claude `execute()`, real Postgres row locks). No production fix is imported, the configured timeouts are unchanged and the registry stays `unassessed`. Each `PORT.md` lists what changed and what is not covered.
+- **Receipts** (upstream `8595efc2`, control `b2385913`):
+  - `github-launcher-run-scope`: **upstream-fails**, 2 of 6 required by assertion (no canonical own-run mount). The three denial tests pass upstream only because upstream mounts no launcher directory. Control 6/6.
+  - `claude-terminal-cleanup`: **upstream-fails**, 19 of 35 by assertion. Control 35/35.
+  - `native-handoff-admission`: **upstream-fails**, 7 of 9 required by assertion, no timeouts. Control 9/9, file 121/121.
+- Proposals for all three stay **adapt**.
+
 Remaining gates, none satisfied yet:
-- Independent review of the fourteen proposed decisions, and of the three `unknown` receipts that rest on source evidence (`github-launcher-run-scope`, `claude-terminal-cleanup`, `native-handoff-admission`).
+- Independent review of the fourteen proposed decisions, including the stage-6 ports and receipts for `github-launcher-run-scope`, `claude-terminal-cleanup` and `native-handoff-admission`.
 - Owner action on the failing `review` check, and attribution of the e2e shard 1/8 announcements failure. Serialized shard 1/9 has passed since base commit `83f770b3`. After that, exact-head CI on the published head.
 - Independent review of the expected-lane graph and its reader (R4).
 - Build the combined candidate from accepted decisions: upstream `8595efc2` plus kept and adapted patches, with `pr.yml` re-pinned. Then its exact-head CI, package provenance and isolated install/boot/assets. No combined candidate exists yet.
