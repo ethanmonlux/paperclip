@@ -102,6 +102,12 @@ Stage 8 (fix `53373965`, registry `e6a86a4e`, port `cf1c70a6`, card `d5385c5f`, 
 - **Proof.** 12 new regressions fail on unmodified `b2385913` and pass with the fix; the negative controls pass on both. **Receipts** (upstream `8595efc2`, control `53373965`): **upstream-fails**, 12 of 12 required by assertion (`9b60e519`). Control passes 12/12, files 26/26 (`d9a5ed46`).
 - Not reproduced, not changed: the 404 loop on settled recovery actions, and success from an unbound heartbeat (the STA-38 case was a caller-supplied generic wake). The registry stays `unassessed`; the proposal is **adapt**.
 
+Stage 8, R7 follow-up (fix `6e5f6590`, registry `01050b56`, card `094fe52e`, STA-22 round 9 and its convergence checkpoint):
+
+- **Defect.** A queued summary snapshot had no writer identity, so the writer's own later status write unparked the executor; the adapter could also mix the two snapshot containers.
+- **Fix** (`fix(native-continuation):`, server only). Both snapshots name the exact revision they copied. One predicate serves the live document and both snapshots: body, time and writer come from that revision, validated against this issue's continuation summary. Unknown or invalid provenance keeps the park.
+- **Proof.** 26 new regressions fail by assertion on `e8bb1484` and pass with the fix. **Receipts** (upstream `8595efc2`, control `6e5f6590`): **upstream-fails**, 20 of 49 required by assertion (`21ff918f`). Control 49/49, files 63/63 (`1573b468`). The proposal stays **adapt**; the registry stays `unassessed`.
+
 Remaining gates, none satisfied yet:
 - Independent review of the fifteen proposed decisions, including the stage-8 `native-task-bound-continuation` fix, port and receipts, including the stage-6 ports and receipts for `github-launcher-run-scope` and `claude-terminal-cleanup`, and the stage-7 `native-handoff-admission` port and receipts (R6).
 - Owner action on the failing `review` check, and attribution of the e2e shard 1/8 announcements failure. Serialized shard 1/9 has passed since base commit `83f770b3`. After that, exact-head CI on the published head.

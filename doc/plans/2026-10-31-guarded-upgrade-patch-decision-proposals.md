@@ -17,7 +17,8 @@ Inputs:
   case added, ports at `8e8c2d36b424072ca464826c6f9ef804412966dd`; its row
   cites those receipts.
   Stage 8 added `native-task-bound-continuation` (fix `53373965`, port
-  `cf1c70a6`); its row cites those receipts, with control = the fix commit.
+  `cf1c70a6`); its R7 follow-up `6e5f6590` (registry `01050b56`) re-ran that
+  group. Its row cites the R7 receipts, with control = the fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -52,7 +53,7 @@ Meaning of the decisions:
 | claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
 | native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
-| native-task-bound-continuation | **upstream-fails** 12/12 (`9b60e519`), port `cf1c70a6` | passes 12/12, files 26/26 (`d9a5ed46`) | `legacy-continuation.ts`, `issue-continuation-summary.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts` changed; `issue-stage-boundary.ts` new | **adapt** |
+| native-task-bound-continuation | **upstream-fails**, 20 of 49 required by assertion (`21ff918f`), ports `01050b56` | passes 49/49, files 63/63 (`1573b468`) | `legacy-continuation.ts`, `issue-continuation-summary.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts` changed; `issue-stage-boundary.ts` new | **adapt** |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
 upstream covers any of these behaviors.
@@ -172,8 +173,24 @@ upstream covers any of these behaviors.
     server made it company-scoped and denied its task writes, which is the
     fail-closed outcome. Review Done waking the same Engineer works natively
     (`issue_children_completed` on STA-21) and has existing coverage.
-  - Carried on this branch as one self-contained server commit, so it can be
-    selected onto the repair line for a later qualified installation.
+  - **R7 (STA-22 round 9), fixed in `6e5f6590`.** A queued run's summary
+    snapshot (top-level or in the wake payload) carried only body and time,
+    so its writer was unknown and that writer's own later status write
+    unparked the executor; the adapter could also mix one container's body
+    with the other's time. Both producers now record `documentId` and
+    `revisionId`. The adapter reads one container, else the live document,
+    and one predicate takes body, time and writer from that revision of this
+    issue's continuation summary. Missing, malformed, foreign or mismatched
+    identity, or a revision with no writer run, keeps the park.
+  - R7 receipts: upstream fails 20 of 49 required, all by assertion. Its R7
+    failures are the other-actor positives, the queued-body substitution
+    and the three producers. Upstream passes the fail-closed R7 negatives
+    because it never unparks on a stage change at all. 26 R7 cases fail by
+    assertion on `e8bb1484` and pass with the fix. The stage-8 receipts
+    (`9b60e519`, `d9a5ed46`) stay as history.
+  - Carried on this branch as two self-contained server commits
+    (`53373965`, `6e5f6590`), to be selected together onto the repair line
+    for a later qualified installation.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
