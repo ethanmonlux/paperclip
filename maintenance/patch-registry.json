@@ -5,7 +5,9 @@
   "upstreamRepository": "paperclipai/paperclip",
   "upstreamRef": "master",
   "firstCandidateUpstreamSha": "8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57",
-  "forkPatchSourceSha": "315bc90f765e1ec1e202cd749a9bfbf0f5d96ac4",
+  "forkPatchSourceSha": "975bc8d75c767b391bab7035401295495f45a4eb",
+  "evidenceSourceSha": "d52bf38475d14257336ff206e5370bcd67eb6fe5",
+  "evidenceSourceNote": "d52bf384 is 315bc90f plus maintenance docs only (GitHub commit stats: 2 added doc files), so its test blobs equal 315bc90f. 975bc8d7 adds only the Codex shell-proxy patch; its evidence is fetched from that commit and is unknown until that object is available locally.",
   "automaticActivationEnabled": false,
   "patches": [
     {
@@ -17,6 +19,7 @@
         "448eebdbb27af81fd4fed54728d225e623297366"
       ],
       "evidencePaths": [
+        "packages/adapter-utils/src/local-process-proxy-stdio.test.ts",
         "packages/adapter-utils/src/local-process-sandbox.test.ts"
       ],
       "decision": "unassessed",
@@ -25,7 +28,19 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Merged-usr mount handling has no dedicated fork regression test (local-process-sandbox.test.ts is unchanged from stable); that part needs independent manual review.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapter-utils/src/local-process-proxy-stdio.test.ts"
+        ],
+        "requiredTests": [
+          "preserves large synchronous stdout/stderr despite a nonblocking bridge and slow consumer",
+          "retains stdin, argv, cwd, environment and nonzero provider exit",
+          "forwards cancellation and preserves signal termination",
+          "terminates after provider exit when destination writes cannot drain"
+        ]
+      }
     },
     {
       "id": "proxy-socket-error-owner",
@@ -34,7 +49,7 @@
         "f23e05aacc24cbe66d602adc3ccba6e7981060ec"
       ],
       "evidencePaths": [
-        "packages/adapter-utils/src/local-process-sandbox.test.ts"
+        "packages/adapter-utils/src/local-process-proxy-errors.test.ts"
       ],
       "decision": "unassessed",
       "retirementRequires": [
@@ -42,7 +57,16 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapter-utils/src/local-process-proxy-errors.test.ts"
+        ],
+        "requiredTests": [
+          "owns accepted proxy socket errors after CONNECT"
+        ]
+      }
     },
     {
       "id": "codex-auth-provenance",
@@ -59,7 +83,18 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/codex-local/src/server/parse.test.ts"
+        ],
+        "requiredTests": [
+          "does not invalidate credentials from historical auth text in a",
+          "ignores auth text inside a truncated JSONL tool result after a harness crash",
+          "retains genuine protocol authentication failures"
+        ]
+      }
     },
     {
       "id": "claude-auth-provenance",
@@ -79,7 +114,17 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. acp.auth.test.ts and test.remote.test.ts exercise the one-line acp.ts/test.ts caller changes and must be reviewed with the combined candidate; they are not upstream-only discriminators.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/claude-local/src/server/parse.test.ts"
+        ],
+        "requiredTests": [
+          "fixed Claude hello probe login instructions",
+          "Claude auth output provenance"
+        ]
+      }
     },
     {
       "id": "git-install-payload",
@@ -98,7 +143,18 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "cli/src/__tests__/install-command.test.ts"
+        ],
+        "requiredTests": [
+          "stages UI and native skills before preparing the bundled server package",
+          "keeps each dependency's own workspace version in the prepared server manifest",
+          "stamps the requested archive commit instead of stale env or an enclosing repository"
+        ]
+      }
     },
     {
       "id": "installer-test-isolation",
@@ -115,7 +171,11 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "Test-harness isolation fix with no behavior assertion to reproduce; prove upstream install tests never reach the real service manager in a sandboxed run."
+      }
     },
     {
       "id": "portable-runner-fixtures",
@@ -132,7 +192,11 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "node:test fixture portability change to an existing assertion; review upstream fixture independence directly."
+      }
     },
     {
       "id": "portable-sandbox-denial",
@@ -149,7 +213,16 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. The required test is skipped where the workspace command sandbox is unavailable; that yields unknown, never pass.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "server/src/services/native-runtime/runner-bridge-tools.test.ts"
+        ],
+        "requiredTests": [
+          "runs useful commands but denies files outside the workspace and injected credentials"
+        ]
+      }
     },
     {
       "id": "trusted-ci-baseline",
@@ -166,7 +239,38 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "CI workflow pin; an upstream candidate needs freshly reviewed equivalent gates, not a test run."
+      }
+    },
+    {
+      "id": "codex-shell-proxy-allowlist",
+      "purpose": "Keep the local sandbox allowlist proxy variables in identity-filtered Codex task shells without inheriting other host environment.",
+      "sourceCommits": [
+        "975bc8d75c767b391bab7035401295495f45a4eb"
+      ],
+      "evidencePaths": [
+        "packages/adapters/codex-local/src/server/execute.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "upstreamOnly": {
+        "kind": "vitest",
+        "sourceSha": "975bc8d75c767b391bab7035401295495f45a4eb",
+        "testFiles": [
+          "packages/adapters/codex-local/src/server/execute.test.ts"
+        ],
+        "requiredTests": [
+          "preserves the local allowlist bridge in identity-filtered Codex shells"
+        ]
+      },
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10 head 975bc8d7 per founder receipt; the 975bc8d7 commit object is not in this checkout yet."
     }
   ]
 }
