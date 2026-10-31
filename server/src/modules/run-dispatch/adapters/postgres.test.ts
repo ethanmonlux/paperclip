@@ -27,6 +27,19 @@ import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 
+// Pause only after the real invitation query; keep the production lock/read.
+const invitationBoundary = vi.hoisted(() => ({ afterRead: null as null | (() => Promise<void>) }));
+vi.mock("../../../services/pending-agent-interaction.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../services/pending-agent-interaction.js")>();
+  return { ...actual, pendingAgentInteractionAddressee: async (
+    ...args: Parameters<typeof actual.pendingAgentInteractionAddressee>
+  ) => {
+    const allowed = await actual.pendingAgentInteractionAddressee(...args);
+    await invitationBoundary.afterRead?.();
+    return allowed;
+  } };
+});
+
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
 // `domain/policy.test.ts` cover the gates' branching with hand-built facts;
@@ -53,6 +66,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }, 20_000);
 
   afterEach(async () => {
+    invitationBoundary.afterRead = null;
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(issueDocuments);
@@ -201,6 +215,48 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(dispatch).toHaveBeenCalledOnce();
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null });
+  });
+
+  it("serializes concurrent invitation cancellation with the final provider handoff", async () => {
+    const f = await seedAddressedHandoff("running");
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    let read!: () => void, release!: () => void, cancelPid!: (pid: number) => void;
+    const readDone = new Promise<void>(resolve => { read = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const pidReady = new Promise<number>(resolve => { cancelPid = resolve; });
+    const order: string[] = [];
+    invitationBoundary.afterRead = async () => { read(); await released; };
+    const dispatch = vi.fn(async () => { order.push("dispatch"); });
+    const gate = createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    await readDone;
+    const cancellation = db.transaction(async tx => {
+      const rows = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      cancelPid(rows[0]!.pid);
+      await tx.update(issueThreadInteractions).set({ status: "cancelled" })
+        .where(eq(issueThreadInteractions.id, f.interactionId));
+      order.push("revoked");
+    });
+    try {
+      const pid = await pidReady;
+      // Observe a real lock wait, rather than using a timing-only assertion.
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const rows = await db.execute<{ wait_event_type: string | null }>(
+          sql`select wait_event_type from pg_stat_activity where pid = ${pid}`);
+        if (rows[0]?.wait_event_type === "Lock") { waiting = true; break; }
+        if (order.includes("revoked")) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(waiting).toBe(true);
+      expect(order).toEqual([]);
+    } finally {
+      release();
+      await gate;
+      await cancellation;
+    }
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(order).toEqual(["dispatch", "revoked"]);
   });
 
   it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
