@@ -2224,6 +2224,8 @@ export async function buildPaperclipWakePayload(input: {
     key: string;
     title: string | null;
     body: string;
+    documentId?: string | null;
+    latestRevisionId?: string | null;
     sourceTrust?: SourceTrustMetadata | null;
     updatedAt: Date;
   } | null;
@@ -2787,6 +2789,8 @@ export async function buildPaperclipWakePayload(input: {
           bodyTruncated: safeContinuationSummary.body.length > 4_000,
           sourceTrust: safeContinuationSummary.sourceTrust ?? null,
           updatedAt: safeContinuationSummary.updatedAt.toISOString(),
+          documentId: safeContinuationSummary.documentId ?? null,
+          revisionId: safeContinuationSummary.latestRevisionId ?? null,
         }
       : null,
     commentIds,

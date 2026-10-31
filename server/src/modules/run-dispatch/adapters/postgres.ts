@@ -8,7 +8,6 @@ import {
   agentWakeupRequests,
   agents,
   connectionIntentDeliveries,
-  documentRevisions,
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
@@ -29,15 +28,15 @@ import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../..
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
-import { issueStatusChangedSince } from "../../../services/issue-stage-boundary.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
 } from "../../../services/issue-tree-control.js";
 import {
-  continuationSummaryParksExecutor,
+  continuationSummaryParksCurrentStage,
   getIssueContinuationSummaryDocument,
+  readQueuedContinuationSummary,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
@@ -126,12 +125,6 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
     participantAgentId: input.agentId, currentStageType: "native_completion_review",
     currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
   } : null;
-}
-
-function parseIsoDate(value: string | null): Date | null {
-  if (!value) return null;
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -565,35 +558,17 @@ export function createPostgresRunDispatchAdapter(
     let continuationSummaryBody: string | null = null;
     let continuationParksExecutor = false;
     if (continuationParkApplies) {
-      const queuedWake = parseObject(context.paperclipWake);
-      const queuedContinuationSummary =
-        readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
-        readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
-      continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
-      continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
-      // A summary describes the stage it was written in. A later status change
-      // by anyone but its writer opens a new stage the summary cannot park.
-      const summaryWrittenAt = queuedContinuationSummary
-        ? parseIsoDate(
-            readNonEmptyString(parseObject(context.paperclipContinuationSummary).updatedAt) ??
-              readNonEmptyString(parseObject(queuedWake.continuationSummary).updatedAt),
-          )
-        : currentContinuationSummary?.updatedAt ?? null;
-      if (continuationParksExecutor && summaryWrittenAt) {
-        const summaryRunId = currentContinuationSummary?.latestRevisionId
-          ? await dbOrTx
-              .select({ runId: documentRevisions.createdByRunId })
-              .from(documentRevisions)
-              .where(eq(documentRevisions.id, currentContinuationSummary.latestRevisionId))
-              .then((rows) => rows[0]?.runId ?? null)
-          : null;
-        if (await issueStatusChangedSince(dbOrTx, {
-          companyId: input.companyId, issueId, since: summaryWrittenAt, excludeRunId: summaryRunId,
-        })) continuationParksExecutor = false;
-      }
+      const queuedSummary = readQueuedContinuationSummary(context);
+      const liveSummary = queuedSummary ? null : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
+      const decision = await continuationSummaryParksCurrentStage(dbOrTx, {
+        companyId: input.companyId,
+        issueId,
+        summary: queuedSummary ?? (liveSummary
+          ? { body: liveSummary.body, documentId: liveSummary.documentId, revisionId: liveSummary.latestRevisionId }
+          : null),
+      });
+      continuationSummaryBody = decision.body;
+      continuationParksExecutor = decision.parks;
     }
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);

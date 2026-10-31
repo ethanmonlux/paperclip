@@ -194,6 +194,7 @@ describe("native task-bound continuation across stages", () => {
       await db.insert(documents).values({ id: documentId, companyId, title: "Continuation Summary", format: "markdown", latestBody: body, latestRevisionId: revisionId, latestRevisionNumber: 1, createdByAgentId: agentId, updatedByAgentId: agentId, updatedAt, createdAt: updatedAt });
       await db.insert(documentRevisions).values({ id: revisionId, companyId, documentId, revisionNumber: 1, title: "Continuation Summary", format: "markdown", body, createdByAgentId: agentId, createdByRunId, createdAt: updatedAt });
       await db.insert(issueDocuments).values({ companyId, issueId, documentId, key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY });
+      return { documentId, revisionId };
     }
     async function queueContinuation(companyId: string, agentId: string, issueId: string, extraContext: Record<string, unknown> = {}) {
       const id = randomUUID();
@@ -212,8 +213,10 @@ describe("native task-bound continuation across stages", () => {
 
     it("does not let a queued previous-stage summary snapshot park the fresh assignment", async () => {
       const f = await fixture({ recordedStatus: "in_review", reopenAfterRun: true });
+      // The snapshot names the exact summary revision it copied (R7).
+      const summary = await seedSummary(f.companyId, f.issueId, f.agentId, STALE_REVIEW_SUMMARY, at(f.t0, 1), f.runId);
       const runId = await queueContinuation(f.companyId, f.agentId, f.issueId, {
-        paperclipContinuationSummary: { body: STALE_REVIEW_SUMMARY, updatedAt: at(f.t0, 1).toISOString() },
+        paperclipContinuationSummary: { body: STALE_REVIEW_SUMMARY, updatedAt: at(f.t0, 1).toISOString(), ...summary },
       });
       expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId: f.companyId, expectedStatus: "queued", now: new Date() }))
         .toMatchObject({ outcome: "not_stale" });
@@ -243,6 +246,184 @@ describe("native task-bound continuation across stages", () => {
       const runId = await queueContinuation(f.companyId, f.agentId, f.issueId);
       expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId: f.companyId, expectedStatus: "queued", now: new Date() }))
         .toMatchObject({ outcome: "cancelled", errorCode: "issue_continuation_waiting_on_review" });
+    });
+  });
+
+  // FAC-760 STA-22 round 9, R7: a queued summary snapshot carried only
+  // body/updatedAt, so the writer of the summary was unknown on that path and
+  // the writer's own later status write unparked the executor. One summary
+  // revision must have the same writer and stage meaning wherever it is read.
+  describe("continuation summary provenance (R7)", () => {
+    type Representation = "live" | "top" | "nested";
+    const representations: Representation[] = ["live", "top", "nested"];
+    const queuedRepresentations: Representation[] = ["top", "nested"];
+    const PROBE_SUMMARY = STALE_REVIEW_SUMMARY;
+    const OWNER_SUMMARY = "# Continuation Summary\n\n## Next Action\n\n- Rerun the migration probe on the private copy.";
+
+    async function seedRevisions(companyId: string, issueId: string, agentId: string, revisions: Array<{ body: string; createdAt: Date; createdByRunId: string | null }>, key: string = ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY) {
+      const documentId = randomUUID();
+      const revisionIds = revisions.map(() => randomUUID());
+      const last = revisions[revisions.length - 1];
+      await db.insert(documents).values({ id: documentId, companyId, title: "Continuation Summary", format: "markdown", latestBody: last.body, latestRevisionId: revisionIds[revisionIds.length - 1], latestRevisionNumber: revisions.length, createdByAgentId: agentId, updatedByAgentId: agentId, updatedAt: last.createdAt, createdAt: revisions[0].createdAt });
+      await db.insert(documentRevisions).values(revisions.map((revision, index) => ({ id: revisionIds[index], companyId, documentId, revisionNumber: index + 1, title: "Continuation Summary", format: "markdown", body: revision.body, createdByAgentId: agentId, createdByRunId: revision.createdByRunId, createdAt: revision.createdAt })));
+      await db.insert(issueDocuments).values({ companyId, issueId, documentId, key });
+      return { documentId, revisionIds };
+    }
+    function snapshotContext(representation: Representation, snapshot: Record<string, unknown> | null): Record<string, unknown> {
+      if (representation === "live" || !snapshot) return {};
+      return representation === "top" ? { paperclipContinuationSummary: snapshot } : { paperclipWake: { reason: "issue_continuation_needed", continuationSummary: snapshot } };
+    }
+    async function statusWrite(f: Awaited<ReturnType<typeof fixture>>, input: { runId: string | null; actorId: string; createdAt: Date; changed?: boolean }) {
+      await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: input.actorId, agentId: input.actorId, runId: input.runId, action: "issue.updated", entityType: "issue", entityId: f.issueId,
+        details: input.changed === false ? { status: "in_progress" } : { status: "in_progress", changes: { status: { from: "todo", to: "in_progress" } } }, createdAt: input.createdAt });
+    }
+    async function outcome(f: Awaited<ReturnType<typeof fixture>>, extraContext: Record<string, unknown>) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", status: "queued", runtimeMode: "legacy",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed", ...extraContext } });
+      // A fresh adapter per dispatch: nothing is cached across a restart.
+      return createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ runId, companyId: f.companyId, expectedStatus: "queued", now: new Date() });
+    }
+    const PARKED = { outcome: "cancelled", errorCode: "issue_continuation_waiting_on_review" };
+    const ADMITTED = { outcome: "not_stale" };
+
+    async function summaryFixture() {
+      const f = await fixture({ recordedStatus: null, reopenAfterRun: false });
+      const writtenAt = at(f.t0, 1);
+      const { documentId, revisionIds } = await seedRevisions(f.companyId, f.issueId, f.agentId, [{ body: PROBE_SUMMARY, createdAt: writtenAt, createdByRunId: f.runId }]);
+      const snapshot = { key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, title: "Continuation Summary", body: PROBE_SUMMARY, sourceTrust: null, updatedAt: writtenAt.toISOString(), documentId, revisionId: revisionIds[0] };
+      return { f, writtenAt, documentId, revisionId: revisionIds[0], snapshot };
+    }
+
+    describe.each(representations)("%s summary", representation => {
+      it("stays parked when the summary's own run later changes the status (reviewer probe)", async () => {
+        const { f, writtenAt, snapshot } = await summaryFixture();
+        await statusWrite(f, { runId: f.runId, actorId: f.agentId, createdAt: at(writtenAt, 1) });
+        expect(await outcome(f, snapshotContext(representation, snapshot))).toMatchObject(PARKED);
+      });
+
+      it("admits the continuation when another actor opens a new stage after the summary", async () => {
+        const { f, writtenAt, snapshot } = await summaryFixture();
+        await statusWrite(f, { runId: null, actorId: f.coordinatorId, createdAt: at(writtenAt, 60) });
+        expect(await outcome(f, snapshotContext(representation, snapshot))).toMatchObject(ADMITTED);
+      });
+
+      it("stays parked when no status change followed the summary", async () => {
+        const { f, snapshot } = await summaryFixture();
+        expect(await outcome(f, snapshotContext(representation, snapshot))).toMatchObject(PARKED);
+      });
+
+      it("stays parked after another actor's PATCH that did not change the status", async () => {
+        const { f, writtenAt, snapshot } = await summaryFixture();
+        await statusWrite(f, { runId: null, actorId: f.coordinatorId, createdAt: at(writtenAt, 60), changed: false });
+        expect(await outcome(f, snapshotContext(representation, snapshot))).toMatchObject(PARKED);
+      });
+
+      it("keeps the writer of the snapshot's own revision after a later revision is written", async () => {
+        const f = await fixture({ recordedStatus: null, reopenAfterRun: false });
+        const laterRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: laterRunId, companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", status: "succeeded", runtimeMode: "legacy", contextSnapshot: { issueId: f.issueId } });
+        const { documentId, revisionIds } = await seedRevisions(f.companyId, f.issueId, f.agentId, [
+          { body: PROBE_SUMMARY, createdAt: at(f.t0, 1), createdByRunId: f.runId },
+          { body: PROBE_SUMMARY, createdAt: at(f.t0, 3), createdByRunId: laterRunId },
+        ]);
+        // The first revision's writer changes the status between the two revisions.
+        await statusWrite(f, { runId: f.runId, actorId: f.agentId, createdAt: at(f.t0, 2) });
+        const queued = { body: PROBE_SUMMARY, updatedAt: at(f.t0, 1).toISOString(), documentId, revisionId: revisionIds[0] };
+        expect(await outcome(f, snapshotContext(representation, queued))).toMatchObject(PARKED);
+      });
+    });
+
+    describe.each(queuedRepresentations)("queued %s snapshot", representation => {
+      it("stays parked when the snapshot names no summary revision", async () => {
+        const { f, writtenAt } = await summaryFixture();
+        await statusWrite(f, { runId: null, actorId: f.coordinatorId, createdAt: at(writtenAt, 60) });
+        const unidentified = { body: PROBE_SUMMARY, updatedAt: writtenAt.toISOString() };
+        expect(await outcome(f, snapshotContext(representation, unidentified))).toMatchObject(PARKED);
+      });
+
+      it("stays parked on the reviewer's exact probe: no identity and a status write by the summary's run", async () => {
+        const { f, writtenAt } = await summaryFixture();
+        await statusWrite(f, { runId: f.runId, actorId: f.agentId, createdAt: at(writtenAt, 1) });
+        expect(await outcome(f, snapshotContext(representation, { body: PROBE_SUMMARY, updatedAt: writtenAt.toISOString() }))).toMatchObject(PARKED);
+      });
+
+      it.each([
+        ["a revision of another issue's summary", "foreign-issue"],
+        ["a revision of another company's summary", "foreign-company"],
+        ["a revision of a different document on the same issue", "other-key"],
+        ["a revision that does not belong to the named document", "mismatched-document"],
+        ["a revision id that does not exist", "absent"],
+        ["identifiers that are not ids", "malformed"],
+      ])("stays parked when the snapshot names %s", async (_label, kind) => {
+        const { f, writtenAt, documentId, revisionId } = await summaryFixture();
+        await statusWrite(f, { runId: null, actorId: f.coordinatorId, createdAt: at(writtenAt, 60) });
+        let identity: { documentId: string; revisionId: string };
+        if (kind === "foreign-issue" || kind === "foreign-company") {
+          const other = kind === "foreign-issue" ? f : await fixture({ recordedStatus: null, reopenAfterRun: false });
+          const otherIssueId = randomUUID();
+          await db.insert(issues).values({ id: otherIssueId, companyId: other.companyId, title: "Other task", status: "in_progress", assigneeAgentId: other.agentId, responsibleUserId: "fixture-owner" });
+          const seeded = await seedRevisions(other.companyId, otherIssueId, other.agentId, [{ body: PROBE_SUMMARY, createdAt: writtenAt, createdByRunId: null }]);
+          identity = { documentId: seeded.documentId, revisionId: seeded.revisionIds[0] };
+        } else if (kind === "other-key") {
+          const seeded = await seedRevisions(f.companyId, f.issueId, f.agentId, [{ body: PROBE_SUMMARY, createdAt: writtenAt, createdByRunId: null }], "plan");
+          identity = { documentId: seeded.documentId, revisionId: seeded.revisionIds[0] };
+        } else if (kind === "mismatched-document") {
+          identity = { documentId: randomUUID(), revisionId };
+        } else if (kind === "absent") {
+          identity = { documentId, revisionId: randomUUID() };
+        } else {
+          identity = { documentId: "not-a-document", revisionId: "not-a-revision" };
+        }
+        expect(await outcome(f, snapshotContext(representation, { body: PROBE_SUMMARY, updatedAt: writtenAt.toISOString(), ...identity }))).toMatchObject(PARKED);
+      });
+
+      it("reads the park from the identified revision, not from the queued copy of its body", async () => {
+        const { f, writtenAt, snapshot } = await summaryFixture();
+        await statusWrite(f, { runId: f.runId, actorId: f.agentId, createdAt: at(writtenAt, 1) });
+        expect(await outcome(f, snapshotContext(representation, { ...snapshot, body: OWNER_SUMMARY }))).toMatchObject(PARKED);
+      });
+    });
+
+    it("never takes the timestamp or identity from the other queued container", async () => {
+      const { f, writtenAt, snapshot } = await summaryFixture();
+      await statusWrite(f, { runId: null, actorId: f.coordinatorId, createdAt: at(writtenAt, 60) });
+      // The top-level copy has no provenance; the nested one does. The top-level
+      // copy is the one read, so its missing provenance decides: stay parked.
+      expect(await outcome(f, {
+        paperclipContinuationSummary: { body: PROBE_SUMMARY },
+        paperclipWake: { reason: "issue_continuation_needed", continuationSummary: snapshot },
+      })).toMatchObject(PARKED);
+    });
+
+    describe("producers", () => {
+      it("returns the document identity with the live summary", async () => {
+        const { f, documentId, revisionId } = await summaryFixture();
+        const { getIssueContinuationSummaryDocument } = await import("../services/issue-continuation-summary.js");
+        expect(await getIssueContinuationSummaryDocument(db, f.issueId)).toMatchObject({ documentId, latestRevisionId: revisionId });
+      });
+
+      it("puts the exact revision identity in the run's top-level summary snapshot", async () => {
+        const summaryModule: Record<string, unknown> = await import("../services/issue-continuation-summary.js");
+        expect(summaryModule.continuationSummaryContextSnapshot).toBeTypeOf("function");
+        const build = summaryModule.continuationSummaryContextSnapshot as (summary: Record<string, unknown>) => Record<string, unknown>;
+        const updatedAt = new Date("2026-10-31T19:00:00.000Z");
+        expect(build({ key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, title: "Continuation Summary", body: PROBE_SUMMARY, documentId: "doc-1", latestRevisionId: "rev-1", latestRevisionNumber: 1, sourceTrust: null, updatedAt }))
+          .toEqual({ key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, title: "Continuation Summary", body: PROBE_SUMMARY, sourceTrust: null, updatedAt: updatedAt.toISOString(), documentId: "doc-1", revisionId: "rev-1" });
+      });
+
+      it("puts the exact revision identity in the wake payload's summary snapshot", async () => {
+        const { buildPaperclipWakePayload } = await import("../services/heartbeat.js");
+        const updatedAt = new Date("2026-10-31T19:00:00.000Z");
+        const payload = await buildPaperclipWakePayload({
+          db: { select: () => ({ from: () => ({ where: async () => [] }) }) } as never,
+          companyId: "company-1",
+          contextSnapshot: { wakeReason: "issue_continuation_needed", issueId: "issue-1" },
+          issueSummary: { id: "issue-1", identifier: "STA-22", title: "Review", description: null, status: "in_progress", priority: "high", workMode: "standard" },
+          continuationSummary: { key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, title: "Continuation Summary", body: PROBE_SUMMARY, sourceTrust: null, updatedAt, documentId: "doc-1", latestRevisionId: "rev-1" } as never,
+        });
+        expect(payload?.continuationSummary).toMatchObject({ body: PROBE_SUMMARY, updatedAt: updatedAt.toISOString(), documentId: "doc-1", revisionId: "rev-1" });
+      });
     });
   });
 
