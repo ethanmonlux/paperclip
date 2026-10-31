@@ -67,6 +67,7 @@ import {
   claudeModelUsageTotals,
   claudeModelReceipts,
   parseClaudeStreamJson, createClaudeStreamParser,
+  createClaudeTerminalResultTracker, hasCurrentClaudeTerminalResult,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -975,6 +976,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
     });
+    const observeTerminalResult = createClaudeTerminalResultTracker();
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -989,7 +991,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+        hasTerminalResult: ({ stdout, stderr }) => hasCurrentClaudeTerminalResult(stdout, stderr),
+        observeOutput: observeTerminalResult,
       },
       localProcessSandbox,
     });
@@ -1257,6 +1260,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // error frames, refusals and transport failures retain their disposition.
     const successfulTerminalCleanup =
       parsedSucceeded &&
+      hasCurrentClaudeTerminalResult(proc.stdout, proc.stderr) &&
       !failed &&
       !claudeRefusal &&
       !clearSessionForMaxTurns &&

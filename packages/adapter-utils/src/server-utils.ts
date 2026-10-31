@@ -70,6 +70,8 @@ export interface RunProcessResult {
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
+  /** Incremental latest-turn observer. False cancels a pending cleanup timer. */
+  observeOutput?: (output: { stdout: string; stderr: string }) => boolean;
 }
 
 export const UNMANAGED_BACKGROUND_TASK_STOP_REASON =
@@ -4799,10 +4801,24 @@ export async function runChildProcess(
           terminalCleanupKillTimer = null;
         };
 
+        const observeTerminalOutput = (output: { stdout: string; stderr: string }) => {
+          const observer = opts.terminalResultCleanup?.observeOutput;
+          if (!observer || terminalCleanupStarted) return;
+          try { terminalResultSeen = observer(output); }
+          catch (err) {
+            terminalResultSeen = false;
+            onLogError(err, runId, "failed to observe terminal adapter output");
+          }
+          if (!terminalResultSeen && terminalCleanupTimer) {
+            clearTimeout(terminalCleanupTimer);
+            terminalCleanupTimer = null;
+          }
+        };
+
         const maybeArmTerminalResultCleanup = () => {
           const terminalCleanup = opts.terminalResultCleanup;
           if (!terminalCleanup || terminalCleanupStarted || timedOut) return;
-          if (!terminalResultSeen) {
+          if (!terminalCleanup.observeOutput && !terminalResultSeen) {
             const stdoutStart = Math.max(
               0,
               terminalResultStdoutScanOffset -
@@ -4878,6 +4894,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stdout = appendWithCap(stdout, text);
+          observeTerminalOutput({ stdout: text, stderr: "" });
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stdout", text))
@@ -4896,6 +4913,7 @@ export async function runChildProcess(
           readable.pause();
           const text = String(chunk);
           stderr = appendWithCap(stderr, text);
+          observeTerminalOutput({ stdout: "", stderr: text });
           maybeArmTerminalResultCleanup();
           logChain = logChain
             .then(() => opts.onLog("stderr", text))

@@ -105,4 +105,54 @@ describe("Claude terminal-result cleanup disposition", () => {
     expect(result.timedOut).toBe(true);
     expect(result.resultJson?.adapterCompletion).toBeUndefined();
   });
+  it("does not normalize success followed by an unfinished assistant/tool turn", async () => {
+    const stdout = JSON.stringify(success) + "\n" + JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "pending", name: "Bash" }] } }) + "\n";
+    const result = await adapt({ stdout });
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.resultJson?.adapterCompletion).toBeUndefined();
+  });
+  it.each([
+    { queued_turn_count: 1 },
+    { subagent_stats: { spawned: 2, completed: 1, failed: 0, killed: { user: 0, parent: 0, system: 0 } } },
+    { subagent_stats: { pending: 1 } },
+  ])("does not normalize unsettled result metadata %j", async metadata => {
+    const result = await adapt({}, { ...success, ...metadata });
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.resultJson?.adapterCompletion).toBeUndefined();
+  });
+  it("can normalize a later result after the intervening turn finishes", async () => {
+    const stdout = [success, { type: "assistant", message: { content: [] } }, { ...success, result: "Latest turn complete", queued_turn_count: 0, subagent_stats: { spawned: 2, completed: 2 } }].map(x => JSON.stringify(x)).join("\n");
+    expect(await adapt({ stdout })).toMatchObject({ exitCode: 0, signal: null, summary: "Latest turn complete" });
+  });
+  it.skipIf(process.platform === "win32")("cancels stale controller cleanup while a later turn is unfinished", async () => {
+    const { createClaudeTerminalResultTracker } = await import("./parse.js");
+    const observe = createClaudeTerminalResultTracker();
+    const proc = await runChildProcess(randomUUID(), process.execPath, ["-e", [
+      "process.stdout.write(JSON.stringify(" + JSON.stringify(success) + ")+ '\\n');",
+      "setTimeout(()=>process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'pending'}]}})+'\\n'),10);",
+      "setTimeout(()=>process.exit(3),250);",
+    ].join("")], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 3, graceSec: 1, onLog: async () => {},
+      terminalResultCleanup: { graceMs: 100, hasTerminalResult: () => false, observeOutput: observe },
+    });
+    expect(proc).toMatchObject({ exitCode: 3, signal: null, terminalResultCleanup: null });
+  });
+  it.skipIf(process.platform === "win32")("rearms cleanup only after a later turn emits its own result", async () => {
+    const { createClaudeTerminalResultTracker } = await import("./parse.js");
+    const observe = createClaudeTerminalResultTracker();
+    const proc = await runChildProcess(randomUUID(), process.execPath, ["-e", [
+      "const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');",
+      "emit(" + JSON.stringify(success) + ");",
+      "setTimeout(()=>emit({type:'assistant',message:{content:[]}}),10);",
+      "setTimeout(()=>emit(" + JSON.stringify({ ...success, result: "second complete" }) + "),160);",
+      "setInterval(()=>{},1000);",
+    ].join("")], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 3, graceSec: 1, onLog: async () => {},
+      terminalResultCleanup: { graceMs: 100, hasTerminalResult: () => false, observeOutput: observe },
+    });
+    expect(proc.signal).toBe("SIGTERM");
+    expect(proc.stdout).toContain("second complete");
+    expect(await adapt(proc)).toMatchObject({ exitCode: 0, signal: null, summary: "second complete" });
+  });
+
 });
