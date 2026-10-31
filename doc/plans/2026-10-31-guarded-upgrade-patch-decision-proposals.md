@@ -18,7 +18,9 @@ Inputs:
   cites those receipts.
   Stage 8 added `native-task-bound-continuation` (fix `53373965`, port
   `cf1c70a6`); its R7 follow-up `6e5f6590` (registry `01050b56`) re-ran that
-  group. Its row cites the R7 receipts, with control = the fix commit.
+  group. Stage 9 `37b2bf5b` (registry `ae6f2046`) re-ran it again with the
+  addressed-wake drain regressions. Its row cites the stage-9 receipts, with
+  control = the fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -53,7 +55,7 @@ Meaning of the decisions:
 | claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
 | native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
-| native-task-bound-continuation | **upstream-fails**, 20 of 49 required by assertion (`21ff918f`), ports `01050b56` | passes 49/49, files 63/63 (`1573b468`) | `legacy-continuation.ts`, `issue-continuation-summary.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts` changed; `issue-stage-boundary.ts` new | **adapt** |
+| native-task-bound-continuation | **upstream-fails**, 29 of 58 required by assertion (`f2d73334`), ports `ae6f2046` | passes 58/58, files 82/82 (`60f6770e`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
 upstream covers any of these behaviors.
@@ -188,9 +190,25 @@ upstream covers any of these behaviors.
     because it never unparks on a stage change at all. 26 R7 cases fail by
     assertion on `e8bb1484` and pass with the fix. The stage-8 receipts
     (`9b60e519`, `d9a5ed46`) stay as history.
-  - Carried on this branch as two self-contained server commits
-    (`53373965`, `6e5f6590`), to be selected together onto the repair line
-    for a later qualified installation.
+  - **Stage 9 (FAC-760 STA-43), fixed in `37b2bf5b`.** A dispatch-gate
+    cancellation cleared the issue execution lock without re-draining the
+    deferred queue, a deferred addressed-card wake outlived its invitation
+    and spent the one promotion, and the gate reported the lost invitation
+    as `issue_assignee_changed`. The gate cancellation now re-drains in a
+    drain-only mode, the release retires a deferred `interaction_pending`
+    wake whose invitation left `pending`, and the gate reports
+    `interaction_no_longer_pending`.
+  - Stage-9 receipts: upstream fails 29 of 58 required, all by assertion,
+    including all 9 stage-9 cases and the single-pending-card control:
+    upstream's gate has no addressed-card admission, so it cannot dispatch
+    an addressed Coordinator at all. Upstream's own stranded-queue sweep
+    covers assignee or mention wakes with queued comments or interaction
+    responses, not a pending card's addressee. The 9 cases fail by
+    assertion on `748e0901` and pass with the fix. The R7 receipts
+    (`21ff918f`, `1573b468`) stay as history.
+  - Carried on this branch as three self-contained server commits
+    (`53373965`, `6e5f6590`, `37b2bf5b`), to be selected together onto the
+    repair line for a later qualified installation.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
