@@ -12,6 +12,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueDocuments,
+  issueThreadInteractions,
   issueRelations,
   issueRecoveryActions,
   issueTreeHolds,
@@ -155,6 +156,81 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     return runId;
   }
+
+  async function seedAddressedHandoff(status: "queued" | "running" | "scheduled_retry" = "queued") {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const ownerId = randomUUID(), issueId = randomUUID(), interactionId = randomUUID(), now = new Date();
+    await seedAgent({ id: ownerId, companyId, name: "Source owner" });
+    await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: ownerId });
+    const sourceRunId = await seedRun({ companyId, agentId: ownerId, contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: now }).where(eq(heartbeatRuns.id, sourceRunId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      sourceRunId, createdByAgentId: ownerId, addresseeAgentId: agentId,
+      payload: { version: 1, prompt: "Route this source handoff to independent review." },
+    });
+    const runId = await seedRun({ companyId, agentId, status, now,
+      scheduledRetryReason: status === "scheduled_retry" ? "transient_failure" : null,
+      contextSnapshot: { issueId, source: "issue.interaction.created", wakeReason: "interaction_pending",
+        interactionKind: "request_confirmation", interactionId, sourceRunId },
+    });
+    return { companyId, agentId, ownerId, issueId, interactionId, sourceRunId, runId, now };
+  }
+
+  it("admits a persisted addressed handoff without reassignment or source checkout", async () => {
+    const f = await seedAddressedHandoff();
+    const adapter = createPostgresRunDispatchAdapter(db);
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "not_stale" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null, status: "in_review" });
+    // The source may still be checkpointing when the addressed wake is enqueued.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "not_stale" });
+  });
+
+  it("dispatches the addressed recipient only while the invitation and execution lock remain current", async () => {
+    const f = await seedAddressedHandoff("running");
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const dispatch = vi.fn(async () => "recipient started");
+    const outcome = await createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    expect(outcome.dispatched).toBe(true);
+    if (outcome.dispatched) expect(await outcome.resultPromise).toBe("recipient started");
+    expect(dispatch).toHaveBeenCalledOnce();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null });
+  });
+
+  it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
+    const f = await seedAddressedHandoff("running");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, f.interactionId));
+    const dispatch = vi.fn(async () => "must not execute");
+    expect(await adapter.dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch }))
+      .toMatchObject({ dispatched: false });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].assigneeAgentId).toBe(f.ownerId);
+  });
+
+  it("revalidates recipient changes and issue-scoped provenance instead of trusting wake flags", async () => {
+    const f = await seedAddressedHandoff();
+    const adapter = createPostgresRunDispatchAdapter(db);
+    await db.update(issueThreadInteractions).set({ addresseeAgentId: f.ownerId }).where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+  });
+
+  it("revalidates the pending invitation during scheduled retry admission", async () => {
+    const f = await seedAddressedHandoff("scheduled_retry");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    expect(await adapter.evaluateScheduledRetryGate({ ...f, retryReasonOverride: "transient_failure" })).toMatchObject({ allowed: true });
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(await adapter.evaluateScheduledRetryGate({ ...f, retryReasonOverride: "transient_failure" }))
+      .toMatchObject({ allowed: false, errorCode: "issue_reassigned" });
+  });
 
   async function seedCleanupRetry(status: "scheduled_retry" | "queued" = "scheduled_retry") {
     const { companyId, agentId } = await seedCompanyAndAgent();

@@ -680,7 +680,7 @@ If you are stuck or blocked:
 - Do not reassign work or create a task for a manager or another agent merely because you are stuck. Reporting lines and titles do not grant access or authority.
 - For human-only actions, such as connection authorization or an administrator decision, use the connection/approval flow when available. Otherwise save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task and leave it `in_review` with yourself assigned; a comment alone is not a waiting path. Omitting the resolver policy defaults to `anyone`.
 - Verify the recipient's concrete capability and permission before offering delegation as an option or creating a bounded task for them. Never delegate to bypass a permission denial. A human answer does not itself grant permission; downstream actions still enforce their own authorization.
-- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker.
+- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker. For staged source/review work, see [agent stage handoffs](../../../doc/agent-stage-handoffs.md).
 
 ---
 
