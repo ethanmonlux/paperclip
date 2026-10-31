@@ -367,6 +367,12 @@ import {
   telegramChatSdkCallbackData,
 } from "./chat-interaction-publications.js";
 import { chatProviderConversationUrl } from "./chat-provider-links.js";
+import {
+  acknowledgeFounderEpisode,
+  FOUNDER_NOTIFICATION_ACK_KIND,
+  founderPublicationKey,
+  isFounderAckPayload,
+} from "./founder-notifications.js";
 import { classifyChatPublicationError } from "./chat-publication-errors.js";
 import {
   enqueueChatRunMilestones,
@@ -20340,6 +20346,198 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return processed;
   }
 
+  /**
+   * Acknowledges one founder notification card. Only the notified recipient,
+   * through a currently linked identity, on the card's own direct-message
+   * thread and message, may acknowledge it. Acknowledgement records that the
+   * card was seen; it never answers the decision or changes the task.
+   */
+  async function handleFounderNotificationAck(
+    event: ChatSdkCallbackEvent<ActionEvent>,
+    runtimeContext: RuntimeContext,
+    endpoint: EndpointRow,
+    actor: { principalId: string; userId: string },
+    token: typeof chatActions.$inferSelect,
+    deny: (safelyKnown?: {
+      conversationId?: string | null;
+      principalId?: string | null;
+    }) => Promise<void>,
+  ) {
+    const payload = token.payload;
+    if (
+      !isFounderAckPayload(payload) ||
+      !token.conversationId ||
+      payload.recipientUserId !== actor.userId
+    ) {
+      return deny({ principalId: actor.principalId });
+    }
+    const conversation = await db
+      .select()
+      .from(chatConversations)
+      .where(
+        and(
+          eq(chatConversations.companyId, endpoint.companyId),
+          eq(chatConversations.endpointId, endpoint.id),
+          eq(chatConversations.id, token.conversationId),
+          inArray(chatConversations.state, ["active", "waiting", "completed"]),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (
+      !conversation ||
+      !conversation.isDirectMessage ||
+      !actionThreadMatchesConversation(
+        event.provider,
+        event.event.threadId,
+        conversation.externalThreadId,
+      )
+    ) {
+      return deny({ principalId: actor.principalId });
+    }
+    const safelyKnown = {
+      conversationId: conversation.id,
+      principalId: actor.principalId,
+    };
+    if (
+      !endpoint.allowDirectMessages ||
+      (conversation.state === "completed" &&
+        (await hasCommittedTaskControlCompletion(conversation.id)))
+    ) {
+      return deny(safelyKnown);
+    }
+    const publication = await db
+      .select()
+      .from(chatPublications)
+      .where(
+        and(
+          eq(chatPublications.companyId, endpoint.companyId),
+          eq(chatPublications.endpointId, endpoint.id),
+          eq(chatPublications.conversationId, conversation.id),
+          eq(chatPublications.id, payload.publicationId),
+          eq(
+            chatPublications.idempotencyKey,
+            founderPublicationKey(payload.episodeId),
+          ),
+          inArray(chatPublications.state, ["published", "delivery_unknown"]),
+          or(
+            isNull(chatPublications.providerMessageId),
+            eq(chatPublications.providerMessageId, event.event.messageId),
+          ),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!publication) return deny(safelyKnown);
+    const card = publication.payload as SafeChatPublicationPayload;
+    if (event.provider === "telegram") {
+      const raw = event.event.raw;
+      const callbackData =
+        raw && typeof raw === "object" && "data" in raw
+          ? (raw as { data?: unknown }).data
+          : null;
+      if (
+        typeof callbackData !== "string" ||
+        Buffer.byteLength(callbackData, "utf8") >
+          TELEGRAM_CALLBACK_DATA_LIMIT_BYTES ||
+        callbackData !== telegramChatSdkCallbackData(event.event.actionId) ||
+        event.event.value !== undefined
+      ) {
+        return deny(safelyKnown);
+      }
+    }
+    if (
+      card.interactionId !== payload.episodeId ||
+      (event.provider !== "telegram" &&
+        event.event.value !== card.interactionId) ||
+      !card.card?.actions?.some(
+        (action) =>
+          action.type === "callback" && action.actionId === event.event.actionId,
+      )
+    ) {
+      return deny(safelyKnown);
+    }
+    // A repeated click on an already acknowledged card is a harmless no-op.
+    if (token.status === "processed") return;
+    if (token.status !== "issued") return deny(safelyKnown);
+    if (Date.parse(payload.expiresAt) <= Date.now()) {
+      await db
+        .update(chatActions)
+        .set({
+          status: "expired",
+          result: { code: "founder_notification_ack_expired" },
+          updatedAt: new Date(),
+        })
+        .where(
+          and(eq(chatActions.id, token.id), eq(chatActions.status, "issued")),
+        );
+      return deny(safelyKnown);
+    }
+    let acknowledgedIssueId: string | null = null;
+    try {
+      await db.transaction(async (tx) => {
+        const current = await runtimeCallbackEndpoint(
+          tx,
+          endpoint.id,
+          runtimeContext,
+          ["active"],
+        );
+        if (!current || !current.allowDirectMessages) {
+          throw forbidden("This chat action is no longer authorized", {
+            code: "chat_action_authorization_changed",
+          });
+        }
+        const authorization = await lockCurrentPrincipalAuthorization(
+          tx,
+          current,
+          actor.principalId,
+        );
+        if (
+          !authorization.allowed ||
+          authorization.linkedDenied ||
+          authorization.userId !== payload.recipientUserId
+        ) {
+          throw forbidden("This chat action is no longer authorized", {
+            code: "chat_action_authorization_changed",
+          });
+        }
+        const locked = await tx
+          .select()
+          .from(chatActions)
+          .where(eq(chatActions.id, token.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked || locked.status !== "issued") return;
+        const acknowledged = await acknowledgeFounderEpisode(tx as unknown as Db, {
+          companyId: endpoint.companyId,
+          episodeId: payload.episodeId,
+          userId: payload.recipientUserId,
+          via: "chat",
+        });
+        if (acknowledged.acknowledged) {
+          acknowledgedIssueId = acknowledged.episode.payload.issueId;
+        }
+      });
+    } catch (error) {
+      if (
+        isExternalActionAuthorizationChange(error) ||
+        (error instanceof HttpError && [403, 404, 409].includes(error.status))
+      ) {
+        return deny(safelyKnown);
+      }
+      throw error;
+    }
+    if (acknowledgedIssueId) {
+      await logActivity(db, {
+        companyId: endpoint.companyId,
+        actorType: "user",
+        actorId: payload.recipientUserId,
+        action: "founder_notification.acknowledged",
+        entityType: "issue",
+        entityId: acknowledgedIssueId,
+        details: { episodeId: payload.episodeId, endpointId: endpoint.id, via: "chat" },
+      });
+    }
+  }
+
   async function handleAction(
     event: ChatSdkCallbackEvent<ActionEvent>,
     runtimeContext: RuntimeContext,
@@ -20398,6 +20596,30 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       principal.principal.isBot
     ) {
       return deny({ principalId: principal.principal.id });
+    }
+    // Founder notification acknowledgements are a separate, narrower token
+    // kind. They never select an interaction or a conversation-bound task.
+    const founderAck = await db
+      .select()
+      .from(chatActions)
+      .where(
+        and(
+          eq(chatActions.companyId, record.endpoint.companyId),
+          eq(chatActions.endpointId, record.endpoint.id),
+          eq(chatActions.kind, FOUNDER_NOTIFICATION_ACK_KIND),
+          eq(chatActions.providerActionId, event.event.actionId),
+        ),
+      )
+      .then((rows) => (rows.length === 1 ? rows[0]! : null));
+    if (founderAck) {
+      return handleFounderNotificationAck(
+        event,
+        runtimeContext,
+        record.endpoint,
+        { principalId: principal.principal.id, userId: principal.userId },
+        founderAck,
+        deny,
+      );
     }
     const isCorrection = isDiscordQuestionFormCorrectionId(
       event.event.actionId,

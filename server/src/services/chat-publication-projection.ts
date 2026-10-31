@@ -63,6 +63,7 @@ const PUBLICATION_SOURCES = new Set<ExternalChatPublicationSource>([
   "safe_milestone",
   "issue_interaction",
   "task_control",
+  "founder_notification",
 ]);
 const CARD_KINDS = new Set<SafeExternalChatCardKind>([
   "status",
@@ -90,7 +91,8 @@ export type ExternalChatPublicationSource =
   | "explicit_board_send"
   | "safe_milestone"
   | "issue_interaction"
-  | "task_control";
+  | "task_control"
+  | "founder_notification";
 
 export interface ChatPublicationProjectionInput {
   /** A caller must deliberately classify the source as externally visible. */

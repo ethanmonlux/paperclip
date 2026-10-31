@@ -227,3 +227,20 @@ export const replayChatDeliverySchema = z.object({}).strict();
 export const chatPublicEndpointIdSchema = z
   .string()
   .regex(/^[a-zA-Z0-9_-]{32,128}$/);
+
+export const upsertFounderNotificationRouteSchema = z
+  .object({
+    recipientUserId: z.string().min(1).max(256),
+    endpointId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    enabled: z.boolean().default(false),
+    stallAfterMs: z.number().int().min(5 * 60_000).max(24 * 60 * 60_000).optional(),
+  })
+  .strict();
+
+export const updateFounderNotificationRouteSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    stallAfterMs: z.number().int().min(5 * 60_000).max(24 * 60 * 60_000).optional(),
+  })
+  .strict();

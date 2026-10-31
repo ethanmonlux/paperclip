@@ -572,3 +572,66 @@ export interface PhotonProjectInspection {
 export type PhotonChannelConfiguration =
   | { allocation?: "dedicated"; projectId: string; lineId: string }
   | { allocation: "shared"; projectId: string };
+
+/**
+ * Board-configured destination for founder-attention phone notifications. A
+ * route binds one Paperclip recipient to an existing direct-message
+ * conversation proven to belong to that recipient's linked chat identity.
+ * Routes start disabled; no notification is produced until a connection
+ * manager explicitly enables one.
+ */
+export interface FounderNotificationRoute {
+  id: string;
+  companyId: string;
+  recipientUserId: string;
+  endpointId: string;
+  conversationId: string;
+  enabled: boolean;
+  stallAfterMs: number;
+  /** Last reason a due episode could not be sent, until the binding recovers. */
+  lastUnavailableReason: FounderNotificationRouteUnavailableReason | null;
+  /** Server re-verification of endpoint, DM and recipient identity binding. */
+  binding: { verified: true } | { verified: false; reason: FounderNotificationRouteUnavailableReason };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type FounderNotificationRouteUnavailableReason =
+  | "endpoint_unavailable"
+  | "conversation_unavailable"
+  | "not_direct_message"
+  | "recipient_not_linked"
+  | "foreign_participant"
+  | "recipient_not_member";
+
+export const FOUNDER_NOTIFICATION_EPISODE_STATES = ["observing", "open", "resolved"] as const;
+export type FounderNotificationEpisodeState = (typeof FOUNDER_NOTIFICATION_EPISODE_STATES)[number];
+
+/** Delivery is read from the linked outbox row, never duplicated or guessed. */
+export type FounderNotificationDeliveryState = "not_sent" | ChatPublicationState;
+
+export interface FounderNotificationEpisode {
+  id: string;
+  routeId: string;
+  recipientUserId: string;
+  attentionItemId: string;
+  sourceKind: string;
+  notificationClass: "decision" | "stall";
+  occurrence: number;
+  issueId: string;
+  issueIdentifier: string | null;
+  state: FounderNotificationEpisodeState;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  observations: number;
+  notifiedAt: string | null;
+  acknowledgedAt: string | null;
+  resolvedAt: string | null;
+  delivery: {
+    state: FounderNotificationDeliveryState;
+    attempts: number;
+    redactedError: string | null;
+    publishedAt: string | null;
+  };
+  resolutionDelivery: { state: FounderNotificationDeliveryState } | null;
+}

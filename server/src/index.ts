@@ -93,6 +93,8 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { founderNotificationService } from "./services/founder-notifications.js";
+import { founderNotificationAttentionSource } from "./services/founder-notification-attention.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
@@ -1670,6 +1672,12 @@ async function startServerWithDatabaseTeardown(
       return { archived, ...notifications };
     };
     await runRetentionSweep();
+    // Founder phone notifications are inert until a board connection manager
+    // enables a verified route; with none enabled a tick reads only live
+    // endpoint ids and their indexed action rows.
+    const founderNotifications = founderNotificationService(db as any, {
+      listAttention: founderNotificationAttentionSource(db as any),
+    });
 
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
@@ -1682,6 +1690,9 @@ async function startServerWithDatabaseTeardown(
         }));
         trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
+        }));
+        trackHeartbeatSchedulerWork(founderNotifications.sweep().catch((err: unknown) => {
+          logger.error({ err }, "founder notification sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
