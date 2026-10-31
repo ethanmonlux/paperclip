@@ -17,7 +17,7 @@ import { packageVersion } from "../version.js";
 const execFileAsync = promisify(execFile);
 export type InstallMode = "managed" | "global-npm" | "npx" | "source" | "unknown";
 export type UpdateOptions = { canary?: boolean; latest?: boolean; version?: string; rollback?: boolean; check?: boolean; dryRun?: boolean; json?: boolean; yes?: boolean; backup?: boolean };
-type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string) => Promise<boolean>; hasInstanceData: () => boolean };
+type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string, expectedCommit?: string) => Promise<boolean>; hasInstanceData: () => boolean };
 
 const DATABASE_UNREACHABLE_CODES = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT"]);
 
@@ -67,11 +67,11 @@ async function runPreUpdateBackup(options: UpdateOptions, backup: () => Promise<
   }
 }
 
-async function restartActiveManagedService(expectedVersion: string): Promise<boolean> {
+async function restartActiveManagedService(expectedVersion: string, expectedCommit?: string): Promise<boolean> {
   const instanceId = resolvePaperclipInstanceId();
   const detection = await detectServiceManager({ instanceId });
   if (!detection.supported || !(await detection.manager.status()).active) return false;
-  await restartManagedService({ instanceId, expectedVersion });
+  await restartManagedService({ instanceId, expectedVersion, expectedCommit });
   return true;
 }
 
@@ -144,17 +144,21 @@ async function defaultConfirm(message: string): Promise<boolean> {
   const answer = await p.confirm({ message, initialValue: false });
   return !p.isCancel(answer) && answer === true;
 }
+// Git payloads share a package version across commits; verify them by exact commit.
+function restartForRecord(restartActiveService: Dependencies["restartActiveService"], record: Pick<InstallRecord, "source" | "version" | "sha">): Promise<boolean> {
+  return record.source === "git" && record.sha ? restartActiveService(record.version, record.sha) : restartActiveService(record.version);
+}
 function emit(options: UpdateOptions, value: Record<string, unknown>, message: string): void { if (options.json) console.log(JSON.stringify(value, null, 2)); else console.log(message); }
 
 async function rollbackAfterServiceValidationFailure(
   paths: InstallStorePaths,
-  restartActiveService: (expectedVersion: string) => Promise<boolean>,
+  restartActiveService: Dependencies["restartActiveService"],
   validationError: unknown,
   payloadLabel: string,
 ): Promise<never> {
   const rolledBack = await withInstallStoreLock(async () => rollbackManagedInstall(paths), paths);
   try {
-    await restartActiveService(rolledBack.version);
+    await restartForRecord(restartActiveService, rolledBack);
   } catch (restartError) {
     throw new Error(
       `${payloadLabel} failed service validation and was rolled back to ${rolledBack.version}, but the rolled-back service also failed to restart.`,
@@ -174,7 +178,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     if (mode !== "managed") throw new Error("--rollback is only available for managed installs.");
     if (options.dryRun) { emit(options, { mode, action: "rollback", dryRun: true, target: manifest?.previous[0]?.version ?? null }, `Would roll back to ${manifest?.previous[0]?.version ?? "the previous payload"}.`); return; }
     const next = await withInstallStoreLock(async () => rollbackManagedInstall(paths), paths);
-    const restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(next.version);
+    const restarted = await restartForRecord(overrides.restartActiveService ?? restartActiveManagedService, next);
     emit(options, { mode, action: "rollback", version: next.version, restarted }, pc.green(`Rolled back to paperclipai ${next.version}${restarted ? " and restarted the active service" : ""}. Database migrations are not reversed; restore the pre-update backup if needed.`));
     return;
   }
@@ -204,7 +208,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     }, paths);
     let restarted: boolean;
     try {
-      restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(installed.version);
+      restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(installed.version, targetSha);
     } catch (error) {
       return rollbackAfterServiceValidationFailure(
         paths,
