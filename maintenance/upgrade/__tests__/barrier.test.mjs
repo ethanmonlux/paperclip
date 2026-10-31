@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { assessHealth, BarrierError, createApiClient, runUnderMaintenanceBarrier, waitForExactHealth } from "../lib/barrier.mjs";
 
@@ -137,4 +140,24 @@ test("in-memory runs keep the instance non-quiescent", async () => {
 
 test("requires a credential", () => {
   assert.throws(() => createApiClient({ baseUrl: "http://127.0.0.1:1" }), (error) => error.code === "credential_missing");
+});
+
+test("instance requests bypass environment proxies so the credential stays local", () => {
+  const barrier = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "lib", "barrier.mjs");
+  const script = `
+    import { createServer } from "node:http";
+    import { createApiClient } from ${JSON.stringify(barrier)};
+    const server = createServer((req, res) => res.end(JSON.stringify({ auth: req.headers.authorization })));
+    server.listen(0, "127.0.0.1", async () => {
+      const request = createApiClient({ baseUrl: "http://127.0.0.1:" + server.address().port, authorization: "Bearer local" });
+      try { console.log(JSON.stringify(await request("GET", "/api/health"))); } finally { server.close(); }
+    });`;
+  const deadProxy = "http://127.0.0.1:9";
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8",
+    timeout: 15_000,
+    env: { PATH: process.env.PATH, NODE_USE_ENV_PROXY: "1", HTTP_PROXY: deadProxy, HTTPS_PROXY: deadProxy, http_proxy: deadProxy, https_proxy: deadProxy },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { status: 200, json: { auth: "Bearer local" } });
 });

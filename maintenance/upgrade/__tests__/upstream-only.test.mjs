@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { evaluateUpstreamOnly } from "../lib/upstream-only.mjs";
+import { evaluateUpstreamOnly, installEnv, minimalEnv } from "../lib/upstream-only.mjs";
 
 // Hermetic identity: hosts may export empty GIT_AUTHOR_* variables.
 const identity = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
@@ -34,7 +34,8 @@ const test = fs.readFileSync(files[0], "utf8");
 fs.writeFileSync("observed.json", JSON.stringify({ source, test, envKeys: Object.keys(process.env) }));
 const fixed = source.includes("FIXED");
 fs.writeFileSync(report, JSON.stringify({ testResults: [{ name: require("node:path").resolve(files[0]), status: fixed ? "passed" : "failed", message: "",
-  assertionResults: [{ fullName: "impl keeps output", status: fixed ? "passed" : "failed" }] }] }));
+  assertionResults: [{ fullName: "impl keeps output", status: fixed ? "passed" : "failed",
+    failureMessages: fixed ? [] : ["AssertionError: expected 'upstream rewrite' to contain 'FIXED'"] }] }] }));
 process.exit(fixed ? 0 : 1);
 `;
 
@@ -91,6 +92,29 @@ test("runs tests with a minimal allowlisted environment, not host credentials", 
     assert.ok(!observed.envKeys.includes("PAPERCLIP_API_KEY"));
     assert.ok(observed.envKeys.includes("CI"));
   } finally { delete process.env.UPSTREAM_ONLY_TEST_SECRET_TOKEN; f.cleanup(); }
+});
+
+test("install gets proxy and cache settings but never credentials; tests do not", () => {
+  const host = {
+    PATH: "/bin", HOME: "/h", HTTPS_PROXY: "http://127.0.0.1:3128", https_proxy: "http://user:pw@proxy.invalid:1",
+    HTTP_PROXY: "not a url", npm_config_store_dir: "/tmp/store", COREPACK_HOME: "/ro/corepack", PAPERCLIP_API_KEY: "secret", GITHUB_TOKEN: "secret",
+  };
+  assert.deepEqual(minimalEnv(host), { CI: "1", PATH: "/bin", HOME: "/h", COREPACK_HOME: "/ro/corepack" });
+  assert.deepEqual(installEnv(host), {
+    CI: "1", PATH: "/bin", HOME: "/h", COREPACK_HOME: "/ro/corepack", HTTPS_PROXY: "http://127.0.0.1:3128", npm_config_store_dir: "/tmp/store",
+  });
+  const f = fixture(true);
+  try {
+    const receipt = f.run({
+      installArgv: [process.execPath, "-e", "require('node:fs').writeFileSync('install-env.json', JSON.stringify(Object.keys(process.env)))"],
+      installEnvironment: installEnv(host),
+      env: { CI: "1", PATH: process.env.PATH },
+    });
+    assert.equal(receipt.outcome, "upstream-passes");
+    const work = path.join(f.dir, "work", "upstream-p1");
+    assert.ok(JSON.parse(readFileSync(path.join(work, "install-env.json"), "utf8")).includes("HTTPS_PROXY"));
+    assert.ok(!JSON.parse(readFileSync(path.join(work, "observed.json"), "utf8")).envKeys.includes("HTTPS_PROXY"));
+  } finally { f.cleanup(); }
 });
 
 test("missing fork tests, unavailable commits, failed installs and missing runners are unknown", () => {

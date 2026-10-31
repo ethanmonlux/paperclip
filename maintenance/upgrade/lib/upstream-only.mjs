@@ -8,7 +8,15 @@ export const RECEIPT_SCHEMA = "staple.upgrade.upstream-only.v1";
 const SHA = /^[0-9a-f]{40}$/;
 const TEST_FILE = /\.test\.(?:ts|tsx|mts|js|mjs)$/;
 // Tests get a fixed, minimal environment: no host credentials or tokens.
-const ENV_ALLOWLIST = ["PATH", "HOME", "TMPDIR", "LANG", "TZ"];
+// Corepack settings locate the pinned package manager without downloading it.
+const ENV_ALLOWLIST = ["PATH", "HOME", "TMPDIR", "LANG", "TZ", "COREPACK_HOME", "COREPACK_ENABLE_DOWNLOAD_PROMPT", "COREPACK_ENABLE_AUTO_PIN"];
+// The install step additionally needs the egress proxy and private package
+// caches. Proxy URLs that embed credentials are dropped rather than forwarded.
+const INSTALL_ENV_ALLOWLIST = [
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "NODE_USE_ENV_PROXY",
+  "npm_config_cache", "npm_config_store_dir",
+];
+const PROXY_KEY = /^(?:https?_proxy)$/i;
 const DEFAULT_TEST_ARGV = ["pnpm", "exec", "vitest", "run", "--reporter=json", "--outputFile={report}", "{testFiles}"];
 
 function git(repo, args, options = {}) {
@@ -24,9 +32,29 @@ function blob(repo, sha, file) {
 
 const sha256 = (buffer) => createHash("sha256").update(buffer).digest("hex");
 
-function minimalEnv(source = process.env) {
+export function minimalEnv(source = process.env) {
   const env = { CI: "1" };
   for (const key of ENV_ALLOWLIST) if (source[key] !== undefined) env[key] = source[key];
+  return env;
+}
+
+function proxyHasCredentials(value) {
+  try {
+    const url = new URL(value);
+    return Boolean(url.username || url.password);
+  } catch {
+    return true;
+  }
+}
+
+export function installEnv(source = process.env) {
+  const env = minimalEnv(source);
+  for (const key of INSTALL_ENV_ALLOWLIST) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (PROXY_KEY.test(key) && proxyHasCredentials(value)) continue;
+    env[key] = value;
+  }
   return env;
 }
 
@@ -63,6 +91,7 @@ export function evaluateUpstreamOnly({
   testArgv = DEFAULT_TEST_ARGV,
   timeoutMs = 20 * 60_000,
   env = minimalEnv(),
+  installEnvironment = installEnv(),
   now = () => new Date(),
   keepWorktree = false,
 }) {
@@ -127,7 +156,7 @@ export function evaluateUpstreamOnly({
     receipt.overlayChangedFiles = changed;
 
     if (installArgv) {
-      receipt.install = run(installArgv, tree, timeoutMs, env);
+      receipt.install = run(installArgv, tree, timeoutMs, installEnvironment);
       if (receipt.install.exitCode !== 0) {
         receipt.reasons.push("install-failed");
         return finish();

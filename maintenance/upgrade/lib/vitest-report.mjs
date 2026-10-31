@@ -3,10 +3,18 @@ import path from "node:path";
 /**
  * Upstream-only outcomes. Only `upstream-passes` can support retiring a patch,
  * and even then only together with an independent review. `upstream-fails`
- * means upstream does not demonstrate the protected behavior. Everything we
- * cannot prove (load failures, skips, missing tests, odd exits) is `unknown`.
+ * means an assertion in the evidence test failed against upstream. Everything we
+ * cannot prove (load or API-mismatch errors, skips, missing tests, odd exits)
+ * is `unknown`.
  */
 export const OUTCOMES = Object.freeze(["upstream-passes", "upstream-fails", "unknown"]);
+
+const ASSERTION_FAILURE = /^\s*AssertionError\b/;
+
+function isAssertionFailure(assertion) {
+  const messages = Array.isArray(assertion.failureMessages) ? assertion.failureMessages : [];
+  return messages.length > 0 && messages.every((message) => typeof message === "string" && ASSERTION_FAILURE.test(message));
+}
 
 function normalize(file) {
   return file.split(path.sep).join("/");
@@ -70,6 +78,16 @@ export function classifyVitestReport({ report, exitCode, root, testFiles, requir
     return result("unknown");
   }
   if (counts.failed > 0) {
+    // Only an assertion failure shows that upstream lacks the behavior. A
+    // TypeError, missing export, timeout or crash means the fork's test cannot
+    // exercise upstream as written, which proves nothing about the behavior.
+    const nonAssertion = [...new Set(considered)]
+      .filter(({ assertion }) => assertion.status === "failed" && !isAssertionFailure(assertion))
+      .map(({ assertion }) => `non-assertion-failure:${assertion.fullName}`);
+    if (nonAssertion.length > 0) {
+      reasons.push(...nonAssertion);
+      return result("unknown");
+    }
     reasons.push("evidence-test-failed");
     return result("upstream-fails");
   }

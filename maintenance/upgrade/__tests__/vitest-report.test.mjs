@@ -6,7 +6,7 @@ const root = "/repo";
 const file = "pkg/a.test.ts";
 const suite = (assertionResults, extra = {}) => ({ testResults: [{ name: `${root}/${file}`, status: "passed", message: "", assertionResults, ...extra }] });
 const passed = (fullName) => ({ fullName, status: "passed" });
-const failed = (fullName) => ({ fullName, status: "failed", failureMessages: ["expected"] });
+const failed = (fullName) => ({ fullName, status: "failed", failureMessages: ["AssertionError: expected 'a' to be 'b'"] });
 
 test("passes only when every considered evidence test passes and the run exits 0", () => {
   const result = classifyVitestReport({ report: suite([passed("x keeps output")]), exitCode: 0, root, testFiles: [file] });
@@ -44,4 +44,14 @@ test("green assertions with a suite-level error or a nonzero exit are unknown", 
   assert.equal(classifyVitestReport({ report: suite([passed("a")], { status: "failed", message: "afterAll hook failed" }), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
   assert.equal(classifyVitestReport({ report: suite([passed("a")]), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
   assert.equal(classifyVitestReport({ report: suite([passed("a")]), exitCode: null, root, testFiles: [file] }).outcome, "unknown");
+});
+
+test("failures that are not assertions (missing exports, type errors, timeouts) are unknown", () => {
+  const typeError = { fullName: "b", status: "failed", failureMessages: ["TypeError: (0 , m.createBridge) is not a function"] };
+  const result = classifyVitestReport({ report: suite([passed("a"), typeError]), exitCode: 1, root, testFiles: [file] });
+  assert.deepEqual([result.outcome, result.reasons], ["unknown", ["non-assertion-failure:b"]]);
+  const timeout = { fullName: "c", status: "failed", failureMessages: ["Error: Test timed out in 5000ms."] };
+  assert.equal(classifyVitestReport({ report: suite([failed("a"), timeout]), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
+  const silent = { fullName: "d", status: "failed", failureMessages: [] };
+  assert.equal(classifyVitestReport({ report: suite([silent]), exitCode: 1, root, testFiles: [file] }).outcome, "unknown");
 });

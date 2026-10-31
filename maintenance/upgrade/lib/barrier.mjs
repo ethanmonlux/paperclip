@@ -1,3 +1,6 @@
+import http from "node:http";
+import https from "node:https";
+
 const DRAIN_PATH = "/api/instance/task-drain";
 
 export class BarrierError extends Error {
@@ -9,8 +12,34 @@ export class BarrierError extends Error {
   }
 }
 
+/**
+ * Direct request on a fresh Agent. Global fetch and the global agents honour
+ * NODE_USE_ENV_PROXY, which would send the instance credential through an
+ * egress proxy; the barrier must only ever talk to the instance itself.
+ */
+export function directFetch(url, { method = "GET", headers = {}, body, signal } = {}) {
+  const target = new URL(url);
+  const transport = target.protocol === "https:" ? https : target.protocol === "http:" ? http : null;
+  if (!transport) return Promise.reject(new BarrierError("unsupported_url", `Unsupported instance URL protocol ${target.protocol}`));
+  const agent = new transport.Agent({ keepAlive: false });
+  return new Promise((resolve, reject) => {
+    const req = transport.request(target, { method, headers, agent, signal }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({ status: res.statusCode, json: async () => JSON.parse(text) });
+      });
+    });
+    req.on("error", reject);
+    req.on("close", () => agent.destroy());
+    req.end(body);
+  });
+}
+
 /** Minimal authenticated JSON client. The credential is never logged or returned. */
-export function createApiClient({ baseUrl, authorization, fetchImpl = globalThis.fetch, timeoutMs = 10_000 }) {
+export function createApiClient({ baseUrl, authorization, fetchImpl = directFetch, timeoutMs = 10_000 }) {
   if (!authorization) throw new BarrierError("credential_missing", "An authenticated instance-admin credential is required.");
   return async function request(method, path, body) {
     const response = await fetchImpl(new URL(path, baseUrl), {
