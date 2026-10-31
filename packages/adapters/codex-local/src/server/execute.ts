@@ -31,6 +31,7 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  localGitHubLauncherSandboxPaths,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -1004,7 +1005,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [{ path: effectiveCodexHome, access: "rw" },
+              ...await localGitHubLauncherSandboxPaths({ runId, env })],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -1238,8 +1240,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
           // Keep Codex's default secret-name exclusions except for the scoped
           // Paperclip API token used by the agent skill. Never include host env.
-          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
+          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_GITHUB_BROKER_TOKEN" || !/key|secret|token/i.test(key)),
           ...identityNames,
+          // The outer local sandbox injects these after this command is built.
+          // Keep its bridge reachable from Codex child shells without inheriting
+          // arbitrary host environment or changing the network allowlist.
+          ...(localProcessSandbox?.networkScope === "allowlist"
+            ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+            : []),
         ])];
         args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
           "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);

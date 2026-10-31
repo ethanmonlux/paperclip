@@ -1,5 +1,6 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  MAX_CAPTURE_BYTES,
   asString,
   asNumber,
   asBoolean,
@@ -627,4 +628,60 @@ export function isClaudeProviderQuotaError(input: {
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
+}
+
+/** Tracks the latest complete CLI turn, independently of usage's last result. */
+export function createClaudeTerminalResultTracker() {
+  let pending = "";
+  let discardingLine = false;
+  let terminal = false;
+  const resultIsSettled = (event: Record<string, unknown>) => {
+    if ("queued_turn_count" in event && event.queued_turn_count !== 0) return false;
+    if (!("subagent_stats" in event)) return true;
+    const stats = parseObject(event.subagent_stats);
+    const spawned = stats.spawned;
+    if (typeof spawned !== "number" || !Number.isInteger(spawned) || spawned < 0) return false;
+    const count = (value: unknown) => value === undefined ? 0 :
+      typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : NaN;
+    const killed = typeof stats.killed === "number" ? count(stats.killed) :
+      Object.values(parseObject(stats.killed)).reduce<number>((sum, value) => sum + count(value), 0);
+    return spawned === count(stats.completed) + count(stats.failed) + killed;
+  };
+  const consumeLine = (line: string) => {
+    if (line.length > MAX_CAPTURE_BYTES) { terminal = false; return; }
+    if (!line.trim()) return;
+    const event = parseJson(line);
+    if (!event) { terminal = false; return; }
+    if (event.type === "rate_limit_event") return;
+    terminal = event.type === "result" && resultIsSettled(event);
+  };
+  return (output: { stdout: string; stderr: string }) => {
+    if (output.stderr.trim()) terminal = false;
+    pending += output.stdout;
+    let newline: number;
+    while ((newline = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      if (!discardingLine) consumeLine(line);
+      else terminal = false;
+      discardingLine = false;
+    }
+    if (!pending.trim()) pending = "";
+    if (pending.trim()) {
+      // A partial next turn immediately invalidates the preceding result.
+      if (!discardingLine && parseJson(pending)) {
+        consumeLine(pending);
+        pending = "";
+      } else if (pending.length > MAX_CAPTURE_BYTES) {
+        terminal = false;
+        pending = "";
+        discardingLine = true;
+      }
+    }
+    return terminal && !discardingLine && !pending.trim();
+  };
+}
+
+export function hasCurrentClaudeTerminalResult(stdout: string) {
+  return createClaudeTerminalResultTracker()({ stdout, stderr: "" });
 }

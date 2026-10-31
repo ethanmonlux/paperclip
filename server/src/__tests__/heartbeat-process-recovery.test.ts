@@ -5936,7 +5936,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("keeps an explicit local-path/worktree conflict blocked with a board action and no Sentry event", async () => {
     const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
-    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-workspace-policy-"));
+    // This case requires an ordinary non-Git ancestor chain. Shared /tmp can
+    // contain another fixture's damaged .git, which correctly remains reportable.
+    const cwd = await fs.mkdtemp(path.join(os.homedir(), "paperclip-local-workspace-policy-"));
     const projectId = randomUUID();
     const workspaceId = randomUUID();
     const heartbeat = heartbeatService(db);

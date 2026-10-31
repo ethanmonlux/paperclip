@@ -12,6 +12,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueDocuments,
+  issueThreadInteractions,
   issueRelations,
   issueRecoveryActions,
   issueTreeHolds,
@@ -25,6 +26,21 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { issueThreadInteractionService } from "../../../services/issue-thread-interactions.js";
+
+// Pause only after the real invitation query; keep the production lock/read.
+const invitationBoundary = vi.hoisted(() => ({ beforeRead: null as null | (() => Promise<void>), afterRead: null as null | (() => Promise<void>) }));
+vi.mock("../../../services/pending-agent-interaction.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../services/pending-agent-interaction.js")>();
+  return { ...actual, pendingAgentInteractionAddressee: async (
+    ...args: Parameters<typeof actual.pendingAgentInteractionAddressee>
+  ) => {
+    await invitationBoundary.beforeRead?.();
+    const allowed = await actual.pendingAgentInteractionAddressee(...args);
+    await invitationBoundary.afterRead?.();
+    return allowed;
+  } };
+});
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -52,6 +68,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   }, 20_000);
 
   afterEach(async () => {
+    invitationBoundary.afterRead = null;
+    invitationBoundary.beforeRead = null;
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(issueDocuments);
@@ -155,6 +173,180 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     return runId;
   }
+
+  async function seedAddressedHandoff(status: "queued" | "running" | "scheduled_retry" = "queued") {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const ownerId = randomUUID(), issueId = randomUUID(), interactionId = randomUUID(), now = new Date();
+    await seedAgent({ id: ownerId, companyId, name: "Source owner" });
+    await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: ownerId });
+    const sourceRunId = await seedRun({ companyId, agentId: ownerId, contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: now }).where(eq(heartbeatRuns.id, sourceRunId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId, issueId, kind: "request_confirmation", status: "pending",
+      sourceRunId, createdByAgentId: ownerId, addresseeAgentId: agentId,
+      payload: { version: 1, prompt: "Route this source handoff to independent review." },
+    });
+    const runId = await seedRun({ companyId, agentId, status, now,
+      scheduledRetryReason: status === "scheduled_retry" ? "transient_failure" : null,
+      contextSnapshot: { issueId, source: "issue.interaction.created", wakeReason: "interaction_pending",
+        interactionKind: "request_confirmation", interactionId, sourceRunId },
+    });
+    return { companyId, agentId, ownerId, issueId, interactionId, sourceRunId, runId, now };
+  }
+
+  it("admits a persisted addressed handoff without reassignment or source checkout", async () => {
+    const f = await seedAddressedHandoff();
+    const adapter = createPostgresRunDispatchAdapter(db);
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "not_stale" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null, status: "in_review" });
+    // The source may still be checkpointing when the addressed wake is enqueued.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "not_stale" });
+  });
+
+  it("dispatches the addressed recipient only while the invitation and execution lock remain current", async () => {
+    const f = await seedAddressedHandoff("running");
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    const dispatch = vi.fn(async () => "recipient started");
+    const outcome = await createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    expect(outcome.dispatched).toBe(true);
+    if (outcome.dispatched) expect(await outcome.resultPromise).toBe("recipient started");
+    expect(dispatch).toHaveBeenCalledOnce();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null });
+  });
+
+  it("serializes concurrent invitation cancellation with the final provider handoff", async () => {
+    const f = await seedAddressedHandoff("running");
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    let read!: () => void, release!: () => void, cancelPid!: (pid: number) => void;
+    const readDone = new Promise<void>(resolve => { read = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const pidReady = new Promise<number>(resolve => { cancelPid = resolve; });
+    const order: string[] = [];
+    invitationBoundary.afterRead = async () => { read(); await released; };
+    const dispatch = vi.fn(async () => { order.push("dispatch"); });
+    const gate = createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    await readDone;
+    const cancellation = db.transaction(async tx => {
+      const rows = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      cancelPid(rows[0]!.pid);
+      await tx.update(issueThreadInteractions).set({ status: "cancelled" })
+        .where(eq(issueThreadInteractions.id, f.interactionId));
+      order.push("revoked");
+    });
+    try {
+      const pid = await pidReady;
+      // Observe a real lock wait, rather than using a timing-only assertion.
+      let waiting = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const rows = await db.execute<{ wait_event_type: string | null }>(
+          sql`select wait_event_type from pg_stat_activity where pid = ${pid}`);
+        if (rows[0]?.wait_event_type === "Lock") { waiting = true; break; }
+        if (order.includes("revoked")) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(waiting).toBe(true);
+      expect(order).toEqual([]);
+    } finally {
+      release();
+      await gate;
+      await cancellation;
+    }
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(order).toEqual(["dispatch", "revoked"]);
+  });
+
+  it("orders stale-target expiry issue-first against final invitation dispatch", async () => {
+    const f = await seedAddressedHandoff("running");
+    const documentId = randomUUID(), oldRevisionId = randomUUID(), revisionId = randomUUID();
+    await db.insert(documents).values({ id: documentId, companyId: f.companyId,
+      title: "Handoff", format: "markdown", latestBody: "revised handoff",
+      latestRevisionId: revisionId, latestRevisionNumber: 2, createdByAgentId: f.ownerId });
+    await db.insert(documentRevisions).values([
+      { id: oldRevisionId, companyId: f.companyId, documentId, revisionNumber: 1,
+        title: "Handoff", format: "markdown", body: "original handoff", createdByAgentId: f.ownerId },
+      { id: revisionId, companyId: f.companyId, documentId, revisionNumber: 2,
+        title: "Handoff", format: "markdown", body: "revised handoff", createdByAgentId: f.ownerId },
+    ]);
+    await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: f.issueId,
+      documentId, key: "handoff" });
+    await db.update(issueThreadInteractions).set({ payload: { version: 1, prompt: "Route handoff",
+      target: { type: "issue_document", issueId: f.issueId, documentId, key: "handoff",
+        revisionId: oldRevisionId, revisionNumber: 1 } } }).where(eq(issueThreadInteractions.id, f.interactionId));
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    let atRead!: () => void, release!: () => void;
+    const readReached = new Promise<void>(resolve => { atRead = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    invitationBoundary.beforeRead = async () => { atRead(); await released; };
+    const dispatch = vi.fn(async () => "recipient started");
+    const gate = createPostgresRunDispatchAdapter(db)
+      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
+    await readReached;
+    // Exercise the real human rejection path, including stale-target expiry.
+    const expiry = issueThreadInteractionService(db).rejectInteraction(
+      { id: f.issueId, companyId: f.companyId, status: "in_review" }, f.interactionId,
+      { reason: "The handoff changed" }, { userId: "local-board" },
+    ).then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
+    try {
+      let waitingQuery = "";
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const rows = await db.execute<{ query: string }>(sql`
+          select query from pg_stat_activity
+          where datname = current_database() and pid <> pg_backend_pid()
+            and wait_event_type = 'Lock' and query like '%"issues"%'`);
+        waitingQuery = rows[0]?.query ?? "";
+        if (waitingQuery) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      // The old path first locked the invitation, then blocked updating the
+      // issue, which would deadlock when the dispatch query is released.
+      expect(waitingQuery).toMatch(/^select /i);
+    } finally {
+      release();
+      await Promise.allSettled([gate, expiry]);
+    }
+    expect((await gate).dispatched).toBe(true);
+    expect(dispatch).toHaveBeenCalledOnce();
+    const expired = await expiry;
+    expect(expired.ok).toBe(false);
+    expect((await db.select().from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, f.interactionId)))[0]?.status).toBe("expired");
+  });
+
+  it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
+    const f = await seedAddressedHandoff("running");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+    await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, f.interactionId));
+    const dispatch = vi.fn(async () => "must not execute");
+    expect(await adapter.dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch }))
+      .toMatchObject({ dispatched: false });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].assigneeAgentId).toBe(f.ownerId);
+  });
+
+  it("revalidates recipient changes and issue-scoped provenance instead of trusting wake flags", async () => {
+    const f = await seedAddressedHandoff();
+    const adapter = createPostgresRunDispatchAdapter(db);
+    await db.update(issueThreadInteractions).set({ addresseeAgentId: f.ownerId }).where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+  });
+
+  it("revalidates the pending invitation during scheduled retry admission", async () => {
+    const f = await seedAddressedHandoff("scheduled_retry");
+    const adapter = createPostgresRunDispatchAdapter(db);
+    expect(await adapter.evaluateScheduledRetryGate({ ...f, retryReasonOverride: "transient_failure" })).toMatchObject({ allowed: true });
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, f.interactionId));
+    expect(await adapter.evaluateScheduledRetryGate({ ...f, retryReasonOverride: "transient_failure" }))
+      .toMatchObject({ allowed: false, errorCode: "issue_reassigned" });
+  });
 
   async function seedCleanupRetry(status: "scheduled_retry" | "queued" = "scheduled_retry") {
     const { companyId, agentId } = await seedCompanyAndAgent();

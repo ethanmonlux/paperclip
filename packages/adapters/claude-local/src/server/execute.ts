@@ -24,6 +24,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  localGitHubLauncherSandboxPaths,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -66,6 +67,7 @@ import {
   claudeModelUsageTotals,
   claudeModelReceipts,
   parseClaudeStreamJson, createClaudeStreamParser,
+  createClaudeTerminalResultTracker, hasCurrentClaudeTerminalResult,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -579,6 +581,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           workspaceDir: effectiveExecutionCwd,
           filesystemScope,
           managedPaths: [
+            ...await localGitHubLauncherSandboxPaths({ runId, env }),
             { path: sharedClaudeConfigDir, access: "rw" },
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
@@ -973,6 +976,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
     });
+    const observeTerminalResult = createClaudeTerminalResultTracker();
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -987,7 +991,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+        hasTerminalResult: ({ stdout }) => hasCurrentClaudeTerminalResult(stdout),
+        observeOutput: observeTerminalResult,
       },
       localProcessSandbox,
     });
@@ -1007,6 +1012,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
     const { proc, parsedStream, parsed } = attempt;
+    const incompleteTerminalCleanup =
+      proc.terminalResultCleanup?.orderedOutputObserved === true &&
+      (!proc.terminalResultCleanup.terminalResultSeen ||
+        !hasCurrentClaudeTerminalResult(proc.stdout));
+    const incompleteTerminalCleanupMessage = "Claude continued activity during terminal-result cleanup; completion is unproven. Reconcile task effects before continuation.";
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1041,8 +1051,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
-      const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const fallbackErrorMessage = incompleteTerminalCleanup
+        ? incompleteTerminalCleanupMessage
+        : parseFallbackErrorMessage(proc);
       const providerQuota =
+        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
@@ -1052,6 +1065,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
+        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1075,6 +1089,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // surfaces the typed `duplex_channel_lost` code before any provider
         // classification, so the CLI lane and the ACP lane report it alike.
         ? proc.errorCode
+        : incompleteTerminalCleanup
+        ? "unmanaged_background_task_stopped"
         : loginMeta.requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
@@ -1157,7 +1173,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedIsError = asBoolean(parsed.is_error, false);
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
+    const failed = incompleteTerminalCleanup ||
+      (!parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError));
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1183,11 +1200,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
-      : null;
+    const errorMessage = incompleteTerminalCleanup
+      ? incompleteTerminalCleanupMessage
+      : failed
+        ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+        : null;
     const providerQuota =
       failed &&
+      !incompleteTerminalCleanup &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1199,6 +1219,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     const transientUpstream =
       failed &&
+      !incompleteTerminalCleanup &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1222,6 +1243,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
+      : incompleteTerminalCleanup
+      ? "unmanaged_background_task_stopped"
       : loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
@@ -1249,6 +1272,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : claudeRefusal
       ? "model_refusal"
       : null;
+    // The process controller deliberately stops a lingering CLI after a terminal
+    // frame. Its signal is cleanup evidence, not a provider execution failure.
+    // Only normalize that exact, successful cleanup; real signals, timeouts,
+    // error frames, refusals and transport failures retain their disposition.
+    const successfulTerminalCleanup =
+      parsedSucceeded &&
+      hasCurrentClaudeTerminalResult(proc.stdout) &&
+      !failed &&
+      !claudeRefusal &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !resolvedErrorCode &&
+      !proc.timedOut &&
+      proc.exitCode === null &&
+      (proc.signal === "SIGTERM" || proc.signal === "SIGKILL") &&
+      proc.terminalResultCleanup?.kind === "terminal_result_cleanup" &&
+      proc.terminalResultCleanup.stopped === true &&
+      proc.terminalResultCleanup.terminalResultSeen === true &&
+      proc.terminalResultCleanup.orderedOutputObserved === true &&
+      proc.terminalResultCleanup.signal === proc.signal;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -1259,11 +1302,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...(successfulTerminalCleanup
+        ? { adapterCompletion: {
+            reason: "successful_terminal_result_cleanup",
+            processExitCode: proc.exitCode,
+            processSignal: proc.signal,
+          } }
+        : {}),
     };
 
     return {
-      exitCode: proc.exitCode,
-      signal: proc.signal,
+      exitCode: successfulTerminalCleanup ? 0 : proc.exitCode,
+      signal: successfulTerminalCleanup ? null : proc.signal,
       timedOut: false,
       usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,

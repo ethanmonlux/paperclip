@@ -76,6 +76,8 @@ export type GateDecision =
     };
 
 export type ScheduledRetryFacts = {
+  /** Verified from the current persisted pending invitation, not wake payload claims. */
+  isPendingInteractionAddressee?: boolean;
   runId: string;
   runAgentId: string;
   issueId: string | null;
@@ -130,6 +132,8 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  /** Revalidated at queued and final pre-dispatch gates. */
+  isPendingInteractionAddressee?: boolean;
   pendingResponse?: "interaction" | "approval" | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
@@ -168,6 +172,7 @@ export type QueuedRunFacts = {
 };
 
 type OwnershipFacts = {
+  isPendingInteractionAddressee?: boolean;
   runAgentId: string;
   issueAssigneeAgentId: string | null;
   isNonAssigneeWorkspaceBusyRetry: boolean;
@@ -187,6 +192,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.issueAssigneeAgentId === facts.runAgentId) return "current_owner";
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
+  if (facts.isPendingInteractionAddressee === true) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -343,6 +349,7 @@ export function decideScheduledRetryGate(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
+    isPendingInteractionAddressee: facts.isPendingInteractionAddressee,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.hasParticipant &&
@@ -433,6 +440,7 @@ export function decideScheduledRetryGate(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
+    bypass: facts.isPendingInteractionAddressee === true,
   });
   if (participantOutcome === "participant_changed") {
     return {
@@ -573,6 +581,7 @@ export function decideQueuedRunStaleness(
     runAgentId: facts.runAgentId,
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
+    isPendingInteractionAddressee: facts.isPendingInteractionAddressee,
     isInteractionWake: facts.isInteractionWake,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
@@ -669,7 +678,7 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent,
+    bypass: facts.wakeCommentIdPresent || facts.isPendingInteractionAddressee === true,
   });
   if (participantOutcome === "participant_changed") {
     return {

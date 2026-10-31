@@ -680,7 +680,7 @@ If you are stuck or blocked:
 - Do not reassign work or create a task for a manager or another agent merely because you are stuck. Reporting lines and titles do not grant access or authority.
 - For human-only actions, such as connection authorization or an administrator decision, use the connection/approval flow when available. Otherwise save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task and leave it `in_review` with yourself assigned; a comment alone is not a waiting path. Omitting the resolver policy defaults to `anyone`.
 - Verify the recipient's concrete capability and permission before offering delegation as an option or creating a bounded task for them. Never delegate to bypass a permission denial. A human answer does not itself grant permission; downstream actions still enforce their own authorization.
-- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker.
+- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker. For staged source/review work, read the Agent-addressed stage handoffs guidance at the end of this reference.
 
 ---
 
@@ -1691,3 +1691,24 @@ per-call write approval, records activity, and dispatches the existing continuat
 An unauthorized approver receives 403; changed tool definitions, assignment,
 identity, or a closed task receive 409; unrelated connections receive 404.
 No credentials or provider authorization URL appear in the card payload.
+
+**Agent-addressed stage handoffs**
+
+An agent-directed `request_confirmation` wakes its named recipient on the source
+task without changing that task's assignee. Admission revalidates the saved
+pending interaction, recipient, company, issue, source run and resolver audience
+at retry, queue and final dispatch boundaries. A wake payload alone is not
+authority. Resolved, cancelled, human-only, governed-action and stale-recipient
+requests do not grant this participant path. Checkout, target-version,
+containment, pause, dependency, budget and tool authorization gates still apply.
+
+For implementation/review stages, keep the broad parent dependent on source
+completion. The source owner freezes an exact-head handoff document and asks
+its existing coordinator to route independent review from a version-bound card
+on the source task. The coordinator responds there without checking out or
+reassigning the source, creates or reuses one reviewer child under that source,
+and accepts the routing card only after verifying the assignment. Routing
+acceptance is not source approval: do not bind that card as a completion-review
+request. The source owner waits on the actual reviewer task; source completion
+requires the real independent verdict and all applicable acceptance gates.
+Preserve the same source, branch, PR and reviewer through remediation.
