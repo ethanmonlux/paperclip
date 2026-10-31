@@ -5,9 +5,9 @@
   "upstreamRepository": "paperclipai/paperclip",
   "upstreamRef": "master",
   "firstCandidateUpstreamSha": "8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57",
-  "forkPatchSourceSha": "5305f21c97a2dd3a77e529fb10778be48e8eeb02",
-  "evidenceSourceSha": "5305f21c97a2dd3a77e529fb10778be48e8eeb02",
-  "evidenceSourceNote": "5305f21c is the current PR #10 repair head, installed live per FAC-760. All original regressions are read from that commit. Ported regressions are read from the committed blob under maintenance/upgrade/ports/ at the harness commit, and each receipt binds both blobs.",
+  "forkPatchSourceSha": "b2385913e0f2048af05a3a60a0e4515528c7cb07",
+  "evidenceSourceSha": "b2385913e0f2048af05a3a60a0e4515528c7cb07",
+  "evidenceSourceNote": "b2385913 is the current PR #10 repair head and PR #11's base, installed live per FAC-760 (the native handoff repair). All original regressions are read from that commit. Ported regressions are read from the committed blob under maintenance/upgrade/ports/ at the harness commit, and each receipt binds both blobs.",
   "automaticActivationEnabled": false,
   "patches": [
     {
@@ -291,7 +291,7 @@
           "preserves the local allowlist bridge in identity-filtered Codex shells"
         ]
       },
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10; evidence is read from 5305f21c, which also contains the later launcher test in the same file."
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10; evidence is read from b2385913, which also contains the later launcher test in the same file."
     },
     {
       "id": "github-launcher-run-scope",
@@ -350,6 +350,68 @@
           "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
           "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
         ]
+      }
+    },
+    {
+      "id": "native-handoff-admission",
+      "purpose": "Admit an agent-addressed pending request_confirmation recipient on the source task without reassignment, revalidating the persisted interaction under row locks at retry, queue and final dispatch, and expiring stale document targets issue-first.",
+      "sourceCommits": [
+        "a0809c5cf961c1ab9851500c520aa76a7086ec94",
+        "00d786b62db0f87ef801201665e50a4dcaf87ace",
+        "2a34dfbaf5889ebea96feff5b943aa1988ed34d7",
+        "b2385913e0f2048af05a3a60a0e4515528c7cb07"
+      ],
+      "evidencePaths": [
+        "server/src/modules/run-dispatch/domain/policy.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.test.ts",
+        "server/src/services/pending-agent-interaction.test.ts",
+        "skills/paperclip/references/api-reference.md"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. pending-agent-interaction.ts and its unit test are fork-only (absent upstream), so that test cannot load there and is not an upstream-only discriminator. Upstream policy.ts is byte-identical to stable; upstream postgres.ts and issue-thread-interactions.ts changed. b2385913 changes only documentation: the shipped skills/paperclip/references/api-reference.md carries the stage-handoff guidance (doc/ is not packaged); upstream's api-reference.md changed and must be re-merged, not replaced. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "server/src/modules/run-dispatch/domain/policy.test.ts",
+          "server/src/modules/run-dispatch/adapters/postgres.test.ts"
+        ],
+        "requiredTests": [
+          "admits the addressed participant without replacing the source owner or reviewer",
+          "does not authorize source-assignee continuations or override terminal and execution locks",
+          "preserves budget, pause, dependency and invokability gates",
+          "admits a persisted addressed handoff without reassignment or source checkout",
+          "dispatches the addressed recipient only while the invitation and execution lock remain current",
+          "serializes concurrent invitation cancellation with the final provider handoff",
+          "orders stale-target expiry issue-first against final invitation dispatch",
+          "revalidates recipient changes and issue-scoped provenance instead of trusting wake flags",
+          "revalidates the pending invitation during scheduled retry admission"
+        ]
+      }
+    },
+    {
+      "id": "recovery-fixture-isolation",
+      "purpose": "The explicit non-Git local-path recovery case must use an owned clean ancestor chain, not shared /tmp, where another fixture's damaged .git is correctly reported.",
+      "sourceCommits": [
+        "83f770b321292f77bb7f8f2eeea6050b09a25883"
+      ],
+      "evidencePaths": [
+        "server/src/__tests__/heartbeat-process-recovery.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Test-fixture-only change; no production code. Upstream 8595efc2 still creates this fixture under os.tmpdir() (heartbeat-process-recovery.test.ts:6274). Serialized server shard 1/9 failed this test on e5decf9f before the fix.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "Fixture isolation with no behavior assertion to reproduce; its failure depends on other fixtures sharing /tmp. Review whether upstream's version of the test still uses a shared temporary ancestor."
       }
     }
   ],

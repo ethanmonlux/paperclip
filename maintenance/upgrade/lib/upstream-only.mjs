@@ -24,8 +24,13 @@ const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 // Tests run in a fresh user and network namespace with only loopback up, so a
 // fixed port held by the host (for example a sandbox proxy) cannot turn a
 // listen failure into a fake behavioral result, and tests reach no network.
+// `private-network-user` then drops back to the caller's own uid/gid in a
+// nested user namespace, for tests that refuse to run as root (embedded
+// Postgres `initdb`); the network namespace stays the same.
 export const TEST_ISOLATION = Object.freeze({
   "private-network": (argv) => ["unshare", "--user", "--map-root-user", "--net", "sh", "-c", 'ip link set lo up && exec "$@"', "sh", ...argv],
+  "private-network-user": (argv) => ["unshare", "--user", "--map-root-user", "--net", "sh", "-c",
+    `ip link set lo up && exec unshare --user --map-user=${process.getuid()} --map-group=${process.getgid()} "$@"`, "sh", ...argv],
   none: (argv) => argv,
 });
 

@@ -289,3 +289,33 @@ s.listen(${port}, "127.0.0.1", () => s.close(() => done(true)));
     assert.throws(() => f.run({ testIsolation: "bogus" }), /Unknown test isolation/);
   } finally { server.close(); f.cleanup(); }
 });
+
+test("private-network-user isolation keeps the private network but runs as the caller's own uid", { skip: canIsolate || requireIsolation ? false : "user/network namespaces unavailable on this host" }, async () => {
+  assert.ok(canIsolate, "user/network namespaces are required but unavailable");
+  const net = await import("node:net");
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const f = fixture(true);
+  try {
+    // Passes only if the host-held port is free (private network) and the
+    // process is the caller's uid/gid, not namespace root.
+    const runner = `
+const fs = require("node:fs"); const net = require("node:net");
+const [report, ...files] = process.argv.slice(1);
+fs.writeFileSync("ids.json", JSON.stringify({ uid: process.getuid(), gid: process.getgid() }));
+const s = net.createServer();
+const done = (ok, msg) => { fs.writeFileSync(report, JSON.stringify({ testResults: [{ name: require("node:path").resolve(files[0]), status: ok ? "passed" : "failed", message: "",
+  assertionResults: [{ fullName: "impl keeps output", status: ok ? "passed" : "failed", failureMessages: ok ? [] : [msg] }] }] })); process.exit(ok ? 0 : 1); };
+s.on("error", (e) => done(false, "Error: " + e.code));
+s.listen(${port}, "127.0.0.1", () => s.close(() => done(${process.getuid()} === process.getuid() && ${process.getgid()} === process.getgid(), "AssertionError: wrong uid")));
+`;
+    const argv = [process.execPath, "-e", runner, "{report}", "{testFiles}"];
+    const asRoot = f.run({ testArgv: argv, testIsolation: "private-network" });
+    assert.deepEqual(JSON.parse(readFileSync(path.join(asRoot.attemptDir, "upstream", "ids.json"), "utf8")), { uid: 0, gid: 0 });
+    const asUser = f.run({ testArgv: argv, testIsolation: "private-network-user" });
+    assert.equal(asUser.outcome, "upstream-passes", asUser.test.outputTail);
+    assert.equal(asUser.testIsolation, "private-network-user");
+    assert.deepEqual(JSON.parse(readFileSync(path.join(asUser.attemptDir, "upstream", "ids.json"), "utf8")), { uid: process.getuid(), gid: process.getgid() });
+  } finally { server.close(); f.cleanup(); }
+});

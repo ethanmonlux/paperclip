@@ -21,7 +21,7 @@ const defaultCiGraph = path.join(repoRoot, "maintenance", "ci-graph.json");
 const usage = `Usage:
   node maintenance/upgrade/cli.mjs validate [--registry FILE]
   node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD]
-      [--ports-sha SHA] [--isolation private-network|none] [--registry FILE]
+      [--ports-sha SHA] [--isolation private-network|private-network-user|none] [--registry FILE]
   node maintenance/upgrade/cli.mjs ci-graph --base-context REV [--candidate REV] [--check] [--ci-graph FILE]
   node maintenance/upgrade/cli.mjs admission --evidence FILE --base-context REV [--registry FILE] [--ci-graph FILE]
   node maintenance/upgrade/cli.mjs migration-inventory --base SHA --candidate SHA [--dir packages/db/src/migrations]`;
