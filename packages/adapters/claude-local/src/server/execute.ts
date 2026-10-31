@@ -1012,6 +1012,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
     const { proc, parsedStream, parsed } = attempt;
+    const incompleteTerminalCleanup =
+      proc.terminalResultCleanup?.orderedOutputObserved === true &&
+      (!proc.terminalResultCleanup.terminalResultSeen ||
+        !hasCurrentClaudeTerminalResult(proc.stdout));
+    const incompleteTerminalCleanupMessage = "Claude continued activity during terminal-result cleanup; completion is unproven. Reconcile task effects before continuation.";
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1046,8 +1051,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
-      const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const fallbackErrorMessage = incompleteTerminalCleanup
+        ? incompleteTerminalCleanupMessage
+        : parseFallbackErrorMessage(proc);
       const providerQuota =
+        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
@@ -1057,6 +1065,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
+        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1080,6 +1089,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // surfaces the typed `duplex_channel_lost` code before any provider
         // classification, so the CLI lane and the ACP lane report it alike.
         ? proc.errorCode
+        : incompleteTerminalCleanup
+        ? "unmanaged_background_task_stopped"
         : loginMeta.requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
@@ -1162,10 +1173,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedIsError = asBoolean(parsed.is_error, false);
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const incompleteTerminalCleanup =
-      proc.terminalResultCleanup?.orderedOutputObserved === true &&
-      (!proc.terminalResultCleanup.terminalResultSeen ||
-        !hasCurrentClaudeTerminalResult(proc.stdout));
     const failed = incompleteTerminalCleanup ||
       (!parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError));
     // Validate-before-persist guard: never persist a sessionId whose transcript
@@ -1194,7 +1201,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } as Record<string, unknown>)
       : null;
     const errorMessage = incompleteTerminalCleanup
-      ? "Claude continued activity during terminal-result cleanup; completion is unproven. Reconcile task effects before continuation."
+      ? incompleteTerminalCleanupMessage
       : failed
         ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
         : null;

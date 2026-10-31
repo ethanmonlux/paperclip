@@ -192,4 +192,44 @@ describe("Claude terminal-result cleanup disposition", () => {
     expect(result.resultJson?.adapterCompletion).toBeUndefined();
   });
 
+  it.skipIf(process.platform === "win32").each([0, 1])("keeps capture-evicted cleanup in reconciliation disposition for exit %i", async exitCode => {
+    const proc = await runChildProcess(randomUUID(), process.execPath, ["-e", [
+      "process.on('SIGTERM',()=>process.stdout.write('x'.repeat(4*1024*1024+4096),()=>process.stderr.write('service unavailable\\n',()=>process.exit(" + exitCode + "))));",
+      "process.stdout.write(JSON.stringify(" + JSON.stringify(success) + ")+'\\n');",
+      "setInterval(()=>{},1000);",
+    ].join("")], {
+      cwd: os.tmpdir(), env: {}, timeoutSec: 5, graceSec: 2, onLog: async () => {},
+      terminalResultCleanup: { graceMs: 50, hasTerminalResult: () => false, observeOutput: createClaudeTerminalResultTracker() },
+    });
+    expect(proc.exitCode).toBe(exitCode);
+    expect(proc.stdout).not.toContain('"type":"result"');
+    expect(proc.terminalResultCleanup).toMatchObject({ orderedOutputObserved: true, terminalResultSeen: false });
+    const result = await adapt(proc);
+    expect(result.errorCode).toBe("unmanaged_background_task_stopped");
+    expect(result.errorMessage).toContain("completion is unproven");
+    expect(result.errorFamily).toBeNull();
+    expect(result.retryNotBefore ?? null).toBeNull();
+    expect(result.resultJson?.unmanagedBackgroundTask).toMatchObject({ terminalResultSeen: false });
+  });
+  it.each(["429 rate limit", "service unavailable"])("does not infer retry from unparsed incomplete-cleanup prose %s", async stderr => {
+    const result = await adapt({
+      exitCode: 1, signal: null, stdout: "evicted terminal frame", stderr,
+      terminalResultCleanup: { ...cleanup, terminalResultSeen: false },
+    });
+    expect(result.errorCode).toBe("unmanaged_background_task_stopped");
+    expect(result.errorFamily).toBeNull();
+    expect(result.retryNotBefore ?? null).toBeNull();
+  });
+  it.each([
+    [{ errorCode: "duplex_channel_lost" }, "duplex_channel_lost"],
+    [{ timedOut: true }, "timeout"],
+  ])("preserves stronger unparsed precedence %j", async (extra, code) => {
+    const result = await adapt({
+      exitCode: 1, signal: null, stdout: "evicted terminal frame", stderr: "429 service unavailable",
+      terminalResultCleanup: { ...cleanup, terminalResultSeen: false }, ...extra,
+    });
+    expect(result.errorCode).toBe(code);
+    expect(result.retryNotBefore ?? null).toBeNull();
+  });
+
 });
