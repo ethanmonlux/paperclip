@@ -133,9 +133,34 @@ describe("update command", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining(`commit ${newSha.slice(0, 12)}`));
     expect(fs.readFileSync(paths.shimPath, "utf8")).toContain(`export PATH='${path.dirname(process.execPath)}'`);
     expect(backup).toHaveBeenCalledOnce();
-    expect(restartActiveService).toHaveBeenCalledWith("0.3.1");
+    expect(restartActiveService).toHaveBeenCalledWith("0.3.1", newSha);
     expect(readInstallManifest(paths)?.sha).toBe(newSha);
     expect(fs.realpathSync(paths.currentPath)).toBe(fs.realpathSync(newPayload));
+  });
+
+  it("verifies git payload restarts by exact commit and rolls back to the previous commit", async () => {
+    const paths = resolveInstallStorePaths(); initializeInstallStore(paths);
+    const oldSha = "1".repeat(40); const newSha = "2".repeat(40);
+    const oldPayload = payloadPathFor(paths, "git", oldSha.slice(0, 12));
+    const executable = createPayload(oldPayload, "0.3.1");
+    fs.writeFileSync(path.join(oldPayload, "node_modules", "paperclipai", "package.json"), JSON.stringify({ version: "0.3.1" }));
+    const newPayload = payloadPathFor(paths, "git", newSha.slice(0, 12));
+    createPayload(newPayload, "0.3.1");
+    fs.writeFileSync(path.join(newPayload, "node_modules", "paperclipai", "package.json"), JSON.stringify({ version: "0.3.1" }));
+    flipCurrentAtomic(oldPayload, paths);
+    writeInstallManifestAtomic({ schemaVersion: 1, source: "git", version: "0.3.1", channel: "pinned", repo: "paperclipai/paperclip", ref: "master", sha: oldSha, payloadPath: oldPayload, installedAt: "2026-07-22T00:00:00.000Z", previous: [] }, paths);
+    writeManagedShim(paths);
+    // Both payloads share a package version, so only the commit can tell them apart.
+    const restartActiveService = vi.fn(async (_version: string, commit?: string) => {
+      if (commit === newSha) throw new Error("health timeout at commit");
+      return true;
+    });
+    const runCommand = vi.fn(async (file: string) => file === "curl" ? { stdout: JSON.stringify({ sha: newSha }), stderr: "" } : { stdout: "0.3.1\n", stderr: "" });
+    await expect(updateCommand({ yes: true, backup: false }, { paths, executablePath: executable, runCommand, restartActiveService })).rejects.toThrow("rolled back to 0.3.1");
+    expect(restartActiveService).toHaveBeenNthCalledWith(1, "0.3.1", newSha);
+    expect(restartActiveService).toHaveBeenNthCalledWith(2, "0.3.1", oldSha);
+    expect(readInstallManifest(paths)?.sha).toBe(oldSha);
+    expect(fs.realpathSync(paths.currentPath)).toBe(fs.realpathSync(oldPayload));
   });
 
   it("reports SHA git installs as pinned without resolving again", async () => {

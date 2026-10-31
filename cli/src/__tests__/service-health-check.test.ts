@@ -10,7 +10,7 @@ import {
   renderLaunchdPlist,
   renderSystemdUnit,
 } from "../services/service-manager.js";
-import { resolveRestartExpectedVersion, withHotRestartLock } from "../commands/service.js";
+import { healthMatchesExpectation, resolveRestartExpectedVersion, withHotRestartLock } from "../commands/service.js";
 import type { PaperclipConfig } from "../config/schema.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 
@@ -71,6 +71,19 @@ describe("service health doctor checks", () => {
     await expect(serviceHealthChecks(config, { detect, probe })).resolves.toEqual([]);
     expect(detect).not.toHaveBeenCalled();
     expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("verifies an expected commit against redacted authenticated-mode health", () => {
+    const sha = "9".repeat(40);
+    // Anonymous health on an authenticated deployment carries commit but no version.
+    const redacted = { ok: true, serverVersion: null, commit: sha };
+    expect(healthMatchesExpectation(redacted, { version: "0.3.1" })).toBe(false);
+    expect(healthMatchesExpectation(redacted, { version: "0.3.1", commit: sha })).toBe(true);
+    expect(healthMatchesExpectation({ ...redacted, commit: "8".repeat(40) }, { commit: sha })).toBe(false);
+    expect(healthMatchesExpectation({ ...redacted, commit: null }, { commit: sha })).toBe(false);
+    expect(healthMatchesExpectation({ ...redacted, ok: false }, { commit: sha })).toBe(false);
+    expect(healthMatchesExpectation({ ok: true, serverVersion: "0.3.1", commit: null }, { version: "0.3.1" })).toBe(true);
+    expect(healthMatchesExpectation({ ok: true, serverVersion: null, commit: null }, {})).toBe(true);
   });
 
   it("skips exact version matching unless a restart version is explicit", () => {

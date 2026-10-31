@@ -1,0 +1,496 @@
+{
+  "schemaVersion": 1,
+  "status": "preparation-not-enforcement",
+  "owner": "FAC-760",
+  "upstreamRepository": "paperclipai/paperclip",
+  "upstreamRef": "master",
+  "firstCandidateUpstreamSha": "8595efc20bda3ce20a9fbbf34a5d156a6fcf6d57",
+  "forkPatchSourceSha": "b2385913e0f2048af05a3a60a0e4515528c7cb07",
+  "evidenceSourceSha": "b2385913e0f2048af05a3a60a0e4515528c7cb07",
+  "evidenceSourceNote": "b2385913 is the current PR #10 repair head and PR #11's base, installed live per FAC-760 (the native handoff repair). All original regressions are read from that commit. Ported regressions are read from the committed blob under maintenance/upgrade/ports/ at the harness commit, and each receipt binds both blobs.",
+  "automaticActivationEnabled": false,
+  "patches": [
+    {
+      "id": "provider-output-and-mounts",
+      "purpose": "Preserve child stdout/stderr, bounded drain/cancellation and merged-usr mounts.",
+      "sourceCommits": [
+        "904851063ddf5f83ae298cac97eea877b8b57771",
+        "2e6e2f4bec1225e2b3b863f04b163884184afe19",
+        "448eebdbb27af81fd4fed54728d225e623297366"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/local-process-proxy-stdio.test.ts",
+        "packages/adapter-utils/src/local-process-sandbox.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Merged-usr mount handling has no dedicated fork regression test (local-process-sandbox.test.ts is unchanged from stable); that part needs independent manual review. Upstream 8595efc2 local-process-sandbox.ts is byte-identical to stable 1b4c8038 (blob 95f6227a); the bridge stays module-private there, so the run exports it with an export-only shim. The upstream bridge listens on fixed port 31337, so tests run in a private network namespace.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapter-utils/src/local-process-proxy-stdio.test.ts"
+        ],
+        "requiredTests": [
+          "preserves large synchronous stdout/stderr despite a nonblocking bridge and slow consumer",
+          "retains stdin, argv, cwd, environment and nonzero provider exit",
+          "forwards cancellation and preserves signal termination",
+          "terminates after provider exit when destination writes cannot drain"
+        ],
+        "exportShim": [
+          {
+            "file": "packages/adapter-utils/src/local-process-sandbox.ts",
+            "symbols": [
+              "createNetworkProxyBridge"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "proxy-socket-error-owner",
+      "purpose": "Keep accepted proxy socket errors owned after CONNECT.",
+      "sourceCommits": [
+        "f23e05aacc24cbe66d602adc3ccba6e7981060ec"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/local-process-proxy-errors.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Upstream keeps startNetworkAllowlistProxy module-private (file identical to stable), so the run exports it with an export-only shim.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapter-utils/src/local-process-proxy-errors.test.ts"
+        ],
+        "requiredTests": [
+          "owns accepted proxy socket errors after CONNECT"
+        ],
+        "exportShim": [
+          {
+            "file": "packages/adapter-utils/src/local-process-sandbox.ts",
+            "symbols": [
+              "startNetworkAllowlistProxy"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "codex-auth-provenance",
+      "purpose": "Only provider-owned error evidence may invalidate Codex authentication.",
+      "sourceCommits": [
+        "17c7b9b86aac9e90518b7b2ce989629327c149c2"
+      ],
+      "evidencePaths": [
+        "packages/adapters/codex-local/src/server/parse.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/codex-local/src/server/parse.test.ts"
+        ],
+        "requiredTests": [
+          "does not invalidate credentials from historical auth text in a",
+          "ignores auth text inside a truncated JSONL tool result after a harness crash",
+          "retains genuine protocol authentication failures"
+        ]
+      }
+    },
+    {
+      "id": "claude-auth-provenance",
+      "purpose": "Ignore quoted task/history/model prose while preserving actual authentication/probe errors.",
+      "sourceCommits": [
+        "1233ed7dd8cfd3dcb0094cf14642431d5c122b53",
+        "315bc90f765e1ec1e202cd749a9bfbf0f5d96ac4"
+      ],
+      "evidencePaths": [
+        "packages/adapters/claude-local/src/server/parse.test.ts",
+        "packages/adapters/claude-local/src/server/acp.auth.test.ts",
+        "packages/adapters/claude-local/src/server/test.remote.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. acp.auth.test.ts and test.remote.test.ts exercise the one-line acp.ts/test.ts caller changes and must be reviewed with the combined candidate; they are not upstream-only discriminators.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/claude-local/src/server/parse.test.ts"
+        ],
+        "requiredTests": [
+          "fixed Claude hello probe login instructions",
+          "Claude auth output provenance"
+        ]
+      }
+    },
+    {
+      "id": "git-install-payload",
+      "purpose": "Ship built UI/skills with exact source provenance; pack without source-only hooks and retain independent package versions.",
+      "sourceCommits": [
+        "f49409b16eaf53872343dc92fcab97696fb4507a",
+        "2899cffb1af2e80e63387616c300be70b1f020ce",
+        "0fc0c7d3fb9fe5c36d5e9202092591dee60a63bc"
+      ],
+      "evidencePaths": [
+        "cli/src/__tests__/install-command.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. The original fixture crashed with ENOENT on upstream; see maintenance/upgrade/ports/git-install-payload/PORT.md for the observation-only port.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "cli/src/__tests__/install-command.test.ts"
+        ],
+        "requiredTests": [
+          "stages UI and native skills before preparing the bundled server package",
+          "keeps each dependency's own workspace version in the prepared server manifest",
+          "stamps the requested archive commit instead of stale env or an enclosing repository"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/git-install-payload/install-command.test.ts",
+            "target": "cli/src/__tests__/install-command.test.ts"
+          }
+        ]
+      }
+    },
+    {
+      "id": "installer-test-isolation",
+      "purpose": "Installer tests must not reach the real service manager.",
+      "sourceCommits": [
+        "9efa9cd8e42830ddbe3be48d8d70134e796911ab"
+      ],
+      "evidencePaths": [
+        "cli/src/__tests__/install-command.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "Test-harness isolation fix with no behavior assertion to reproduce; prove upstream install tests never reach the real service manager in a sandboxed run."
+      }
+    },
+    {
+      "id": "portable-runner-fixtures",
+      "purpose": "Runner staging tests must not depend on coreutils binary identity.",
+      "sourceCommits": [
+        "904851063ddf5f83ae298cac97eea877b8b57771"
+      ],
+      "evidencePaths": [
+        "packages/paperclip-runner/scripts/stage-runner-binary.test.mjs"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "node:test fixture portability change to an existing assertion; review upstream fixture independence directly."
+      }
+    },
+    {
+      "id": "portable-sandbox-denial",
+      "purpose": "Require protected-file denial and unchanged contents across valid shell exit codes.",
+      "sourceCommits": [
+        "288d4de96ff5af91a64b417c924ccad1e680bc93"
+      ],
+      "evidencePaths": [
+        "server/src/services/native-runtime/runner-bridge-tools.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. The required test is skipped where the workspace command sandbox is unavailable; that yields unknown, never pass.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "server/src/services/native-runtime/runner-bridge-tools.test.ts"
+        ],
+        "requiredTests": [
+          "runs useful commands but denies files outside the workspace and injected credentials"
+        ]
+      }
+    },
+    {
+      "id": "trusted-ci-baseline",
+      "purpose": "Current repair uses an immutable trusted CI baseline; upstream upgrade needs freshly reviewed equivalent gates.",
+      "sourceCommits": [
+        "c84f297f8e1bf1e13d04d1463268cbc4aa7bccd0"
+      ],
+      "evidencePaths": [
+        ".github/workflows/pr.yml"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "CI workflow pin; an upstream candidate needs freshly reviewed equivalent gates, not a test run."
+      }
+    },
+    {
+      "id": "codex-shell-proxy-allowlist",
+      "purpose": "Keep the local sandbox allowlist proxy variables in identity-filtered Codex task shells without inheriting other host environment.",
+      "sourceCommits": [
+        "975bc8d75c767b391bab7035401295495f45a4eb"
+      ],
+      "evidencePaths": [
+        "packages/adapters/codex-local/src/server/execute.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/codex-local/src/server/execute.test.ts"
+        ],
+        "requiredTests": [
+          "preserves the local allowlist bridge in identity-filtered Codex shells"
+        ]
+      },
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Installed live with PR10; evidence is read from b2385913, which also contains the later launcher test in the same file."
+    },
+    {
+      "id": "github-launcher-run-scope",
+      "purpose": "Mount only this run's canonical managed GitHub launcher directory into the local sandbox and keep the Codex broker capability.",
+      "sourceCommits": [
+        "22765b53a949fc164c5bbfd3be51a1f3c22b00ea"
+      ],
+      "evidencePaths": [
+        "packages/adapter-utils/src/github-launcher-sandbox.test.ts",
+        "packages/adapters/codex-local/src/server/execute.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. The bwrap broker test only runs with PAPERCLIP_TEST_BWRAP and is not a required discriminator. github-launcher-sandbox.test.ts calls the fork-only localGitHubLauncherSandboxPaths helper, so upstream cannot run it; its behaviours are ported to the Codex execute() boundary in maintenance/upgrade/ports/github-launcher-run-scope/PORT.md. The Claude adapter's launcher mount has no evidence file and stays a combined-candidate item.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/codex-local/src/server/execute.test.ts"
+        ],
+        "requiredTests": [
+          "does not mount an arbitrary configured launcher directory through execute()",
+          "does not mount another run's launcher directory through execute()",
+          "never mounts a symlinked own-run launcher directory or its target through execute()",
+          "mounts this run's canonical launcher directory read-write through execute()",
+          "passes this run's managed GitHub launchers into the local sandbox",
+          "keeps this run's GitHub broker capability name in Codex shells without its value in argv"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/github-launcher-run-scope/execute.test.ts",
+            "target": "packages/adapters/codex-local/src/server/execute.test.ts"
+          }
+        ]
+      }
+    },
+    {
+      "id": "claude-terminal-cleanup",
+      "purpose": "Bind Claude terminal-result cleanup to the latest settled turn and keep unproven cleanup in reconciliation rather than inferring success or failure.",
+      "sourceCommits": [
+        "fe157b23de7e1833729b930df2fdcbe78087c85f",
+        "bfd4f26a622ed57b66014889b074708903f47de3",
+        "7f187cea1816d623d36ff6ca592c791c00ac580d",
+        "5305f21c97a2dd3a77e529fb10778be48e8eeb02"
+      ],
+      "evidencePaths": [
+        "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
+        "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. Every test in both files is evidence. The originals call the fork-only latest-turn tracker directly; the ports run the same scripted provider output as real child processes through execute(); see maintenance/upgrade/ports/claude-terminal-cleanup/PORT.md.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts",
+          "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/claude-terminal-cleanup/execute.terminal-cleanup.test.ts",
+            "target": "packages/adapters/claude-local/src/server/execute.terminal-cleanup.test.ts"
+          },
+          {
+            "port": "maintenance/upgrade/ports/claude-terminal-cleanup/parse.terminal-cleanup.test.ts",
+            "target": "packages/adapters/claude-local/src/server/parse.terminal-cleanup.test.ts"
+          }
+        ]
+      }
+    },
+    {
+      "id": "native-handoff-admission",
+      "purpose": "Admit an agent-addressed pending request_confirmation recipient on the source task without reassignment, revalidating the persisted interaction under row locks at retry, queue and final dispatch, and expiring stale document targets issue-first.",
+      "sourceCommits": [
+        "a0809c5cf961c1ab9851500c520aa76a7086ec94",
+        "00d786b62db0f87ef801201665e50a4dcaf87ace",
+        "2a34dfbaf5889ebea96feff5b943aa1988ed34d7",
+        "b2385913e0f2048af05a3a60a0e4515528c7cb07"
+      ],
+      "evidencePaths": [
+        "server/src/modules/run-dispatch/domain/policy.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.test.ts",
+        "server/src/services/pending-agent-interaction.test.ts",
+        "skills/paperclip/references/api-reference.md"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Commit references are provenance, not a cherry-pick recipe. pending-agent-interaction.ts and its unit test are fork-only (absent upstream), so that test cannot load there and is not an upstream-only discriminator. Upstream policy.ts is byte-identical to stable; upstream postgres.ts and issue-thread-interactions.ts changed. b2385913 changes only documentation: the shipped skills/paperclip/references/api-reference.md carries the stage-handoff guidance (doc/ is not packaged); upstream's api-reference.md changed and must be re-merged, not replaced. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. The two concurrency regressions paused inside a vi.mock of the fork-only helper, which upstream never reaches, so they timed out; the port pauses the real gate with test-held Postgres row locks and bounded waits instead, and adds a dispatch-first case that pauses the gate's own transaction after its locked invitation read through a test-only Db seam; see maintenance/upgrade/ports/native-handoff-admission/PORT.md. Run with --isolation private-network-user.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "testFiles": [
+          "server/src/modules/run-dispatch/domain/policy.test.ts",
+          "server/src/modules/run-dispatch/adapters/postgres.test.ts"
+        ],
+        "requiredTests": [
+          "admits the addressed participant without replacing the source owner or reviewer",
+          "does not authorize source-assignee continuations or override terminal and execution locks",
+          "preserves budget, pause, dependency and invokability gates",
+          "admits a persisted addressed handoff without reassignment or source checkout",
+          "dispatches the addressed recipient only while the invitation and execution lock remain current",
+          "serializes concurrent invitation cancellation with the final provider handoff",
+          "keeps the gate's invitation lock from its read through the provider handoff",
+          "orders stale-target expiry issue-first against final invitation dispatch",
+          "revalidates recipient changes and issue-scoped provenance instead of trusting wake flags",
+          "revalidates the pending invitation during scheduled retry admission"
+        ],
+        "ports": [
+          {
+            "port": "maintenance/upgrade/ports/native-handoff-admission/postgres.test.ts",
+            "target": "server/src/modules/run-dispatch/adapters/postgres.test.ts"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recovery-fixture-isolation",
+      "purpose": "The explicit non-Git local-path recovery case must use an owned clean ancestor chain, not shared /tmp, where another fixture's damaged .git is correctly reported.",
+      "sourceCommits": [
+        "83f770b321292f77bb7f8f2eeea6050b09a25883"
+      ],
+      "evidencePaths": [
+        "server/src/__tests__/heartbeat-process-recovery.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "Test-fixture-only change; no production code. Upstream 8595efc2 still creates this fixture under os.tmpdir() (heartbeat-process-recovery.test.ts:6274). Serialized server shard 1/9 failed this test on e5decf9f before the fix.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "Fixture isolation with no behavior assertion to reproduce; its failure depends on other fixtures sharing /tmp. Review whether upstream's version of the test still uses a shared temporary ancestor."
+      }
+    }
+  ],
+  "requiredCiJobsNote": "Every lane of the reviewed expected CI graph (maintenance/ci-graph.json), regenerated from the candidate's exact workflow blobs: its pull_request workflows, the PR base branch's pull_request_target workflows and each immutable reusable workflow. Admission requires this set to equal the graph's lanes (R4: an aggregate such as `ci / verify` does not prove the lanes it does not need), and every observed check must also succeed. Path- or branch-filtered workflows are recorded as conditional: their checks must succeed when present but are not expected. Any change to a workflow blob changes the graph and needs fresh review.",
+  "ciGraphDigest": "98bf4d66231bc281c611e1238cb583b5b0db68b42a792a66c9a4177a637aecda",
+  "requiredCiJobs": [
+    "ci / Build",
+    "ci / Canary Dry Run",
+    "ci / Docker context integrity",
+    "ci / General tests (chat (1/3))",
+    "ci / General tests (chat (2/3))",
+    "ci / General tests (chat (3/3))",
+    "ci / General tests (server (1/12))",
+    "ci / General tests (server (10/12))",
+    "ci / General tests (server (11/12))",
+    "ci / General tests (server (12/12))",
+    "ci / General tests (server (2/12))",
+    "ci / General tests (server (3/12))",
+    "ci / General tests (server (4/12))",
+    "ci / General tests (server (5/12))",
+    "ci / General tests (server (6/12))",
+    "ci / General tests (server (7/12))",
+    "ci / General tests (server (8/12))",
+    "ci / General tests (server (9/12))",
+    "ci / General tests (workspaces-a (1/2))",
+    "ci / General tests (workspaces-a (2/2))",
+    "ci / General tests (workspaces-b)",
+    "ci / General tests (workspaces-c)",
+    "ci / Select trusted runner",
+    "ci / Typecheck + Release Registry",
+    "ci / Verify Paperclip Runner (rust)",
+    "ci / Verify Paperclip Runner (static checks)",
+    "ci / Verify Paperclip Runner (vitest 1/2)",
+    "ci / Verify Paperclip Runner (vitest 2/2)",
+    "ci / Verify serialized server suites (1/9)",
+    "ci / Verify serialized server suites (2/9)",
+    "ci / Verify serialized server suites (3/9)",
+    "ci / Verify serialized server suites (4/9)",
+    "ci / Verify serialized server suites (5/9)",
+    "ci / Verify serialized server suites (6/9)",
+    "ci / Verify serialized server suites (7/9)",
+    "ci / Verify serialized server suites (8/9)",
+    "ci / Verify serialized server suites (9/9)",
+    "ci / e2e",
+    "ci / e2e shard (1/8)",
+    "ci / e2e shard (2/8)",
+    "ci / e2e shard (3/8)",
+    "ci / e2e shard (4/8)",
+    "ci / e2e shard (5/8)",
+    "ci / e2e shard (6/8)",
+    "ci / e2e shard (7/8)",
+    "ci / e2e shard (8/8)",
+    "ci / policy",
+    "ci / verify",
+    "maintenance upgrade toolkit",
+    "review"
+  ]
+}
