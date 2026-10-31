@@ -24,6 +24,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  localGitHubLauncherSandboxPaths,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -579,6 +580,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           workspaceDir: effectiveExecutionCwd,
           filesystemScope,
           managedPaths: [
+            ...await localGitHubLauncherSandboxPaths({ runId, env }),
             { path: sharedClaudeConfigDir, access: "rw" },
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },

@@ -118,7 +118,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; localAllowlist?: boolean }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; localAllowlist?: boolean; withLocalGitHubLauncher?: boolean }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -137,6 +137,8 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     process.env.CODEX_HOME = sharedHostHome;
     sandboxAuthFixture.bytes = Buffer.from(input.sandboxAuth, "utf8");
 
+    const launcherDir = path.join(os.tmpdir(), "paperclip-github-runtime", "run-copyback-e2e");
+    if (input.withLocalGitHubLauncher) { await mkdir(launcherDir, { recursive: true }); cleanupDirs.push(launcherDir); }
     const commandArgs: string[] = [];
     const executionResult = await execute({
       runId: "run-copyback-e2e",
@@ -160,7 +162,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
         ...(input.localAllowlist ? { networkScope: "allowlist", networkAllowlist: ["paperclip.test"] } : {}),
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
-        env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}) },
+        env: { ...(input.withLocalGitHubLauncher ? { PAPERCLIP_GITHUB_LAUNCHER_DIR: launcherDir } : {}), CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token", PAPERCLIP_GITHUB_BROKER_TOKEN: "assigned-github-capability" } : {}) },
       },
       context: {
         paperclipWorkspace: {
@@ -185,6 +187,8 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
 
     return {
       commandArgs,
+      processOptions: (runChildProcess.mock.calls as unknown as unknown[][]).at(-1)?.[3] as { localProcessSandbox?: { managedPaths?: Array<{path: string; access: string}> } },
+      launcherDir,
       finalHostAuth: await readFile(hostAuthPath, "utf8"),
       finalHostMode: (await lstat(hostAuthPath)).mode & 0o777,
       executionResult,
@@ -198,7 +202,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));
     const keys = JSON.parse(policy!.slice(policy!.indexOf("=") + 1));
     expect(keys).toEqual(expect.arrayContaining([
-      "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+      "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "PAPERCLIP_GITHUB_BROKER_TOKEN",
     ]));
     expect(keys).not.toContain("HTTP_PROXY");
     expect(keys).not.toContain("HTTPS_PROXY");
@@ -207,6 +211,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
+    expect(commandArgs.join(" ")).not.toContain("assigned-github-capability");
   });
 
   it("preserves the local allowlist bridge in identity-filtered Codex shells", async () => {
@@ -220,6 +225,11 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     ]));
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(keys).not.toContain("MY_SERVICE_TOKEN");
+  });
+
+  it("passes this run's managed GitHub launchers into the local sandbox", async () => {
+    const { processOptions, launcherDir } = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", withIdentity: true, localAllowlist: true, withLocalGitHubLauncher: true });
+    expect(processOptions.localProcessSandbox?.managedPaths).toContainEqual({ path: launcherDir, access: "rw" });
   });
 
   it("collects stopped-provider instruction edits before a throwing remote restore", async () => {
