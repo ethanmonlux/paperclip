@@ -440,9 +440,10 @@
     },
     {
       "id": "native-task-bound-continuation",
-      "purpose": "Give a reopened task a normal task-bound stage: wake the same assignee on a closed -> in_progress reopen, never treat a previous stage run that recorded Done/In Review/Blocked as an undisposed run, and never let a summary written before the current stage park it.",
+      "purpose": "Give a reopened task a normal task-bound stage: wake the same assignee on a closed -> in_progress reopen, never treat a previous stage run that recorded Done/In Review/Blocked as an undisposed run, and never let a summary written before the current stage park it, reading every summary representation from one identified revision so its writer's own status write cannot unpark it.",
       "sourceCommits": [
-        "53373965bfe5a24c8cc461bb775d6e7a464edaf3"
+        "53373965bfe5a24c8cc461bb775d6e7a464edaf3",
+        "6e5f6590ea42c5e261a06237b468f1b7f4469ba6"
       ],
       "evidencePaths": [
         "server/src/__tests__/native-task-bound-continuation.test.ts",
@@ -454,10 +455,10 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Carried on maintenance/guarded-upgrade-setup, not on the repair line fix/network-proxy-child-stdio; 53373965 is one self-contained server commit (code plus regressions) so it can be selected onto the repair line for a later qualified installation. Reproduced from STA-22 round 8 native records: comment cd8268d7 landed on a Done task, a separate PATCH reopened it done -> in_progress with no wake, and the stranded sweep dispatched issue_disposition_repair run 9dab77f6 against previous-stage run 0bf7baf2 (recovery action 774502e5). Stage boundaries come from structured issue.updated audit rows (run_id, details.status, details.changes.status or details._previous.status), not summary prose. The route regression runs from a port of upstream's own harness file; see maintenance/upgrade/ports/native-task-bound-continuation/PORT.md. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. Run with --isolation private-network-user.",
+      "notes": "Carried on maintenance/guarded-upgrade-setup, not on the repair line fix/network-proxy-child-stdio; 53373965 and its R7 follow-up 6e5f6590 are self-contained server commits (code plus regressions), selected together onto the repair line for a later qualified installation. Reproduced from STA-22 round 8 native records: comment cd8268d7 landed on a Done task, a separate PATCH reopened it done -> in_progress with no wake, and the stranded sweep dispatched issue_disposition_repair run 9dab77f6 against previous-stage run 0bf7baf2 (recovery action 774502e5). Stage boundaries come from structured issue.updated audit rows (run_id, details.status, details.changes.status or details._previous.status), not summary prose. The route regression runs from a port of upstream's own harness file; see maintenance/upgrade/ports/native-task-bound-continuation/PORT.md. The Postgres regressions need embedded Postgres; a host that cannot start it skips them, which is unknown. Run with --isolation private-network-user. R7 (STA-22 round 9): queued summary snapshots now name their revision, and live and queued summaries share one predicate that takes body, time and writer from that revision; missing or invalid provenance keeps the park.",
       "upstreamOnly": {
         "kind": "vitest",
-        "sourceSha": "53373965bfe5a24c8cc461bb775d6e7a464edaf3",
+        "sourceSha": "6e5f6590ea42c5e261a06237b468f1b7f4469ba6",
         "testFiles": [
           "server/src/__tests__/native-task-bound-continuation.test.ts",
           "server/src/__tests__/issue-update-comment-wakeup-routes.test.ts"
@@ -474,7 +475,8 @@
           "does not let a summary written before the current stage park the fresh assignment",
           "does not let a queued previous-stage summary snapshot park the fresh assignment",
           "does not carry a generated status-specific next action (Wait for reviewer feedback or approval before continuing executor work.) into a different status",
-          "does not carry a generated status-specific next action (Review the completed issue output and close any remaining follow-up comments.) into a different status"
+          "does not carry a generated status-specific next action (Review the completed issue output and close any remaining follow-up comments.) into a different status",
+          "continuation summary provenance (R7)"
         ],
         "ports": [
           {
