@@ -117,23 +117,32 @@ export async function configureSpekoSessionTools(db: Db, input: {
   const actionId = `speko_lifecycle:${fingerprint}`;
   const [previous] = await db.select().from(chatActions).where(and(eq(chatActions.companyId, input.companyId), eq(chatActions.endpointId, input.endpointId), eq(chatActions.providerActionId, actionId)));
   if (previous && previous.status !== "failed" && !matching.length) throw conflict("Speko webhook setup has an uncertain outcome. Inspect Webhooks in Speko before reconnecting.");
-  // Effect reservation (r2 §2.4 row g): the webhook setup is admitted, and
-  // its receipt created, in one transaction with the upgrade-fence check.
+  // Effect reservation (r2 §2.4 row g): this attempt is admitted, and its
+  // receipt is in flight, in one transaction with the upgrade-fence check.
+  // An earlier receipt (a completed reconnect, or a retry after a definitive
+  // rejection) is re-armed like the tool receipts above, so no provider write
+  // runs behind a stale completed or failed result.
   const action = await db.transaction(async (tx) => {
     await assertSpekoSetupAdmitted(tx as unknown as Db);
-    return previous ?? (await tx.insert(chatActions).values({companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}).returning())[0]!;
+    const [reserved] = previous
+      ? await tx.update(chatActions).set({ status: "processing", updatedAt: new Date() }).where(eq(chatActions.id, previous.id)).returning()
+      : await tx.insert(chatActions).values({companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}).returning();
+    return reserved!;
   });
+  // The one receipt covers both provider writes of this attempt. It completes
+  // only after the voice-defaults PATCH returns; an unknown outcome of either
+  // write leaves it in flight, and only a definitive rejection marks it failed.
   await input.assertOwned();
   try {
     const receipt = await input.client.configureWebhook(input.agentId, callback.href, input.signingSecret, matching[0]?.id);
+    await input.assertOwned();
+    await db.update(chatActions).set({ result: { webhookId: receipt.id }, updatedAt: new Date() }).where(eq(chatActions.id, action.id));
+    await input.client.configureVoiceDefaults(input.agentId);
     await input.assertOwned();
     await db.update(chatActions).set({ status: "completed", result: { webhookId: receipt.id }, updatedAt: new Date() }).where(eq(chatActions.id, action.id));
   } catch (error) {
     if (error instanceof SpekoProviderError && !error.outcomeUnknown) await db.update(chatActions).set({ status: "failed", updatedAt: new Date() }).where(eq(chatActions.id, action.id));
     throw error;
   }
-  await input.assertOwned();
-  await input.client.configureVoiceDefaults(input.agentId);
-  await input.assertOwned();
 
 }

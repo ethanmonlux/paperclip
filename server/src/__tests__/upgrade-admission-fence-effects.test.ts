@@ -338,9 +338,10 @@ describeEmbedded("upgrade admission fence, phase 2a effect reservations", () => 
 
 // N7 (admission-design r2 §2.4, r8 §1 phase 2): every effect reservation write
 // is pinned, and the fence check must sit in the same transaction callback,
-// before the write. Rows f–k have no behaviour case in this stage (their
-// service harnesses need provider fixtures); this structural pin and the
-// writer-set counts below are their evidence, and a removed gate fails here.
+// before the write. This is textual drift detection, not a control-flow
+// proof. Rows f–k have executed held and open cases for one real writer each
+// in upgrade-admission-fence-effects-fk.test.ts (stage 26); the remaining
+// f–k sites rely on this pin and the writer-set counts below.
 describe("upgrade admission fence effect reservations (structural, N7)", () => {
   const read = (file: string) => readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
   const sites: Array<{ row: string; file: string; boundary: string; write: string }> = [
@@ -364,6 +365,7 @@ describe("upgrade admission fence effect reservations (structural, N7)", () => {
     { row: "g", file: "services/connectors/slack-retry.ts", boundary: "chat_action.dispatch", write: "        status: \"executing\"," },
     { row: "g", file: "services/voice/speko-tool-setup.ts", boundary: "helper:assertSpekoSetupAdmitted", write: "kind: \"speko_tool_setup\"" },
     { row: "g", file: "services/voice/speko-tool-setup.ts", boundary: "helper:assertSpekoSetupAdmitted", write: "kind: \"speko_lifecycle_setup\", providerActionId: actionId" },
+    { row: "g", file: "services/voice/speko-tool-setup.ts", boundary: "helper:assertSpekoSetupAdmitted", write: ".where(eq(chatActions.id, previous.id))" },
     { row: "h", file: "services/voice/voice-reply-push.ts", boundary: "voice_reply.push", write: "const values = {status: \"dispatching\"" },
     { row: "i", file: "services/browser-use.ts", boundary: "browser_use.create", write: "      await tx.insert(runs).values({" },
     { row: "j", file: "services/dot-runner-broker.ts", boundary: "dot_runner.reserve", write: "const [reserved] = await tx.insert(operations).values(" },
@@ -440,7 +442,7 @@ describe("upgrade admission fence effect reservations (structural, N7)", () => {
       "insert(runs)": { "services/browser-use.ts": 1 },
       'status: "processing"': {
         "services/chat-channels.ts": 17, "services/chat-question-forms.ts": 1,
-        "services/voice/speko-tool-setup.ts": 3, "services/connectors/slack-writes.ts": 1,
+        "services/voice/speko-tool-setup.ts": 4, "services/connectors/slack-writes.ts": 1,
       },
     });
   });
