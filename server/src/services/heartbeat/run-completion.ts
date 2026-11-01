@@ -6,7 +6,8 @@ import { readGitConnectionFailure } from "../git-connection-failure.js";
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
-import { cancellationResultJson, readRunCancellation } from "../run-cancellation.js";
+import { cancellationResultJson, controllerLeaseLossCancellation, readRunCancellation } from "../run-cancellation.js";
+import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
@@ -316,6 +317,19 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+// Attribute a stop the lease watchdog caused, whether the adapter returned or
+// threw. Its closed cause and timings show whether renewal stalled in the
+// database or the event loop. A requested stop recorded earlier still wins in
+// cancellationResultJson.
+function controllerLeaseLossResultJson(signal: AbortSignal) {
+  return signal.reason instanceof LegacyControllerLeaseLostError
+    ? {
+        cancellation: controllerLeaseLossCancellation(signal.reason.leaseLossCause),
+        controllerLeaseLoss: { cause: signal.reason.leaseLossCause, ...signal.reason.leaseLossTiming },
+      }
+    : {};
+}
+
 export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunCompletionDependencies) {
   const {
     getRun,
@@ -544,6 +558,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
               : {}),
+            ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
             configFreshness: configFreshnessResultMetadata,
           },
           errorFamily: adapterResult.errorFamily ?? null,
@@ -1103,6 +1118,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ...(workspaceValidationFailure?.resultJson ??
             configurationIncompleteFailure?.resultJson ??
             {}),
+          ...(stoppedDuringFailure ? controllerLeaseLossResultJson(signal) : {}),
           ...(!legacyAdapterEntered && run.runtimeMode !== "native"
             ? {
                 executionRecovery: {

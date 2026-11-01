@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "./heartbeat.js";
-import { hasLiveLegacyController, legacyControllerBootId, legacyControllerClaim,
+import { hasLiveLegacyController, LEGACY_CONTROLLER_RENEW_MS, legacyControllerBootId, legacyControllerClaim,
   renewLegacyControllerLease, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -102,7 +102,8 @@ const support = await getEmbeddedPostgresTestSupport();
   });
   it("rejects dispatch at the lease deadline even if the database query never settles", async () => {
     const run = await seed();
-    const hungDb = { update: () => ({ set: () => ({ where: () => ({ returning: () => new Promise(() => {}) }) }) }) } as unknown as typeof db;
+    const hungDb = { update: () => ({ set: () => ({ where: () => ({ returning: () => new Promise(() => {}) }) }) }),
+      transaction: () => new Promise(() => {}) } as unknown as typeof db;
     vi.useFakeTimers();
     const controller = new AbortController();
     const watch = watchLegacyControllerLease(hungDb, { ...run, controllerLeaseExpiresAt: new Date(Date.now() + 100) }, controller);
@@ -111,6 +112,56 @@ const support = await getEmbeddedPostgresTestSupport();
       await vi.advanceTimersByTimeAsync(101);
       await checked;
       expect(controller.signal.aborted).toBe(true);
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+
+  // STA-21 stage 12: the abort reason carries a closed loss cause and the
+  // watchdog timings, so completion can attribute the stop.
+  it("types a rejected renewal as renewal_rejected", async () => {
+    const run = await seed();
+    await expire(run.id);
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(db, run, controller);
+    try {
+      await expect(watch.assertOwned()).rejects.toThrow("lease lost");
+      const reason = controller.signal.reason as { leaseLossCause?: string; leaseLossTiming?: Record<string, unknown> };
+      expect(reason.leaseLossCause).toBe("renewal_rejected");
+      expect(reason.leaseLossTiming).toMatchObject({ renewalCount: 0, renewalPendingMs: null, deadlineLateMs: null });
+    } finally { watch.stop(); }
+  });
+
+  it("types a hung renewal at the lease deadline as renewal_deadline", async () => {
+    const run = await seed();
+    // Upstream renews inside a transaction; hang either entry point.
+    const hungDb = { update: () => ({ set: () => ({ where: () => ({ returning: () => new Promise(() => {}) }) }) }),
+      transaction: () => new Promise(() => {}) } as unknown as typeof db;
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(hungDb, { ...run, controllerLeaseExpiresAt: new Date(Date.now() + 100) }, controller);
+    try {
+      const checked = expect(watch.assertOwned()).rejects.toThrow("lease lost");
+      await vi.advanceTimersByTimeAsync(101);
+      await checked;
+      const reason = controller.signal.reason as { leaseLossCause?: string; leaseLossTiming?: Record<string, unknown> };
+      expect(reason.leaseLossCause).toBe("renewal_deadline");
+      expect(reason.leaseLossTiming?.renewalPendingMs).toBeGreaterThanOrEqual(100);
+      expect(typeof reason.leaseLossTiming?.deadlineLateMs).toBe("number");
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+
+  it("types a failed periodic renewal as renewal_error and keeps the first cause", async () => {
+    const run = await seed();
+    const fail = () => { throw new Error("Connection terminated unexpectedly"); };
+    const failingDb = { update: fail, transaction: fail } as unknown as typeof db;
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(failingDb, { ...run, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }, controller);
+    try {
+      await vi.advanceTimersByTimeAsync(LEGACY_CONTROLLER_RENEW_MS + 1);
+      expect(controller.signal.aborted).toBe(true);
+      expect((controller.signal.reason as { leaseLossCause?: string }).leaseLossCause).toBe("renewal_error");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect((controller.signal.reason as { leaseLossCause?: string }).leaseLossCause).toBe("renewal_error");
     } finally { watch.stop(); vi.useRealTimers(); }
   });
 
