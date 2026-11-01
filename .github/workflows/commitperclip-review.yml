@@ -6,6 +6,10 @@ on:
 
 # Always runs from base branch context — never executes PR code.
 # pull_request_target gives access to secrets for untrusted fork PRs.
+#
+# The commitperclip bot is a GitHub App installed only on the upstream
+# repository. Forks have no COMMITPERCLIP_KEY, so outside upstream the bot
+# steps are skipped and only Dependency Review runs.
 
 permissions:
   pull-requests: write
@@ -33,8 +37,13 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Note fork exemption
+        if: github.repository != 'paperclipai/paperclip' || github.repository_id != '1170821064'
+        run: echo "::notice::commitperclip bot steps are upstream-only; skipped in ${{ github.repository }}."
+
       - name: Generate commitperclip token
         id: token
+        if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
@@ -44,7 +53,9 @@ jobs:
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: >-
+          steps.token.outcome == 'success' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:
