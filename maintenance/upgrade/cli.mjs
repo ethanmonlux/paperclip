@@ -11,7 +11,8 @@ import { evaluateAdmission } from "./lib/admission.mjs";
 import { verifyCiGraph } from "./lib/ci-graph.mjs";
 import { ciGraphFromGit } from "./lib/ci-graph-git.mjs";
 import { inventoryMigrations } from "./lib/migration-inventory.mjs";
-import { loadRegistry, validateRegistry } from "./lib/registry.mjs";
+import { checkRegistryProvenance, loadRegistry, validateRegistry } from "./lib/registry.mjs";
+import { commitFilesFromGit } from "./lib/registry-git.mjs";
 import { evaluateUpstreamOnly, receiptDigest } from "./lib/upstream-only.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -19,7 +20,7 @@ const defaultRegistry = path.join(repoRoot, "maintenance", "patch-registry.json"
 const defaultCiGraph = path.join(repoRoot, "maintenance", "ci-graph.json");
 
 const usage = `Usage:
-  node maintenance/upgrade/cli.mjs validate [--registry FILE]
+  node maintenance/upgrade/cli.mjs validate [--provenance] [--registry FILE]
   node maintenance/upgrade/cli.mjs upstream-only --out DIR [--patch ID]... [--upstream SHA] [--fork SHA] [--install CMD]
       [--ports-sha SHA] [--isolation private-network|private-network-user|none] [--registry FILE]
   node maintenance/upgrade/cli.mjs ci-graph --base-context REV [--candidate REV] [--check] [--ci-graph FILE]
@@ -61,6 +62,7 @@ function main(argv) {
       "base-context": { type: "string" },
       "ci-graph": { type: "string", default: defaultCiGraph },
       check: { type: "boolean", default: false },
+      provenance: { type: "boolean", default: false },
     },
   });
   if (command === "migration-inventory") {
@@ -89,6 +91,12 @@ function main(argv) {
   }
   const registry = loadRegistry(values.registry);
   if (command === "validate") {
+    if (values.provenance) {
+      // Needs the source commits and their parents locally; a shallow checkout reads unknown (exit 2), never valid.
+      const result = checkRegistryProvenance(registry, (sha) => commitFilesFromGit(repoRoot, sha));
+      console.log(JSON.stringify({ valid: result.status === "pass", provenance: result.status, errors: result.errors, unknown: result.unknown }, null, 2));
+      return result.status === "pass" ? 0 : result.status === "fail" ? 1 : 2;
+    }
     const errors = validateRegistry(registry);
     console.log(JSON.stringify({ valid: errors.length === 0, errors }, null, 2));
     return errors.length === 0 ? 0 : 1;

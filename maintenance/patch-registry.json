@@ -18,6 +18,12 @@
         "2e6e2f4bec1225e2b3b863f04b163884184afe19",
         "448eebdbb27af81fd4fed54728d225e623297366"
       ],
+      "sourcePaths": {
+        "2e6e2f4bec1225e2b3b863f04b163884184afe19": [
+          "packages/adapter-utils/src/local-process-proxy-stdio.test.ts",
+          "packages/adapter-utils/src/local-process-sandbox.ts"
+        ]
+      },
       "evidencePaths": [
         "packages/adapter-utils/src/local-process-proxy-stdio.test.ts",
         "packages/adapter-utils/src/local-process-sandbox.test.ts"
@@ -203,8 +209,13 @@
       "id": "portable-runner-fixtures",
       "purpose": "Runner staging tests must not depend on coreutils binary identity.",
       "sourceCommits": [
-        "904851063ddf5f83ae298cac97eea877b8b57771"
+        "2e6e2f4bec1225e2b3b863f04b163884184afe19"
       ],
+      "sourcePaths": {
+        "2e6e2f4bec1225e2b3b863f04b163884184afe19": [
+          "packages/paperclip-runner/scripts/stage-runner-binary.test.mjs"
+        ]
+      },
       "evidencePaths": [
         "packages/paperclip-runner/scripts/stage-runner-binary.test.mjs"
       ],
@@ -214,7 +225,7 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants.",
+      "notes": "Commit references are provenance, not a cherry-pick recipe; commits may combine unrelated changes and tests must be ported without weakening invariants. Corrected under STA-22 R10: the fixture change is the stage-runner-binary.test.mjs part of mixed commit 2e6e2f4b (shared with provider-output-and-mounts, split by sourcePaths). The earlier citation 90485106 never touched this test.",
       "upstreamOnly": {
         "kind": "manual-review",
         "reason": "node:test fixture portability change to an existing assertion; review upstream fixture independence directly."

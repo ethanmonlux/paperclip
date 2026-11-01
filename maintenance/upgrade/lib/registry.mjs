@@ -8,6 +8,50 @@ const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const PORT_ROOT = "maintenance/upgrade/ports/";
 const safeRelative = (file) => !file.startsWith("/") && !file.split("/").includes("..");
 
+const patchWhere = (patch, index) => `patches[${index}]${patch?.id ? ` (${patch.id})` : ""}`;
+
+/**
+ * `sourcePaths` optionally narrows what a group takes from a source commit:
+ * full source SHA -> the exact repository paths of that commit the group owns.
+ */
+function validateSourcePaths(patch, where, fail) {
+  const scopes = patch.sourcePaths;
+  if (!scopes || typeof scopes !== "object" || Array.isArray(scopes)) { fail(`${where}: sourcePaths must map source commits to path lists`); return; }
+  for (const [sha, paths] of Object.entries(scopes)) {
+    if (!Array.isArray(patch.sourceCommits) || !patch.sourceCommits.includes(sha)) fail(`${where}: sourcePaths key ${sha} is not one of its sourceCommits`);
+    if (!Array.isArray(paths) || paths.length === 0) { fail(`${where}: sourcePaths[${sha}] must be a non-empty path list`); continue; }
+    if (paths.some((file) => typeof file !== "string" || !file || !safeRelative(file))) fail(`${where}: sourcePaths[${sha}] must hold relative repository paths`);
+    if (new Set(paths).size !== paths.length) fail(`${where}: sourcePaths[${sha}] repeats a path`);
+  }
+}
+
+/**
+ * A commit cited by more than one group must be split by path: every claiming
+ * group declares its own scope for it, and the scopes are pairwise disjoint.
+ */
+function validateSharedCommits(patches, fail) {
+  const claims = new Map();
+  for (const [index, patch] of patches.entries()) {
+    if (!Array.isArray(patch?.sourceCommits)) continue;
+    for (const sha of new Set(patch.sourceCommits)) {
+      if (!claims.has(sha)) claims.set(sha, []);
+      claims.get(sha).push({ patch, where: patchWhere(patch, index) });
+    }
+  }
+  for (const [sha, claimants] of claims) {
+    if (claimants.length < 2) continue;
+    const owner = new Map();
+    for (const { patch, where } of claimants) {
+      const scope = patch.sourcePaths?.[sha];
+      if (!Array.isArray(scope) || scope.length === 0) { fail(`${where}: shares source commit ${sha} with another group, so it needs sourcePaths for it`); continue; }
+      for (const file of scope) {
+        if (owner.has(file) && owner.get(file) !== where) fail(`${where}: sourcePaths for shared commit ${sha} must be disjoint; ${file} is also scoped by ${owner.get(file)}`);
+        else owner.set(file, where);
+      }
+    }
+  }
+}
+
 export function loadRegistry(file) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
@@ -33,8 +77,9 @@ export function validateRegistry(registry) {
     return errors;
   }
   const ids = new Set();
+  validateSharedCommits(registry.patches, fail);
   for (const [index, patch] of registry.patches.entries()) {
-    const where = `patches[${index}]${patch?.id ? ` (${patch.id})` : ""}`;
+    const where = patchWhere(patch, index);
     if (!patch?.id || typeof patch.id !== "string") { fail(`${where}: id is required`); continue; }
     if (ids.has(patch.id)) fail(`${where}: duplicate id`);
     ids.add(patch.id);
@@ -43,6 +88,7 @@ export function validateRegistry(registry) {
       fail(`${where}: sourceCommits must be full SHAs`);
     }
     if (!Array.isArray(patch.evidencePaths) || patch.evidencePaths.length === 0) fail(`${where}: evidencePaths are required`);
+    if (patch.sourcePaths !== undefined) validateSourcePaths(patch, where, fail);
     const upstreamOnly = patch.upstreamOnly;
     if (!upstreamOnly) { fail(`${where}: upstreamOnly evaluation is required`); continue; }
     if (upstreamOnly.kind === "manual-review") {
@@ -72,4 +118,31 @@ export function validateRegistry(registry) {
     }
   }
   return errors;
+}
+
+/**
+ * Provenance against actual commits. `readCommit(sha)` returns `{ files }`, the
+ * paths the commit changed against its first parent, or `{ unavailable }`.
+ * Each source commit must change a path its group declares: its scope for that
+ * commit when present (every scoped path must be changed), otherwise one of the
+ * group's evidence paths. A missing commit is unknown, never a pass.
+ */
+export function checkRegistryProvenance(registry, readCommit) {
+  const errors = validateRegistry(registry);
+  const unknown = [];
+  for (const [index, patch] of (Array.isArray(registry?.patches) ? registry.patches : []).entries()) {
+    const where = patchWhere(patch, index);
+    for (const sha of Array.isArray(patch?.sourceCommits) ? patch.sourceCommits : []) {
+      const commit = readCommit(sha);
+      if (!commit || !Array.isArray(commit.files)) { unknown.push(`${where}: ${sha}: ${commit?.unavailable ?? "unavailable"}`); continue; }
+      const changed = new Set(commit.files);
+      const scope = patch.sourcePaths?.[sha];
+      if (Array.isArray(scope)) {
+        for (const file of scope) if (!changed.has(file)) errors.push(`${where}: source commit ${sha} does not change scoped path ${file}`);
+      } else if (!(patch.evidencePaths ?? []).some((file) => changed.has(file))) {
+        errors.push(`${where}: source commit ${sha} touches none of its declared paths (${(patch.evidencePaths ?? []).join(", ")})`);
+      }
+    }
+  }
+  return { status: errors.length > 0 ? "fail" : unknown.length > 0 ? "unknown" : "pass", errors, unknown };
 }
