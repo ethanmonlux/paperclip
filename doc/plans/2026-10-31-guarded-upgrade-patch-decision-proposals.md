@@ -23,6 +23,8 @@ Inputs:
   `cb559ead`) with the R8 drain-intent regressions, and stage 11 `71bf3065`
   (registry `b5e84da5`) with the R9 locked-row regressions. Its row cites the
   stage-11 receipts, with control = the fix commit.
+  Stage 12 added `controller-lease-loss-attribution` (fix `8cf65148`, registry
+  `d19d922a`); its row cites those receipts, with control = the fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -58,9 +60,12 @@ Meaning of the decisions:
 | native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
 | native-task-bound-continuation | **upstream-fails**, 56 of 88 required by assertion (`698e53cd`), ports `b5e84da5` | passes 88/88, files 112/112 (`06d92ac7`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
+| controller-lease-loss-attribution | upstream-passes 28/28 (`2acd7e95`), ports `d19d922a` | passes 28/28 (`a130dec3`) | `legacy-controller-lease.ts`, `run-cancellation.ts`, `run-completion.ts` changed: upstream already has the typed lease-loss attribution | **retire** on upgrade |
 
-No patch is proposed for retirement. Upstream-only evidence does not show that
-upstream covers any of these behaviors.
+Only `controller-lease-loss-attribution` is proposed for retirement, on
+upgrade: its fork port reproduces upstream's own attribution and upstream
+passes every regression. Upstream-only evidence does not show that upstream
+covers any of the other behaviors.
 
 ## Notes per patch
 
@@ -235,6 +240,22 @@ upstream covers any of these behaviors.
     (`53373965`, `6e5f6590`, `37b2bf5b`, `010c5180`, `71bf3065`), to be
     selected together onto the repair line for a later qualified
     installation.
+- **controller-lease-loss-attribution.**
+  - Stage 12 (FAC-760, card `6b2a12f5`). Two successful provider turns
+    (`19befcbc`, `d79920b9`) were stored `cancelled` with source `unknown`.
+    The legacy controller lease watchdog is the only host abort that records
+    nothing, and the local adapters ignore the abort until completion. The
+    live loss cause is unrecorded and stays unknown.
+  - `8cf65148` ports upstream `8595efc2`'s typed attribution: closed cause and
+    timings on the abort reason, cancellation source `controller_lease`. The
+    outcome stays `cancelled` and a recorded Stop keeps precedence. Not
+    carried: upstream's private liveness pool, statement-timeout retry and
+    pre-dispatch `controller_lease_lost` code.
+  - Receipts: upstream passes 28/28, so upstream covers the behavior; the
+    fork commit is carried until the combined candidate replaces it. Two
+    earlier upstream attempts were `unknown` from fork-only fixtures (no
+    company membership for the responsible user; fake databases without
+    `transaction`); they are kept in the evidence bundle.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
