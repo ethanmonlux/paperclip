@@ -574,12 +574,14 @@
     },
     {
       "id": "native-comment-redelivery",
-      "purpose": "At release, drop from an ordinary deferred comment wake every comment that already existed when the finishing run started and is in that run's persisted execution envelope unchanged (same agent, same task, run succeeded); retire the wake when nothing is left. Interaction and resume continuations, edited comments, failed or cancelled runs and comments that arrived after the run started are unchanged.",
+      "purpose": "At release, drop from an ordinary deferred comment wake every comment that already existed when the finishing run started and is in that run's persisted execution envelope unchanged (same agent, same task, run succeeded); retire the wake when nothing is left. Interaction and resume continuations, edited comments, failed or cancelled runs and comments that arrived after the run started are unchanged. A turn dispatched from an authorized queued-comment interrupt (a run of the same agent whose resultJson.queuedCommentInterruptQueueId names the finishing run's wakeupRequestId) delivers nothing, so other queues keep their own turns.",
       "sourceCommits": [
-        "484c09542c54e06c72ea1992dab76cf7a99eafb6"
+        "484c09542c54e06c72ea1992dab76cf7a99eafb6",
+        "7ada55ee6cce1eae840a91466ccc5e787d5b3258"
       ],
       "evidencePaths": [
-        "server/src/__tests__/native-comment-redelivery.test.ts"
+        "server/src/__tests__/native-comment-redelivery.test.ts",
+        "server/src/__tests__/heartbeat-process-recovery.test.ts"
       ],
       "decision": "unassessed",
       "retirementRequires": [
@@ -587,10 +589,10 @@
         "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "FAC-760 STA-21 stage 13. Reproduced from STA-21 native records: run 429cd3b9 started 23:50:19 with Coordinator comment 8aef0bde (23:49:51) in its envelope; after it finished, the separate deferred wake for 8aef0bde became run cf9151ec with nothing new (same shape: 16c796f4 -> 1488ecb9, 87f4cde3 -> 722d1f74). Comments posted during run 9fe66e46 were held as one deferred wake per actor or card; run 8507d192 read them all, then 62ee5a38, 06feabf2 and da4f94c6 replayed one each. Delivery evidence is the finishing run's persisted contextSnapshot.executionContinuation.messages (id and updatedAt), bounded by the comment existing before that run's startedAt. Upstream 8595efc2 has no equivalent. The file drives the real wake-queue release on embedded Postgres; a host that cannot start it skips, which is unknown.",
+      "notes": "FAC-760 STA-21 stage 13. Reproduced from STA-21 native records: run 429cd3b9 started 23:50:19 with Coordinator comment 8aef0bde (23:49:51) in its envelope; after it finished, the separate deferred wake for 8aef0bde became run cf9151ec with nothing new (same shape: 16c796f4 -> 1488ecb9, 87f4cde3 -> 722d1f74). Comments posted during run 9fe66e46 were held as one deferred wake per actor or card; run 8507d192 read them all, then 62ee5a38, 06feabf2 and da4f94c6 replayed one each. Delivery evidence is the finishing run's persisted contextSnapshot.executionContinuation.messages (id and updatedAt), bounded by the comment existing before that run's startedAt. Upstream 8595efc2 has no equivalent. The file drives the real wake-queue release on embedded Postgres; a host that cannot start it skips, which is unknown. Correction 7ada55ee: exact-head CI on 2ea4c7d2 (job 124733328258) failed heartbeat-process-recovery \"resumes only the authorized pending queue after an acknowledged legacy interrupt\"; 484c0954 had retired the other actor's queue after an interrupt turn. Reproduced locally and attributed (without 484c0954 the case passes).",
       "upstreamOnly": {
         "kind": "vitest",
-        "sourceSha": "484c09542c54e06c72ea1992dab76cf7a99eafb6",
+        "sourceSha": "7ada55ee6cce1eae840a91466ccc5e787d5b3258",
         "testFiles": [
           "server/src/__tests__/native-comment-redelivery.test.ts"
         ],
@@ -603,7 +605,10 @@
           "promotes a delivered comment that was edited after the run started",
           "promotes a comment written after the run started, even when the run's envelope was built later and lists it",
           "keeps an interaction continuation's delivered source comment",
-          "keeps a delivered comment wake that carries an explicit resume intent"
+          "keeps a delivered comment wake that carries an explicit resume intent",
+          "still gives another actor's queue its own turn after the requested interrupt turn completes",
+          "still retires the delivered queue when the cancelled run's interrupt named a different queue",
+          "still retires the delivered queue when only another agent's run names the finishing run's wake"
         ]
       }
     },
