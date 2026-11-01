@@ -27,7 +27,9 @@ Inputs:
   `d19d922a`); its row cites those receipts, with control = the fix commit.
   Stage 13 added `native-self-wake-suppression` (fix `1947665a`) and
   `native-comment-redelivery` (fix `484c0954`), registry `6ea6bf16`; their
-  rows cite those receipts, with control = each fix commit.
+  rows cite those receipts, with control = each fix commit. The redelivery
+  row now cites the receipts after correction `7ada55ee` (registry
+  `7ede11e7`), with control = that commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -65,7 +67,7 @@ Meaning of the decisions:
 | native-task-bound-continuation | **upstream-fails**, 56 of 88 required by assertion (`698e53cd`), ports `b5e84da5` | passes 88/88, files 112/112 (`06d92ac7`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
 | controller-lease-loss-attribution | upstream-passes 28/28 (`2acd7e95`), ports `d19d922a` | passes 28/28 (`a130dec3`) | `legacy-controller-lease.ts`, `run-cancellation.ts`, `run-completion.ts` changed: upstream already has the typed lease-loss attribution | **retire** on upgrade |
 | native-self-wake-suppression | **upstream-fails** 3 of 7, by assertion, only through the unblock-owner notification (`549d8406`), ports `6ea6bf16` | passes 7/7 (`f3d3dc94`) | `issue-dependency-wakeups.ts` and the backstop guard identical to upstream; `routable-blocked.ts` notifies a self-named writer upstream | **adapt** |
-| native-comment-redelivery | **upstream-fails** 3 of 9 by assertion (`0039e01f`), ports `6ea6bf16` | passes 9/9, file 12/12 (`18e8aa2b`) | wake-queue adapter, use-cases and policy have no delivered-comment check | **adapt** |
+| native-comment-redelivery | **upstream-fails** 5 of 12 by assertion (`21e11948`), ports `7ede11e7` | passes 12/12, file 15/15 (`5d3d9f53`) | wake-queue adapter, use-cases and policy have no delivered-comment check | **adapt** |
 
 Only `controller-lease-loss-attribution` is proposed for retirement, on
 upgrade: its fork port reproduces upstream's own attribution and upstream
@@ -281,6 +283,15 @@ covers any of the other behaviors.
   - Limit: delivery means the comment was in the envelope persisted for that
     run; an adapter that sends a fixed prompt still lets the agent read the
     task, but this is not proof that the provider read every comment.
+  - Correction `7ada55ee`: exact-head CI on `2ea4c7d2` failed
+    heartbeat-process-recovery "resumes only the authorized pending queue
+    after an acknowledged legacy interrupt". After a queued-comment interrupt
+    the successor turn is scoped to the selected queue, but its envelope lists
+    the whole history, so `484c0954` retired the other actor's queue. A run
+    dispatched from an authorized interrupt (same agent; a run's
+    `queuedCommentInterruptQueueId` names its `wakeupRequestId`) now delivers
+    nothing for this rule. Upstream passes that new case only because it has
+    no delivered-comment check at all.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
