@@ -249,12 +249,12 @@ async function runReleaseDrain(
       continue;
     }
 
-    let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
+    let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false, containedDeliveredComment: false };
     if (
       !candidate.authorizedFailedChatRetry &&
       candidate.queuedCommentIds.length > 0
     ) {
-      liveness = await ports.transaction.getQueuedCommentLiveness({
+      const read = await ports.transaction.getQueuedCommentLiveness({
         companyId: run.companyId,
         issueId: issue.id,
         wakeAgentId: candidate.agentId,
@@ -262,6 +262,19 @@ async function runReleaseDrain(
         finishingRunAgentId: run.agentId,
         queuedCommentIds: candidate.queuedCommentIds,
       });
+      // An ordinary comment wake only asks its agent to read these comments.
+      // Those the finishing run already started with need no further run
+      // (FAC-760 per-comment redelivery). An interaction or resume
+      // continuation keeps its authoritative comments.
+      const delivered = new Set(
+        candidate.preservesIndependentContinuation || candidate.payload.mutation === "interaction"
+          ? [] : read.deliveredCommentIds ?? [],
+      );
+      liveness = {
+        liveNonSelfCommentIds: read.liveNonSelfCommentIds.filter((commentId) => !delivered.has(commentId)),
+        containedSelfAuthoredComment: read.containedSelfAuthoredComment,
+        containedDeliveredComment: delivered.size > 0,
+      };
     }
     // A length mismatch is the only way the lists can differ: the adapter derives `liveNonSelfCommentIds` with `.filter`, so it is always a subsequence of `queuedCommentIds`.
     const liveCommentIdsDiffer = liveness.liveNonSelfCommentIds.length !== candidate.queuedCommentIds.length;
@@ -281,6 +294,7 @@ async function runReleaseDrain(
       liveNonSelfCommentIdsLength: liveness.liveNonSelfCommentIds.length,
       liveCommentIdsDiffer,
       containedSelfAuthoredComment: liveness.containedSelfAuthoredComment,
+      containedDeliveredComment: liveness.containedDeliveredComment,
       preservesIndependentContinuation: candidate.preservesIndependentContinuation,
     });
 
@@ -292,7 +306,9 @@ async function runReleaseDrain(
         wakeId: candidate.id,
         reason: commentAction.selfAuthored
           ? "Deferred wake contained only comments authored by the finishing run"
-          : "Queued messages were discarded before promotion",
+          : commentAction.delivered
+            ? "Deferred wake comments were already delivered to the finishing run"
+            : "Queued messages were discarded before promotion",
         now: input.now,
       });
       continue;

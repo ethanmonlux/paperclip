@@ -129,7 +129,16 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     finishingRunAgentId: string;
     queuedCommentIds: string[];
-  }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  }): Promise<{
+    liveNonSelfCommentIds: string[];
+    containedSelfAuthoredComment: boolean;
+    /**
+     * The live ids that already existed when the finishing run (same agent,
+     * same task, `succeeded`) started and are in its persisted execution
+     * envelope unchanged. The drain decides whether a wake may drop them.
+     */
+    deliveredCommentIds?: string[];
+  }>;
   /** Reads the invitation an addressed wake names, scoped to this company and issue; null when it is not there. */
   getAddressedInteraction(input: {
     companyId: string;

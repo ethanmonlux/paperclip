@@ -139,6 +139,43 @@ function toRunSummary(row: HeartbeatRunRow): RunSummary {
   };
 }
 
+/**
+ * The comment revisions (id -> updatedAt) in the execution envelope a finished
+ * run was started with, plus that run's start. Only a run that completed its
+ * turn (`succeeded`) on this exact task and agent counts; any other shape
+ * delivers nothing, so the deferred wake keeps its comments.
+ */
+async function readDeliveredCommentRevisions(
+  tx: Db,
+  input: { companyId: string; issueId: string; runId: string; agentId: string },
+): Promise<{ startedAt: Date; revisions: Map<string, string> } | null> {
+  const [run] = await tx
+    .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId),
+    ))
+    .limit(1);
+  if (!run || run.status !== "succeeded" || !run.startedAt) return null;
+  const context = parseObject(run.contextSnapshot);
+  if (readNonEmptyString(context.issueId) !== input.issueId) return null;
+  const envelope = parseObject(context.executionContinuation);
+  if (readNonEmptyString(envelope.issueId) !== input.issueId || readNonEmptyString(envelope.companyId) !== input.companyId) {
+    return null;
+  }
+  if (!Array.isArray(envelope.messages)) return null;
+  const revisions = new Map<string, string>();
+  for (const entry of envelope.messages) {
+    const message = parseObject(entry);
+    const id = readNonEmptyString(message.id);
+    const updatedAt = readNonEmptyString(message.updatedAt);
+    if (id && updatedAt && message.deleted !== true) revisions.set(id, updatedAt);
+  }
+  return { startedAt: run.startedAt, revisions };
+}
+
 function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): DeferredWakeCandidate {
   const payload = parseObject(row.payload);
   const queuedCommentIds = queuedCommentIdsFromWakePayload(payload);
@@ -278,7 +315,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds }) {
       const rows = await tx
-        .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
+        .select({
+          id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId,
+          createdAt: issueComments.createdAt, updatedAt: issueComments.updatedAt,
+        })
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds), currentConversationCommentCondition()));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
@@ -289,7 +329,19 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const containedSelfAuthoredComment = rows.some(
         (row) => targetsFinishingRunAgent && !row.deletedAt && row.createdByRunId === finishingRunId,
       );
-      return { liveNonSelfCommentIds, containedSelfAuthoredComment };
+      // A live comment that already existed when the finishing run started and
+      // is in that run's persisted envelope, unchanged, was in front of that run.
+      const delivered = targetsFinishingRunAgent
+        ? await readDeliveredCommentRevisions(tx, { companyId, issueId, runId: finishingRunId, agentId: finishingRunAgentId })
+        : null;
+      const deliveredCommentIds = delivered
+        ? liveNonSelfCommentIds.filter((commentId) => {
+            const row = rows.find((candidate) => candidate.id === commentId)!;
+            return row.createdAt <= delivered.startedAt &&
+              delivered.revisions.get(row.id) === row.updatedAt.toISOString();
+          })
+        : [];
+      return { liveNonSelfCommentIds, containedSelfAuthoredComment, deliveredCommentIds };
     },
 
     async getAddressedInteraction({ companyId, issueId, interactionId }) {

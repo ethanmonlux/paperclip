@@ -128,12 +128,14 @@ export type DeferredWakeQueuedCommentFacts = {
   liveCommentIdsDiffer: boolean;
   /** True when every discarded comment id was authored by the finishing run. */
   containedSelfAuthoredComment: boolean;
+  /** True when a discarded comment id was delivered, unchanged, to the finishing run. */
+  containedDeliveredComment?: boolean;
   /** True when the wake carries an independent reason to continue even with no live comments. */
   preservesIndependentContinuation: boolean;
 };
 
 export type DeferredWakeQueuedCommentDecision =
-  | { kind: "cancel_empty"; selfAuthored: boolean }
+  | { kind: "cancel_empty"; selfAuthored: boolean; delivered?: true }
   | { kind: "normalize" }
   | { kind: "proceed" };
 
@@ -170,7 +172,11 @@ export function decideQueuedCommentAction(
     facts.liveNonSelfCommentIdsLength === 0 &&
     !facts.preservesIndependentContinuation
   ) {
-    return { kind: "cancel_empty", selfAuthored: facts.containedSelfAuthoredComment };
+    return {
+      kind: "cancel_empty",
+      selfAuthored: facts.containedSelfAuthoredComment,
+      ...(facts.containedDeliveredComment ? { delivered: true as const } : {}),
+    };
   }
 
   if (facts.hasQueuedCommentIds && facts.liveCommentIdsDiffer) {
