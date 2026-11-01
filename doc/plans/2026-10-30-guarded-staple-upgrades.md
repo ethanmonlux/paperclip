@@ -52,7 +52,7 @@ Stage 3 (harness `ef0d58e0`, fork source `5305f21c`):
 - **CI.**
   - A `maintenance upgrade toolkit` job runs the toolkit suite with its isolation test required.
   - `requiredCiJobs` is declared for the current CI shape. Every check on the head must still succeed.
-  - The inherited `review` check (commitperclip, missing `COMMITPERCLIP_KEY` on the fork) fails on every head. Under `pull_request_target` its workflow file runs from the PR's base branch, and its job checks out `master`, so this branch cannot change it. It blocks admission until an owner provisions the key or removes that workflow through its own reviewed change.
+  - The inherited `review` check (commitperclip, missing `COMMITPERCLIP_KEY` on the fork) fails on every head. Under `pull_request_target` its workflow file runs from the PR's base branch, and its job checks out `master`, so this branch cannot change it. Founder decision (FAC-760 `69065bff`): turn the workflow off in the fork and do not obtain the key. This branch deletes it and moves its dependency review step to a read-only `dependency review` job in `pr.yml` (patch group `fork-commitperclip-disable`). That source change does not yet disable the effective check: `review` stays an expected, unwaived lane until the PR base carries this change or a supported GitHub workflow disable is verified, and the failed `review` runs on earlier heads stay recorded.
 
 Stage 4 (STA-22 finding R4, expected CI coverage):
 

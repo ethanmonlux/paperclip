@@ -118,11 +118,6 @@
       "blob": "6c709ade0ed44307af7778fcf9edf5a98f0ab8fe"
     },
     {
-      "path": ".github/workflows/commitperclip-review.yml",
-      "context": "head",
-      "blob": "4078244d79413144c24b1a95bab9929379a6f772"
-    },
-    {
       "path": ".github/workflows/docker-runner-check.yml",
       "context": "head",
       "blob": "d6a2115efb9d634ea3ace10175625005d0aaf89f"
@@ -145,7 +140,7 @@
     {
       "path": ".github/workflows/pr.yml",
       "context": "head",
-      "blob": "7cf18752f4fbf3719c28da48bf91b0a0edd750ab"
+      "blob": "27c7dd820a89b421029658272da202fc2baca32a"
     },
     {
       "path": ".github/workflows/refresh-lockfile.yml",
@@ -224,7 +219,7 @@
     {
       "path": ".github/workflows/pr.yml",
       "context": "head",
-      "blob": "7cf18752f4fbf3719c28da48bf91b0a0edd750ab",
+      "blob": "27c7dd820a89b421029658272da202fc2baca32a",
       "trigger": "pull_request",
       "required": true
     },
@@ -708,6 +703,11 @@
       "name": "ci / verify",
       "workflow": ".github/workflows/pr.yml",
       "job": "ci / verify"
+    },
+    {
+      "name": "dependency review",
+      "workflow": ".github/workflows/pr.yml",
+      "job": "dependency_review"
     },
     {
       "name": "maintenance upgrade toolkit",
