@@ -60,6 +60,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import {
   budgetPoliciesForRun,
   budgetService,
@@ -796,6 +797,7 @@ export function fastResponseService(
       selected.connection.connection.config.ai,
     );
     let admitted: Request | null = null;
+    let fenceRefused = false;
     try {
       admitted = await withAccountingTransaction(
         db,
@@ -913,6 +915,13 @@ export function fastResponseService(
             )
               return null;
           }
+          // Effect reservation (admission-design r2 §2.4 row d): a held
+          // fence refuses before the claim; the request stays `pending`.
+          const fenceAdmission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "fast_response.claim");
+          if (!fenceAdmission.admitted) {
+            fenceRefused = true;
+            return null;
+          }
           const [claimed] = await tx
             .update(fastResponseRequests)
             .set({
@@ -948,6 +957,10 @@ export function fastResponseService(
       );
     } catch {
       /* An optional receipt must never fail the accepted turn. */
+    }
+    if (!admitted && fenceRefused) {
+      // Nothing was written; the worker retries until the request expires.
+      return { status: "unavailable", reason: "upgrade_fence_held" };
     }
     if (!admitted) {
       await skip(request, "not_admitted");

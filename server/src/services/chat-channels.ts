@@ -410,6 +410,7 @@ import {
   validateChatQuestionFormSubmission,
 } from "./chat-question-forms.js";
 import { secretService } from "./secrets.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import type {
   ActionEvent,
   AdapterPostableMessage,
@@ -3731,6 +3732,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     );
     const [claimed] = await db.transaction(async (tx) => {
       await credentialLease.assertOwned(tx);
+      // Effect reservation (r2 §2.4 row g): held fence → stays queued.
+      if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted)
+        return [];
       await notifyChatActionWork(tx, "receipt_reaction");
       const rows = await tx
         .update(chatActions)
@@ -4228,6 +4232,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     let providerConfirmed = action.result?.providerConfirmed === true;
     const [claimed] = await db.transaction(async (tx) => {
       await credentialLease.assertOwned(tx);
+      // Effect reservation (r2 §2.4 row g): held fence → stays queued.
+      if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted)
+        return [];
       const rows = await tx
         .update(chatActions)
         .set({
@@ -5245,6 +5252,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                     payload,
                   )
                 : false;
+              // Effect reservation (admission-design r2 §2.4 row g): an
+              // authorized provider send waits while the upgrade fence is
+              // held. Cancelling an unauthorized effect is not admission.
+              if (
+                currentEndpoint &&
+                authorized &&
+                !(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted
+              )
+                return null;
               await notifyChatActionWork(tx, "provider_effect");
               const [transportClaim] = await tx
                 .update(chatActions)
@@ -22613,6 +22629,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         : 0) + 1;
 
     const [claimed] = await db.transaction(async (tx) => {
+      // Effect reservation (r2 §2.4 row g): a held upgrade fence keeps the
+      // slash task start queued before any provider work begins.
+      if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted) return [];
       await notifyChatActionWork(tx, "slash_task_start");
       return tx
         .update(chatActions)
@@ -22895,6 +22914,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             }
 
             failureResource = currentResource;
+            // The transport claim itself is the reservation; a fence held
+            // since `validating` leaves the row for the existing stale requeue.
+            if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted) return null;
             await notifyChatActionWork(tx, "slash_task_start");
             const [transportClaim] = await tx
               .update(chatActions)
@@ -26080,6 +26102,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 shuttingDown ||
                 Date.now() >= Date.parse(window.nextScanAt)
               )
+                return null;
+              // Effect reservation (r2 §2.4 row g): no redelivery request
+              // while the upgrade fence is held; the next scan retries.
+              if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted)
                 return null;
               const result = {
                 attempts: count + 1,
@@ -30677,6 +30703,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 code: "chat_action_no_longer_authorized",
               },
             );
+          }
+          // Effect reservation (r2 §2.4 row g): an operator retry starts a
+          // provider post; a held upgrade fence refuses it with nothing written.
+          const fenceAdmission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch");
+          if (!fenceAdmission.admitted) {
+            throw conflict("Paperclip is holding new provider effects for a maintenance upgrade. Retry later.", {
+              code: fenceAdmission.code,
+            });
           }
           await notifyChatActionWork(tx, "slash_task_start");
           const rows = await tx
@@ -37128,6 +37162,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               if (!run || !["queued", "running"].includes(run.status))
                 status = "active";
             }
+            // Effect reservation (r2 §2.4 row g): held fence → stays queued.
+            if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted)
+              return null;
             await notifyChatActionWork(tx, "slack_session_sync");
             const claimed = await tx
               .update(chatActions)
@@ -37302,6 +37339,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         )
         .then((rows) => rows[0]);
       if (transfer) return false;
+      // Effect reservation (admission-design r2 §2.4 row f): a held upgrade
+      // fence leaves the publication in its waiting state for a later pass.
+      if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_publication.send")).admitted)
+        return false;
       await notifyChatPublicationWork(tx);
       const [row] = await tx
         .update(chatPublications)

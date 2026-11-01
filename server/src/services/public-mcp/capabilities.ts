@@ -8,6 +8,7 @@ import { ISSUE_STATUSES } from "@paperclipai/shared";
 import { errorHandler } from "../../middleware/error-handler.js";
 import { DEFAULT_JSON_BODY_LIMIT } from "../../http/body-limits.js";
 import { logActivity } from "../activity-log.js";
+import { admitEffectReservationUnderUpgradeFence, upgradeFenceHeldResult } from "../upgrade-admission-fence.js";
 import { hashMcpSecret, type McpPrincipal, type PublicMcpOAuth } from "./oauth.js";
 
 export { McpApiError, McpCapabilityError } from "./contracts.js";
@@ -176,7 +177,17 @@ export function createPublicMcpExecutor(db: Db, oauth: PublicMcpOAuth, api: ApiD
 
     const key = { grantId: principal.grant.id, userId: principal.grant.userId, operation: name, requestId: String(args.requestId) };
     const argumentsHash = hashMcpSecret(stable(args));
-    const [receipt] = await db.insert(mcpMutationReceipts).values({ ...key, companyId: principal.grant.companyId, argumentsHash }).onConflictDoNothing().returning();
+    // The receipt is the effect reservation (admission-design r2 §2.4 row a):
+    // it is written in the same transaction as the upgrade-fence check, and a
+    // refusal returns before any receipt exists, so no unknown is created.
+    const reserved = await db.transaction(async (tx) => {
+      const admission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "public_mcp.mutation");
+      if (!admission.admitted) return { held: upgradeFenceHeldResult(admission) };
+      const [row] = await tx.insert(mcpMutationReceipts).values({ ...key, companyId: principal.grant.companyId, argumentsHash }).onConflictDoNothing().returning();
+      return { receipt: row };
+    });
+    if ("held" in reserved) return { ...reserved.held, requestId: key.requestId };
+    const receipt = reserved.receipt;
     if (!receipt) {
       const [existing] = await db.select().from(mcpMutationReceipts).where(and(eq(mcpMutationReceipts.companyId, principal.grant.companyId), eq(mcpMutationReceipts.userId, principal.grant.userId), eq(mcpMutationReceipts.operation, name), eq(mcpMutationReceipts.requestId, key.requestId)));
       if (!existing || existing.argumentsHash !== argumentsHash) throw new McpCapabilityError("requestId was already used with different arguments.");

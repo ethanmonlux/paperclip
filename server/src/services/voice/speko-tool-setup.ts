@@ -4,6 +4,14 @@ import { chatActions, type Db } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
 import { spekoToolDefinitions } from "./speko-protocol.js";
 import { createSpekoProvider, SpekoProviderError } from "./speko-provider.js";
+import { admitEffectReservationUnderUpgradeFence } from "../upgrade-admission-fence.js";
+
+async function assertSpekoSetupAdmitted(tx: Db) {
+  const admission = await admitEffectReservationUnderUpgradeFence(tx, "chat_action.dispatch");
+  if (!admission.admitted) {
+    throw conflict("Paperclip is holding new provider effects for a maintenance upgrade. Reconnect later.", { code: admission.code });
+  }
+}
 
 /** Called while the existing connection credential lease is held. */
 export async function configureSpekoSessionTools(db: Db, input: {
@@ -54,13 +62,18 @@ export async function configureSpekoSessionTools(db: Db, input: {
     const actionId = `speko_tool:${definition.name}:${fingerprint}`;
     let [action] = await db.select().from(chatActions).where(and(eq(chatActions.companyId, input.companyId), eq(chatActions.endpointId, input.endpointId), eq(chatActions.providerActionId, actionId)));
     if (action && action.status !== "failed" && !existing) throw conflict("A previous Speko tool setup has an uncertain outcome. Inspect the voice agent's tools before reconnecting.");
-    if (!action) {
-      [action] = await db.insert(chatActions).values({ companyId: input.companyId, endpointId: input.endpointId, kind: "speko_tool_setup", providerActionId: actionId, status: "processing", payload: { name: definition.name, fingerprint, ownershipAgentId: input.agentId, ownershipDefinitionHash: createHash("sha256").update(JSON.stringify(definition)).digest("hex") } }).returning();
-    }
     // A recovered matching tool is repaired with an idempotent PATCH. GET does
     // not expose the secret, so presence alone cannot verify the signing key.
     await input.assertOwned();
-    await db.update(chatActions).set({ status: "processing", updatedAt: new Date() }).where(eq(chatActions.id, action.id));
+    // Effect reservation (admission-design r2 §2.4 row g): the setup receipt
+    // commits with the upgrade-fence check; a held fence writes nothing.
+    action = await db.transaction(async (tx) => {
+      await assertSpekoSetupAdmitted(tx as unknown as Db);
+      const [reserved] = action
+        ? await tx.update(chatActions).set({ status: "processing", updatedAt: new Date() }).where(eq(chatActions.id, action.id)).returning()
+        : await tx.insert(chatActions).values({ companyId: input.companyId, endpointId: input.endpointId, kind: "speko_tool_setup", providerActionId: actionId, status: "processing", payload: { name: definition.name, fingerprint, ownershipAgentId: input.agentId, ownershipDefinitionHash: createHash("sha256").update(JSON.stringify(definition)).digest("hex") } }).returning();
+      return reserved!;
+    });
     let receipt: { id: string };
     try {
       receipt = await input.client.configureTool(input.agentId, definition, input.signingSecret, existing?.id);
@@ -104,7 +117,12 @@ export async function configureSpekoSessionTools(db: Db, input: {
   const actionId = `speko_lifecycle:${fingerprint}`;
   const [previous] = await db.select().from(chatActions).where(and(eq(chatActions.companyId, input.companyId), eq(chatActions.endpointId, input.endpointId), eq(chatActions.providerActionId, actionId)));
   if (previous && previous.status !== "failed" && !matching.length) throw conflict("Speko webhook setup has an uncertain outcome. Inspect Webhooks in Speko before reconnecting.");
-  const action = previous ?? (await db.insert(chatActions).values({companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}).returning())[0]!;
+  // Effect reservation (r2 §2.4 row g): the webhook setup is admitted, and
+  // its receipt created, in one transaction with the upgrade-fence check.
+  const action = await db.transaction(async (tx) => {
+    await assertSpekoSetupAdmitted(tx as unknown as Db);
+    return previous ?? (await tx.insert(chatActions).values({companyId: input.companyId, endpointId: input.endpointId, kind: "speko_lifecycle_setup", providerActionId: actionId, status: "processing", payload: { fingerprint, ownershipAgentId: input.agentId, ownershipUrl: callback.href }}).returning())[0]!;
+  });
   await input.assertOwned();
   try {
     const receipt = await input.client.configureWebhook(input.agentId, callback.href, input.signingSecret, matching[0]?.id);

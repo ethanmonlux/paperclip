@@ -53,6 +53,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import type { heartbeatService } from "./heartbeat.js";
 import type { StorageService } from "../storage/types.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import {
   MAX_ATTACHMENT_BYTES,
   isAllowedContentType,
@@ -1760,14 +1761,23 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
           content: bytes.toString("base64"),
         });
       }
-      await db
-        .update(emailSends)
-        .set({ firstAttemptAt: send.firstAttemptAt ?? new Date() })
-        .where(eq(emailSends.publicationId, pub.id));
-      await db
-        .update(chatPublications)
-        .set({ state: "streaming", attempts: pub.attempts + 1 })
-        .where(eq(chatPublications.id, pub.id));
+      // Effect reservation (admission-design r2 §2.4 row f): the attempt
+      // marks commit together with the upgrade-fence check. A held fence
+      // writes nothing and sends nothing; the send stays queued.
+      const reserved = await db.transaction(async (tx) => {
+        if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_publication.send")).admitted)
+          return false;
+        await tx
+          .update(emailSends)
+          .set({ firstAttemptAt: send.firstAttemptAt ?? new Date() })
+          .where(eq(emailSends.publicationId, pub.id));
+        await tx
+          .update(chatPublications)
+          .set({ state: "streaming", attempts: pub.attempts + 1 })
+          .where(eq(chatPublications.id, pub.id));
+        return true;
+      });
+      if (!reserved) return;
       const api = agentmailApi(await credential(endpoint), fetchImpl);
       const [reply] = input.conversationId
         ? await db

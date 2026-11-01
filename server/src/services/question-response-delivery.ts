@@ -20,6 +20,7 @@ import { isUniqueViolation } from "../db-errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import type { heartbeatService } from "./heartbeat.js";
 import { nativeSha256 } from "./native-runtime/canonical.js";
 
@@ -454,6 +455,11 @@ export function questionResponseDeliveryService(
         current.lastAttemptAt.getTime() > claimAt.getTime() - claimStaleMs
       )
         return null;
+      // Effect reservation (admission-design r2 §2.4 row e): the claim gates
+      // delivery and native answer resolution, which run only under it. A
+      // held fence leaves the delivery `pending` for the existing retry.
+      const fenceAdmission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "question_delivery.claim");
+      if (!fenceAdmission.admitted) return null;
       return tx
         .update(issueQuestionResponseDeliveries)
         .set({

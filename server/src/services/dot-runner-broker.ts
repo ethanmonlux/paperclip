@@ -6,6 +6,7 @@ import { z } from "zod";
 import { DOT_AGENT_TOOL_GUIDANCE, setAgentAvatarSchema, type SetAgentAvatarInput } from "@paperclipai/shared";
 import { setAgentProfileAvatar } from "./agent-profile-avatar.js";
 import { consumeDotHistoryReceipt } from "./dot-assignment-follow-up.js";
+import { admitEffectReservationUnderUpgradeFence, upgradeFenceHeldResult } from "./upgrade-admission-fence.js";
 import { getStorageService } from "../storage/index.js";
 import { agents, companies, heartbeatRuns, issues, agentWakeupRequests, nativeRunFinalizations, mcpOauthGrants,
   mcpEventSubscriptions, dotAgentBindings as bindings, dotRunnerAssignments as assignments,
@@ -269,9 +270,14 @@ function createBroker(db: Db) {
         if (old) { if (old.digest !== digest) throw fail("requestId was reused with different arguments."); return old; }
         const [count] = await tx.select({ count: sql<number>`count(*)::int` }).from(operations).where(eq(operations.assignmentId, a.id));
         if (count && count.count >= 4000) throw fail("Assignment operation limit reached.");
+        // Effect reservation (admission-design r2 §2.4 row j): a held upgrade
+        // fence refuses before the operation row exists; nothing is forwarded.
+        const admission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "dot_runner.reserve");
+        if (!admission.admitted) return { held: upgradeFenceHeldResult(admission) };
         const [reserved] = await tx.insert(operations).values({ companyId: a.companyId, assignmentId: a.id, requestId, digest, command: { ...command } }).returning();
         return reserved!;
       });
+      if ("held" in row) return row.held;
       if (["reserved", "admitted"].includes(row.status)) void forward(row).catch(() => {});
       const deadline = Date.now() + 1500;
       while (Date.now() < deadline) {

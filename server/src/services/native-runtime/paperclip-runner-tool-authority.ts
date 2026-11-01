@@ -81,6 +81,7 @@ import { logActivity, persistActivity, publishActivity } from "../activity-log.j
 import { captureRunIdentity } from "../run-identity.js";
 import { prepareNativeRunnerFileHandoff, type RemoteWorkspaceFileReader } from "./native-runner-file-handoff.js";
 import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
+import { admitEffectReservationUnderUpgradeFence, upgradeFenceHeldResult } from "../upgrade-admission-fence.js";
 import {
   READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION,
   READ_CURRENT_WAKE_COMMENTS_TOOL_NAME,
@@ -675,6 +676,10 @@ export class PaperclipRunnerToolAuthority {
         return { result: old.result ?? { outcome: "unknown", guidance: "A workspace effect may have occurred. Inspect files and state before issuing another mutation; this call will not execute again." } };
       }
       if (Object.keys(receipts).length >= 1000) throw badRequest("Workspace mutation limit reached");
+      // Effect reservation (admission-design r2 §2.4 row b): a held fence
+      // refuses before the pending receipt exists, so nothing executes.
+      const admission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "runner.workspace_mutation");
+      if (!admission.admitted) return { result: upgradeFenceHeldResult(admission) };
       receipts[key] = { digest, tool: call.tool, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
@@ -769,6 +774,10 @@ export class PaperclipRunnerToolAuthority {
         return { result: existing.result ?? { ok: false, status: null, error: "api_outcome_unknown", outcome: "unknown", guidance: "Inspect state before issuing another mutation." } };
       }
       if (Object.keys(receipts).length >= 512) throw badRequest("Run API mutation limit reached");
+      // Effect reservation (admission-design r2 §2.4 row c): a held fence
+      // refuses before the pending receipt exists, so no HTTP is dispatched.
+      const admission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "runner.call_api");
+      if (!admission.admitted) return { result: { ok: false, status: null, error: admission.code, ...upgradeFenceHeldResult(admission) } };
       receipts[key] = { digest, operationId: operation.operationId, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;

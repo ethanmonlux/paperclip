@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import { chatActions, chatEndpoints, chatPublications, chatVoiceReplies, chatVoiceSessions, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "../instance-settings.js";
+import { admitEffectReservationUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { HttpError } from "../../errors.js";
 import { createSpekoProvider, SpekoProviderError } from "./speko-provider.js";
 import type { voiceSessionStore } from "./voice-session-store.js";
@@ -76,6 +77,9 @@ export async function pushVoiceReplies(db: Db, options: {
           // delivered one. Unknown outcomes are never permission to resend.
           if (saved.some(action => action.payload.textDigest && action.payload.textDigest !== textDigest)
             || prior && (prior.status !== "retry" || Number(prior.result?.retryAt ?? 0) > Date.now())) return null;
+          // Effect reservation (admission-design r2 §2.4 row h): no new
+          // dispatch intent while the upgrade fence is held; the reply stays pending.
+          if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "voice_reply.push")).admitted) return null;
           const values = {status: "dispatching", result: null, updatedAt: new Date()};
           const action = prior
             ? (await tx.update(chatActions).set(values).where(eq(chatActions.id, prior.id)).returning())[0]!

@@ -7,9 +7,10 @@ import { persistActivity, publishActivity, type ActivityPublication } from "./ac
 // FAC-797 guarded-upgrade admission fence, implementation phase 1 (STA-21
 // stage 23, admission-design revisions 2/3/6). One permanent keyed
 // `instance_settings` row holds the fence state; one fixed transaction-scoped
-// advisory lock serializes every gated run claim (shared, non-waiting) against
-// every fence mutation (exclusive). No DDL. Effect reservations, the
-// activation inventory, the updater and the bootstrap are later phases.
+// advisory lock serializes every gated run claim and, since phase 2a (stage
+// 25), every effect reservation (shared, non-waiting) against every fence
+// mutation (exclusive). No DDL. The activation inventory, the settlement
+// resolver, the updater and the bootstrap are later phases.
 
 export const UPGRADE_ADMISSION_FENCE_KEY = "upgrade-admission-fence/v1";
 export const UPGRADE_BOOTSTRAP_EPISODE_KEY = "upgrade-bootstrap-episode/v1";
@@ -41,6 +42,29 @@ export type UpgradeFenceClaimBoundary =
   | "native_finalization.reopen"
   | "native_workspace_export.recovery"
   | "native_workspace_export.retry";
+
+/**
+ * Effect-reservation writers (admission-design r2 §2.4 rows a–l): the durable
+ * write that marks a new outbound effect or provider send as in flight. A
+ * refusal writes nothing and starts no outbound effect; the record stays in
+ * its waiting state and the existing worker retries after release.
+ */
+export type UpgradeFenceEffectBoundary =
+  | "public_mcp.mutation"
+  | "runner.workspace_mutation"
+  | "runner.call_api"
+  | "fast_response.claim"
+  | "question_delivery.claim"
+  | "chat_publication.send"
+  | "chat_action.dispatch"
+  | "voice_reply.push"
+  | "browser_use.create"
+  | "dot_runner.reserve"
+  | "tool_gateway.execute";
+// Row l (decision, status-decision and connection-event effects) has no
+// reservation: those effects settle inside one transaction or are inbound.
+
+export type UpgradeFenceBoundary = UpgradeFenceClaimBoundary | UpgradeFenceEffectBoundary;
 
 /**
  * `required`: an absent row refuses (production; the only default).
@@ -231,13 +255,13 @@ export type UpgradeFenceRefusalCode =
 
 export type UpgradeFenceAdmission =
   | { admitted: true; phase: "open" | "absent_test_open" }
-  | { admitted: false; code: UpgradeFenceRefusalCode; phase: UpgradeFencePhase | null; boundary: UpgradeFenceClaimBoundary };
+  | { admitted: false; code: UpgradeFenceRefusalCode; phase: UpgradeFencePhase | null; boundary: UpgradeFenceBoundary };
 
 /** Thrown where a gated writer must roll back writes it already made. */
 export class UpgradeFenceRefusal extends Error {
   readonly code: UpgradeFenceRefusalCode;
   readonly phase: UpgradeFencePhase | null;
-  readonly boundary: UpgradeFenceClaimBoundary;
+  readonly boundary: UpgradeFenceBoundary;
   constructor(refusal: Extract<UpgradeFenceAdmission, { admitted: false }>) {
     super(`Upgrade admission fence refused ${refusal.boundary}: ${refusal.code}`);
     this.name = "UpgradeFenceRefusal";
@@ -252,16 +276,14 @@ export function isUpgradeFenceRefusal(error: unknown): error is UpgradeFenceRefu
 }
 
 /**
- * The run-claim gate. Call inside the claim's own transaction, before the
- * write that makes the run `running`: shared non-waiting fence lock, then the
- * fence row in a later statement at READ COMMITTED. Anything other than an
- * `open` row (or an absent row in test mode) refuses; an expired `held` row
- * still refuses until a fence mutation commits its expiry. Never writes.
+ * The shared gate. Call inside the writer's own transaction, before the write
+ * that claims a run or reserves an outbound effect: shared non-waiting fence
+ * lock, then the fence row in a later statement at READ COMMITTED. Anything
+ * other than an `open` row (or an absent row in test mode) refuses; an expired
+ * `held` row still refuses until a fence mutation commits its expiry. Never
+ * writes.
  */
-export async function admitRunClaimUnderUpgradeFence(
-  tx: Db,
-  boundary: UpgradeFenceClaimBoundary,
-): Promise<UpgradeFenceAdmission> {
+async function admitUnderUpgradeFence(tx: Db, boundary: UpgradeFenceBoundary): Promise<UpgradeFenceAdmission> {
   const [isolation] = await execRows(tx, sql`select current_setting('transaction_isolation') as level`);
   if (isolation?.level !== "read committed")
     return { admitted: false, code: "upgrade_fence_isolation", phase: null, boundary };
@@ -283,10 +305,47 @@ export async function admitRunClaimUnderUpgradeFence(
   return { admitted: true, phase: "open" };
 }
 
+/** The run-claim gate (phase 1). */
+export async function admitRunClaimUnderUpgradeFence(
+  tx: Db,
+  boundary: UpgradeFenceClaimBoundary,
+): Promise<UpgradeFenceAdmission> {
+  return admitUnderUpgradeFence(tx, boundary);
+}
+
 /** Same gate for writers whose earlier writes in the transaction must roll back. */
 export async function assertRunClaimUnderUpgradeFence(tx: Db, boundary: UpgradeFenceClaimBoundary) {
-  const admission = await admitRunClaimUnderUpgradeFence(tx, boundary);
+  const admission = await admitUnderUpgradeFence(tx, boundary);
   if (!admission.admitted) throw new UpgradeFenceRefusal(admission);
+}
+
+/** The effect-reservation gate (phase 2a, r2 §2.4 rows a–l). */
+export async function admitEffectReservationUnderUpgradeFence(
+  tx: Db,
+  boundary: UpgradeFenceEffectBoundary,
+): Promise<UpgradeFenceAdmission> {
+  return admitUnderUpgradeFence(tx, boundary);
+}
+
+/** Effect gate for writers whose earlier writes in the transaction must roll back. */
+export async function assertEffectReservationUnderUpgradeFence(tx: Db, boundary: UpgradeFenceEffectBoundary) {
+  const admission = await admitUnderUpgradeFence(tx, boundary);
+  if (!admission.admitted) throw new UpgradeFenceRefusal(admission);
+}
+
+/**
+ * The structured result a tool-facing writer returns instead of reserving
+ * while the fence refuses. No receipt exists, so no unknown outcome is
+ * created; the same request may be retried after the fence opens.
+ */
+export function upgradeFenceHeldResult(refusal: { code: UpgradeFenceRefusalCode }) {
+  return {
+    outcome: "held" as const,
+    retryable: true as const,
+    code: refusal.code,
+    message:
+      "Paperclip is holding new effects for a maintenance upgrade. Nothing was executed or recorded for this request. Retry the same request later.",
+  };
 }
 
 export type UpgradeFenceMutationErrorCode =

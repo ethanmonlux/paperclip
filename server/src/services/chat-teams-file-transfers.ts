@@ -3,6 +3,7 @@ import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { ChatFileTransferPhase } from "@paperclipai/shared";
 import { guardedRemoteHttpFetch } from "./remote-http-fetch.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import {
   assets,
   chatActions,
@@ -687,6 +688,11 @@ export function teamsFileTransferService(
       await verify(tx, authority(row), stage);
       const { state, binding } = await decoded(row);
       if (stage !== "file_info" && row.expiresAt <= now()) fail();
+      // Effect reservation (admission-design r2 §2.4 row f, Teams file
+      // lane): a held upgrade fence leaves the stage pending. Reconciliation
+      // above (unknown outcomes, expiry) is not admission and still commits.
+      if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_publication.send")).admitted)
+        return null;
       row = await update(tx, row, {
         phase:
           stage === "consent"
