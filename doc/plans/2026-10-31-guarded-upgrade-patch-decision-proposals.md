@@ -56,7 +56,7 @@ Meaning of the decisions:
 | claude-auth-provenance | **upstream-fails** 11/15 (`a99c7d63`) | passes 15/15 | `parse.ts`/`acp.ts` identical; `test.ts` changed | **adapt** (`test.ts` caller) |
 | git-install-payload | **upstream-fails** 3/3 (`5d362d2f`), port `58ce7442` | passes 3/3 | `install.ts` changed (npm 12 hunk only) | **adapt** |
 | installer-test-isolation | unknown, manual (`1e6847ae`) | n/a | test file changed; the global service-manager isolation is absent upstream | **adapt** |
-| portable-runner-fixtures | unknown, manual (`205f10b6`) | n/a | test changed; upstream still copies `/bin/sleep` | **adapt** |
+| portable-runner-fixtures | unknown, manual (`205f10b6`); source corrected to the test-file part of `2e6e2f4b` (R10) | n/a | test changed; upstream still copies `/bin/sleep` | **adapt** |
 | portable-sandbox-denial | upstream-passes 1/1 (`4be8d10e`) | passes 1/1 | test identical to stable | **keep** (test-only, not retire) |
 | trusted-ci-baseline | unknown, manual (`eac37fea`) | n/a | `pr.yml` changed | **adapt** |
 | codex-shell-proxy-allowlist | **upstream-fails** 1/1 (`4b1d6975`) | passes 1/1 | `execute.ts` changed | **adapt** |
