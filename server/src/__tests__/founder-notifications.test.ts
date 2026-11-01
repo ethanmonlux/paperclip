@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, like } from "drizzle-orm";
+import { and, eq, like, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -17,7 +17,6 @@ import {
   companies,
   companyMemberships,
   createDb,
-  issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -29,6 +28,7 @@ import { errorHandler } from "../middleware/index.js";
 import { founderNotificationRoutes } from "../routes/founder-notifications.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { issueService } from "../services/issues.js";
 import {
   founderNotificationAttentionSource,
   withFounderOccurrenceFingerprints,
@@ -537,41 +537,44 @@ describeEmbeddedPostgres("founder notifications", () => {
     expect(await reviewEpisodes()).toHaveLength(5);
   });
 
-  it("anchors a blocker occurrence at its oldest current hold, with no equality fingerprint", async () => {
+  it("attaches occurrence identity only to reviews, never to a stalled blocker", async () => {
     const fixture = await seed();
-    const first = new Date("2026-10-31T10:00:00Z");
-    await db.update(issues).set({ blockedTransitionAt: first }).where(eq(issues.id, fixture.task.id));
-    const item = attentionItem(fixture, { sourceKind: "blocker_attention", dedupKey: `blocker:${fixture.task.id}` });
+    await db.update(issues).set({ blockedTransitionAt: new Date("2026-10-31T10:00:00Z") }).where(eq(issues.id, fixture.task.id));
+    const blocker = attentionItem(fixture, { sourceKind: "blocker_attention", dedupKey: `blocker:${fixture.task.id}` });
+    const review = attentionItem(fixture, { sourceKind: "review", dedupKey: `review:${fixture.task.id}` });
     const other = attentionItem(fixture, { sourceKind: "approval", dedupKey: `approval:${randomUUID()}` });
-    const facts = await withFounderOccurrenceFingerprints(db, fixture.companyId, [item, other]);
-    expect(facts[0]!.founderOccurrenceFingerprint).toBeUndefined();
-    expect(facts[0]!.founderContinuityAnchorAt).toBe(first.toISOString());
-    expect(facts[1]!.founderOccurrenceFingerprint).toBeUndefined();
-    expect(facts[1]!.founderContinuityAnchorAt).toBeUndefined();
+    const [blockerFact, reviewFact, otherFact] = await withFounderOccurrenceFingerprints(db, fixture.companyId, [blocker, review, other]);
+    expect(blockerFact).toEqual(blocker);
+    expect(reviewFact!.founderOccurrenceFingerprint).toMatch(/^[0-9a-f]{24}$/);
+    expect(otherFact).toEqual(other);
   });
 
-  it("keeps one blocker episode while any hold continues and supersedes it only when every hold restarted", async () => {
-    const fixture = await seed();
+  /**
+   * A blocker stall driven through native issue mutations, read by the real
+   * complete attention source and reconciled by real sweeps. Date is faked so
+   * native transition timestamps and sweep times share one clock.
+   */
+  async function blockerStallHarness(fixture: Awaited<ReturnType<typeof seed>>) {
     const S = FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN;
-    let route = await enabledRoute(fixture, S);
-    const start = Date.parse("2026-10-31T10:00:00Z");
-    const at = (multiple: number) => new Date(start + multiple * S);
-    // One terminal holds two dependents blocked, with staggered transitions.
-    await db.update(issues).set({ status: "todo", blockedTransitionAt: null }).where(eq(issues.id, fixture.task.id));
-    const dependent = async (title: string, blockedAt: Date) => {
+    const key = `blocker:${fixture.task.id}`;
+    const start = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: start });
+    const at = (multiple: number) => vi.setSystemTime(start + Math.round(multiple * S));
+    const issueSvc = issueService(db);
+    await issueSvc.update(fixture.task.id, { status: "todo" });
+    const hold = async (id: string) => {
+      await issueSvc.update(id, { status: "blocked", blockedByIssueIds: [fixture.task.id] });
+    };
+    const release = async (id: string) => {
+      await issueSvc.update(id, { status: "todo", blockedByIssueIds: [] });
+    };
+    const dependent = async (title: string) => {
       const [row] = await db
         .insert(issues)
-        .values({ companyId: fixture.companyId, title, status: "blocked", assigneeAgentId: fixture.agentId, blockedTransitionAt: blockedAt })
+        .values({ companyId: fixture.companyId, title, status: "todo", assigneeAgentId: fixture.agentId })
         .returning();
-      await db.insert(issueRelations).values({ companyId: fixture.companyId, issueId: fixture.task.id, relatedIssueId: row!.id, type: "blocks" });
-      return row!;
+      return row!.id;
     };
-    const release = (id: string) => db.update(issues).set({ status: "in_progress", blockedTransitionAt: null }).where(eq(issues.id, id));
-    const reblock = (id: string, blockedAt: Date) => db.update(issues).set({ status: "blocked", blockedTransitionAt: blockedAt }).where(eq(issues.id, id));
-    const a = await dependent("Dependent A", new Date(start));
-    const b = await dependent("Dependent B", new Date(start + 1_000));
-
-    // The fact is read from the real complete attention source every time.
     const source = founderNotificationAttentionSource(db);
     const actor = {
       type: "board" as const,
@@ -581,78 +584,281 @@ describeEmbeddedPostgres("founder notifications", () => {
       source: "session" as const,
     };
     const blockerFacts = async () =>
-      (await source(fixture.companyId, fixture.founderUserId, actor)).filter((fact) => fact.dedupKey === `blocker:${fixture.task.id}`);
-    const pass = async (when: Date) => {
-      const facts = await blockerFacts();
-      expect(facts).toHaveLength(1);
-      return reconcileFounderRoute(db, route, facts, when);
-    };
+      (await source(fixture.companyId, fixture.founderUserId, actor)).filter((fact) => fact.dedupKey === key);
+    let failSnapshots = false;
+    const newService = () =>
+      founderNotificationService(db, {
+        sweepIntervalMs: S,
+        listAttention: async (companyId, recipientUserId, sweepActor) => {
+          if (companyId !== fixture.companyId) return [];
+          if (failSnapshots) throw new Error("feed unavailable");
+          return (await source(companyId, recipientUserId, sweepActor)).filter((fact) => fact.dedupKey === key);
+        },
+      });
     const blockerEpisodes = async () =>
       (await episodes(fixture.companyId))
-        .sort((x, y) => x.payload.occurrence - y.payload.occurrence)
-        .map((row) => [row.payload.occurrence, row.status, row.payload.resolutionReason]);
-    const cards = async () => (await founderPublications(fixture.companyId)).map((row) => row.state).sort();
+        .filter((row) => row.payload.dedupKey === key)
+        .sort((x, y) => x.payload.occurrence - y.payload.occurrence);
+    const summary = async () =>
+      (await blockerEpisodes()).map((row) => [row.payload.occurrence, row.status, row.payload.resolutionReason]);
+    const cards = async () =>
+      (await founderPublications(fixture.companyId)).map((row) => row.state).sort();
     const notices = async () => founderPublications(fixture.companyId, "founder-notification-resolution:");
-    const publishLatest = async () => {
+    const tokens = async () =>
+      (
+        await db
+          .select()
+          .from(chatActions)
+          .where(and(eq(chatActions.companyId, fixture.companyId), eq(chatActions.kind, "founder_notification_ack")))
+      ).map((row) => [row.providerActionId, row.status]);
+    const publishPending = async () => {
       const pending = (await founderPublications(fixture.companyId)).filter((row) => row.state === "pending");
       expect(pending).toHaveLength(1);
-      await db.update(chatPublications).set({ state: "published", providerMessageId: randomUUID() }).where(eq(chatPublications.id, pending[0]!.id));
+      await db.update(chatPublications).set({ state: "published", providerMessageId: randomUUID(), publishedAt: new Date() }).where(eq(chatPublications.id, pending[0]!.id));
     };
+    return {
+      S, at, hold, release, dependent, blockerFacts, newService, blockerEpisodes, summary, cards, notices, tokens, publishPending,
+      setSnapshotFailure: (value: boolean) => { failSnapshots = value; },
+    };
+  }
 
-    await pass(at(0));
-    await pass(at(1));
-    expect(await blockerEpisodes()).toEqual([[1, "open", null]]);
-    await publishLatest();
+  it("keeps one blocker episode through any hold turnover and starts a new one only after a sweep observes it clear", async () => {
+    const fixture = await seed();
+    await enabledRoute(fixture, FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN);
+    try {
+      const h = await blockerStallHarness(fixture);
+      const [a, b, c, x, d, e] = [
+        await h.dependent("Dependent A"), await h.dependent("Dependent B"), await h.dependent("Dependent C"),
+        await h.dependent("Dependent X"), await h.dependent("Dependent D"), await h.dependent("Dependent E"),
+      ];
+      let service = h.newService();
+      h.at(0);
+      await h.hold(a);
+      await service.sweep();
+      h.at(0.1);
+      await h.hold(b);
+      h.at(1);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "open", null]]);
+      await h.publishPending();
+      const originalTokens = await h.tokens();
+      expect(originalTokens).toHaveLength(1);
+      expect(originalTokens[0]![1]).toBe("issued");
+      const unchanged = async () => {
+        expect(await h.blockerFacts()).toHaveLength(1);
+        expect(await h.summary()).toEqual([[1, "open", null]]);
+        expect(await h.cards()).toEqual(["published"]);
+        expect(await h.notices()).toHaveLength(0);
+        expect(await h.tokens()).toEqual(originalTokens);
+      };
 
-    // Releasing only the earliest dependent is progress, not recovery.
-    await release(a.id);
-    await pass(at(2));
-    await pass(at(3));
-    expect(await blockerEpisodes()).toEqual([[1, "open", null]]);
-    expect(await cards()).toEqual(["published"]);
-    expect(await notices()).toHaveLength(0);
+      // Round 2: releasing only the earliest dependent is progress.
+      h.at(1.5);
+      await h.release(a);
+      h.at(2);
+      await service.sweep();
+      await unchanged();
 
-    // A dependent added mid-stall changes nothing either.
-    const c = await dependent("Dependent C", new Date(at(3).getTime() + 1_000));
-    await pass(at(4));
-    expect(await blockerEpisodes()).toEqual([[1, "open", null]]);
-    expect(await cards()).toEqual(["published"]);
+      // Round 3: C is held while B is still held, then B is released, all
+      // before the next poll.
+      h.at(2.3);
+      await h.hold(c);
+      h.at(2.6);
+      await h.release(b);
+      h.at(3);
+      await service.sweep();
+      await unchanged();
 
-    // Every hold is released and re-formed between two polls: a new
-    // occurrence. The founder is still needed, so no "no longer needs you".
-    await reblock(b.id, new Date(at(4).getTime() + 1_000));
-    await reblock(c.id, new Date(at(4).getTime() + 2_000));
-    await pass(at(5));
-    await pass(at(6));
-    expect(await blockerEpisodes()).toEqual([[1, "resolved", "superseded"], [2, "open", null]]);
-    expect(await cards()).toEqual(["pending", "published"]);
-    expect(await notices()).toHaveLength(0);
-    await publishLatest();
+      // Bridge: X is held while C is released and C is held again, then X is
+      // released. X is never observed and C's hold restarted.
+      h.at(3.2);
+      await h.hold(x);
+      h.at(3.4);
+      await h.release(c);
+      h.at(3.6);
+      await h.hold(c);
+      h.at(3.8);
+      await h.release(x);
+      h.at(4);
+      await service.sweep();
+      await unchanged();
 
-    // The same discontinuity while the server is down: the restarted sweep
-    // reads only durable state and still tells the two apart.
-    await reblock(b.id, new Date(at(7).getTime()));
-    await reblock(c.id, new Date(at(8).getTime()));
-    [route] = await listFounderRoutes(db, fixture.companyId, { enabledOnly: true });
-    await pass(at(12));
-    await pass(at(13));
-    expect(await blockerEpisodes()).toEqual([
-      [1, "resolved", "superseded"],
-      [2, "resolved", "superseded"],
-      [3, "open", null],
-    ]);
-    expect(await cards()).toEqual(["pending", "published", "published"]);
-    expect(await notices()).toHaveLength(0);
-    await publishLatest();
+      // A relation rewrite with no status change.
+      h.at(4.5);
+      await issueService(db).update(c, { blockedByIssueIds: [fixture.task.id] });
+      h.at(5);
+      await service.sweep();
+      await unchanged();
 
-    // Releasing the last holds clears the fact: one resolution notice.
-    await release(b.id);
-    await release(c.id);
-    expect(await blockerFacts()).toHaveLength(0);
-    const cleared = await reconcileFounderRoute(db, route, [], at(14));
-    expect(cleared).toMatchObject({ resolved: 1, resolutionNotices: 1 });
-    expect((await blockerEpisodes()).at(-1)).toEqual([3, "resolved", "item_cleared"]);
-    expect(await notices()).toHaveLength(1);
+      // Equal timestamps: two holds start and the last one ends at one instant.
+      h.at(5.5);
+      await h.hold(d);
+      await h.hold(e);
+      await h.release(c);
+      h.at(6);
+      await service.sweep();
+      await unchanged();
+      expect((await h.blockerEpisodes())[0]!.payload).toMatchObject({ observationGaps: 0, maxObservationGapMs: null });
+
+      // Downtime: a restarted sweep continues the episode and records the
+      // unobserved period instead of treating it as proof.
+      service = h.newService();
+      h.at(12);
+      await service.sweep();
+      await unchanged();
+      // Failed snapshots resolve nothing; the next successful one records the
+      // gap they left.
+      h.setSnapshotFailure(true);
+      h.at(13);
+      await service.sweep();
+      h.at(14);
+      await service.sweep();
+      h.setSnapshotFailure(false);
+      h.at(15);
+      await service.sweep();
+      await unchanged();
+      expect((await h.blockerEpisodes())[0]!.payload).toMatchObject({ observationGaps: 2, maxObservationGapMs: 6 * h.S });
+      const [view] = await service.listEpisodes(fixture.companyId);
+      expect(view).toMatchObject({ state: "open", observationGaps: 2, maxObservationGapMs: 6 * h.S });
+
+      // The original card's outcome is now UNKNOWN. A real clear: every hold
+      // is released and a complete sweep observes the fact absent.
+      await db.update(chatPublications).set({ state: "delivery_unknown" }).where(and(eq(chatPublications.companyId, fixture.companyId), eq(chatPublications.state, "published")));
+      h.at(15.5);
+      await h.release(d);
+      await h.release(e);
+      expect(await h.blockerFacts()).toHaveLength(0);
+      h.at(16);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"]]);
+      expect(await h.notices()).toHaveLength(1);
+      expect(await h.cards()).toEqual(["delivery_unknown"]);
+      expect((await h.tokens()).map(([, status]) => status)).toEqual(["expired"]);
+
+      // The stall forms again: a new occurrence that waits out the persistence
+      // bound, across a restart, then alerts exactly once.
+      h.at(16.5);
+      await h.hold(b);
+      h.at(17);
+      await service.sweep();
+      h.at(17.5);
+      service = h.newService();
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"], [2, "observing", null]]);
+      expect(await h.cards()).toEqual(["delivery_unknown"]);
+      h.at(18);
+      await service.sweep();
+      h.at(18.2);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"], [2, "open", null]]);
+      expect(await h.cards()).toEqual(["delivery_unknown", "pending"]);
+      const [first, second] = await h.blockerEpisodes();
+      expect(second!.payload.publicationId).not.toBe(first!.payload.publicationId);
+      expect(second!.payload).toMatchObject({ observationGaps: 0, maxObservationGapMs: null });
+      expect(await h.notices()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("judges terminal completion, cancellation and reopening only by what complete sweeps observe", async () => {
+    const fixture = await seed();
+    await enabledRoute(fixture, FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN);
+    try {
+      const h = await blockerStallHarness(fixture);
+      const issueSvc = issueService(db);
+      const b = await h.dependent("Dependent B");
+      let service = h.newService();
+      h.at(0);
+      await h.hold(b);
+      await service.sweep();
+      h.at(1);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "open", null]]);
+      await h.publishPending();
+
+      // Cancelling the terminal does not resolve its dependents.
+      h.at(1.5);
+      await issueSvc.update(fixture.task.id, { status: "cancelled" });
+      expect(await h.blockerFacts()).toHaveLength(1);
+      h.at(2);
+      await service.sweep();
+      h.at(2.5);
+      await issueSvc.update(fixture.task.id, { status: "todo" });
+      h.at(3);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "open", null]]);
+      expect(await h.cards()).toEqual(["published"]);
+
+      // Completing the terminal clears the stall; a sweep observes it absent.
+      h.at(3.5);
+      await issueSvc.update(fixture.task.id, { status: "done" });
+      expect(await h.blockerFacts()).toHaveLength(0);
+      h.at(4);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"]]);
+      expect(await h.notices()).toHaveLength(1);
+
+      // Reopening the terminal re-forms the stall as a new occurrence.
+      h.at(4.5);
+      await issueSvc.update(fixture.task.id, { status: "todo" });
+      h.at(5);
+      await service.sweep();
+      h.at(6);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"], [2, "open", null]]);
+      expect(await h.cards()).toEqual(["pending", "published"]);
+      await h.publishPending();
+
+      // Done and reopened while the server is down: no sweep observed the
+      // stall absent, so it is one episode with the unobserved period shown.
+      h.at(6.5);
+      await issueSvc.update(fixture.task.id, { status: "done" });
+      h.at(7);
+      await issueSvc.update(fixture.task.id, { status: "todo" });
+      service = h.newService();
+      h.at(12);
+      await service.sweep();
+      const all = await h.blockerEpisodes();
+      expect(all.map((row) => [row.payload.occurrence, row.status])).toEqual([[1, "resolved"], [2, "open"]]);
+      expect(all[1]!.payload).toMatchObject({ observationGaps: 1, maxObservationGapMs: 6 * h.S });
+      expect(await h.cards()).toEqual(["published", "published"]);
+      expect(await h.notices()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues blocker episodes from older payloads and under concurrent sweeps", async () => {
+    const fixture = await seed();
+    const S = FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN;
+    const route = await enabledRoute(fixture, S);
+    const stall = attentionItem(fixture, { sourceKind: "blocker_attention", dedupKey: `blocker:${fixture.task.id}`, relatedIssue: null, subject: { kind: "issue", id: fixture.task.id, companyId: fixture.companyId, title: fixture.task.title, identifier: fixture.task.identifier, status: "blocked", href: null } });
+    const start = Date.parse("2026-10-31T10:00:00Z");
+    const options = { sweepIntervalMs: 30_000 };
+
+    // Overlapping first passes converge on one episode.
+    await Promise.all([0, 1, 2].map(() => reconcileFounderRoute(db, route, [stall], new Date(start), options)));
+    expect(await episodes(fixture.companyId)).toHaveLength(1);
+
+    // An episode written before the gap fields existed, carrying an
+    // equality fingerprint from an earlier build, reads as no gaps and
+    // continues by presence.
+    await db
+      .update(chatActions)
+      .set({ payload: sql`(${chatActions.payload} - 'observationGaps' - 'maxObservationGapMs') || '{"occurrenceFingerprint":"legacy-blocker-fingerprint"}'::jsonb` })
+      .where(and(eq(chatActions.companyId, fixture.companyId), eq(chatActions.kind, "founder_notification_episode")));
+    const [legacyView] = await listFounderEpisodeViews(db, fixture.companyId);
+    expect(legacyView).toMatchObject({ state: "observing", observationGaps: 0, maxObservationGapMs: null });
+
+    // Overlapping due passes send exactly one card.
+    await Promise.all([0, 1, 2].map(() => reconcileFounderRoute(db, route, [stall], new Date(start + S), options)));
+    expect(await founderPublications(fixture.companyId)).toHaveLength(1);
+    await reconcileFounderRoute(db, route, [stall], new Date(start + 2 * S), options);
+    const rows = await episodes(fixture.companyId);
+    expect(rows.map((row) => [row.payload.occurrence, row.status])).toEqual([[1, "open"]]);
+    expect(rows[0]!.payload).toMatchObject({ observationGaps: 2, maxObservationGapMs: S });
+    expect(await founderPublications(fixture.companyId)).toHaveLength(1);
   });
 
   it("never resolves facts when the attention snapshot fails", async () => {

@@ -55,6 +55,8 @@ export const FOUNDER_NOTIFICATION_ACK_TTL_MS = 7 * 24 * 60 * 60_000;
 const ACK_TOKEN_PREFIX = "pcf:";
 const MAX_CARD_TEXT = 160;
 const EPISODE_LIST_LIMIT = 100;
+/** The scheduler's default tick; see `heartbeatSchedulerIntervalMs`. */
+export const FOUNDER_NOTIFICATION_DEFAULT_SWEEP_INTERVAL_MS = 30_000;
 
 type RouteStatus = "enabled" | "disabled";
 type EpisodeStatus = "observing" | "open" | "resolved";
@@ -76,9 +78,9 @@ export type FounderNotificationEpisodePayload = {
   notificationClass: FounderNotificationClass;
   dedupKey: string;
   /**
-   * Opaque hash of the attributable occurrence (review gate, blocking
-   * transition) for facts whose attention dedupKey survives a clear/reopen.
-   * Null when the dedupKey alone already identifies the occurrence.
+   * Opaque hash of the attributable occurrence (a review gate) for facts whose
+   * attention dedupKey survives a clear/reopen. Null when presence alone
+   * identifies the occurrence, as for stalled blockers.
    */
   occurrenceFingerprint: string | null;
   occurrence: number;
@@ -88,6 +90,15 @@ export type FounderNotificationEpisodePayload = {
   firstObservedAt: string;
   lastObservedAt: string;
   observations: number;
+  /**
+   * Unobserved periods inside this episode: successive successful sweeps that
+   * saw the fact present more than two sweep intervals apart (downtime,
+   * failed snapshots). The episode continued across them, but nothing proves
+   * the fact stayed present in between. Absent on payloads written before
+   * these fields existed, which reads as none recorded.
+   */
+  observationGaps?: number;
+  maxObservationGapMs?: number | null;
   notifiedAt: string | null;
   publicationId: string | null;
   /** Last delivery state already surfaced in logs; avoids per-tick noise. */
@@ -180,30 +191,49 @@ export function isFounderAckPayload(value: unknown): value is FounderNotificatio
 }
 
 /**
- * An attention item as the founder sweep sees it. For a fact whose dedupKey
- * is stable across a clear and reopen, the adapter attaches occurrence
- * identity so a reopening missed between polls or across downtime is still a
- * distinct episode:
- * - `founderOccurrenceFingerprint`: equality identity of one occurrence (a
- *   review gate); a different value is a new occurrence.
- * - `founderContinuityAnchorAt`: the start of the oldest condition currently
- *   sustaining the fact (a blocker's longest current hold). The occurrence
- *   continues while it is no later than the episode's last observation.
+ * An attention item as the founder sweep sees it. For a review, whose dedupKey
+ * is stable across a clear and reopen, the adapter attaches
+ * `founderOccurrenceFingerprint`, the equality identity of one review gate, so
+ * a review reopened between polls or across downtime is still a distinct
+ * episode.
  */
 export type FounderAttentionFact = AttentionItem & {
   founderOccurrenceFingerprint?: string | null;
-  founderContinuityAnchorAt?: string | null;
 };
 
 /**
- * Whether a present fact is the occurrence an active episode tracks. A
- * missing anchor cannot prove a discontinuity, so it continues.
+ * Whether a present fact is the occurrence an active episode tracks. A fact
+ * without an occurrence fingerprint, such as a stalled blocker, is one
+ * occurrence for as long as every complete sweep observes it present; it ends
+ * only when a complete sweep observes it absent. Missing identity never mints
+ * a new occurrence.
  */
 function isSameOccurrence(episode: FounderEpisodeRow, fact: FounderAttentionFact): boolean {
-  if ((episode.payload.occurrenceFingerprint ?? null) !== (fact.founderOccurrenceFingerprint ?? null)) return false;
-  const anchor = fact.founderContinuityAnchorAt ? Date.parse(fact.founderContinuityAnchorAt) : Number.NaN;
-  if (Number.isNaN(anchor)) return true;
-  return anchor <= Date.parse(episode.payload.lastObservedAt);
+  const fingerprint = fact.founderOccurrenceFingerprint ?? null;
+  if (fingerprint === null) return true;
+  return (episode.payload.occurrenceFingerprint ?? null) === fingerprint;
+}
+
+/**
+ * The observation patch for a continuing episode. A gap longer than two sweep
+ * intervals since its last successful observation is recorded, so an
+ * unobserved period is explicit rather than silently treated as proof the fact
+ * stayed present.
+ */
+function observationPatch(
+  payload: FounderNotificationEpisodePayload,
+  nowMs: number,
+  sweepIntervalMs: number,
+): Pick<FounderNotificationEpisodePayload, "lastObservedAt"> &
+  Partial<Pick<FounderNotificationEpisodePayload, "observationGaps" | "maxObservationGapMs">> {
+  const patch = { lastObservedAt: new Date(nowMs).toISOString() };
+  const gapMs = nowMs - Date.parse(payload.lastObservedAt);
+  if (!(gapMs > 2 * sweepIntervalMs)) return patch;
+  return {
+    ...patch,
+    observationGaps: (payload.observationGaps ?? 0) + 1,
+    maxObservationGapMs: Math.max(payload.maxObservationGapMs ?? 0, gapMs),
+  };
 }
 
 /** Partial JSON merge on the current row, never a stale whole-payload write. */
@@ -901,6 +931,8 @@ export async function listFounderEpisodeViews(
       firstObservedAt: row.payload.firstObservedAt,
       lastObservedAt: row.payload.lastObservedAt,
       observations: row.payload.observations,
+      observationGaps: row.payload.observationGaps ?? 0,
+      maxObservationGapMs: row.payload.maxObservationGapMs ?? null,
       notifiedAt: row.payload.notifiedAt,
       acknowledgedAt: row.payload.acknowledgedAt,
       resolvedAt: row.payload.resolvedAt,
@@ -984,6 +1016,7 @@ export async function reconcileFounderRoute(
   route: FounderRouteRow,
   items: FounderAttentionFact[],
   now: Date,
+  options: { sweepIntervalMs?: number } = {},
 ): Promise<FounderReconcileResult> {
   const result: FounderReconcileResult = {
     observed: 0,
@@ -996,10 +1029,11 @@ export async function reconcileFounderRoute(
   const nowMs = now.getTime();
   const nowIso = now.toISOString();
   const stallAfterMs = boundedStallAfterMs(route.payload.stallAfterMs);
+  const sweepIntervalMs = options.sweepIntervalMs ?? FOUNDER_NOTIFICATION_DEFAULT_SWEEP_INTERVAL_MS;
 
-  // At most one active episode per attention dedupKey. A present fact that
+  // At most one active episode per attention dedupKey. A present review that
   // is a new occurrence (see isSameOccurrence) supersedes it, even if no poll
-  // observed the fact absent.
+  // observed the review absent.
   const present = new Map<string, FounderAttentionFact>();
   const actionable = new Map<string, { item: FounderAttentionFact; kind: FounderNotificationClass; taskIssueId: string }>();
   for (const item of items) {
@@ -1032,15 +1066,16 @@ export async function reconcileFounderRoute(
   }
 
   // Every continuing occurrence records this observation, quiet ones too, so
-  // continuity survives a restart. Partial merge on the current row only.
+  // continuity and observation gaps survive a restart. Partial merge on the
+  // current row only.
   for (const [dedupKey, episode] of activeByKey) {
     if (!episode) continue;
     const counted = episode.status === "observing" && actionable.has(dedupKey);
-    const observations = counted ? episode.payload.observations + 1 : episode.payload.observations;
+    const observed = observationPatch(episode.payload, nowMs, sweepIntervalMs);
     const [updated] = await db
       .update(chatActions)
       .set({
-        payload: mergeEpisodePayload(counted ? { observations, lastObservedAt: nowIso } : { lastObservedAt: nowIso }),
+        payload: mergeEpisodePayload(counted ? { ...observed, observations: episode.payload.observations + 1 } : observed),
         updatedAt: now,
       })
       .where(and(eq(chatActions.id, episode.id), eq(chatActions.status, episode.status)))
@@ -1073,6 +1108,8 @@ export async function reconcileFounderRoute(
         firstObservedAt: nowIso,
         lastObservedAt: nowIso,
         observations: 1,
+        observationGaps: 0,
+        maxObservationGapMs: null,
         notifiedAt: null,
         publicationId: null,
         reportedDeliveryState: null,
@@ -1246,8 +1283,8 @@ async function openEpisode(
 }
 
 /**
- * Settles an episode whose fact cleared or was superseded by a new
- * occurrence. A never-sent card is cancelled. When the fact cleared, a
+ * Settles an episode whose fact cleared or, for a review, was superseded by a
+ * new occurrence. A never-sent card is cancelled. When the fact cleared, a
  * possibly provider-visible card (streaming, unknown or published) gets one
  * resolution notice so the phone never shows a stale actionable prompt. A
  * superseded card gets none: the founder is still needed and the new
@@ -1502,6 +1539,8 @@ export type FounderNotificationSweepDeps = {
     actor: AuthorizationActor,
   ) => Promise<FounderAttentionFact[]>;
   now?: () => Date;
+  /** The scheduler tick, used to recognize unobserved gaps inside an episode. */
+  sweepIntervalMs?: number;
 };
 
 async function recipientActor(
@@ -1562,7 +1601,9 @@ export function founderNotificationService(db: Db, deps: FounderNotificationSwee
         // never treat that as every fact having cleared.
         if (!actor) continue;
         const items = await deps.listAttention(route.companyId, route.payload.recipientUserId, actor);
-        const result = await reconcileFounderRoute(db, route, items, deps.now?.() ?? new Date());
+        const result = await reconcileFounderRoute(db, route, items, deps.now?.() ?? new Date(), {
+          sweepIntervalMs: deps.sweepIntervalMs,
+        });
         // A route disabled or rebound mid-pass belongs to its new owner state.
         if (!result.routeChanged) await recordRouteAvailability(route, result);
         results.push(result);

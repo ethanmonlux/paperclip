@@ -47,32 +47,44 @@ a review reopened on an unchanged head, a new occurrence opens a new episode.
 
 Review (`review:<issue>`) and stalled-blocker (`blocker:<issue>`) facts keep
 the same dedup key when they clear and reopen. A route has at most one active
-episode per dedup key, and the founder adapter attaches occurrence identity so
-a reopening is a new episode even when no tick saw the fact absent, including
-while the server was down:
+episode per dedup key.
 
-- review: an opaque fingerprint of the current stage, last decision and
-  changes-requested round, the issue's latest recorded change into
-  `in_review`, and the head under review where the issue's primary work
-  product records one (`metadata.sha`). A different fingerprint is a new
-  occurrence. Native execution state has no head field, so for an issue
-  without such a work product a new head under an unchanged gate is not
-  told apart.
-- blocker: a continuity anchor, the earliest blocking transition among the
-  issues the blocker currently holds. The set of held issues changes during
-  one stall, so this is not an equality fingerprint. The episode continues
-  while the anchor is no later than its last observation, that is while some
-  hold has lasted since then; releasing or adding individual dependents does
-  not change it. Only when every current hold began after the last
-  observation is it a new occurrence. If one hold is released and another
-  formed between two ticks with no gap seen, that also counts as a new
-  occurrence.
+- review: the founder adapter attaches an opaque fingerprint of the current
+  stage, last decision and changes-requested round, the issue's latest
+  recorded change into `in_review`, and the head under review where the
+  issue's primary work product records one (`metadata.sha`). A different
+  fingerprint is a new occurrence even when no tick saw the review absent,
+  including while the server was down. Native execution state has no head
+  field, so for an issue without such a work product a new head under an
+  unchanged gate is not told apart.
+- blocker: one occurrence lasts for as long as every complete, successful
+  sweep observes the fact present. Changes in which issues the blocker holds
+  (one dependent released while another is held, new dependents, repeated
+  reblocks, relation edits) never start a new occurrence, never re-alert and
+  never expire the acknowledgement button. The occurrence ends only when a
+  complete sweep observes the fact absent: the episode resolves, with one
+  resolution notice if it had alerted. If the stall forms again, it is a new
+  occurrence that must pass the persistence bound again before alerting.
 
-Every tick records the observation on the active episode, so continuity
-survives restarts. The shared attention producer and its dedup keys are
+  Whether a blocker is stalled is derived at read time from run liveness,
+  waits, assignees, finalization barriers, status and relations, and nothing
+  records when a stall starts or ends. So this is a rule about observations,
+  matching the V1 stall definition by consecutive observations: a stall that
+  clears and forms again entirely between two sweeps, or while the server is
+  down, is one episode. Such unobserved periods are not hidden. When
+  successive successful observations of an episode are more than two sweep
+  intervals apart (downtime, failed or skipped snapshots), the episode records
+  the gap, and the episode list shows `observationGaps` and
+  `maxObservationGapMs`. A non-zero count means the episode continued across
+  time when nothing observed the fact, not that the stall was proven
+  continuous.
+
+Every tick records the observation on the active episode, so continuity and
+gaps survive restarts. Episodes written before the gap fields existed read as
+having none recorded. The shared attention producer and its dedup keys are
 unchanged.
 
-When a fact is still present but as a new occurrence, the old episode
+When a review is still present but as a new occurrence, the old episode
 resolves as `superseded`: its unsent card is cancelled, its buttons expire,
 and a card already sent or UNKNOWN keeps its identity and is never replayed.
 It gets no "no longer needs you" notice, because the founder is still needed;

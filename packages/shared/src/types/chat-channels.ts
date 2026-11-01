@@ -624,6 +624,13 @@ export interface FounderNotificationEpisode {
   firstObservedAt: string;
   lastObservedAt: string;
   observations: number;
+  /**
+   * Sweeps that saw the fact present more than two sweep intervals after the
+   * previous successful observation (downtime, failed snapshots). The episode
+   * continued across them without proof the fact stayed present in between.
+   */
+  observationGaps: number;
+  maxObservationGapMs: number | null;
   notifiedAt: string | null;
   acknowledgedAt: string | null;
   resolvedAt: string | null;

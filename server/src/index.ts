@@ -1683,6 +1683,7 @@ async function startServerWithDatabaseTeardown(
         .then(([service, attention]) =>
           service.founderNotificationService(db as any, {
             listAttention: attention.founderNotificationAttentionSource(db as any),
+            sweepIntervalMs: config.heartbeatSchedulerIntervalMs,
           }),
         )
         .catch((err: unknown) => {

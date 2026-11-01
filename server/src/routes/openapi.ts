@@ -6025,6 +6025,8 @@ const founderNotificationEpisodeSchema = z
     firstObservedAt: z.string().datetime(),
     lastObservedAt: z.string().datetime(),
     observations: z.number().int().nonnegative(),
+    observationGaps: z.number().int().nonnegative(),
+    maxObservationGapMs: z.number().int().nonnegative().nullable(),
     notifiedAt: z.string().datetime().nullable(),
     acknowledgedAt: z.string().datetime().nullable(),
     resolvedAt: z.string().datetime().nullable(),

@@ -5,10 +5,8 @@ import { activityLog, issueWorkProducts, issues } from "@paperclipai/db";
 import type { AttentionItem } from "@paperclipai/shared";
 import { attentionService } from "./attention.js";
 import type { FounderAttentionFact, FounderNotificationSweepDeps } from "./founder-notifications.js";
-import { issueService } from "./issues.js";
 
 const REVIEW_KEY_PREFIX = "review:";
-const BLOCKER_KEY_PREFIX = "blocker:";
 
 function fingerprint(parts: Array<string | number | null | undefined>): string {
   return createHash("sha256")
@@ -107,64 +105,34 @@ async function reviewFingerprints(db: Db, companyId: string, issueIds: string[])
 }
 
 /**
- * `blocker:<terminal>` names the stalled blocker, not one blocking episode,
- * and the set of issues it holds blocked changes while one stall continues.
- * So it carries no equality fingerprint. Its continuity anchor is the
- * earliest blocking transition among the issues it currently holds blocked:
- * the reconciler continues the open episode while that anchor is no later
- * than the episode's last observation (some hold has lasted since then), and
- * treats it as a new occurrence only when every current hold began after it.
- */
-async function blockerContinuityAnchors(
-  db: Db,
-  companyId: string,
-  terminalIds: string[],
-): Promise<Map<string, string>> {
-  if (terminalIds.length === 0) return new Map();
-  const wanted = new Set(terminalIds);
-  const blocked = (await issueService(db).list(companyId, { status: "blocked" })) as Array<{
-    id: string;
-    blockedTransitionAt?: Date | string | null;
-    blockerAttention?: { terminalBlockerIssueId?: string | null } | null;
-  }>;
-  const earliest = new Map<string, string>();
-  for (const issue of blocked) {
-    const terminal = issue.blockerAttention?.terminalBlockerIssueId ?? issue.id;
-    if (!wanted.has(terminal) || !issue.blockedTransitionAt) continue;
-    const at = new Date(issue.blockedTransitionAt).toISOString();
-    const current = earliest.get(terminal);
-    if (!current || at < current) earliest.set(terminal, at);
-  }
-  return earliest;
-}
-
-/**
- * Attaches occurrence identity in the founder adapter only. The shared
- * attention producer and its UI dedup keys are unchanged; the fingerprint is
- * an opaque hash and neither it nor the anchor ever reaches a card.
+ * Attaches occurrence identity in the founder adapter only, and only to review
+ * facts. The shared attention producer and its UI dedup keys are unchanged;
+ * the fingerprint is an opaque hash that never reaches a card.
+ *
+ * Stalled-blocker facts get none. Whether `blocker:<terminal>` is present is
+ * derived at read time from run liveness, waits, assignees, finalization,
+ * status and relations, and no writer records when that stall starts or ends,
+ * so no statistic over the current snapshot can tell one continuous stall from
+ * a cleared and re-formed one. The reconciler instead keeps one occurrence for
+ * as long as every complete sweep observes the fact present.
  */
 export async function withFounderOccurrenceFingerprints(
   db: Db,
   companyId: string,
   items: AttentionItem[],
 ): Promise<FounderAttentionFact[]> {
-  const idsFor = (prefix: string) => [
-    ...new Set(items.filter((item) => item.dedupKey.startsWith(prefix)).map((item) => item.dedupKey.slice(prefix.length))),
+  const reviewIds = [
+    ...new Set(
+      items
+        .filter((item) => item.dedupKey.startsWith(REVIEW_KEY_PREFIX))
+        .map((item) => item.dedupKey.slice(REVIEW_KEY_PREFIX.length)),
+    ),
   ];
-  const [reviews, anchors] = await Promise.all([
-    reviewFingerprints(db, companyId, idsFor(REVIEW_KEY_PREFIX)),
-    blockerContinuityAnchors(db, companyId, idsFor(BLOCKER_KEY_PREFIX)),
-  ]);
+  const reviews = await reviewFingerprints(db, companyId, reviewIds);
   return items.map((item) => {
-    if (item.dedupKey.startsWith(REVIEW_KEY_PREFIX)) {
-      const fingerprintFor = reviews.get(item.dedupKey.slice(REVIEW_KEY_PREFIX.length));
-      return fingerprintFor ? { ...item, founderOccurrenceFingerprint: fingerprintFor } : item;
-    }
-    if (item.dedupKey.startsWith(BLOCKER_KEY_PREFIX)) {
-      const anchor = anchors.get(item.dedupKey.slice(BLOCKER_KEY_PREFIX.length));
-      return anchor ? { ...item, founderContinuityAnchorAt: anchor } : item;
-    }
-    return item;
+    if (!item.dedupKey.startsWith(REVIEW_KEY_PREFIX)) return item;
+    const fingerprintFor = reviews.get(item.dedupKey.slice(REVIEW_KEY_PREFIX.length));
+    return fingerprintFor ? { ...item, founderOccurrenceFingerprint: fingerprintFor } : item;
   });
 }
 
