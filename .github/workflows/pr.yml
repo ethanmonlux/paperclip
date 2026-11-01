@@ -67,3 +67,18 @@ jobs:
           UPGRADE_TOOLKIT_REQUIRE_ISOLATION: "1"
           UPGRADE_TOOLKIT_CI_GRAPH_CANDIDATE: ${{ github.event.pull_request.head.sha }}
         run: node --test maintenance/upgrade/__tests__/*.test.mjs
+
+  dependency_review:
+    # Fork-only (FAC-760 founder decision 69065bff): the inherited
+    # commitperclip bot workflow is turned off in this fork because it needs a
+    # GitHub App key the fork does not hold. Its dependency review step is kept
+    # here, on pull_request with read-only permissions, so that coverage stays.
+    name: dependency review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
