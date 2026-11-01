@@ -39,7 +39,6 @@ import {
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
 import {
-  admitRunClaimUnderUpgradeFence,
   assertRunClaimUnderUpgradeFence,
   isUpgradeFenceRefusal,
 } from "../upgrade-admission-fence.js";
@@ -1554,6 +1553,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       void emitAgentTaskRun(db, queuedCommentClaim.run);
       return null;
     }
+    // STA-22 R17: a fence refusal throws out of the whole claim transaction, so
+    // the chat-control admission marker written before the claim rolls back with
+    // it; the run stays queued and byte-identical.
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
@@ -1573,18 +1575,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              throwOnFenceRefusal: true,
             });
           }
           return tx.transaction(async (claimTx) => {
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
-            if (!(await admitRunClaimUnderUpgradeFence(claimTx as unknown as Db, "queue.claim")).admitted) return null;
+            await assertRunClaimUnderUpgradeFence(claimTx as unknown as Db, "queue.claim");
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);
             await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
             return claimedRun;
           });
+        }).catch((error: unknown) => {
+          if (isUpgradeFenceRefusal(error)) return null;
+          throw error;
         });
     if (!claimed) return null;
 

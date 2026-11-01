@@ -1,6 +1,8 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { instanceSettings, type Db } from "@paperclipai/db";
+import { companies, instanceSettings, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
+import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 
 // FAC-797 guarded-upgrade admission fence, implementation phase 1 (STA-21
 // stage 23, admission-design revisions 2/3/6). One permanent keyed
@@ -57,6 +59,21 @@ export function getUpgradeAdmissionFenceMode(): UpgradeFenceMode {
 }
 
 export type UpgradeFenceActor = { type: string; id: string | null };
+
+/** Who an `activity_log` row attributes a fence transition to. */
+export type UpgradeFenceActivityActor = {
+  actorType: "agent" | "user" | "system" | "plugin";
+  actorId: string;
+  agentId?: string | null;
+  runId?: string | null;
+  agentApiKeyId?: string | null;
+};
+
+/** An expiry is committed by whichever caller observes it; it is never the caller's own act. */
+export const UPGRADE_FENCE_EXPIRY_ACTOR: UpgradeFenceActivityActor = {
+  actorType: "system",
+  actorId: "upgrade-fence-expiry",
+};
 
 export type UpgradeFenceTransition = {
   from: UpgradeFencePhase;
@@ -313,7 +330,59 @@ export type UpgradeFenceStatus = {
   admitsRunClaims: boolean;
 };
 
-type MutationAudit = (tx: Db, transition: UpgradeFenceTransition) => Promise<void>;
+export function upgradeFenceActivityAction(transition: UpgradeFenceTransition) {
+  if (transition.to === "held") return "instance.upgrade_fence.held";
+  if (transition.reason === "aborted_by_owner") return "instance.upgrade_fence.aborted";
+  return "instance.upgrade_fence.expired";
+}
+
+/**
+ * STA-22 R16: every committed fence transition (hold, abort, and expiry from
+ * any caller) writes its `activity_log` rows in the transition's own
+ * transaction. A failed audit write throws, so the fence state does not commit.
+ * Live events are only collected here and published after commit.
+ */
+async function auditFenceTransition(
+  tx: Db,
+  transition: UpgradeFenceTransition,
+  actor: UpgradeFenceActivityActor,
+  publications: ActivityPublication[],
+) {
+  const companyRows = await tx.select({ id: companies.id }).from(companies);
+  for (const { id: companyId } of companyRows) {
+    const { publication } = await persistActivity(tx, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId ?? null,
+      runId: actor.runId ?? null,
+      agentApiKeyId: actor.agentApiKeyId ?? null,
+      action: upgradeFenceActivityAction(transition),
+      entityType: "instance_settings",
+      entityId: UPGRADE_ADMISSION_FENCE_KEY,
+      details: {
+        from: transition.from,
+        to: transition.to,
+        epoch: transition.epoch,
+        reason: transition.reason,
+        at: transition.at,
+        ...(transition.note ? { note: transition.note } : {}),
+      },
+    });
+    publications.push(publication);
+  }
+}
+
+/** Post-commit only: the audit rows already committed, so a publish failure is logged, not raised. */
+function publishFenceActivities(publications: ActivityPublication[]) {
+  for (const publication of publications) {
+    try {
+      publishActivity(publication);
+    } catch (err) {
+      logger.error({ err, companyId: publication.companyId }, "failed to publish upgrade fence activity event");
+    }
+  }
+}
 
 async function databaseNow(db: Db): Promise<number> {
   const [row] = await execRows(db, sql`select (extract(epoch from clock_timestamp()) * 1000)::float8 as now_ms`);
@@ -341,10 +410,13 @@ async function writeFenceState(tx: Db, state: UpgradeFenceState) {
  */
 async function withFenceMutation<T>(
   db: Db,
-  run: (tx: Db, current: UpgradeFenceState, nowMs: number) => Promise<T>,
+  run: (tx: Db, current: UpgradeFenceState, nowMs: number, publications: ActivityPublication[]) => Promise<T>,
 ): Promise<T> {
+  let publications: ActivityPublication[] = [];
+  let result: T;
   try {
-    return await db.transaction(async (rawTx) => {
+    result = await db.transaction(async (rawTx) => {
+      publications = [];
       const tx = rawTx as unknown as Db;
       await tx.execute(sql.raw(`set local lock_timeout = '${MUTATION_LOCK_TIMEOUT}'`));
       await tx.execute(
@@ -355,13 +427,15 @@ async function withFenceMutation<T>(
         throw new UpgradeFenceMutationError("fence_row_missing", "The upgrade admission fence row is missing; the instance is stopped for its owner.", "stopped_for_owner");
       if (fence.kind === "unreadable")
         throw new UpgradeFenceMutationError("fence_row_unreadable", `The upgrade admission fence row is unreadable (${fence.detail}).`, "stopped_for_owner");
-      return run(tx, fence.state, await databaseNow(tx));
+      return run(tx, fence.state, await databaseNow(tx), publications);
     });
   } catch (error) {
     if (isLockTimeout(error))
       throw new UpgradeFenceMutationError("upgrade_fence_busy", "Another upgrade fence operation holds the fence lock.");
     throw error;
   }
+  publishFenceActivities(publications);
+  return result;
 }
 
 export function upgradeAdmissionFenceService(db: Db) {
@@ -409,10 +483,11 @@ export function upgradeAdmissionFenceService(db: Db) {
   async function sweepExpired(): Promise<UpgradeFenceTransition | null> {
     const fence = await readFenceRow(db);
     if (fence.kind !== "valid" || fence.state.phase === "open" || fence.state.phase === "stopped_for_owner") return null;
-    return withFenceMutation(db, async (tx, current, nowMs) => {
+    return withFenceMutation(db, async (tx, current, nowMs, publications) => {
       const expired = expireUpgradeFenceState(current, nowMs);
       if (!expired.transition) return null;
       await writeFenceState(tx, expired.state);
+      await auditFenceTransition(tx, expired.transition, UPGRADE_FENCE_EXPIRY_ACTOR, publications);
       return expired.transition;
     });
   }
@@ -420,18 +495,19 @@ export function upgradeAdmissionFenceService(db: Db) {
   /** open → held. Returns the owner token once; only its hash is stored. */
   async function hold(input: {
     actor: UpgradeFenceActor;
+    activityActor: UpgradeFenceActivityActor;
     ttlSeconds?: number;
     candidate?: Record<string, unknown> | null;
-    audit?: MutationAudit;
   }) {
     const ttlSeconds = input.ttlSeconds ?? UPGRADE_FENCE_DEFAULT_TTL_SECONDS;
     if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < UPGRADE_FENCE_MIN_TTL_SECONDS || ttlSeconds > UPGRADE_FENCE_MAX_TTL_SECONDS)
       throw new UpgradeFenceMutationError("upgrade_fence_invalid_ttl", `ttlSeconds must be an integer from ${UPGRADE_FENCE_MIN_TTL_SECONDS} to ${UPGRADE_FENCE_MAX_TTL_SECONDS}.`);
     const token = randomBytes(32).toString("base64url");
-    return withFenceMutation(db, async (tx, current, nowMs) => {
+    return withFenceMutation(db, async (tx, current, nowMs, publications) => {
       const expired = expireUpgradeFenceState(current, nowMs);
       let state = expired.state;
-      if (expired.transition) await input.audit?.(tx, expired.transition);
+      // A refused hold below rolls this expiry back too; the next sweep commits it.
+      if (expired.transition) await auditFenceTransition(tx, expired.transition, UPGRADE_FENCE_EXPIRY_ACTOR, publications);
       if (state.phase === "held")
         throw new UpgradeFenceMutationError("upgrade_fence_held", "The upgrade admission fence is already held.", state.phase);
       if (state.phase !== "open")
@@ -449,7 +525,7 @@ export function upgradeAdmissionFenceService(db: Db) {
         candidate: input.candidate ?? null,
       }, transition);
       await writeFenceState(tx, state);
-      await input.audit?.(tx, transition);
+      await auditFenceTransition(tx, transition, input.activityActor, publications);
       return { phase: "held" as const, epoch, ownerToken: token, heldUntil: state.heldUntil!, transition };
     });
   }
@@ -457,12 +533,12 @@ export function upgradeAdmissionFenceService(db: Db) {
   /** held → open by its owner: the pre-activation abort. Any other phase refuses. */
   async function abort(input: {
     actor: UpgradeFenceActor;
+    activityActor: UpgradeFenceActivityActor;
     epoch: number;
     ownerToken: string;
     reason?: string | null;
-    audit?: MutationAudit;
   }) {
-    return withFenceMutation(db, async (tx, current, nowMs) => {
+    return withFenceMutation(db, async (tx, current, nowMs, publications) => {
       if (current.phase !== "held")
         throw new UpgradeFenceMutationError("upgrade_fence_not_abortable", `The upgrade admission fence is ${current.phase}; only a held fence can be aborted.`, current.phase);
       if (current.epoch !== input.epoch || !current.owner || !tokenMatches(input.ownerToken, current.owner.tokenSha256))
@@ -470,7 +546,7 @@ export function upgradeAdmissionFenceService(db: Db) {
       const expired = expireUpgradeFenceState(current, nowMs);
       if (expired.transition) {
         await writeFenceState(tx, expired.state);
-        await input.audit?.(tx, expired.transition);
+        await auditFenceTransition(tx, expired.transition, UPGRADE_FENCE_EXPIRY_ACTOR, publications);
         return { phase: "open" as const, epoch: current.epoch, transition: expired.transition };
       }
       const note = input.reason?.trim() ? input.reason.trim().slice(0, 500) : null;
@@ -487,7 +563,7 @@ export function upgradeAdmissionFenceService(db: Db) {
         candidate: null,
       }, transition);
       await writeFenceState(tx, state);
-      await input.audit?.(tx, transition);
+      await auditFenceTransition(tx, transition, input.activityActor, publications);
       return { phase: "open" as const, epoch: current.epoch, transition };
     });
   }

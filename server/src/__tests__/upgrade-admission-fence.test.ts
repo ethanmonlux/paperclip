@@ -23,6 +23,7 @@ import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { claimNativeSessionResumptions } from "../services/native-runtime/native-finalization-reconciler.js";
 import { errorHandler } from "../middleware/index.js";
 import { instanceSettingsRoutes } from "../routes/instance-settings.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // FAC-797 / STA-21 stage 23: persisted upgrade admission fence, phase 1.
@@ -30,6 +31,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // Postgres, the real heartbeat claim path, the real instance routes. Red on
 // c541ff6b because no fence row, lock, route or claim gate exists there; the
 // fence module is imported optionally so a missing module fails by assertion.
+// Stage 24 (R16, R17) adds transaction-bound transition audit and whole-claim
+// rollback cases; red on 67542a5c.
 
 type FenceModule = typeof import("../services/upgrade-admission-fence.js");
 const fence = await import("../services/upgrade-admission-fence.js").catch(() => null) as FenceModule | null;
@@ -557,6 +560,174 @@ describeEmbedded("upgrade admission fence, phase 1", () => {
       const responses = await Promise.all([1, 2].map(() => request(server).post("/api/instance/upgrade-fence").send({ ttlSeconds: 600 })));
       expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
       expect(((await readFence())!.general as Record<string, unknown>)).toMatchObject({ phase: "held", epoch: 1 });
+    });
+  });
+
+  describe("transaction-bound transition audit and refusal rollback (stage 24: R16, R17)", () => {
+    const admin = (companyIds: string[] = []) => ({ type: "board", userId: "owner-user", source: "session", isInstanceAdmin: true, companyIds });
+    function app(actor: Record<string, unknown>) {
+      const server = express();
+      server.use(express.json());
+      server.use((req, _res, next) => { (req as unknown as { actor: unknown }).actor = actor; next(); });
+      server.use("/api", instanceSettingsRoutes(db));
+      server.use(errorHandler);
+      return server;
+    }
+    const past = () => new Date(Date.now() - 1000).toISOString();
+    const sweep = () => fence!.upgradeAdmissionFenceService(db as never).sweepExpired();
+    async function fenceAudit(companyId: string) {
+      return db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), sql`${activityLog.action} like 'instance.upgrade_fence.%'`,
+      )).orderBy(activityLog.createdAt);
+    }
+    /** Real database failure for fence audit rows only; every other activity insert is untouched. */
+    async function failFenceAuditInserts() {
+      await db.execute(sql.raw(`
+        create or replace function sta21_fail_fence_audit() returns trigger language plpgsql as $$
+        begin
+          if new.action like 'instance.upgrade_fence.%' then raise exception 'sta21 injected fence audit failure'; end if;
+          return new;
+        end $$;
+        drop trigger if exists sta21_fail_fence_audit on activity_log;
+        create trigger sta21_fail_fence_audit before insert on activity_log for each row execute function sta21_fail_fence_audit();
+      `));
+    }
+    afterEach(async () => {
+      await db.execute(sql.raw(`drop trigger if exists sta21_fail_fence_audit on activity_log`));
+    });
+
+    it("the periodic sweep audits the held → open expiry in its own transaction with a system actor (R16)", async () => {
+      const f = await fixture();
+      await putFence(heldState(new Date(past()), { epoch: 5 }));
+      const transition = await sweep();
+      expect(transition?.reason).toBe("expired_before_activation");
+      expect(((await readFence())!.general as Record<string, unknown>).phase).toBe("open");
+      const audit = await fenceAudit(f.companyId);
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({
+        action: "instance.upgrade_fence.expired", actorType: "system", actorId: "upgrade-fence-expiry",
+        entityType: "instance_settings", entityId: FENCE_KEY,
+      });
+      expect(audit[0]!.details).toMatchObject({ from: "held", to: "open", epoch: 5, reason: "expired_before_activation" });
+    });
+
+    it("the sweep audits a verifying lease expiry to stopped_for_owner (R16)", async () => {
+      const f = await fixture();
+      await putFence(fenceState("verifying", { leaseUntil: past(), epoch: 9 }));
+      expect((await sweep())?.reason).toBe("verification_lease_expired");
+      const audit = await fenceAudit(f.companyId);
+      expect(audit.map((row) => [row.action, (row.details as Record<string, unknown>).to])).toEqual([
+        ["instance.upgrade_fence.expired", "stopped_for_owner"],
+      ]);
+    });
+
+    it("two concurrent sweeps commit one expiry and one audit row (R16, at most once)", async () => {
+      const f = await fixture();
+      await putFence(heldState(new Date(past())));
+      const results = await Promise.all([sweep(), sweep(), sweep()]);
+      expect(results.filter((result) => result !== null)).toHaveLength(1);
+      expect(await fenceAudit(f.companyId)).toHaveLength(1);
+    });
+
+    it("a failed expiry audit rolls back: the fence stays held and nothing is published (R16)", async () => {
+      const f = await fixture();
+      await putFence(heldState(new Date(past())));
+      await failFenceAuditInserts();
+      const events: unknown[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(f.companyId, (event) => { events.push(event); });
+      try {
+        await expect(sweep()).rejects.toThrow();
+      } finally {
+        unsubscribe();
+      }
+      expect(((await readFence())!.general as Record<string, unknown>).phase).toBe("held");
+      expect(await fenceAudit(f.companyId)).toHaveLength(0);
+      expect(events).toHaveLength(0);
+      await expectRefused(f);
+    });
+
+    it("a failed hold audit rolls back the hold; the fence stays open (R16)", async () => {
+      const f = await fixture();
+      await putFence(fenceState("open", { epoch: 3 }));
+      await failFenceAuditInserts();
+      const response = await request(app(admin([f.companyId]))).post("/api/instance/upgrade-fence").send({ ttlSeconds: 600 });
+      expect(response.status).toBe(500);
+      expect(((await readFence())!.general as Record<string, unknown>)).toMatchObject({ phase: "open", epoch: 3, owner: null });
+    });
+
+    it("an expiry committed by a hold is audited as the system expiry, the hold as the requester (R16)", async () => {
+      const f = await fixture();
+      await putFence(heldState(new Date(past()), { epoch: 7 }));
+      const held = await request(app(admin([f.companyId]))).post("/api/instance/upgrade-fence").send({ ttlSeconds: 120 });
+      expect(held.status).toBe(200);
+      const audit = await fenceAudit(f.companyId);
+      expect(audit.map((row) => [row.action, row.actorType, row.actorId])).toEqual([
+        ["instance.upgrade_fence.expired", "system", "upgrade-fence-expiry"],
+        ["instance.upgrade_fence.held", "user", "owner-user"],
+      ]);
+    });
+
+    it("the fence audit is published only after commit, from the committed row (R16)", async () => {
+      const f = await fixture();
+      await putFence(heldState(new Date(past())));
+      const seen: Array<{ type: string; committed: boolean }> = [];
+      const pending: Array<Promise<void>> = [];
+      const unsubscribe = subscribeCompanyLiveEvents(f.companyId, (event) => {
+        const payload = (event as { payload?: { action?: string } }).payload;
+        if (event.type !== "activity.logged" || !payload?.action?.startsWith("instance.upgrade_fence.")) return;
+        // Read from a different connection: the row must already be committed.
+        pending.push(other.select().from(activityLog).where(and(
+          eq(activityLog.companyId, f.companyId), eq(activityLog.action, payload.action),
+        )).then((rows) => { seen.push({ type: payload.action!, committed: rows.length === 1 }); }));
+      });
+      try {
+        await sweep();
+        await Promise.all(pending);
+      } finally {
+        unsubscribe();
+      }
+      expect(seen).toEqual([{ type: "instance.upgrade_fence.expired", committed: true }]);
+    });
+
+    it("an expiry audited inside a hold that then refuses rolls back and publishes nothing (R16)", async () => {
+      const f = await fixture();
+      await putFence(fenceState("activating", { leaseUntil: past(), epoch: 4 }));
+      const events: unknown[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(f.companyId, (event) => { events.push(event); });
+      let response: Awaited<ReturnType<ReturnType<typeof request>["post"]>>;
+      try {
+        response = await request(app(admin([f.companyId]))).post("/api/instance/upgrade-fence").send({ ttlSeconds: 600 });
+      } finally {
+        unsubscribe();
+      }
+      expect(response.status).toBe(409);
+      expect(response.body.details?.code ?? response.body.code).toBe("upgrade_fence_not_holdable");
+      expect(((await readFence())!.general as Record<string, unknown>)).toMatchObject({ phase: "activating", epoch: 4 });
+      expect(await fenceAudit(f.companyId)).toHaveLength(0);
+      expect(events).toHaveLength(0);
+      // The sweep then commits and audits that expiry on its own.
+      expect((await sweep())?.reason).toBe("activation_lease_expired");
+      expect((await fenceAudit(f.companyId)).map((row) => row.action)).toEqual(["instance.upgrade_fence.expired"]);
+    });
+
+    it("a refused ordinary claim rolls back the whole claim transaction: the run row is unchanged (R17)", async () => {
+      await putFence(heldState(inAnHour()));
+      const f = await fixture();
+      const before = await f.read();
+      // The production caller sees a plain refusal (null), never the internal throw.
+      await expect(queueService().claimQueuedRun(f.run, undefined, [])).resolves.toBeNull();
+      await expectRefused(f);
+      const after = await f.read();
+      expect((after.runnerProfileJson as Record<string, unknown> | null)?.chatControlRecoveryAdmission).toBeUndefined();
+      expect(after.runnerProfileJson).toEqual(before.runnerProfileJson);
+      expect(after.updatedAt?.toISOString()).toBe(before.updatedAt?.toISOString());
+    });
+
+    it("control: an admitted ordinary claim still records its chat-control admission (R17)", async () => {
+      await putFence(fenceState("open"));
+      const f = await fixture();
+      expect((await claim(f.run))?.status).toBe("running");
+      expect((await f.read()).runnerProfileJson as Record<string, unknown>).toHaveProperty("chatControlRecoveryAdmission");
     });
   });
 

@@ -29,10 +29,9 @@ import {
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
 import {
-  UPGRADE_ADMISSION_FENCE_KEY,
   UpgradeFenceMutationError,
   upgradeAdmissionFenceService,
-  type UpgradeFenceTransition,
+  type UpgradeFenceActivityActor,
 } from "../services/upgrade-admission-fence.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
@@ -461,35 +460,17 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
     }
     throw error;
   }
-  function upgradeFenceAudit(req: Request, companyIds: string[], publications: ActivityPublication[]) {
+  // STA-22 R16: the fence service writes each transition's audit rows in that
+  // transition's own transaction (an expiry as the system expiry actor) and
+  // publishes them only after commit.
+  function fenceActivityActor(req: Request): UpgradeFenceActivityActor {
     const actor = getActorInfo(req);
-    return async (tx: Db, transition: UpgradeFenceTransition) => {
-      const action = transition.to === "held"
-        ? "instance.upgrade_fence.held"
-        : transition.reason === "expired_before_activation"
-          ? "instance.upgrade_fence.expired"
-          : "instance.upgrade_fence.aborted";
-      for (const companyId of companyIds) {
-        await logActivity(tx, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action,
-          entityType: "instance_settings",
-          entityId: UPGRADE_ADMISSION_FENCE_KEY,
-          details: {
-            from: transition.from,
-            to: transition.to,
-            epoch: transition.epoch,
-            reason: transition.reason,
-            at: transition.at,
-            ...(transition.note ? { note: transition.note } : {}),
-          },
-        }, publications);
-      }
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
     };
   }
   function fenceActor(req: Request) {
@@ -511,15 +492,12 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
     if (candidate !== undefined && candidate !== null
       && (typeof candidate !== "object" || Array.isArray(candidate) || JSON.stringify(candidate).length > 2048))
       throw badRequest("candidate must be a small JSON object", { code: "upgrade_fence_invalid_candidate" });
-    const companyIds = await svc.listCompanyIds();
-    const publications: ActivityPublication[] = [];
     const held = await upgradeFence.hold({
       actor: fenceActor(req),
+      activityActor: fenceActivityActor(req),
       ttlSeconds: body.ttlSeconds as number | undefined,
       candidate: (candidate ?? null) as Record<string, unknown> | null,
-      audit: upgradeFenceAudit(req, companyIds, publications),
     }).catch(rethrowUpgradeFenceError);
-    publishActivitiesBestEffort(publications, "instance.upgrade_fence.held");
     res.json({ phase: held.phase, epoch: held.epoch, heldUntil: held.heldUntil, ownerToken: held.ownerToken });
   });
 
@@ -530,16 +508,13 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       || typeof body.ownerToken !== "string" || body.ownerToken.length === 0
       || (body.reason !== undefined && typeof body.reason !== "string"))
       throw badRequest("epoch (integer) and ownerToken (string) are required", { code: "upgrade_fence_invalid_abort" });
-    const companyIds = await svc.listCompanyIds();
-    const publications: ActivityPublication[] = [];
     const aborted = await upgradeFence.abort({
       actor: fenceActor(req),
+      activityActor: fenceActivityActor(req),
       epoch: body.epoch,
       ownerToken: body.ownerToken,
       reason: (body.reason as string | undefined) ?? null,
-      audit: upgradeFenceAudit(req, companyIds, publications),
     }).catch(rethrowUpgradeFenceError);
-    publishActivitiesBestEffort(publications, "instance.upgrade_fence.aborted");
     res.json({ phase: aborted.phase, epoch: aborted.epoch, reason: aborted.transition.reason });
   });
 

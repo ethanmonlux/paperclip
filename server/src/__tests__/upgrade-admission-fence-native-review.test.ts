@@ -60,7 +60,10 @@ describeEmbedded("upgrade admission fence: native review claim", () => {
     const read = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]!);
     const wake = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)).then(rows => rows[0]!);
     const claim = () => claimQueuedNativeReviewRun(db, { run: run!, agentNameKey: "reviewer", claimedAt: new Date(), claimValues: {} });
-    return { read, wake, claim };
+    const claimThrowing = () => claimQueuedNativeReviewRun(db, {
+      run: run!, agentNameKey: "reviewer", claimedAt: new Date(), claimValues: {}, throwOnFenceRefusal: true,
+    } as Parameters<typeof claimQueuedNativeReviewRun>[1]);
+    return { read, wake, claim, claimThrowing };
   }
 
   it("control: an open fence admits the native review claim", async () => {
@@ -79,6 +82,21 @@ describeEmbedded("upgrade admission fence: native review claim", () => {
     expect(await f.claim()).toBeNull();
     expect((await f.read()).status).toBe("queued");
     expect((await f.wake()).status).toBe("queued");
+  });
+
+  it("stage 24 (R17): inside the queue's claim transaction the refusal throws, so the caller rolls back every earlier write", async () => {
+    await setFence(state("held", { owner: { tokenSha256: "b".repeat(64), actor: { type: "user", id: "o" }, heldAt: new Date().toISOString() }, heldUntil: new Date(Date.now() + 3600_000).toISOString() }));
+    const f = await reviewRun();
+    const outcome = await f.claimThrowing().then(() => "resolved", (error: unknown) => error);
+    expect(fence?.isUpgradeFenceRefusal(outcome)).toBe(true);
+    expect((await f.read()).status).toBe("queued");
+    expect((await f.wake()).status).toBe("queued");
+  });
+
+  it("stage 24 control: with the throwing option an open fence still admits the claim", async () => {
+    await setFence(state("open"));
+    const f = await reviewRun();
+    expect((await f.claimThrowing())?.status).toBe("running");
   });
 
   it("an absent row refuses in production mode (existing instance stops for its owner)", async () => {
