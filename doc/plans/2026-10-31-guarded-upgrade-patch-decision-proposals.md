@@ -19,9 +19,10 @@ Inputs:
   Stage 8 added `native-task-bound-continuation` (fix `53373965`, port
   `cf1c70a6`); its R7 follow-up `6e5f6590` (registry `01050b56`) re-ran that
   group. Stage 9 `37b2bf5b` (registry `ae6f2046`) re-ran it again with the
-  addressed-wake drain regressions, and stage 10 `010c5180` (registry
-  `cb559ead`) with the R8 drain-intent regressions. Its row cites the
-  stage-10 receipts, with control = the fix commit.
+  addressed-wake drain regressions, stage 10 `010c5180` (registry
+  `cb559ead`) with the R8 drain-intent regressions, and stage 11 `71bf3065`
+  (registry `b5e84da5`) with the R9 locked-row regressions. Its row cites the
+  stage-11 receipts, with control = the fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -56,7 +57,7 @@ Meaning of the decisions:
 | claude-terminal-cleanup | **upstream-fails** 19/35 (`85909f69`), ports `875e99ab` | passes 35/35 (`a56ff983`) | `execute.ts`/`server-utils.ts` changed; `parse.ts` identical | **adapt** |
 | native-handoff-admission | **upstream-fails** 8/10 (`e54579c3`), port `8e8c2d36` | passes 10/10, file 122/122 (`e4b7fb00`) | `policy.ts` identical; `postgres.ts`, `issue-thread-interactions.ts`, `api-reference.md` changed; `pending-agent-interaction.ts` absent | **adapt** |
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
-| native-task-bound-continuation | **upstream-fails**, 45 of 76 required by assertion (`8fc21461`), ports `cb559ead` | passes 76/76, files 100/100 (`93333a9f`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
+| native-task-bound-continuation | **upstream-fails**, 56 of 88 required by assertion (`698e53cd`), ports `b5e84da5` | passes 88/88, files 112/112 (`06d92ac7`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
 
 No patch is proposed for retirement. Upstream-only evidence does not show that
 upstream covers any of these behaviors.
@@ -219,9 +220,21 @@ upstream covers any of these behaviors.
     an intent; its gate also never dispatches an addressed Coordinator). The
     13 R8 regressions fail by assertion on `64c07ec0` and pass with the fix.
     The stage-9 receipts (`f2d73334`, `60f6770e`) stay as history.
-  - Carried on this branch as four self-contained server commits
-    (`53373965`, `6e5f6590`, `37b2bf5b`, `010c5180`), to be selected
-    together onto the repair line for a later qualified installation.
+  - **Stage 11 (STA-22 round 12, R9), fixed in `71bf3065`.** The release
+    kept only the intent from its locked re-read of the run row; Stop, the
+    queue-interrupt override, the never-started exemption, the snapshot and
+    settlement came from an earlier unlocked read, so a Stop committed in
+    between was ignored. The locked row is now the only source for all of
+    them; if its status or task changed, a pending intent stays pending.
+  - Stage-11 receipts: upstream fails 56 of 88 required, all by assertion.
+    Its 11 failing R9 cases fail at setup: upstream writes no drain intent,
+    so there is nothing for a lost drain to leave pending. The 10 R9
+    regressions fail by assertion on `32a1b64e` and pass with the fix. The
+    stage-10 receipts (`8fc21461`, `93333a9f`) stay as history.
+  - Carried on this branch as five self-contained server commits
+    (`53373965`, `6e5f6590`, `37b2bf5b`, `010c5180`, `71bf3065`), to be
+    selected together onto the repair line for a later qualified
+    installation.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
