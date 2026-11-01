@@ -25,6 +25,9 @@ Inputs:
   stage-11 receipts, with control = the fix commit.
   Stage 12 added `controller-lease-loss-attribution` (fix `8cf65148`, registry
   `d19d922a`); its row cites those receipts, with control = the fix commit.
+  Stage 13 added `native-self-wake-suppression` (fix `1947665a`) and
+  `native-comment-redelivery` (fix `484c0954`), registry `6ea6bf16`; their
+  rows cite those receipts, with control = each fix commit.
 - Each test ran in a private user+network namespace, after an install that
   mirrors upstream `test:run:general` preparation. `native-handoff-admission`
   uses `private-network-user`, which keeps that network namespace but runs as
@@ -61,6 +64,8 @@ Meaning of the decisions:
 | recovery-fixture-isolation | unknown, manual (`fb53e68c`) | n/a | test file changed; upstream fixture still under `os.tmpdir()` | **adapt** (test-only) |
 | native-task-bound-continuation | **upstream-fails**, 56 of 88 required by assertion (`698e53cd`), ports `b5e84da5` | passes 88/88, files 112/112 (`06d92ac7`) | `legacy-continuation.ts`, `issue-continuation-summary.ts`, `wake-queue/domain/values.ts` identical to stable; `service.ts`, `postgres.ts`, `issues.ts`, `heartbeat.ts`, `run-preparation.ts`, `wake-queue` use-cases/adapter/policy, `heartbeat/queue.ts`, `run-control.ts` changed; `issue-stage-boundary.ts` new; `pending-agent-interaction.ts` absent | **adapt** |
 | controller-lease-loss-attribution | upstream-passes 28/28 (`2acd7e95`), ports `d19d922a` | passes 28/28 (`a130dec3`) | `legacy-controller-lease.ts`, `run-cancellation.ts`, `run-completion.ts` changed: upstream already has the typed lease-loss attribution | **retire** on upgrade |
+| native-self-wake-suppression | **upstream-fails** 3 of 7, by assertion, only through the unblock-owner notification (`549d8406`), ports `6ea6bf16` | passes 7/7 (`f3d3dc94`) | `issue-dependency-wakeups.ts` and the backstop guard identical to upstream; `routable-blocked.ts` notifies a self-named writer upstream | **adapt** |
+| native-comment-redelivery | **upstream-fails** 3 of 9 by assertion (`0039e01f`), ports `6ea6bf16` | passes 9/9, file 12/12 (`18e8aa2b`) | wake-queue adapter, use-cases and policy have no delivered-comment check | **adapt** |
 
 Only `controller-lease-loss-attribution` is proposed for retirement, on
 upgrade: its fork port reproduces upstream's own attribution and upstream
@@ -256,6 +261,26 @@ covers any of the other behaviors.
     earlier upstream attempts were `unknown` from fork-only fixtures (no
     company membership for the responsible user; fake databases without
     `transaction`); they are kept in the evidence bundle.
+- **native-self-wake-suppression.**
+  - Stage 13 (FAC-760, card `b098958d`). STA-33's assignee re-blocked its own
+    task on a Done blocker with itself as unblock owner, and both the
+    restored-dependency wake and the unblock notification re-woke it.
+  - `1947665a` ports upstream's `shouldWakeOnRestoredBlockedDependency` and
+    `wasBlockedByAssigneeAgent` byte-identically, with upstream's backstop
+    cases, and adds the fork rule that the notification skips a writer that
+    named itself owner. Agents may only name themselves as owner.
+  - Receipts: upstream fails only the three cases that reach the notification;
+    it passes the restored-path case. Retiring needs upstream to stop
+    notifying a self-named writer.
+- **native-comment-redelivery.**
+  - Stage 13. Deferred comment wakes were replayed one run each after the
+    finishing run had already started with those comments.
+  - `484c0954` uses the finishing run's persisted execution envelope (id and
+    `updatedAt`) and its `startedAt` as the delivery record, for ordinary
+    comment wakes of a succeeded run on the same task and agent only.
+  - Limit: delivery means the comment was in the envelope persisted for that
+    run; an adapter that sends a fixed prompt still lets the agent read the
+    task, but this is not proof that the provider read every comment.
 - **recovery-fixture-isolation.**
   - The fix changes only a test fixture. Upstream's copy of
     "keeps an explicit local-path/worktree conflict blocked…" still creates
