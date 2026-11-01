@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork } from "../chat-work-notifications.js";
+import { admitEffectReservationUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { and, eq, sql, inArray } from "drizzle-orm";
 import { chatActions, toolInvocations, type Db } from "@paperclipai/db";
 import {
@@ -52,6 +53,11 @@ export async function claimSlackRateLimitRetry(
       typeof action.result.retryAt !== "string" ||
       !(Date.parse(action.result.retryAt) <= Date.now())
     )
+      return false;
+    // Effect reservation (admission-design r2 §2.4 row g): re-arming a failed
+    // Slack write marks its invocation executing; a held upgrade fence refuses
+    // with nothing written.
+    if (!(await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch")).admitted)
       return false;
     await notifyChatPublicationWork(tx);
     await tx

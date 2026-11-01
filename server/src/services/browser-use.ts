@@ -44,6 +44,7 @@ import { createFinanceEventInTransaction } from "./finance.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { logActivity } from "./activity-log.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 import { browserUseViewports } from "./browser-use-viewport.js";
 import { forbidden, notFound, conflict } from "../errors.js";
 
@@ -424,6 +425,12 @@ export function browserUseService(
     );
     const sid = args.sessionId;
     const s = await db.transaction(async (tx) => {
+      // Effect reservation (admission-design r2 §2.4 row i): the browser run
+      // row and session start commit with the upgrade-fence check. A held
+      // fence refuses with nothing written and no provider session started.
+      const fenceAdmission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "browser_use.create");
+      if (!fenceAdmission.admitted)
+        throw conflict("Paperclip is holding new browser sessions for a maintenance upgrade. Retry later.", { code: fenceAdmission.code });
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.browser);
       let row: Session;
       if (sid) {

@@ -16,6 +16,11 @@ export type LockedIssueExecution = {
   recoveryOnly?: boolean;
   primaryIssue: IssueSnapshot;
   run: RunSnapshot;
+  /**
+   * Consuming a claim-gate drain intent: drain only the deferred wakes that
+   * existed when the cancellation committed, never later or unrelated work.
+   */
+  drainOnlyWakeIds?: string[];
 };
 
 export type ReleaseTransactionResult = {
@@ -110,7 +115,13 @@ export type PromoteDeferredWakeInput = {
  */
 export interface WakeQueueTransaction {
   findInvokableAgent(input: { companyId: string; agentId: string }): Promise<InvokableAgentSnapshot | null>;
-  findNextDeferredWake(input: { companyId: string; issueId: string; excludedWakeIds?: string[] }): Promise<DeferredWakeCandidate | null>;
+  findNextDeferredWake(input: {
+    companyId: string;
+    issueId: string;
+    excludedWakeIds?: string[];
+    /** When present, only these wakes are eligible. */
+    onlyWakeIds?: string[];
+  }): Promise<DeferredWakeCandidate | null>;
   getQueuedCommentLiveness(input: {
     companyId: string;
     issueId: string;
@@ -118,7 +129,22 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     finishingRunAgentId: string;
     queuedCommentIds: string[];
-  }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  }): Promise<{
+    liveNonSelfCommentIds: string[];
+    containedSelfAuthoredComment: boolean;
+    /**
+     * The live ids that already existed when the finishing run (same agent,
+     * same task, `succeeded`) started and are in its persisted execution
+     * envelope unchanged. The drain decides whether a wake may drop them.
+     */
+    deliveredCommentIds?: string[];
+  }>;
+  /** Reads the invitation an addressed wake names, scoped to this company and issue; null when it is not there. */
+  getAddressedInteraction(input: {
+    companyId: string;
+    issueId: string;
+    interactionId: string;
+  }): Promise<{ status: string } | null>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
     companyId: string;
@@ -235,7 +261,17 @@ export interface WakeQueueTransaction {
  */
 export interface IssueLockWriter {
   withIssueExecutionLock(
-    input: { companyId: string; runId: string; now: Date },
+    input: {
+      companyId: string;
+      runId: string;
+      now: Date;
+      /**
+       * The run was cancelled at the dispatch gate before any provider work.
+       * Drain the deferred queue only: it is not a failed attempt, so it never
+       * projects the task to blocked or records terminal recovery.
+       */
+      undispatchedGateCancellation?: boolean;
+    },
     fn: (
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },

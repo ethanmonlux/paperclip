@@ -54,6 +54,7 @@ import {
   type ActivityPublication,
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
+import { assertRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 
@@ -968,6 +969,8 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "accept_replacement_turn") {
+    // FAC-797 admission fence for a replacement turn on an existing run.
+    await assertRunClaimUnderUpgradeFence(input.tx as unknown as Db, "status_decision.replacement_turn");
     const [run] = await input.tx
       .update(heartbeatRuns)
       .set({

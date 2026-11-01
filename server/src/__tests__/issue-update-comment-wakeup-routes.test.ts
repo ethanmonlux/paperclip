@@ -329,6 +329,40 @@ describe("issue update comment wakeups", () => {
     }));
   });
 
+  it.each(["done", "cancelled"])("wakes the same assignee when another actor reopens %s work directly to in_progress", async (status) => {
+    // FAC-760 STA-22 round 8: the next stage opened done -> in_progress with an
+    // unchanged assignee and no wake, so recovery later replayed the old stage.
+    const existing = makeIssue({ status, assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
+      reason: "issue_status_changed",
+      payload: expect.objectContaining({ issueId: existing.id, mutation: "update" }),
+      contextSnapshot: expect.objectContaining({ issueId: existing.id, source: "issue.status_change" }),
+    }));
+  });
+
+  it("does not wake an in_progress task whose status did not change", async () => {
+    const existing = makeIssue({ status: "in_progress", assigneeAgentId: ASSIGNEE_AGENT_ID, assigneeUserId: null });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it.each([null, "active"] as const)("includes the new comment and shared session key in assignment wakes (external: %s)", async (externalConversationState) => {
     const existing = makeIssue({ externalConversationState });
     const updated = makeIssue({

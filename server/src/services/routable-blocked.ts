@@ -22,6 +22,12 @@ export function isProspectiveBlockedTransition(issue: RoutableBlockedIssue): iss
 
 export async function deliverAgentUnblockNotification(input: {
   issue: RoutableBlockedIssue;
+  /**
+   * The agent whose write entered `blocked`, or null for a board/system write.
+   * An agent that names itself unblock owner already holds that action; waking
+   * it for its own write only re-runs it (FAC-760 STA-33 self-wake loop).
+   */
+  writerAgentId?: string | null;
   wakeup: (agentId: string, options: {
     source: "automation";
     triggerDetail: "system";
@@ -40,6 +46,7 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
+  if (input.writerAgentId && owner.agentId === input.writerAgentId) return false;
 
   await input.wakeup(owner.agentId, {
     source: "automation",

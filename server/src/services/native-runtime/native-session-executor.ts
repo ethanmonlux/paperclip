@@ -195,6 +195,7 @@ import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { assertRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
   isNativeRunnerOwnershipHeld,
@@ -7220,6 +7221,12 @@ export async function cancelNativeSession(
             (effect) => effect.kind === "accept_replacement_turn",
           )
         ) {
+          // FAC-797 admission fence: no production caller requests a
+          // turn-scoped replacement at this head; fail closed if one does.
+          await assertRunClaimUnderUpgradeFence(
+            tx as unknown as Db,
+            "native_session.replacement_turn",
+          );
           await tx
             .update(heartbeatRuns)
             .set({

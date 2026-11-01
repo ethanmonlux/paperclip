@@ -1,4 +1,5 @@
 import { notifyChatPublicationWork } from "../chat-work-notifications.js";
+import { admitEffectReservationUnderUpgradeFence, upgradeFenceHeldResult } from "../upgrade-admission-fence.js";
 import { authorizeSlackDocument } from "./slack-document.js";
 import { slackMessage } from "./slack-message.js";
 import { createHash } from "node:crypto";
@@ -155,16 +156,24 @@ export async function executeSlackWrite(
       instruction:
         "Do not retry with another key. Inspect delivery before reconciling an uncertain result.",
     };
-  const [claimed] = await db.transaction(async (tx) => {
+  const reservation = await db.transaction(async (tx) => {
+    // Effect reservation (admission-design r2 §2.4 row g): a held upgrade
+    // fence refuses before the claim; the operation stays `received` and the
+    // same idempotency key may be retried after release.
+    const admission = await admitEffectReservationUnderUpgradeFence(tx as unknown as Db, "chat_action.dispatch");
+    if (!admission.admitted) return { held: upgradeFenceHeldResult(admission) };
     await notifyChatPublicationWork(tx);
-    return tx
+    const rows = await tx
       .update(chatActions)
       .set({ status: "processing", updatedAt: new Date() })
       .where(
         and(eq(chatActions.id, action.id), eq(chatActions.status, "received")),
       )
       .returning();
+    return { claimed: rows[0] };
   });
+  if ("held" in reservation) return { actionId: action.id, state: "received", ...reservation.held };
+  const claimed = reservation.claimed;
   if (!claimed) return { actionId: action.id, state: "processing" };
   try {
     authority = await resolveSlackTaskAuthority(db, binding);

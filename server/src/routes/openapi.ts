@@ -6790,6 +6790,46 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/instance/upgrade-fence",
+  tags: ["instance"],
+  summary:
+    "Instance admins: read the persisted upgrade admission fence (FAC-797 phase 1). A missing or unreadable fence row reports stopped_for_owner and admits no run claims; the owner token is never returned here",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/upgrade-fence",
+  tags: ["instance"],
+  summary:
+    "Instance admins: hold the upgrade admission fence (open → held, new epoch) so new run claims refuse. Returns the owner token once; only its hash is stored. 409 when the fence is not open or its row is missing",
+  request: {
+    body: jsonBody(z.object({
+      ttlSeconds: z.number().int().min(60).max(86400).optional(),
+      candidate: z.record(z.string(), z.unknown()).nullable().optional(),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/upgrade-fence",
+  tags: ["instance"],
+  summary:
+    "Instance admins: abort a held upgrade admission fence before activation (held → open) with its epoch and owner token. 409 for any other phase, a stale epoch or a wrong token",
+  request: {
+    body: jsonBody(z.object({
+      epoch: z.number().int(),
+      ownerToken: z.string().min(1),
+      reason: z.string().optional(),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/instance/lifecycle",
   tags: ["instance"],
   summary:

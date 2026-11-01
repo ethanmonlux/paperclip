@@ -38,6 +38,10 @@ import {
   readNativeReviewAssignmentContext,
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
+import {
+  assertRunClaimUnderUpgradeFence,
+  isUpgradeFenceRefusal,
+} from "../upgrade-admission-fence.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
@@ -197,7 +201,11 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
   getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
   executeRun: (runId: string) => Promise<void>;
-  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
+  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: {
+    suppressImmediateRecovery?: boolean;
+    undispatchedGateCancellation?: boolean;
+    deferredPostCommitEffects?: WakeQueuePostCommitEffect[];
+  }) => Promise<unknown>;
   applyWakeQueuePostCommitEffects: (effects: WakeQueuePostCommitEffect[]) => Promise<void>;
   publishRunLifecyclePluginEvent: (run: HeartbeatRun) => void;
   cancelRunInternal: (runId: string, reason?: string, options?: { errorCode?: string }) => Promise<unknown>;
@@ -1105,9 +1113,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         runId: run.id,
         companyId: run.companyId,
         expectedStatus: "queued",
+        // The cancellation commits with a durable drain intent for the queue below.
+        recordDrainIntent: true,
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled") {
+          // The gate cleared the lock this run was promoted into. Re-drain the
+          // same deferred queue so a live wake behind it is not stranded. The
+          // run never started: drain only, with no recovery of its own. The
+          // committed intent settles only with this drain's persisted outcome;
+          // if it fails or this process stops, the restart sweep consumes it.
+          await releaseIssueExecutionAndPromote(run, {
+            suppressImmediateRecovery: true, undispatchedGateCancellation: true, deferredPostCommitEffects,
+          }).catch((err) => {
+            logger.warn({ err, runId: run.id, issueId }, "gate cancellation drain deferred to the restart sweep");
+          });
+        }
         logger.info(
           {
             runId: run.id,
@@ -1349,6 +1371,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   })
                   .where(eq(heartbeatRuns.id, lockedRun.id));
               }
+              // FAC-797 admission fence: refuse before any admission write
+              // commits; the admission marker above rolls back with this.
+              await assertRunClaimUnderUpgradeFence(
+                tx as unknown as Db,
+                "queue.queued_comment_claim",
+              );
               const authoritativeIds = queuedCommentIdsFromWakePayload(
                 wake.payload,
               );
@@ -1486,6 +1514,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
+              if (isUpgradeFenceRefusal(error))
+                return { kind: "stale" as const, run: null };
               throw error;
             })
         : null;
@@ -1523,6 +1553,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       void emitAgentTaskRun(db, queuedCommentClaim.run);
       return null;
     }
+    // STA-22 R17: a fence refusal throws out of the whole claim transaction, so
+    // the chat-control admission marker written before the claim rolls back with
+    // it; the run stays queued and byte-identical.
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
@@ -1542,17 +1575,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              throwOnFenceRefusal: true,
             });
           }
           return tx.transaction(async (claimTx) => {
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
+            await assertRunClaimUnderUpgradeFence(claimTx as unknown as Db, "queue.claim");
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);
             await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
             return claimedRun;
           });
+        }).catch((error: unknown) => {
+          if (isUpgradeFenceRefusal(error)) return null;
+          throw error;
         });
     if (!claimed) return null;
 
@@ -1837,6 +1875,30 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }).catch((err) => {
         logger.error({ err, runId: run.id }, "failed to retry interrupted comment queue");
       });
+    }
+
+    // A claim-gate cancellation commits a drain intent for the deferred queue
+    // it left behind. Consume each still-pending intent through the same release
+    // admission, whoever the wakes belong to (an addressed Coordinator is not the
+    // assignee). The release settles the intent only from its persisted outcome;
+    // a held intent stays pending and is revisited here.
+    const pendingGateDrains = await db
+      .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(and(
+        eq(heartbeatRuns.status, "cancelled"),
+        sql`${heartbeatRuns.resultJson}->'gateCancellationDrain'->>'state' = 'pending'`,
+        eq(companies.status, "active"),
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.updatedAt))
+      .limit(50);
+    for (const run of pendingGateDrains) {
+      await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, undispatchedGateCancellation: true })
+        .catch((err) => {
+          logger.warn({ err, runId: run.id }, "failed to consume gate cancellation drain intent");
+        });
     }
 
     const queuedRuns = await db

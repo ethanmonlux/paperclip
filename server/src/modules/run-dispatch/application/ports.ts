@@ -39,6 +39,12 @@ export type CancelStaleQueuedRunInput = {
   companyId: string;
   now: Date;
   expectedStatus: "queued" | "running";
+  /**
+   * The queued-run claim gate re-drains the deferred queue after this
+   * cancellation. Persist that obligation atomically with the cancellation, so
+   * a lost or failed drain is retried by the restart sweep.
+   */
+  recordDrainIntent?: boolean;
 };
 
 export type DispatchResolvedInteractionInput<T> = CancelStaleQueuedRunInput & {

@@ -15,6 +15,7 @@ import { getServerInfoSnapshot } from "../../server-info.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
+import { admitRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { nativeRestartInterruptedTurnId, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 
@@ -890,6 +891,15 @@ export async function claimNativeRestartRecoveries(input: {
         return { kind: "blocked", runId: row.run.id, reason } as const;
       }
 
+      // FAC-797 admission fence: restart recovery is not admission. A held
+      // or missing fence leaves the run and its coordinator untouched.
+      if (!(await admitRunClaimUnderUpgradeFence(tx as unknown as Db, "native_restart_recovery.claim")).admitted) {
+        return {
+          kind: "awaiting_evidence",
+          runId: row.run.id,
+          reason: "upgrade_fence_held",
+        } as const;
+      }
       const generation = row.coordinator.controllerGeneration + 1;
       const leaseOwner = `${controller.bootId}:${generation}:${randomUUID()}`;
       const event = historyEntry({

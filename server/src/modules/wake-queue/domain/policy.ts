@@ -128,12 +128,14 @@ export type DeferredWakeQueuedCommentFacts = {
   liveCommentIdsDiffer: boolean;
   /** True when every discarded comment id was authored by the finishing run. */
   containedSelfAuthoredComment: boolean;
+  /** True when a discarded comment id was delivered, unchanged, to the finishing run. */
+  containedDeliveredComment?: boolean;
   /** True when the wake carries an independent reason to continue even with no live comments. */
   preservesIndependentContinuation: boolean;
 };
 
 export type DeferredWakeQueuedCommentDecision =
-  | { kind: "cancel_empty"; selfAuthored: boolean }
+  | { kind: "cancel_empty"; selfAuthored: boolean; delivered?: true }
   | { kind: "normalize" }
   | { kind: "proceed" };
 
@@ -170,7 +172,11 @@ export function decideQueuedCommentAction(
     facts.liveNonSelfCommentIdsLength === 0 &&
     !facts.preservesIndependentContinuation
   ) {
-    return { kind: "cancel_empty", selfAuthored: facts.containedSelfAuthoredComment };
+    return {
+      kind: "cancel_empty",
+      selfAuthored: facts.containedSelfAuthoredComment,
+      ...(facts.containedDeliveredComment ? { delivered: true as const } : {}),
+    };
   }
 
   if (facts.hasQueuedCommentIds && facts.liveCommentIdsDiffer) {
@@ -193,6 +199,21 @@ export function decideWakeOutcome(facts: DeferredWakeOutcomeFacts): DeferredWake
   }
 
   return { kind: "promote" };
+}
+
+export type AddressedInteractionWakeFacts = {
+  /** The persisted invitation the wake names, read under the release lock, or null when it is missing from this issue. */
+  interaction: { status: string } | null;
+};
+
+/**
+ * An addressed wake is only a receipt for its invitation. Once that invitation
+ * has left `pending`, promoting the wake would spend the one promotion on a run
+ * the dispatch gate must cancel. A pending invitation stays queued even when
+ * the gate may still reject it; the gate owns that decision.
+ */
+export function decideAddressedInteractionWake(facts: AddressedInteractionWakeFacts): "live" | "retire" {
+  return facts.interaction?.status === "pending" ? "live" : "retire";
 }
 
 /** Shared between the review-participant and immediate branches; the caller derives every field from the same expression regardless of which branch applies. */

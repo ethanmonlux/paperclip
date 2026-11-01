@@ -279,6 +279,7 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  shouldWakeOnRestoredBlockedDependency,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -14617,6 +14618,7 @@ export function issueRoutes(
         let ownerNotifiedAt: Date | null = null;
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
+          writerAgentId: actor.actorType === "agent" ? actor.agentId : null,
           wakeup: heartbeat.wakeup,
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
@@ -15335,6 +15337,14 @@ export function issueRoutes(
         isClosedIssueStatus(existing.status) &&
         issue.status === "todo" &&
         req.body.status !== undefined;
+      // Reopening straight to in_progress opens a new stage for the same
+      // assignee just like todo does. Without a wake, recovery later replays
+      // the previous stage's run instead of starting this one.
+      const statusChangedFromClosedToInProgress =
+        isClosedIssueStatus(existing.status) &&
+        issue.status === "in_progress" &&
+        req.body.status !== undefined &&
+        !(actor.actorType === "agent" && actor.actorId === issue.assigneeAgentId);
       const userResumedFromReviewToTodo =
         actor.actorType === "user" &&
         existing.status === "in_review" &&
@@ -15482,6 +15492,7 @@ export function issueRoutes(
           (statusChangedFromBacklog ||
             statusChangedFromBlockedToTodo ||
             statusChangedFromClosedToTodo ||
+            statusChangedFromClosedToInProgress ||
             userResumedFromReviewToTodo) &&
           issue.assigneeAgentId
         ) {
@@ -15605,12 +15616,15 @@ export function issueRoutes(
           }
         }
 
-        const restoredBlockedReadyDependency =
-          issue.status === "blocked" &&
-          issue.assigneeAgentId &&
-          (existing.status !== "blocked" ||
-            Array.isArray(req.body.blockedByIssueIds) ||
-            existing.assigneeAgentId !== issue.assigneeAgentId);
+        const restoredBlockedReadyDependency = shouldWakeOnRestoredBlockedDependency({
+          previousStatus: existing.status,
+          nextStatus: issue.status,
+          previousAssigneeAgentId: existing.assigneeAgentId ?? null,
+          nextAssigneeAgentId: issue.assigneeAgentId ?? null,
+          blockerSetEdited: Array.isArray(req.body.blockedByIssueIds),
+          actorType: actor.actorType,
+          actorAgentId: actor.agentId ?? null,
+        });
         if (
           restoredBlockedReadyDependency &&
           typeof dependencyReadinessSvc.getDependencyReadiness === "function"

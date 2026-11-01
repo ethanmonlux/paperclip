@@ -2,6 +2,7 @@ import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipa
 import { and, eq } from "drizzle-orm";
 import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
 import { claimNativeReviewExecutionLock, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { admitRunClaimUnderUpgradeFence, UpgradeFenceRefusal } from "../upgrade-admission-fence.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
 export async function claimQueuedNativeReviewRun(db: Db, input: {
@@ -9,6 +10,11 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
   agentNameKey: string | null;
   claimedAt: Date;
   claimValues: PgUpdateSetSource<typeof heartbeatRuns>;
+  /**
+   * The queue claims inside an outer transaction that has already written; a
+   * thrown refusal lets it roll that back (STA-22 R17). Standalone callers get null.
+   */
+  throwOnFenceRefusal?: boolean;
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
@@ -33,6 +39,12 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
     )).for("update");
     if (!run || run.status !== "queued" || run.wakeupRequestId !== input.run.wakeupRequestId) return null;
     if ((run.contextSnapshot as Record<string, unknown> | null)?.issueId !== issueId) return null;
+    // FAC-797 admission fence, before the execution lock or claim is written.
+    const admission = await admitRunClaimUnderUpgradeFence(tx as unknown as Db, "native_review.claim");
+    if (!admission.admitted) {
+      if (input.throwOnFenceRefusal) throw new UpgradeFenceRefusal(admission);
+      return null;
+    }
     const locked = await claimNativeReviewExecutionLock(tx as unknown as Db, {
       companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id,
       contextSnapshot: context, agentNameKey: input.agentNameKey, claimedAt: input.claimedAt,

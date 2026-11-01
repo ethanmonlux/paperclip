@@ -175,6 +175,7 @@ import {
   verifyToolArgumentsSignature,
 } from "./tool-content-guards.js";
 import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.js";
+import { admitEffectReservationUnderUpgradeFence } from "./upgrade-admission-fence.js";
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -350,6 +351,23 @@ export class ToolGatewayHttpError extends Error {
     public readonly details: Record<string, unknown> = {},
   ) {
     super(message);
+  }
+}
+
+/**
+ * Effect-reservation gate for tool executions (admission-design r2 §2.4 row
+ * k). Call in the transaction that marks the execution in flight. A held
+ * upgrade fence throws before anything is written.
+ */
+async function assertToolExecutionAdmitted(tx: Db) {
+  const admission = await admitEffectReservationUnderUpgradeFence(tx, "tool_gateway.execute");
+  if (!admission.admitted) {
+    throw new ToolGatewayHttpError(
+      409,
+      "Paperclip is holding new tool executions for a maintenance upgrade. Nothing was executed; retry later.",
+      admission.code,
+      { retryable: true },
+    );
   }
 }
 
@@ -7239,14 +7257,17 @@ export function createToolGatewayService(
         error: { message: string; reasonCode: string };
       }
   > {
-    await db
-      .update(toolInvocations)
-      .set({
-        status: "executing",
-        startedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(toolInvocations.id, args.invocationId));
+    await db.transaction(async (tx) => {
+      await assertToolExecutionAdmitted(tx as unknown as Db);
+      await tx
+        .update(toolInvocations)
+        .set({
+          status: "executing",
+          startedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(toolInvocations.id, args.invocationId));
+    });
     await writeAudit({
       session: args.session,
       companyId: args.companyId,
@@ -7871,16 +7892,22 @@ export function createToolGatewayService(
       );
     }
 
-    const [claimed] = await db
-      .update(toolActionRequests)
-      .set({ status: "executing", updatedAt: new Date() })
-      .where(
-        and(
-          eq(toolActionRequests.id, actionRequest.id),
-          eq(toolActionRequests.status, "approved"),
-        ),
-      )
-      .returning();
+    // Effect reservation (admission-design r2 §2.4 row k): the approved
+    // action is consumed in one transaction with the upgrade-fence check. A
+    // held fence leaves the approval unconsumed and starts no provider call.
+    const [claimed] = await db.transaction(async (tx) => {
+      await assertToolExecutionAdmitted(tx as unknown as Db);
+      return tx
+        .update(toolActionRequests)
+        .set({ status: "executing", updatedAt: new Date() })
+        .where(
+          and(
+            eq(toolActionRequests.id, actionRequest.id),
+            eq(toolActionRequests.status, "approved"),
+          ),
+        )
+        .returning();
+    });
     if (!claimed) {
       const settled = await waitForActionRequestExecution(actionRequest.id);
       const [settledInvocation] = await db
@@ -10462,20 +10489,25 @@ export function createToolGatewayService(
           });
         }
         const claimedAt = new Date();
-        const [claimed] = await db
-          .update(toolActionRequests)
-          .set({
-            status: "executing",
-            resolvedByAgentId: session.agentId,
-            updatedAt: claimedAt,
-          })
-          .where(
-            and(
-              eq(toolActionRequests.id, actionRequest.id),
-              eq(toolActionRequests.status, "approved"),
-            ),
-          )
-          .returning();
+        // Effect reservation (r2 §2.4 row k): consume the approval only with
+        // the upgrade-fence check in the same transaction.
+        const [claimed] = await db.transaction(async (tx) => {
+          await assertToolExecutionAdmitted(tx as unknown as Db);
+          return tx
+            .update(toolActionRequests)
+            .set({
+              status: "executing",
+              resolvedByAgentId: session.agentId,
+              updatedAt: claimedAt,
+            })
+            .where(
+              and(
+                eq(toolActionRequests.id, actionRequest.id),
+                eq(toolActionRequests.status, "approved"),
+              ),
+            )
+            .returning();
+        });
         if (!claimed) {
           throw new ToolGatewayHttpError(
             409,
@@ -10592,14 +10624,20 @@ export function createToolGatewayService(
             },
           );
         }
-        await db
-          .update(toolInvocations)
-          .set({
-            status: "executing",
-            startedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(toolInvocations.id, invocationId));
+        // Effect reservation (r2 §2.4 row k): an authorized invocation is
+        // marked executing only with the upgrade-fence check; a refusal leaves
+        // it `authorized` and calls no provider.
+        await db.transaction(async (tx) => {
+          await assertToolExecutionAdmitted(tx as unknown as Db);
+          await tx
+            .update(toolInvocations)
+            .set({
+              status: "executing",
+              startedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(toolInvocations.id, invocationId));
+        });
       }
 
       await writeAudit({
@@ -11052,14 +11090,18 @@ export function createToolGatewayService(
         );
       }
 
-      await db
-        .update(toolInvocations)
-        .set({
-          status: "executing",
-          startedAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(eq(toolInvocations.id, invocationId));
+      // Effect reservation (r2 §2.4 row k), plugin tools.
+      await db.transaction(async (tx) => {
+        await assertToolExecutionAdmitted(tx as unknown as Db);
+        await tx
+          .update(toolInvocations)
+          .set({
+            status: "executing",
+            startedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(toolInvocations.id, invocationId));
+      });
 
       await writeAudit({
         session: sessionLike,

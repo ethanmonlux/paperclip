@@ -8,7 +8,8 @@ import { detectServiceManager, type ServiceManager, type ServiceStatus } from ".
 import { buildLocalHealthUrl } from "../utils/health-url.js";
 
 type CommonOptions = { instance?: string; json?: boolean };
-type HealthResult = { ok: boolean; serverVersion: string | null; error?: string };
+export type HealthResult = { ok: boolean; serverVersion: string | null; commit: string | null; error?: string };
+export type HealthExpectation = { version?: string | null; commit?: string | null };
 
 function output(value: unknown, json: boolean | undefined): void {
   if (json) console.log(JSON.stringify(value, null, 2));
@@ -32,22 +33,41 @@ function healthUrl(instanceId: string): string {
 async function probeHealth(instanceId: string): Promise<HealthResult> {
   try {
     const response = await fetch(healthUrl(instanceId), { signal: AbortSignal.timeout(2_000) });
-    const body = await response.json() as { status?: unknown; serverVersion?: unknown; version?: unknown };
-    return { ok: response.ok && body.status === "ok", serverVersion: typeof body.serverVersion === "string" ? body.serverVersion : typeof body.version === "string" ? body.version : null };
+    const body = await response.json() as { status?: unknown; serverVersion?: unknown; version?: unknown; commit?: unknown };
+    return {
+      ok: response.ok && body.status === "ok",
+      serverVersion: typeof body.serverVersion === "string" ? body.serverVersion : typeof body.version === "string" ? body.version : null,
+      commit: typeof body.commit === "string" ? body.commit : null,
+    };
   } catch (error) {
-    return { ok: false, serverVersion: null, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, serverVersion: null, commit: null, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
-async function waitForHealth(instanceId: string, expectedVersion: string | null, timeoutMs = 60_000): Promise<HealthResult> {
+// Authenticated deployments redact the version from anonymous health but always
+// publish the build commit. An expected exact commit is the stronger identity,
+// so it replaces the version comparison rather than adding to it.
+export function healthMatchesExpectation(health: HealthResult, expected: HealthExpectation): boolean {
+  if (!health.ok) return false;
+  if (expected.commit) return health.commit === expected.commit;
+  return !expected.version || health.serverVersion === expected.version;
+}
+
+function describeExpectation(expected: HealthExpectation): string {
+  if (expected.commit) return ` at commit ${expected.commit}`;
+  return expected.version ? ` at version ${expected.version}` : "";
+}
+
+async function waitForHealth(instanceId: string, expected: HealthExpectation, timeoutMs = 60_000): Promise<HealthResult> {
   const deadline = Date.now() + timeoutMs;
-  let last: HealthResult = { ok: false, serverVersion: null };
+  let last: HealthResult = { ok: false, serverVersion: null, commit: null };
   while (Date.now() < deadline) {
     last = await probeHealth(instanceId);
-    if (last.ok && (!expectedVersion || last.serverVersion === expectedVersion)) return last;
+    if (healthMatchesExpectation(last, expected)) return last;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`Paperclip service did not become healthy${expectedVersion ? ` at version ${expectedVersion}` : ""}: ${last.error ?? `reported ${last.serverVersion ?? "no version"}`}`);
+  const reported = expected.commit ? `commit ${last.commit ?? "none"}` : last.serverVersion ?? "no version";
+  throw new Error(`Paperclip service did not become healthy${describeExpectation(expected)}: ${last.error ?? `reported ${reported}`}`);
 }
 
 export function resolveRestartExpectedVersion(expectedVersion: string | null | undefined): string | null {
@@ -149,7 +169,7 @@ async function waitForRestartReport(instanceId: string, requestedAt: string, tim
   return null;
 }
 
-export async function restartManagedService(input: { instanceId?: string; expectedVersion?: string | null; waitForDrain?: boolean } = {}): Promise<{ status: ServiceStatus; health: HealthResult; report: unknown | null }> {
+export async function restartManagedService(input: { instanceId?: string; expectedVersion?: string | null; expectedCommit?: string | null; waitForDrain?: boolean } = {}): Promise<{ status: ServiceStatus; health: HealthResult; report: unknown | null }> {
   const instanceId = resolvePaperclipInstanceId(input.instanceId);
   return withHotRestartLock(instanceId, async () => {
     const detection = await detectServiceManager({ instanceId });
@@ -157,7 +177,7 @@ export async function restartManagedService(input: { instanceId?: string; expect
     const before = await detection.manager.status();
     const intent = await writeHotRestartIntent(before, instanceId, input.waitForDrain ?? false);
     await detection.manager.restart();
-    const health = await waitForHealth(instanceId, resolveRestartExpectedVersion(input.expectedVersion));
+    const health = await waitForHealth(instanceId, { version: resolveRestartExpectedVersion(input.expectedVersion), commit: input.expectedCommit ?? null });
     return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt) };
   });
 }
@@ -203,7 +223,8 @@ export function registerServiceCommands(program: Command): void {
   common(service.command("restart").description("Hot-restart the service while preserving active agent runs"))
     .option("--wait", "Wait for active runs to drain instead of adopting them", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
-    .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
+    .option("--expected-commit <sha>", "Require the restarted server to report this exact build commit (overrides --expected-version)")
+    .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, expectedCommit: opts.expectedCommit, waitForDrain: opts.wait }), opts.json));
 
   common(service.command("status").description("Show supervisor and health status")).action(async (opts) => {
     const manager = await resolveManager(opts); if (!manager) return;

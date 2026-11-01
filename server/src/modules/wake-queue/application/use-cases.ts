@@ -1,5 +1,6 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import {
+  decideAddressedInteractionWake,
   decideQueuedCommentAction,
   decideReleaseRecovery,
   decideWakeAdmission,
@@ -8,8 +9,10 @@ import {
 } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+  INTERACTION_NO_LONGER_PENDING_CODE,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
+  readAddressedInteractionWakeId,
   readNonEmptyString,
   parseObject,
 } from "../domain/values.js";
@@ -120,6 +123,12 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /**
+   * The run never reached a provider: the dispatch gate cancelled it. Its
+   * release only re-drains the deferred queue it was promoted from, so the
+   * next live wake is not stranded. It plans no recovery for itself.
+   */
+  undispatchedGateCancellation?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -157,6 +166,7 @@ async function runReleaseDrain(
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
       ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
+      ...(locked.drainOnlyWakeIds ? { onlyWakeIds: locked.drainOnlyWakeIds } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
@@ -167,6 +177,27 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    // An addressed wake is a receipt for its invitation. Retire it once the
+    // invitation left `pending`, so it never spends the promotion that the
+    // live card's wake behind it needs.
+    const addressedInteractionId = readAddressedInteractionWakeId(candidate.deferredContextSeed);
+    if (addressedInteractionId) {
+      const interaction = await ports.transaction.getAddressedInteraction({
+        companyId: run.companyId, issueId: issue.id, interactionId: addressedInteractionId,
+      });
+      if (decideAddressedInteractionWake({ interaction }) === "retire") {
+        await ports.transaction.cancelDeferredWake({
+          companyId: run.companyId,
+          wakeId: candidate.id,
+          reason: `${INTERACTION_NO_LONGER_PENDING_CODE}: the addressed interaction is ${
+            interaction?.status ?? "missing"
+          }; its deferred wake was retired before promotion`,
+          now: input.now,
+        });
+        continue;
+      }
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -218,12 +249,12 @@ async function runReleaseDrain(
       continue;
     }
 
-    let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
+    let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false, containedDeliveredComment: false };
     if (
       !candidate.authorizedFailedChatRetry &&
       candidate.queuedCommentIds.length > 0
     ) {
-      liveness = await ports.transaction.getQueuedCommentLiveness({
+      const read = await ports.transaction.getQueuedCommentLiveness({
         companyId: run.companyId,
         issueId: issue.id,
         wakeAgentId: candidate.agentId,
@@ -231,6 +262,19 @@ async function runReleaseDrain(
         finishingRunAgentId: run.agentId,
         queuedCommentIds: candidate.queuedCommentIds,
       });
+      // An ordinary comment wake only asks its agent to read these comments.
+      // Those the finishing run already started with need no further run
+      // (FAC-760 per-comment redelivery). An interaction or resume
+      // continuation keeps its authoritative comments.
+      const delivered = new Set(
+        candidate.preservesIndependentContinuation || candidate.payload.mutation === "interaction"
+          ? [] : read.deliveredCommentIds ?? [],
+      );
+      liveness = {
+        liveNonSelfCommentIds: read.liveNonSelfCommentIds.filter((commentId) => !delivered.has(commentId)),
+        containedSelfAuthoredComment: read.containedSelfAuthoredComment,
+        containedDeliveredComment: delivered.size > 0,
+      };
     }
     // A length mismatch is the only way the lists can differ: the adapter derives `liveNonSelfCommentIds` with `.filter`, so it is always a subsequence of `queuedCommentIds`.
     const liveCommentIdsDiffer = liveness.liveNonSelfCommentIds.length !== candidate.queuedCommentIds.length;
@@ -250,6 +294,7 @@ async function runReleaseDrain(
       liveNonSelfCommentIdsLength: liveness.liveNonSelfCommentIds.length,
       liveCommentIdsDiffer,
       containedSelfAuthoredComment: liveness.containedSelfAuthoredComment,
+      containedDeliveredComment: liveness.containedDeliveredComment,
       preservesIndependentContinuation: candidate.preservesIndependentContinuation,
     });
 
@@ -261,7 +306,9 @@ async function runReleaseDrain(
         wakeId: candidate.id,
         reason: commentAction.selfAuthored
           ? "Deferred wake contained only comments authored by the finishing run"
-          : "Queued messages were discarded before promotion",
+          : commentAction.delivered
+            ? "Deferred wake comments were already delivered to the finishing run"
+            : "Queued messages were discarded before promotion",
         now: input.now,
       });
       continue;
@@ -309,6 +356,8 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  // A gate-cancelled run never started, so it owns no recovery of its own.
+  if (input.undispatchedGateCancellation) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
@@ -962,7 +1011,10 @@ export function createReleaseIssueExecution(deps: {
     input: ReleaseIssueExecutionInput,
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
-      { companyId: input.companyId, runId: input.runId, now: input.now },
+      {
+        companyId: input.companyId, runId: input.runId, now: input.now,
+        ...(input.undispatchedGateCancellation ? { undispatchedGateCancellation: true } : {}),
+      },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 

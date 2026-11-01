@@ -120,7 +120,8 @@ export type QueuedRunStalenessErrorCode =
   | "issue_execution_lock_changed"
   | "issue_blocked"
   | "issue_review_participant_changed"
-  | "issue_continuation_waiting_on_review";
+  | "issue_continuation_waiting_on_review"
+  | "interaction_no_longer_pending";
 
 export type StalenessDecision =
   | { stale: false }
@@ -134,6 +135,12 @@ export type StalenessDecision =
 export type QueuedRunFacts = {
   /** Revalidated at queued and final pre-dispatch gates. */
   isPendingInteractionAddressee?: boolean;
+  /**
+   * The persisted invitation an addressed-card wake names, read under the
+   * gate's locks. Null for every other wake. `status` is null when the
+   * invitation is missing from this issue.
+   */
+  addressedInteraction?: { interactionId: string; status: string | null } | null;
   pendingResponse?: "interaction" | "approval" | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
@@ -589,6 +596,18 @@ export function decideQueuedRunStaleness(
       facts.reviewParticipant.participantAgentId === facts.runAgentId,
     isAuthorizedSourceScopedRecovery: facts.isAuthorizedSourceScopedRecovery,
   });
+  if (ownership === "reassigned" && facts.addressedInteraction &&
+      facts.addressedInteraction.status !== "pending" && facts.issueAssigneeAgentId !== facts.runAgentId) {
+    // An addressed responder was never the assignee: its invitation leaving
+    // `pending` is not a reassignment and wakes no one else.
+    const { interactionId, status } = facts.addressedInteraction;
+    return {
+      stale: true,
+      errorCode: "interaction_no_longer_pending",
+      reason: `Cancelled because the addressed interaction is ${status ?? "missing"} and no longer pending before the queued run could start; no other agent is woken by this cancellation`,
+      details: { issueId: facts.issueId, interactionId, interactionStatus: status },
+    };
+  }
   if (ownership === "reassigned") {
     return {
       stale: true,

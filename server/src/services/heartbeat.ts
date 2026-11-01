@@ -470,6 +470,7 @@ import {
   issueTreeControlService,
 } from "./issue-tree-control.js";
 import {
+  continuationSummaryContextSnapshot,
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
 } from "./issue-continuation-summary.js";
@@ -2717,13 +2718,7 @@ export function heartbeatService(
         ? await issuesSvc.getAncestors(issueRef.id)
         : [];
       if (continuationSummary) {
-        context.paperclipContinuationSummary = {
-          key: safeContinuationSummary!.key,
-          title: safeContinuationSummary!.title,
-          body: safeContinuationSummary!.body,
-          sourceTrust: safeContinuationSummary!.sourceTrust ?? null,
-          updatedAt: safeContinuationSummary!.updatedAt.toISOString(),
-        };
+        context.paperclipContinuationSummary = continuationSummaryContextSnapshot(safeContinuationSummary!);
       } else {
         delete context.paperclipContinuationSummary;
       }

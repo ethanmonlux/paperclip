@@ -7,7 +7,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden } from "../errors.js";
+import { badRequest, conflict, forbidden } from "../errors.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -28,6 +28,11 @@ import {
   type ActivityPublication,
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
+import {
+  UpgradeFenceMutationError,
+  upgradeAdmissionFenceService,
+  type UpgradeFenceActivityActor,
+} from "../services/upgrade-admission-fence.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
@@ -440,6 +445,77 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       return wasActive;
     });
     res.json({ wasActive });
+  });
+
+  // FAC-797 upgrade admission fence, phase 1: authenticated status, hold and
+  // pre-activation abort only. There is no route to activation, verification,
+  // release or break; those are later phases. The owner token is returned once
+  // by the hold and only its hash is stored.
+  const upgradeFence = upgradeAdmissionFenceService(db);
+  function rethrowUpgradeFenceError(error: unknown): never {
+    if (error instanceof UpgradeFenceMutationError) {
+      const details = { code: error.code, phase: error.phase };
+      if (error.code === "upgrade_fence_invalid_ttl") throw badRequest(error.message, details);
+      throw conflict(error.message, details);
+    }
+    throw error;
+  }
+  // STA-22 R16: the fence service writes each transition's audit rows in that
+  // transition's own transaction (an expiry as the system expiry actor) and
+  // publishes them only after commit.
+  function fenceActivityActor(req: Request): UpgradeFenceActivityActor {
+    const actor = getActorInfo(req);
+    return {
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+    };
+  }
+  function fenceActor(req: Request) {
+    const actor = getActorInfo(req);
+    return { type: actor.actorType, id: actor.actorId };
+  }
+
+  router.get("/instance/upgrade-fence", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await upgradeFence.status());
+  });
+
+  router.post("/instance/upgrade-fence", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (body.ttlSeconds !== undefined && typeof body.ttlSeconds !== "number")
+      throw badRequest("ttlSeconds must be a number", { code: "upgrade_fence_invalid_ttl" });
+    const candidate = body.candidate;
+    if (candidate !== undefined && candidate !== null
+      && (typeof candidate !== "object" || Array.isArray(candidate) || JSON.stringify(candidate).length > 2048))
+      throw badRequest("candidate must be a small JSON object", { code: "upgrade_fence_invalid_candidate" });
+    const held = await upgradeFence.hold({
+      actor: fenceActor(req),
+      activityActor: fenceActivityActor(req),
+      ttlSeconds: body.ttlSeconds as number | undefined,
+      candidate: (candidate ?? null) as Record<string, unknown> | null,
+    }).catch(rethrowUpgradeFenceError);
+    res.json({ phase: held.phase, epoch: held.epoch, heldUntil: held.heldUntil, ownerToken: held.ownerToken });
+  });
+
+  router.delete("/instance/upgrade-fence", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.epoch !== "number" || !Number.isSafeInteger(body.epoch)
+      || typeof body.ownerToken !== "string" || body.ownerToken.length === 0
+      || (body.reason !== undefined && typeof body.reason !== "string"))
+      throw badRequest("epoch (integer) and ownerToken (string) are required", { code: "upgrade_fence_invalid_abort" });
+    const aborted = await upgradeFence.abort({
+      actor: fenceActor(req),
+      activityActor: fenceActivityActor(req),
+      epoch: body.epoch,
+      ownerToken: body.ownerToken,
+      reason: (body.reason as string | undefined) ?? null,
+    }).catch(rethrowUpgradeFenceError);
+    res.json({ phase: aborted.phase, epoch: aborted.epoch, reason: aborted.transition.reason });
   });
 
   // Cloud lifecycle read-back: the harness answers a tenant's archive

@@ -1,6 +1,7 @@
-import { pendingAgentInteractionAddressee } from "../../../services/pending-agent-interaction.js";
+import { pendingAgentInteractionAddressee, readAddressedInteractionStatus } from "../../../services/pending-agent-interaction.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { buildGateCancellationDrainIntent, GATE_CANCELLATION_DRAIN_KEY } from "../../../services/gate-cancellation-drain.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -34,8 +35,9 @@ import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
 } from "../../../services/issue-tree-control.js";
 import {
-  continuationSummaryParksExecutor,
+  continuationSummaryParksCurrentStage,
   getIssueContinuationSummaryDocument,
+  readQueuedContinuationSummary,
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
@@ -557,15 +559,17 @@ export function createPostgresRunDispatchAdapter(
     let continuationSummaryBody: string | null = null;
     let continuationParksExecutor = false;
     if (continuationParkApplies) {
-      const queuedWake = parseObject(context.paperclipWake);
-      const queuedContinuationSummary =
-        readNonEmptyString(parseObject(context.paperclipContinuationSummary).body) ??
-        readNonEmptyString(parseObject(queuedWake.continuationSummary).body);
-      const currentContinuationSummary = queuedContinuationSummary
-        ? null
-        : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
-      continuationSummaryBody = queuedContinuationSummary ?? currentContinuationSummary?.body ?? null;
-      continuationParksExecutor = continuationSummaryParksExecutor(continuationSummaryBody);
+      const queuedSummary = readQueuedContinuationSummary(context);
+      const liveSummary = queuedSummary ? null : await getIssueContinuationSummaryDocument(dbOrTx, issueId);
+      const decision = await continuationSummaryParksCurrentStage(dbOrTx, {
+        companyId: input.companyId,
+        issueId,
+        summary: queuedSummary ?? (liveSummary
+          ? { body: liveSummary.body, documentId: liveSummary.documentId, revisionId: liveSummary.latestRevisionId }
+          : null),
+      });
+      continuationSummaryBody = decision.body;
+      continuationParksExecutor = decision.parks;
     }
 
     const recoveryActionId = readNonEmptyString(context.recoveryActionId);
@@ -614,6 +618,9 @@ export function createPostgresRunDispatchAdapter(
         companyId: input.companyId, issueId, agentId: input.agentId,
         contextSnapshot: context,
       }) : false,
+      addressedInteraction: issue ? await readAddressedInteractionStatus(dbOrTx, {
+        companyId: input.companyId, issueId, contextSnapshot: context,
+      }) : null,
       isResolvedInteractionContinuation,
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
@@ -892,7 +899,34 @@ export function createPostgresRunDispatchAdapter(
     expectedStatus: "queued" | "running",
     now: Date,
     providerDispatchNotStarted = false,
+    recordDrainIntent = false,
   ): Promise<CancelStaleQueuedRunOutcome> {
+      // Read under the gate's issue lock, before the lock is cleared below:
+      // the deferred queue this cancellation leaves behind, and who still owns it.
+      const drainIntent = recordDrainIntent && expectedStatus === "queued"
+        ? await tx
+          .select({ executionRunId: issues.executionRunId })
+          .from(issues)
+          .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+          .then(rows => rows[0] ?? null)
+          .then(async issue => buildGateCancellationDrainIntent({
+            issueId,
+            deferredWakeIds: await tx
+              .select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(and(
+                eq(agentWakeupRequests.companyId, run.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+              ))
+              .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+              .then(rows => rows.map(row => row.id)),
+            providerWorkStarted: run.startedAt != null,
+            cancelledErrorCode: decision.errorCode,
+            now,
+            lockHolderRunId: issue?.executionRunId && issue.executionRunId !== run.id ? issue.executionRunId : null,
+          }))
+        : null;
       const [row] = await tx
         .update(heartbeatRuns)
         .set({
@@ -909,6 +943,7 @@ export function createPostgresRunDispatchAdapter(
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),
+            ...(drainIntent ? { [GATE_CANCELLATION_DRAIN_KEY]: drainIntent } : {}),
             effectiveTimeoutSec: 0,
             timeoutConfigured: false,
             timeoutSource: "stale_queued_run_gate",
@@ -1100,7 +1135,9 @@ export function createPostgresRunDispatchAdapter(
         const deferred = await deferRetryForCleanupInTx(tx, run, issueId, input.now, executionBlocker);
         if (deferred) return deferred;
       }
-      return cancelStaleRunInTx(tx, run, issueId, decision, input.expectedStatus, input.now);
+      return cancelStaleRunInTx(
+        tx, run, issueId, decision, input.expectedStatus, input.now, false, input.recordDrainIntent === true,
+      );
     };
 
     return withIssueThenRunLocks(

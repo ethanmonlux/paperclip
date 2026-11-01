@@ -132,6 +132,7 @@ import {
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
+import { bootUpgradeAdmissionFence, upgradeAdmissionFenceService } from "./services/upgrade-admission-fence.js";
 import {
   createEmbeddedPostgresSupervisor,
   type EmbeddedPostgresSupervisor,
@@ -266,6 +267,10 @@ async function startServerWithDatabaseTeardown(
   type EnsureMigrationsOptions = {
     autoApply?: boolean;
   };
+  // Set only when this invocation created the migration journal of a database
+  // that had none and no tables: the one fresh install that initializes the
+  // FAC-797 upgrade admission fence.
+  let createdMigrationJournal = false;
   
   async function ensureMigrations(
     connectionString: string,
@@ -322,6 +327,9 @@ async function startServerWithDatabaseTeardown(
 
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
     await applyPendingMigrations(connectionString);
+    if (state.status === "needsMigrations" && state.reason === "no-migration-journal-empty-db") {
+      createdMigrationJournal = true;
+    }
     return "applied (pending migrations)";
   }
   
@@ -653,6 +661,18 @@ async function startServerWithDatabaseTeardown(
     await Promise.all(clients.map((client) => endDatabaseClient(client, 5)));
   };
   startupDatabase.close = closeDatabaseClients;
+
+  // FAC-797 upgrade admission fence: read before startup recovery, claim loops
+  // or workers. Every gated claim re-reads the row in its own transaction, so a
+  // failure here leaves run claims refused rather than admitted.
+  try {
+    const upgradeFenceStatus = await bootUpgradeAdmissionFence(db, { createdMigrationJournal });
+    const fenceLog = { phase: upgradeFenceStatus.phase, epoch: upgradeFenceStatus.epoch, reason: upgradeFenceStatus.reason };
+    if (upgradeFenceStatus.admitsRunClaims) logger.info(fenceLog, "upgrade admission fence open");
+    else logger.warn(fenceLog, "upgrade admission fence is not open; new run claims are refused until its owner acts");
+  } catch (err) {
+    logger.error({ err }, "upgrade admission fence could not be read at boot; new run claims stay refused");
+  }
   
   // A claimed warm-pool stack may restart while its provider environment still
   // names the pool host. Restore the signed, durable identity before Better
@@ -1191,7 +1211,19 @@ async function startServerWithDatabaseTeardown(
     ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
   ] as const;
+  const upgradeFence = upgradeAdmissionFenceService(db);
+  let upgradeFenceSweepInFlight = false;
   const sweepExecutionControl = () => {
+    // FAC-797: commit due fence expiries even while drains suppress other work.
+    if (!heartbeatSchedulerStopped && !upgradeFenceSweepInFlight) {
+      upgradeFenceSweepInFlight = true;
+      trackHeartbeatSchedulerWork(Promise.resolve().then(() => upgradeFence.sweepExpired())
+        .then((transition) => {
+          if (transition) logger.warn({ ...transition }, "upgrade admission fence lease expired");
+        })
+        .catch(err => logger.error({ err }, "upgrade admission fence expiry sweep failed"))
+        .finally(() => { upgradeFenceSweepInFlight = false; }));
+    }
     if (isIdleTaskDrainActive() || heartbeatSchedulerStopped || isWarmStandby()) return;
     // Independent durable queues must not block one another. Each queue remains
     // single-flight; a later sweep observes committed transitions from its peers.

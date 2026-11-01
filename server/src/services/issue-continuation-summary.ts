@@ -1,9 +1,10 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { documents, issueDocuments, issues } from "@paperclipai/db";
+import { documentRevisions, documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
 import { summarizeRunErrorForModel } from "./heartbeat-run-summary.js";
+import { issueStatusChangedSince } from "./issue-stage-boundary.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -43,6 +44,7 @@ export type IssueContinuationSummaryDocument = {
   key: typeof ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY;
   title: string | null;
   body: string;
+  documentId: string;
   latestRevisionId: string | null;
   latestRevisionNumber: number;
   sourceTrust: SourceTrustMetadata | null;
@@ -100,9 +102,18 @@ function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
   return "implementation";
 }
 
+// Generated for one status only. Carrying them into another status would let
+// an earlier stage's wording park or misdirect the current stage.
+const STATUS_NEXT_ACTIONS: Record<string, string> = {
+  done: "Review the completed issue output and close any remaining follow-up comments.",
+  in_review: "Wait for reviewer feedback or approval before continuing executor work.",
+};
+const GENERATED_STATUS_NEXT_ACTIONS = new Set(Object.values(STATUS_NEXT_ACTIONS));
+
 function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previousNextAction: string | null) {
-  if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
-  if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
+  const statusNextAction = STATUS_NEXT_ACTIONS[issue.status];
+  if (statusNextAction) return statusNextAction;
+  if (previousNextAction && GENERATED_STATUS_NEXT_ACTIONS.has(previousNextAction)) previousNextAction = null;
   if (run.status === "failed" || run.status === "timed_out") {
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }
@@ -132,6 +143,111 @@ export function continuationSummaryParksExecutor(body: string | null | undefined
   const nextAction = extractContinuationSummaryNextAction(body);
   if (!nextAction) return false;
   return WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(nextAction);
+}
+
+/**
+ * A summary as some reader holds it: the body it saw and, when known, the
+ * exact document revision that body was copied from.
+ */
+export type HeldContinuationSummary = {
+  body: string;
+  documentId: string | null;
+  revisionId: string | null;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** The run context's summary snapshot, naming the exact revision it copied. */
+export function continuationSummaryContextSnapshot(summary: IssueContinuationSummaryDocument) {
+  return {
+    key: summary.key,
+    title: summary.title,
+    body: summary.body,
+    sourceTrust: summary.sourceTrust ?? null,
+    updatedAt: summary.updatedAt.toISOString(),
+    documentId: summary.documentId,
+    revisionId: summary.latestRevisionId,
+  };
+}
+
+/**
+ * The summary snapshot carried by a queued run. Exactly one container is read
+ * (the top-level copy, else the wake payload's copy); its fields are never
+ * combined with the other container's.
+ */
+export function readQueuedContinuationSummary(context: Record<string, unknown>): HeldContinuationSummary | null {
+  for (const container of [
+    asRecord(context.paperclipContinuationSummary),
+    asRecord(asRecord(context.paperclipWake).continuationSummary),
+  ]) {
+    const body = typeof container.body === "string" && container.body.trim().length > 0 ? container.body : null;
+    if (!body) continue;
+    return { body, documentId: asNonEmptyString(container.documentId), revisionId: asNonEmptyString(container.revisionId) };
+  }
+  return null;
+}
+
+/**
+ * Body, time and writer of one immutable summary revision, or null when the
+ * identity is absent or is not a revision of this issue's continuation summary.
+ */
+export async function resolveContinuationSummaryRevision(
+  db: Db,
+  input: { companyId: string; issueId: string; documentId: string | null; revisionId: string | null },
+) {
+  if (!input.documentId || !input.revisionId) return null;
+  if (!UUID_RE.test(input.documentId) || !UUID_RE.test(input.revisionId)) return null;
+  const [row] = await db
+    .select({ body: documentRevisions.body, createdAt: documentRevisions.createdAt, createdByRunId: documentRevisions.createdByRunId })
+    .from(documentRevisions)
+    .innerJoin(issueDocuments, and(
+      eq(issueDocuments.documentId, documentRevisions.documentId),
+      eq(issueDocuments.companyId, documentRevisions.companyId),
+    ))
+    .where(and(
+      eq(documentRevisions.id, input.revisionId),
+      eq(documentRevisions.documentId, input.documentId),
+      eq(documentRevisions.companyId, input.companyId),
+      eq(issueDocuments.issueId, input.issueId),
+      eq(issueDocuments.key, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
+    ))
+    .limit(1);
+  return row ? { body: row.body, writtenAt: row.createdAt, writerRunId: row.createdByRunId } : null;
+}
+
+/**
+ * Whether a held summary parks the executor in the current stage. The same
+ * rule applies to the live document and to either queued snapshot: body, time
+ * and writer all come from the one identified revision. A summary describes the
+ * stage it was written in, so a later status change by anyone but its writer
+ * opens a new stage it cannot park. Unknown provenance never establishes such a
+ * change, so the park stands.
+ */
+export async function continuationSummaryParksCurrentStage(
+  db: Db,
+  input: { companyId: string; issueId: string; summary: HeldContinuationSummary | null },
+): Promise<{ body: string | null; parks: boolean }> {
+  if (!input.summary) return { body: null, parks: false };
+  const revision = await resolveContinuationSummaryRevision(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    documentId: input.summary.documentId,
+    revisionId: input.summary.revisionId,
+  });
+  const body = revision?.body ?? input.summary.body;
+  if (!continuationSummaryParksExecutor(body)) return { body, parks: false };
+  if (!revision?.writerRunId) return { body, parks: true };
+  const newStage = await issueStatusChangedSince(db, {
+    companyId: input.companyId,
+    issueId: input.issueId,
+    since: revision.writtenAt,
+    excludeRunId: revision.writerRunId,
+  });
+  return { body, parks: !newStage };
 }
 
 export function buildContinuationSummaryMarkdown(input: {
@@ -223,6 +339,7 @@ export async function getIssueContinuationSummaryDocument(
       key: issueDocuments.key,
       title: documents.title,
       body: documents.latestBody,
+      documentId: documents.id,
       latestRevisionId: documents.latestRevisionId,
       latestRevisionNumber: documents.latestRevisionNumber,
       sourceTrust: documents.sourceTrust,
@@ -238,6 +355,7 @@ export async function getIssueContinuationSummaryDocument(
     key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     title: row.title,
     body: row.body,
+    documentId: row.documentId,
     latestRevisionId: row.latestRevisionId,
     latestRevisionNumber: row.latestRevisionNumber,
     sourceTrust: row.sourceTrust ?? null,
