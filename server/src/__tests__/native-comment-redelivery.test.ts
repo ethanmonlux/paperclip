@@ -105,11 +105,12 @@ describeEmbedded("deferred comment wakes already delivered to the finishing run"
     }
 
     /** An Engineer run holding the task, started with `envelope` delivered. */
-    async function engineerRun(offsetSeconds: number, envelope: Comment[], options: { issueId?: string } = {}) {
+    async function engineerRun(offsetSeconds: number, envelope: Comment[], options: { issueId?: string; wakeupRequestId?: string } = {}) {
       const runId = randomUUID();
       const runIssueId = options.issueId ?? issueId;
       await db.insert(heartbeatRuns).values({
         id: runId, companyId, agentId: engineerId, invocationSource: "automation", status: "running",
+        wakeupRequestId: options.wakeupRequestId ?? null,
         runtimeMode: "legacy", startedAt: at(t0, offsetSeconds), createdAt: at(t0, offsetSeconds),
         contextSnapshot: {
           issueId: runIssueId, taskId: runIssueId,
@@ -359,6 +360,81 @@ describeEmbedded("deferred comment wakes already delivered to the finishing run"
       // Never retired as "already delivered": the Engineer's envelope is not the Coordinator's.
       expect(after.error ?? "").not.toContain("already delivered");
       expect(before.status).toBe("deferred_issue_execution");
+    });
+  });
+
+  // A queued-comment interrupt ("send these queued messages now") cancels the
+  // running turn and dispatches exactly the selected queue. That turn's
+  // envelope still carries the whole task history, so another actor's queued
+  // comment is in it, but the interrupt contract owes that queue its own turn
+  // once the requested turn completes (heartbeat-process-recovery "resumes only
+  // the authorized pending queue after an acknowledged legacy interrupt"). The
+  // typed link is the cancelled run's `resultJson.queuedCommentInterruptQueueId`
+  // naming the finishing run's own `wakeupRequestId`.
+  describe("authorized queued-comment interrupt turns", () => {
+    async function interruptTurn(f: Awaited<ReturnType<typeof fixture>>, options: {
+      interruptNames?: "own" | "other"; interruptAgent?: "engineer" | "coordinator";
+    } = {}) {
+      const selected = await f.comment(10, { userId: "responsible-user" }, "Send this now.");
+      const other = await f.comment(11, { userId: "other-user" }, "Other actor's queued input.");
+      const selectedWake = await f.deferredCommentWake(10, [selected], { actor: { type: "user", id: "responsible-user" } });
+      const otherWake = await f.deferredCommentWake(11, [other], { actor: { type: "user", id: "other-user" } });
+      // The interrupted turn, cancelled by the operator's queue interrupt.
+      const interruptedRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: interruptedRunId, companyId: f.companyId,
+        agentId: options.interruptAgent === "coordinator" ? f.coordinatorId : f.engineerId,
+        invocationSource: "automation", status: "cancelled", runtimeMode: "legacy",
+        startedAt: at(f.t0, 5), createdAt: at(f.t0, 5), finishedAt: at(f.t0, 15),
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId },
+        resultJson: {
+          operatorInterrupted: true,
+          queuedCommentInterruptQueueId: options.interruptNames === "other" ? randomUUID() : selectedWake,
+          executionCancellation: { state: "acknowledged" },
+        },
+      });
+      // The selected queue was promoted into the turn that is now finishing.
+      const runId = await f.engineerRun(20, [selected, other], { wakeupRequestId: selectedWake });
+      await db.update(agentWakeupRequests).set({ status: "completed", runId }).where(eq(agentWakeupRequests.id, selectedWake));
+      await f.finish(runId);
+      return { runId, other, otherWake };
+    }
+
+    it("still gives another actor's queue its own turn after the requested interrupt turn completes", async () => {
+      const f = await fixture();
+      const { runId, other, otherWake } = await interruptTurn(f);
+
+      const result = await release(f.companyId, runId);
+
+      expect(result.outcome.kind).toBe("promoted");
+      const promoted = await f.wake(otherWake);
+      expect(promoted.error ?? "").not.toContain("already delivered");
+      expect(promoted.status).not.toBe("cancelled");
+      expect(f.promotedCommentIds(promoted)).toEqual([other.id]);
+      expect(await f.queuedRunsFor(f.engineerId)).toHaveLength(1);
+    });
+
+    it("still retires the delivered queue when the cancelled run's interrupt named a different queue", async () => {
+      const f = await fixture();
+      const { runId, otherWake } = await interruptTurn(f, { interruptNames: "other" });
+
+      await release(f.companyId, runId);
+
+      const retired = await f.wake(otherWake);
+      expect(retired.status).toBe("cancelled");
+      expect(retired.error).toContain("already delivered");
+      expect(await f.queuedRunsFor(f.engineerId)).toHaveLength(0);
+    });
+
+    it("still retires the delivered queue when only another agent's run names the finishing run's wake", async () => {
+      const f = await fixture();
+      const { runId, otherWake } = await interruptTurn(f, { interruptAgent: "coordinator" });
+
+      await release(f.companyId, runId);
+
+      const retired = await f.wake(otherWake);
+      expect(retired.status).toBe("cancelled");
+      expect(retired.error).toContain("already delivered");
     });
   });
 });

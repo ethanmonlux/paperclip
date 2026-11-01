@@ -144,13 +144,22 @@ function toRunSummary(row: HeartbeatRunRow): RunSummary {
  * run was started with, plus that run's start. Only a run that completed its
  * turn (`succeeded`) on this exact task and agent counts; any other shape
  * delivers nothing, so the deferred wake keeps its comments.
+ *
+ * A turn dispatched from an authorized queued-comment interrupt is scoped to
+ * the selected queue: its envelope still lists the whole task history, but the
+ * interrupt contract owes every other queue its own turn after it. The typed
+ * link is a cancelled run of this agent whose `queuedCommentInterruptQueueId`
+ * names the finishing run's own wake; such a turn delivers nothing either.
  */
 async function readDeliveredCommentRevisions(
   tx: Db,
   input: { companyId: string; issueId: string; runId: string; agentId: string },
 ): Promise<{ startedAt: Date; revisions: Map<string, string> } | null> {
   const [run] = await tx
-    .select({ status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt, contextSnapshot: heartbeatRuns.contextSnapshot })
+    .select({
+      status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt, contextSnapshot: heartbeatRuns.contextSnapshot,
+      wakeupRequestId: heartbeatRuns.wakeupRequestId,
+    })
     .from(heartbeatRuns)
     .where(and(
       eq(heartbeatRuns.id, input.runId),
@@ -159,6 +168,18 @@ async function readDeliveredCommentRevisions(
     ))
     .limit(1);
   if (!run || run.status !== "succeeded" || !run.startedAt) return null;
+  if (run.wakeupRequestId) {
+    const [interrupt] = await tx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        sql`${heartbeatRuns.resultJson} ->> 'queuedCommentInterruptQueueId' = ${run.wakeupRequestId}`,
+      ))
+      .limit(1);
+    if (interrupt) return null;
+  }
   const context = parseObject(run.contextSnapshot);
   if (readNonEmptyString(context.issueId) !== input.issueId) return null;
   const envelope = parseObject(context.executionContinuation);
