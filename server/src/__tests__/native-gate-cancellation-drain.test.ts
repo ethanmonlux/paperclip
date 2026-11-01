@@ -525,4 +525,212 @@ describeEmbedded("native gate cancellation drain intent (R8)", () => {
       expect(await liveRunsFor(f, only.interactionId)).toHaveLength(1);
     });
   });
+
+  // FAC-760 STA-22 round 12, finding R9: the release read the run row once
+  // without a lock, then re-read it FOR UPDATE under the issue lock but used
+  // only the intent from that second read. Every admission fact (Stop, the
+  // never-started exemption, the queue interrupt) and the returned snapshot
+  // came from the first read, so a change committed between the two reads was
+  // ignored. These cases hold the issue row lock from a separate connection so
+  // the release stops after its first read, commit the change, then let it go.
+  // No production hook is involved.
+  describe("run row changed between the release's first read and its locked read (R9)", () => {
+    /** Runs `release` with the issue row locked elsewhere; `change` commits once the release is waiting on that lock. */
+    async function releaseWithChangeBetweenReads<T>(f: Fixture, release: () => Promise<T>, change: () => Promise<unknown>) {
+      let releaseHolder!: () => void;
+      const holderDone = new Promise<void>(resolve => { releaseHolder = resolve; });
+      let holderLocked!: () => void;
+      const locked = new Promise<void>(resolve => { holderLocked = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`select id from issues where id = ${f.issueId} for update`);
+        holderLocked();
+        await holderDone;
+      });
+      await locked;
+      const releasing = release();
+      try {
+        await waitForIssueLockWaiter();
+        await change();
+      } finally {
+        releaseHolder();
+        await holder;
+      }
+      return releasing;
+    }
+
+    async function waitForIssueLockWaiter() {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const rows = await db.execute(sql`
+          select count(*)::int as n from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+            and query ilike '%from issues%for update%'`);
+        const n = Number((rows as unknown as Array<{ n: number }>)[0]?.n ?? 0);
+        if (n > 0) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      throw new Error("test: the release never waited on the issue lock");
+    }
+
+    const replay = (svc: ReturnType<typeof services>, run: Run) => svc.releaseIssueExecutionAndPromote(run, {
+      suppressImmediateRecovery: true, undispatchedGateCancellation: true,
+    } as Parameters<HeartbeatQueueDependencies["releaseIssueExecutionAndPromote"]>[1]);
+
+    /** A lost post-commit drain leaves the cancelled run with a pending intent for a replay or sweep. */
+    async function lostDrain() {
+      const f = await fixture();
+      const { live, promoted } = await f.staleFirstLiveSecond();
+      await claim(services({ loseGateDrain: true }), promoted);
+      expect(intentOf(await f.run(promoted.id))?.state).toBe("pending");
+      return { f, live, promoted };
+    }
+
+    const mergeResult = (runId: string, patch: Record<string, unknown>) =>
+      db.update(heartbeatRuns)
+        .set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb` })
+        .where(eq(heartbeatRuns.id, runId));
+
+    function nativeReceipt(run: Run) {
+      return {
+        schema: "paperclip.native-cancellation.v1", runId: run.id, companyId: run.companyId, issueId: run.nativeIssueId,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      };
+    }
+    const stopWriters: Array<[string, (run: Run) => Record<string, unknown>]> = [
+      ["an acknowledged executionCancellation", () => ({ executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } })],
+      ["an acknowledged native operator Stop", run => ({ cancelledByActorType: "user", cancelledByUserId: "board-user", nativeCancellation: nativeReceipt(run) })],
+      ["an acknowledged native reassignment stop", run => ({ reassignmentStopRequested: true, nativeCancellation: nativeReceipt(run) })],
+    ];
+
+    it.each(stopWriters)("does not promote when %s is committed between the reads, and keeps the intent pending", async (_label, stop) => {
+      const { f, live, promoted } = await lostDrain();
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted), () => mergeResult(promoted.id, stop(promoted)));
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect((await f.wake(live.wakeId)).status).toBe("deferred_issue_execution");
+      const after = await f.run(promoted.id);
+      expect(after.resultJson).toMatchObject(stop(promoted).executionCancellation ? { executionCancellation: { state: "acknowledged" } } : {});
+      expect(intentOf(after)?.state).toBe("pending");
+    });
+
+    it("keeps that Stop across a duplicate replay, concurrent consumers and fresh-process restart sweeps", async () => {
+      const { f, live, promoted } = await lostDrain();
+      const stop = { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } };
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted), () => mergeResult(promoted.id, stop));
+      await Promise.all([replay(services(), promoted).catch(() => null), services().queue.resumeQueuedRuns()]);
+      await services().queue.resumeQueuedRuns();
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect((await f.coordinatorRuns()).filter(r => r.status !== "cancelled")).toEqual([]);
+      const after = await f.run(promoted.id);
+      expect(after.resultJson).toMatchObject({ executionCancellation: { state: "acknowledged" } });
+      expect(intentOf(after)?.state).toBe("pending");
+    });
+
+    it("decides a queue interrupt from the locked row: one withdrawn between the reads no longer overrides the Stop", async () => {
+      const { f, live, promoted } = await lostDrain();
+      // A Stop that was a queue interrupt for the live card's wake: on a fresh read, that queue is admitted.
+      await mergeResult(promoted.id, {
+        executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() },
+        queuedCommentInterruptQueueId: live.wakeId,
+      });
+      expect((await f.run(promoted.id)).runtimeMode).not.toBe("native");
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted),
+        () => mergeResult(promoted.id, { queuedCommentInterruptQueueId: null }));
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect(intentOf(await f.run(promoted.id))?.state).toBe("pending");
+    });
+
+    it("decides a queue interrupt from the locked row: one recorded between the reads admits its queue once", async () => {
+      const { f, live, promoted } = await lostDrain();
+      await mergeResult(promoted.id, { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } });
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted),
+        () => mergeResult(promoted.id, { queuedCommentInterruptQueueId: live.wakeId }));
+
+      expect(await liveRunsFor(f, live.interactionId)).toHaveLength(1);
+      expect(intentOf(await f.run(promoted.id))).toMatchObject({ state: "settled", outcome: "promoted" });
+    });
+
+    it("withholds the never-started exemption when an earlier started attempt is recorded between the reads", async () => {
+      const { f, live, promoted } = await lostDrain();
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted),
+        () => db.update(heartbeatRuns).set({ startedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, promoted.id)));
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect((await f.wake(live.wakeId)).status).toBe("deferred_issue_execution");
+      expect(intentOf(await f.run(promoted.id))?.state).toBe("pending");
+    });
+
+    it("holds the intent pending, with a recorded reason, when the run's task changed between the reads", async () => {
+      const { f, live, promoted } = await lostDrain();
+      const otherIssueId = randomUUID();
+      await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Other task", status: "todo" });
+      const before = await f.run(promoted.id);
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted),
+        () => db.update(heartbeatRuns).set({ contextSnapshot: { ...(before.contextSnapshot ?? {}), issueId: otherIssueId } })
+          .where(eq(heartbeatRuns.id, promoted.id)));
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect((await f.wake(live.wakeId)).status).toBe("deferred_issue_execution");
+      expect(intentOf(await f.run(promoted.id))).toMatchObject({ state: "pending", heldReason: "run_row_changed" });
+    });
+
+    it("holds the intent pending, with a recorded reason, when the run's status changed between the reads", async () => {
+      const { f, live, promoted } = await lostDrain();
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted),
+        () => db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, promoted.id)));
+
+      expect(await liveRunsFor(f, live.interactionId)).toEqual([]);
+      expect((await f.wake(live.wakeId)).status).toBe("deferred_issue_execution");
+      expect(intentOf(await f.run(promoted.id))).toMatchObject({ state: "pending", heldReason: "run_row_changed" });
+    });
+
+    it("hands the drain and its caller the snapshot of the locked row, not of the first read", async () => {
+      const { f, promoted } = await lostDrain();
+      const adapter = createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "responsible-user",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      });
+      let drained: { errorCode: string | null } | null = null;
+      const result = await releaseWithChangeBetweenReads(f,
+        () => adapter.withIssueExecutionLock(
+          { companyId: f.companyId, runId: promoted.id, now: new Date(), undispatchedGateCancellation: true },
+          async (locked) => {
+            drained = { errorCode: locked.run.errorCode };
+            return { outcome: { kind: "released" }, postCommitEffects: [] };
+          }),
+        () => db.update(heartbeatRuns).set({ errorCode: "test_changed_between_reads" }).where(eq(heartbeatRuns.id, promoted.id)));
+
+      expect(drained).toEqual({ errorCode: "test_changed_between_reads" });
+      expect(result.run).toMatchObject({ id: promoted.id, status: "cancelled", errorCode: "test_changed_between_reads" });
+    });
+
+    it("still promotes exactly one successor when nothing changes while the release waits (control)", async () => {
+      const { f, live, promoted } = await lostDrain();
+      await releaseWithChangeBetweenReads(f, () => replay(services(), promoted), async () => undefined);
+
+      expect(await liveRunsFor(f, live.interactionId)).toHaveLength(1);
+      expect(intentOf(await f.run(promoted.id))).toMatchObject({ state: "settled", outcome: "promoted" });
+      await services().queue.resumeQueuedRuns();
+      expect((await f.coordinatorRuns()).filter(r => r.status !== "cancelled")).toHaveLength(1);
+    });
+
+    it("leaves a release that is not a gate cancellation unchanged (parity control)", async () => {
+      const f = await fixture();
+      const first = await f.card(10);
+      await f.card(40);
+      await f.finishEngineer();
+      await releaseWithChangeBetweenReads(f,
+        () => services().releaseIssueExecution({ companyId: f.companyId, runId: f.engineerRunId, now: new Date() }),
+        async () => undefined);
+      const queued = (await f.coordinatorRuns()).filter(r => r.status === "queued");
+      expect(queued).toHaveLength(1);
+      expect(boundTo(queued[0]!, f.issueId, first.interactionId)).toBe(true);
+      expect(intentOf(await f.run(f.engineerRunId))).toBeUndefined();
+    });
+  });
+
 });

@@ -1039,16 +1039,18 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
       return db.transaction(async (rawTx) => {
         const tx = rawTx as unknown as Db;
-        const run = await tx
+        // Unlocked: this read only chooses which issue rows to lock. On a gate
+        // cancellation every admission fact comes from the run row read again
+        // under those locks (below).
+        const initialRun = await tx
           .select()
           .from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null);
-        if (!run) {
+        if (!initialRun) {
           throw new Error(`wake-queue: run ${input.runId} was not found while releasing issue execution`);
         }
-        const runSnapshot = toRunSnapshot(run);
-        const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        const contextIssueId = readNonEmptyString(parseObject(initialRun.contextSnapshot).issueId);
 
         // Lock the context issue (if any) and every issue that still references this
         // run, in id order, so two concurrent finalizations can never deadlock on
@@ -1060,8 +1062,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
                 where company_id = ${input.companyId}
                   and (
                     id = ${contextIssueId}
-                    or execution_run_id = ${run.id}
-                    or checkout_run_id = ${run.id}
+                    or execution_run_id = ${initialRun.id}
+                    or checkout_run_id = ${initialRun.id}
                   )
                 order by id
                 for update
@@ -1069,7 +1071,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             : sql`
                 select id from issues
                 where company_id = ${input.companyId}
-                  and (execution_run_id = ${run.id} or checkout_run_id = ${run.id})
+                  and (execution_run_id = ${initialRun.id} or checkout_run_id = ${initialRun.id})
                 order by id
                 for update
               `,
@@ -1082,8 +1084,8 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             and(
               eq(issues.companyId, input.companyId),
               contextIssueId
-                ? or(eq(issues.id, contextIssueId), eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id))
-                : or(eq(issues.executionRunId, run.id), eq(issues.checkoutRunId, run.id)),
+                ? or(eq(issues.id, contextIssueId), eq(issues.executionRunId, initialRun.id), eq(issues.checkoutRunId, initialRun.id))
+                : or(eq(issues.executionRunId, initialRun.id), eq(issues.checkoutRunId, initialRun.id)),
             ),
           )
           .orderBy(asc(issues.id));
@@ -1093,24 +1095,33 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         await tx
           .update(issues)
           .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: input.now })
-          .where(and(eq(issues.companyId, input.companyId), eq(issues.executionRunId, run.id)));
+          .where(and(eq(issues.companyId, input.companyId), eq(issues.executionRunId, initialRun.id)));
         await tx
           .update(issues)
           .set({ checkoutRunId: null, updatedAt: input.now })
-          .where(and(eq(issues.companyId, input.companyId), eq(issues.checkoutRunId, run.id)));
+          .where(and(eq(issues.companyId, input.companyId), eq(issues.checkoutRunId, initialRun.id)));
 
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
 
         // A claim-gate cancellation's drain intent, read again under the issue
         // lock so concurrent consumers (post-commit drain, restart sweep, a
-        // replay) serialize: only the first sees it pending.
+        // replay) serialize: only the first sees it pending. That locked row is
+        // the only source for the intent, every admission fact (Stop, the
+        // never-started exemption, the queue interrupt), the snapshot and the
+        // settlement: a change committed after the first read is decided on.
         const gateDrain = input.undispatchedGateCancellation
-          ? await readLockedGateDrain(tx, input.companyId, run.id)
+          ? await readLockedGateDrain(tx, input.companyId, initialRun.id, {
+              status: initialRun.status, contextIssueId,
+            }, input.now)
           : null;
+        const run = gateDrain && gateDrain.kind !== "gone" ? gateDrain.run : initialRun;
+        const runSnapshot = toRunSnapshot(run);
         if (gateDrain && gateDrain.kind !== "consume") {
           if (gateDrain.kind === "settle") await writeGateDrain(tx, gateDrain.run, gateDrain.intent, input.now);
-          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          if (gateDrain.kind !== "none") {
+            return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+          }
         }
         const pendingIntent = gateDrain?.kind === "consume" ? gateDrain.intent : null;
         if (pendingIntent) {
@@ -1287,33 +1298,56 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
   };
 }
 
+type LockedRun = typeof heartbeatRuns.$inferSelect;
 type LockedGateDrain =
-  | { kind: "consume"; run: typeof heartbeatRuns.$inferSelect; intent: GateCancellationDrainIntent }
-  | { kind: "settle"; run: typeof heartbeatRuns.$inferSelect; intent: Record<string, unknown> }
-  | { kind: "done" };
+  | { kind: "consume"; run: LockedRun; intent: GateCancellationDrainIntent }
+  | { kind: "settle"; run: LockedRun; intent: Record<string, unknown> }
+  /** No intent (a run cancelled by an older build): release normally from the locked row, with no never-started exemption. */
+  | { kind: "none"; run: LockedRun }
+  /** Nothing to do for this intent; the locked row is still the release's run. */
+  | { kind: "done"; run: LockedRun }
+  | { kind: "gone" };
 
-/** Issue lock is held: lock the run row next (issue -> run order) and read its intent. */
-async function readLockedGateDrain(tx: Db, companyId: string, runId: string): Promise<LockedGateDrain | null> {
+/**
+ * Issue lock is held: lock the run row next (issue -> run order) and read its
+ * intent. Every outcome carries the locked row, so the release decides only
+ * from it. If the row no longer matches what chose the issue locks (status or
+ * task), nothing is decided here: a pending intent stays pending, with the
+ * reason recorded, for the next consumer.
+ */
+async function readLockedGateDrain(
+  tx: Db,
+  companyId: string,
+  runId: string,
+  expected: { status: string; contextIssueId: string | null },
+  now: Date,
+): Promise<LockedGateDrain> {
   const [locked] = await tx.select().from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
     .for("update");
-  if (!locked) return { kind: "done" };
+  if (!locked) return { kind: "gone" };
+  const lockedContextIssueId = readNonEmptyString(parseObject(locked.contextSnapshot).issueId);
+  if (locked.status !== expected.status || lockedContextIssueId !== expected.contextIssueId) {
+    const raw = locked.resultJson?.[GATE_CANCELLATION_DRAIN_KEY];
+    const rawIntent = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+    return rawIntent?.state === "pending"
+      ? { kind: "settle", run: locked, intent: { ...rawIntent, heldAt: now.toISOString(), heldReason: "run_row_changed" } }
+      : { kind: "done", run: locked };
+  }
   const read = readGateCancellationDrainIntent({
     status: locked.status,
     resultJson: locked.resultJson ?? null,
     contextSnapshot: locked.contextSnapshot ?? null,
   });
-  // A run cancelled by an older build carries no intent: release normally,
-  // with no never-started exemption.
-  if (read.kind === "none") return null;
+  if (read.kind === "none") return { kind: "none", run: locked };
   if (read.kind === "malformed") {
     const raw = read.raw && typeof read.raw === "object" && !Array.isArray(read.raw) ? read.raw as Record<string, unknown> : {};
     // Unknown identity carries no authority: record it and never drain from it.
     return raw.state === "invalid"
-      ? { kind: "done" }
+      ? { kind: "done", run: locked }
       : { kind: "settle", run: locked, intent: { ...raw, state: "invalid", outcome: "malformed" } };
   }
-  if (read.intent.state !== "pending") return { kind: "done" };
+  if (read.intent.state !== "pending") return { kind: "done", run: locked };
   return { kind: "consume", run: locked, intent: read.intent };
 }
 
