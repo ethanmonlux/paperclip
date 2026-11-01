@@ -501,6 +501,42 @@
           }
         ]
       }
+    },
+    {
+      "id": "controller-lease-loss-attribution",
+      "purpose": "Record a legacy controller lease loss as the cause of a cancelled run (source controller_lease with a closed cause and the watchdog timings) instead of an unknown stop, on both the returned and thrown adapter paths, without changing the cancelled outcome or displacing a recorded Stop.",
+      "sourceCommits": [
+        "8cf65148946aad28240e5a9e15e2d3a676a37c1c"
+      ],
+      "evidencePaths": [
+        "server/src/__tests__/legacy-controller-lease-host-cancellation.test.ts",
+        "server/src/services/legacy-controller-lease.test.ts",
+        "server/src/services/run-cancellation.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Relevant regressions run against exact upstream SHA WITHOUT this patch; pass results retained.",
+        "Fresh independent review confirms upstream covers the original behavior and protected boundaries.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "FAC-760 STA-21 stage 12 (Coordinator disposition cd0354d8, card 6b2a12f5). Runs 19befcbc and d79920b9 (the only runs live 20:29-21:03Z, same server boot 0c006597, no lease revocation) ended provider success -> cancelled/unknown. Local adapters ignore the host abort signal; of the host abort sites only the lease watchdog writes nothing. This is a narrow port of upstream 8595efc2 attribution (LegacyControllerLeaseLostError, controller_lease source, controllerLeaseLoss timings). Not carried: upstream private liveness-pool renewal, statement-timeout retry and pre-dispatch controller_lease_lost failure code; the live loss cause is unrecorded, so they are not shown to fix it. Upstream already contains this behaviour, so the expected proposal is retire on upgrade once upstream-only regressions and independent review confirm it. The host file needs embedded Postgres; a host that cannot start it skips, which is unknown. Run with --isolation private-network-user.",
+      "upstreamOnly": {
+        "kind": "vitest",
+        "sourceSha": "8cf65148946aad28240e5a9e15e2d3a676a37c1c",
+        "testFiles": [
+          "server/src/__tests__/legacy-controller-lease-host-cancellation.test.ts",
+          "server/src/services/legacy-controller-lease.test.ts",
+          "server/src/services/run-cancellation.test.ts"
+        ],
+        "requiredTests": [
+          "legacy controller lease loss at the host completion boundary",
+          "types a rejected renewal as renewal_rejected",
+          "types a hung renewal at the lease deadline as renewal_deadline",
+          "types a failed periodic renewal as renewal_error",
+          "keeps a recorded operator Stop over a later lease-loss attribution",
+          "attributes a lease loss over an earlier unattributed stop"
+        ]
+      }
     }
   ],
   "requiredCiJobsNote": "Every lane of the reviewed expected CI graph (maintenance/ci-graph.json), regenerated from the candidate's exact workflow blobs: its pull_request workflows, the PR base branch's pull_request_target workflows and each immutable reusable workflow. Admission requires this set to equal the graph's lanes (R4: an aggregate such as `ci / verify` does not prove the lanes it does not need), and every observed check must also succeed. Path- or branch-filtered workflows are recorded as conditional: their checks must succeed when present but are not expected. Any change to a workflow blob changes the graph and needs fresh review.",
