@@ -38,6 +38,11 @@ import {
   readNativeReviewAssignmentContext,
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
+import {
+  admitRunClaimUnderUpgradeFence,
+  assertRunClaimUnderUpgradeFence,
+  isUpgradeFenceRefusal,
+} from "../upgrade-admission-fence.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
@@ -1367,6 +1372,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   })
                   .where(eq(heartbeatRuns.id, lockedRun.id));
               }
+              // FAC-797 admission fence: refuse before any admission write
+              // commits; the admission marker above rolls back with this.
+              await assertRunClaimUnderUpgradeFence(
+                tx as unknown as Db,
+                "queue.queued_comment_claim",
+              );
               const authoritativeIds = queuedCommentIdsFromWakePayload(
                 wake.payload,
               );
@@ -1504,6 +1515,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .catch((error) => {
               if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
+              if (isUpgradeFenceRefusal(error))
+                return { kind: "stale" as const, run: null };
               throw error;
             })
         : null;
@@ -1565,6 +1578,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           return tx.transaction(async (claimTx) => {
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
+            if (!(await admitRunClaimUnderUpgradeFence(claimTx as unknown as Db, "queue.claim")).admitted) return null;
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);

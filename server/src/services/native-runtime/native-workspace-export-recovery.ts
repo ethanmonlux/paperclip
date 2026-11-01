@@ -3,6 +3,7 @@ import { completionContracts, heartbeatRuns, issues, issueRecoveryActions, nativ
 import { publishLiveEvent } from "../live-events.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "../heartbeat-run-status-payload.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { admitRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-finalization-ownership.js";
 
 const UNSAFE_EXPORT = "native_workspace_sync_out_unsafe_archive";
@@ -28,6 +29,9 @@ export async function recoverLegacyUnsafeWorkspaceExports(db: Db, runIds?: strin
     const owned = await withNativeWorkspaceFinalizationOwnership({ db, ...candidate }, async ownership => {
       await ownership.assertHeld();
       return db.transaction(async tx => {
+        // FAC-797 admission fence: while held or missing, no re-admission and
+        // no recovery-action change; a later pass retries the candidate.
+        if (!(await admitRunClaimUnderUpgradeFence(tx as unknown as Db, "native_workspace_export.recovery")).admitted) return null;
         const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.issueId))).for("update").limit(1);
         const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
           eq(nativeRunFinalizations.companyId, candidate.companyId), eq(nativeRunFinalizations.runId, candidate.runId),

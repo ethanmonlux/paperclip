@@ -42,6 +42,7 @@ import {
   readNativeWorkspaceSyncReference,
 } from "./native-workspace-sync.js";
 import type { EnvironmentRuntimeService } from "../environment-runtime.js";
+import { admitRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 import { classifyNativeEvidence } from "./evidence-classifier.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
 import {
@@ -510,6 +511,9 @@ export async function claimNativeSessionResumptions(input: {
         return false;
       }
 
+      // FAC-797 admission fence: a held or missing fence leaves the
+      // retryable failure untouched for a later pass.
+      if (!(await admitRunClaimUnderUpgradeFence(tx as unknown as Db, "native_finalization.reopen")).admitted) return false;
       const leaseExpiresAt = new Date(now.getTime() + 20 * 60_000);
       const updated = await tx.update(nativeRunFinalizations).set({
         phase: "observed",

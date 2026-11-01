@@ -11,6 +11,7 @@ import { withNativeWorkspaceFinalizationOwnership } from "./native-workspace-fin
 import { readNativeWorkspaceSyncReference } from "./native-workspace-sync.js";
 import type { EnvironmentRuntimeService } from "../environment-runtime.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
+import { admitRunClaimUnderUpgradeFence } from "../upgrade-admission-fence.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const changed = () => conflict("The recorded export repair is no longer current. Refresh the task and inspect its run.", { code: "workspace_export_retry_stale" });
@@ -124,6 +125,10 @@ export async function retryNativeWorkspaceExport(input: {
       }
       await ownership.assertHeld();
       const admitted = await input.db.transaction(async tx => {
+        // FAC-797 admission fence: a held or missing fence refuses the retry
+        // before anything is written.
+        const fence = await admitRunClaimUnderUpgradeFence(tx as unknown as Db, "native_workspace_export.retry");
+        if (!fence.admitted) throw conflict("Workspace export retry is held by the upgrade admission fence. No provider turn was started.", { code: fence.code });
         const current = await inspect(tx as unknown as Db, true, resumeRequestId);
         if (current.result.id !== initial.result.id || current.lease.id !== initial.lease.id
           || current.reference.descriptorSha256 !== initial.reference.descriptorSha256) throw changed();
