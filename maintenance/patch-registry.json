@@ -644,6 +644,29 @@
         "kind": "manual-review",
         "reason": "Fork policy choice (credential the fork does not hold), not upstream behavior; upstream intentionally runs this workflow."
       }
+    },
+    {
+      "id": "upgrade-admission-fence",
+      "purpose": "Fork-only FAC-797 guarded-upgrade admission fence, phase 1: a persisted keyed instance_settings fence row, a fixed advisory lock, hold/abort/status routes and a gate on every write that moves a heartbeat run to running. Effect reservations, the activation inventory, the updater and the bootstrap are later phases.",
+      "sourceCommits": [
+        "1a7b30c85573f619be9a6cac4a6852db09d038c3"
+      ],
+      "evidencePaths": [
+        "server/src/services/upgrade-admission-fence.ts",
+        "server/src/__tests__/upgrade-admission-fence.test.ts",
+        "server/src/__tests__/upgrade-admission-fence-native-review.test.ts"
+      ],
+      "decision": "unassessed",
+      "retirementRequires": [
+        "Upstream ships a persisted, authenticated admission fence that refuses run claims across restart and is proven by these regressions run against an exact upstream SHA without this patch.",
+        "Fresh independent review confirms upstream covers the fence, its claim gates and its fail-closed absent-row behaviour.",
+        "Final combined candidate exact-head CI and runtime qualification pass."
+      ],
+      "notes": "STA-21 stage 23, card 21d9515d, Coordinator disposition cdfa9a26, admission-design revision 7. Q-6 profile P1 is the phase-1 implementation and test bound only. A fence-capable payload over an existing database without the row refuses all run claims until the owner bootstraps (R11); nothing installs one.",
+      "upstreamOnly": {
+        "kind": "manual-review",
+        "reason": "New fork-only feature: upstream 8595efc2 and master 050365e0 have only the process-local task drain and a read-only readiness report (admission-design r1 §2.5), so there is no upstream behaviour to regress. Upstream-only receipts for the phase-1 cases are a later stage."
+      }
     }
   ],
   "requiredCiJobsNote": "Every lane of the reviewed expected CI graph (maintenance/ci-graph.json), regenerated from the candidate's exact workflow blobs: its pull_request workflows, the PR base branch's pull_request_target workflows and each immutable reusable workflow. Admission requires this set to equal the graph's lanes (R4: an aggregate such as `ci / verify` does not prove the lanes it does not need), and every observed check must also succeed. Path- or branch-filtered workflows are recorded as conditional: their checks must succeed when present but are not expected. Any change to a workflow blob changes the graph and needs fresh review. The inherited commitperclip `review` lane (pull_request_target, base-branch workflow) stays required until the PR base no longer carries that workflow or it is disabled by a supported, verified GitHub workflow disable; a source change on the candidate alone does not remove it (FAC-760 69065bff).",
