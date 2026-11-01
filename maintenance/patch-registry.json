@@ -651,13 +651,15 @@
       "sourceCommits": [
         "1a7b30c85573f619be9a6cac4a6852db09d038c3",
         "2ddf8e0a9140c9b8c323c04dbbe9f62de369bcb9",
-        "ea62a1df6ab76461524c0ff1c342149dcb42a7ff"
+        "ea62a1df6ab76461524c0ff1c342149dcb42a7ff",
+        "434236a399a0d4114def919d7d29eff9c89c3e44"
       ],
       "evidencePaths": [
         "server/src/services/upgrade-admission-fence.ts",
         "server/src/__tests__/upgrade-admission-fence.test.ts",
         "server/src/__tests__/upgrade-admission-fence-native-review.test.ts",
-        "server/src/__tests__/upgrade-admission-fence-effects.test.ts"
+        "server/src/__tests__/upgrade-admission-fence-effects.test.ts",
+        "server/src/__tests__/upgrade-admission-fence-effects-fk.test.ts"
       ],
       "decision": "unassessed",
       "retirementRequires": [
@@ -665,7 +667,7 @@
         "Fresh independent review confirms upstream covers the fence, its claim gates and its fail-closed absent-row behaviour.",
         "Final combined candidate exact-head CI and runtime qualification pass."
       ],
-      "notes": "STA-21 stage 23, card 21d9515d, Coordinator disposition cdfa9a26, admission-design revision 7. Stage 24 (2ddf8e0a, card 38e1ba7b, disposition d4644232): STA-22 R16 transaction-bound transition audit for hold, abort and every expiry; R17 whole-claim rollback on a fence refusal; OpenAPI sync of the three fence routes. Stage 25 (ea62a1df, card b84350f3, disposition e570dc21, admission-design revision 9): phase 2a effect-reservation gate at 28 pinned write sites across rows a–k (row l has no reservation); refusal writes nothing and starts no outbound effect; N7 site pin and writer-set scan. Behaviour cases cover rows a–e only. Q-6 profile P1 is the phase-1 implementation and test bound only. A fence-capable payload over an existing database without the row refuses all run claims until the owner bootstraps (R11); nothing installs one.",
+      "notes": "STA-21 stage 23, card 21d9515d, Coordinator disposition cdfa9a26, admission-design revision 7. Stage 24 (2ddf8e0a, card 38e1ba7b, disposition d4644232): STA-22 R16 transaction-bound transition audit for hold, abort and every expiry; R17 whole-claim rollback on a fence refusal; OpenAPI sync of the three fence routes. Stage 25 (ea62a1df, card b84350f3, disposition e570dc21, admission-design revision 9): phase 2a effect-reservation gate at 28 pinned write sites across rows a–k (row l has no reservation); refusal writes nothing and starts no outbound effect; N7 site pin and writer-set scan. Stage 26 (434236a3, card c6437dbe, disposition 26f95032): STA-22 R18, every Speko setup attempt re-arms its receipt in the gated transaction and the lifecycle receipt covers the voice-defaults PATCH; executed held and open cases for one real writer per row f–k. The other f–k sites remain structurally pinned only. Q-6 profile P1 is the phase-1 implementation and test bound only. A fence-capable payload over an existing database without the row refuses all run claims until the owner bootstraps (R11); nothing installs one.",
       "upstreamOnly": {
         "kind": "manual-review",
         "reason": "New fork-only feature: upstream 8595efc2 and master 050365e0 have only the process-local task drain and a read-only readiness report (admission-design r1 §2.5), so there is no upstream behaviour to regress. Upstream-only receipts for the phase-1 cases are a later stage."
