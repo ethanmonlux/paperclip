@@ -18,10 +18,14 @@ import {
   companyMemberships,
   createDb,
   issueThreadInteractions,
+  executionWorkspaces,
   issueWorkProducts,
   issues,
+  projectWorkspaces,
+  projects,
   toolApplications,
   toolConnections,
+  workspaceOperations,
 } from "@paperclipai/db";
 import type { AttentionItem } from "@paperclipai/shared";
 import { errorHandler } from "../middleware/index.js";
@@ -824,6 +828,71 @@ describeEmbeddedPostgres("founder notifications", () => {
       expect(all[1]!.payload).toMatchObject({ observationGaps: 1, maxObservationGapMs: 6 * h.S });
       expect(await h.cards()).toEqual(["published", "published"]);
       expect(await h.notices()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("judges a done terminal held by its workspace-finalize barrier only by what complete sweeps observe", async () => {
+    const fixture = await seed();
+    await enabledRoute(fixture, FOUNDER_NOTIFICATION_STALL_AFTER_MS_MIN);
+    try {
+      const h = await blockerStallHarness(fixture);
+      const [project] = await db.insert(projects).values({ companyId: fixture.companyId, name: "Finalize project", status: "in_progress" }).returning();
+      const [projectWorkspace] = await db
+        .insert(projectWorkspaces)
+        .values({ companyId: fixture.companyId, projectId: project!.id, name: "Primary", sourceType: "local_path", visibility: "default", isPrimary: true })
+        .returning();
+      const [executionWorkspace] = await db
+        .insert(executionWorkspaces)
+        .values({
+          companyId: fixture.companyId,
+          projectId: project!.id,
+          projectWorkspaceId: projectWorkspace!.id,
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          name: "Terminal workspace",
+          status: "active",
+          providerType: "git_worktree",
+        })
+        .returning();
+      await db.update(issues).set({ projectId: project!.id, executionWorkspaceId: executionWorkspace!.id }).where(eq(issues.id, fixture.task.id));
+      const operation = (phase: string, status: string) =>
+        db.insert(workspaceOperations).values({ companyId: fixture.companyId, executionWorkspaceId: executionWorkspace!.id, issueId: fixture.task.id, phase, status, startedAt: new Date() });
+      const b = await h.dependent("Dependent B");
+      const service = h.newService();
+      h.at(0);
+      await h.hold(b);
+      await service.sweep();
+      h.at(1);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "open", null]]);
+      await h.publishPending();
+
+      // The terminal completes, but its last workspace operation has not
+      // finalized, so the dependent stays held.
+      h.at(1.2);
+      await operation("worktree_prepare", "succeeded");
+      h.at(1.5);
+      await issueService(db).update(fixture.task.id, { status: "done" });
+      expect(await h.blockerFacts()).toHaveLength(1);
+      h.at(2);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "open", null]]);
+      expect(await h.cards()).toEqual(["published"]);
+      expect(await h.notices()).toHaveLength(0);
+      expect((await h.tokens()).map(([, status]) => status)).toEqual(["issued"]);
+
+      // Sync-back lands: a complete sweep observes the stall absent.
+
+      h.at(2.5);
+      await operation("workspace_finalize", "succeeded");
+      expect(await h.blockerFacts()).toHaveLength(0);
+      h.at(3);
+      await service.sweep();
+      expect(await h.summary()).toEqual([[1, "resolved", "item_cleared"]]);
+      expect(await h.notices()).toHaveLength(1);
+      expect((await h.tokens()).map(([, status]) => status)).toEqual(["expired"]);
     } finally {
       vi.useRealTimers();
     }
