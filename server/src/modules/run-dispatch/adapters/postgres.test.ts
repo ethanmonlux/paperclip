@@ -210,10 +210,16 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       contextSnapshot: { issueId, source: "issue.interaction.created", wakeReason: "interaction_pending",
         interactionKind: "request_confirmation", interactionId, sourceRunId },
     });
-    // Upstream accounting admission: the final locked dispatch gate requires the
-    // run's held budget reservation, exactly as the other final-gate cases seed it.
-    const reservationId = status === "running" ? (await reserveRunBudget(db, companyId, runId, null)).id : undefined;
-    return { companyId, agentId, ownerId, issueId, interactionId, sourceRunId, runId, now, reservationId };
+    return { companyId, agentId, ownerId, issueId, interactionId, sourceRunId, runId, now };
+  }
+
+  // Upstream accounting admission: the final locked dispatch gate requires the
+  // run's held budget reservation, exactly as the other final-gate cases seed it.
+  async function seedRunningAddressedHandoff() {
+    const f = await seedAddressedHandoff("running");
+    const reservation = await reserveRunBudget(db, f.companyId, f.runId, null);
+    expect(reservation).toMatchObject({ runId: f.runId, state: "held", reused: false });
+    return { ...f, reservationId: reservation.id };
   }
 
   it("admits a persisted addressed handoff without reassignment or source checkout", async () => {
@@ -230,7 +236,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   it("dispatches the addressed recipient only while the invitation and execution lock remain current", async () => {
-    const f = await seedAddressedHandoff("running");
+    const f = await seedRunningAddressedHandoff();
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     const dispatch = vi.fn(async () => "recipient started");
     const outcome = await createPostgresRunDispatchAdapter(db)
@@ -250,7 +256,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     ["accounting admission", 1, ["revoked"], false],
     ["final ownership handoff", 2, ["dispatch", "revoked"], true],
   ] as const)("serializes concurrent invitation cancellation with the %s phase", async (_phase, readNumber, expectedOrder, dispatched) => {
-    const f = await seedAddressedHandoff("running");
+    const f = await seedRunningAddressedHandoff();
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     let read!: () => void, release!: () => void, cancelPid!: (pid: number) => void;
     const readDone = new Promise<void>(resolve => { read = resolve; });
@@ -300,7 +306,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
-    const f = await seedAddressedHandoff("running");
+    const f = await seedRunningAddressedHandoff();
     const adapter = createPostgresRunDispatchAdapter(db);
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, f.interactionId));
