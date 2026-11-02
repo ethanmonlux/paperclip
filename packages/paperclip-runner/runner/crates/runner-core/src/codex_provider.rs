@@ -61,14 +61,22 @@ pub(crate) fn runtime_notification_codex_args(
         let Some(filesystem) = config["filesystem"].as_inline_table_mut() else {
             continue;
         };
-        // Every notification path is granted `read`, including the activity FIFO. Codex
-        // treats a `write` entry as a writable root and binds protected metadata names
-        // (`.git`, `.aws`, ...) beneath it without a directory check, which aborts sandbox
-        // setup for a FIFO. A read-only bind still lets the helper open the FIFO for
-        // writing (it is IPC, not persistent data), while replacing, unlinking or creating
-        // entries beside it is denied. The helper keeps its NOFOLLOW and FIFO type checks.
-        for path in paths {
-            filesystem.insert(path.to_string_lossy().as_ref(), "read".into());
+        // The helper, context and lock are always `read`. The activity FIFO is `read` only on
+        // Linux: there Codex treats a `write` entry as a writable root and binds protected
+        // metadata names (`.git`, `.aws`, ...) beneath it without a directory check, which
+        // aborts bwrap setup for a FIFO, while a `read` grant is a read-only bind that still
+        // lets the helper open the FIFO for writing (it is IPC, not persistent data; Linux
+        // does not apply EROFS to FIFOs) and denies replacing, unlinking or creating entries
+        // beside it. Other Unix sandboxes (macOS Seatbelt maps `read` to `file-read*` only)
+        // keep the `write` grant until that behaviour is qualified there. The helper keeps its
+        // NOFOLLOW and FIFO type checks on every platform.
+        let fifo_mode = if cfg!(target_os = "linux") {
+            "read"
+        } else {
+            "write"
+        };
+        for (path, mode) in paths.iter().zip(["read", "read", "read", fifo_mode]) {
+            filesystem.insert(path.to_string_lossy().as_ref(), mode.into());
         }
         extra.extend(["-c".into(), format!("{prefix}{filesystem}")]);
     }
@@ -4315,6 +4323,11 @@ mod tests {
             ]
         );
         let serialized = extra.join("\n");
+        let fifo_mode = if cfg!(target_os = "linux") {
+            "read"
+        } else {
+            "write"
+        };
         for profile in [
             "paperclip-runner-workspace-only",
             "paperclip-runner-workspace-read-only",
@@ -4334,7 +4347,7 @@ mod tests {
                 ("/runtime/runnerd", "read"),
                 ("/state/private/runtime-notifications.json", "read"),
                 ("/state/private/runtime-activity.lock", "read"),
-                ("/tmp/prn-channel", "read"),
+                ("/tmp/prn-channel", fifo_mode),
             ] {
                 assert_eq!(
                     filesystem.get(path).and_then(toml_edit::Value::as_str),

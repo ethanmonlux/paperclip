@@ -666,13 +666,19 @@ mod tests {
         fs::remove_dir_all(pipe.parent().unwrap()).unwrap();
     }
     #[test]
-    fn codex_profile_grants_notification_paths_read_only_including_the_fifo() {
-        // Codex treats every `write` entry as a writable root and binds protected
+    fn codex_profile_grants_notification_paths_read_only_and_the_fifo_read_only_on_linux() {
+        // On Linux Codex treats every `write` entry as a writable root and binds protected
         // `.git`/`.agents`/`.codex`/`.aws` names beneath it without a directory check,
-        // so a `write` grant on the activity FIFO aborts sandbox setup (ENOTDIR) before
+        // so a `write` grant on the activity FIFO aborts bwrap setup (ENOTDIR) before
         // any tool runs. A `read` grant is a read-only bind: opening the FIFO for writing
         // still delivers frames (read-only mounts do not apply EROFS to FIFOs), while
-        // replacing, unlinking or creating entries beside it is denied.
+        // replacing, unlinking or creating entries beside it is denied. Other Unix
+        // sandboxes (macOS Seatbelt maps `read` to `file-read*` only) keep `write`.
+        let fifo_mode = if cfg!(target_os = "linux") {
+            "read"
+        } else {
+            "write"
+        };
         let profiles = [
             "paperclip-runner-workspace-only",
             "paperclip-runner-workspace-read-only",
@@ -701,13 +707,13 @@ mod tests {
                 .parse::<toml_edit::DocumentMut>()
                 .unwrap();
             let filesystem = config["filesystem"].as_inline_table().unwrap();
-            for path in &paths {
+            for (path, mode) in paths.iter().zip(["read", "read", "read", fifo_mode]) {
                 assert_eq!(
                     filesystem
                         .get(path.to_str().unwrap())
                         .and_then(toml_edit::Value::as_str),
-                    Some("read"),
-                    "{profile} must grant {} read-only",
+                    Some(mode),
+                    "{profile} must grant {} {mode}",
                     path.display()
                 );
             }
@@ -804,18 +810,30 @@ mod tests {
                 "-c".into(), format!("permissions.{name}.network.enabled=false")]);
         }
         let extra = crate::codex_provider::runtime_notification_codex_args(&args, profile, &paths);
-        let script = r#"
+        // The FIFO is a read-only bind only on Linux; elsewhere it keeps a `write` grant, so
+        // unlink/rename denial of the FIFO itself is asserted on Linux only.
+        let fifo_replacement_checks = if cfg!(target_os = "linux") {
+            r#"if rm -f "$5" 2>/dev/null; then exit 78; fi
+if mv "$5" "$5.moved" 2>/dev/null; then exit 79; fi
+"#
+        } else {
+            ""
+        };
+        let script = [
+            r#"
 [ -z "${UNRELATED_SECRET:-}" ] || exit 70
 if cat "$1" >/dev/null 2>&1; then exit 71; fi
 if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then exit 72; fi
 if touch "$2/probe" 2>/dev/null; then exit 75; fi
 if touch "$3/probe" 2>/dev/null; then exit 76; fi
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
-if rm -f "$5" 2>/dev/null; then exit 78; fi
-if mv "$5" "$5.moved" 2>/dev/null; then exit 79; fi
-context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
+"#,
+            fifo_replacement_checks,
+            r#"context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
 "$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" record-activity "$context" example.runtime desktop.used || exit 74
-"#;
+"#,
+        ]
+        .concat();
         let mut child = Command::new(command)
             .args(args)
             .args(extra)
