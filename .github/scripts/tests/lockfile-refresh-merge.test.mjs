@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 
 const workflow = readFileSync(new URL("../../workflows/refresh-lockfile.yml", import.meta.url), "utf8");
 const stepNames = [...workflow.matchAll(/^      - name: (.+)$/gm)].map((match) => match[1]);
@@ -65,4 +66,18 @@ test("the bot merges only the commit this job pushed", () => {
   assert.match(merge, /HEAD_SHA: \$\{\{ steps\.upsert-pr\.outputs\.head_sha \}\}/);
   assert.match(merge, /GH_TOKEN: \$\{\{ steps\.bot-token\.outputs\.token \}\}/);
   assert.match(merge, /gh pr merge "\$PR_URL" .*--match-head-commit "\$HEAD_SHA"/);
+});
+
+
+test("scheduled writes and bypass credentials are excluded from forks", () => {
+  const expression = workflow.match(/^    if: (.+)$/m)?.[1];
+  assert.equal(expression, "github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064'");
+  const evaluate = (repository, repository_id) => runInNewContext(
+    expression.replaceAll("github.repository_id", "repository_id").replaceAll("github.repository", "repository"),
+    { repository, repository_id },
+  );
+  assert.equal(evaluate("paperclipai/paperclip", "1170821064"), true);
+  assert.equal(evaluate("ethanmonlux/paperclip", "1434937120"), false);
+  assert.equal(evaluate("paperclipai/paperclip", "1434937120"), false);
+  assert.equal(evaluate("ethanmonlux/paperclip", "1170821064"), false);
 });
