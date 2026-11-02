@@ -48,10 +48,11 @@ interface NetworkAllowlistProxy {
   close: () => Promise<void>;
 }
 
+// Mount /usr before merged-usr aliases so Bubblewrap can resolve /bin and /lib.
 const SYSTEM_READ_PATHS = [
+  "/usr",
   "/bin",
   "/sbin",
-  "/usr",
   "/lib",
   "/lib64",
   "/etc/ca-certificates",

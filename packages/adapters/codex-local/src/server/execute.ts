@@ -331,6 +331,34 @@ function managedMcpGatewaysFromContext(context: Record<string, unknown>): Manage
 type ResolvedExecutionTarget = ReturnType<typeof readAdapterExecutionTarget>;
 type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
 
+/**
+ * A run-selected subscription home may be a short-lived provider directory.
+ * Managed skill homes symlink its auth.json, but the filesystem sandbox only
+ * mounts the managed home by default. Bind exactly that verified source file,
+ * read-only, so the symlink resolves without exposing the provider directory.
+ * Never select an unrelated account or a missing/expired temporary source.
+ */
+export async function resolveRunScopedCodexCredentialMount(
+  effectiveCodexHome: string,
+  runtimeCredentialHome: string | null,
+): Promise<string | null> {
+  if (!runtimeCredentialHome || path.resolve(effectiveCodexHome) === path.resolve(runtimeCredentialHome)) {
+    return null;
+  }
+  const managedAuthPath = path.join(effectiveCodexHome, "auth.json");
+  const sourceAuthPath = path.join(runtimeCredentialHome, "auth.json");
+  const managedAuth = await fs.lstat(managedAuthPath).catch(() => null);
+  if (!managedAuth?.isSymbolicLink()) return null;
+  const [managedTarget, expectedSource, sourceFile] = await Promise.all([
+    fs.realpath(managedAuthPath).catch(() => null),
+    fs.realpath(sourceAuthPath).catch(() => null),
+    fs.stat(sourceAuthPath).catch(() => null),
+  ]);
+  return managedTarget && expectedSource && managedTarget === expectedSource && sourceFile?.isFile()
+    ? sourceAuthPath
+    : null;
+}
+
 type SandboxCodexAuthProbeResult = "present" | "absent" | "unknown";
 
 /**
@@ -1043,12 +1071,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScopedCredentialMount = filesystemScope && runtimeSkillDigest
+      ? await resolveRunScopedCodexCredentialMount(effectiveCodexHome, runtimeCredentialHome)
+      : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [
+              { path: effectiveCodexHome, access: "rw" },
+              ...(runScopedCredentialMount ? [{ path: runScopedCredentialMount, access: "ro" as const }] : []),
+            ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases

@@ -16,8 +16,9 @@ const CODEX_REFRESH_TOKEN_REUSED_RE =
 const CODEX_REFRESH_TOKEN_EXPIRED_RE =
   /(?:refresh[_\s-]?token[_\s-]?expired|refresh token (?:has )?expired|expired refresh token)/i;
 const CODEX_REFRESH_TOKEN_INVALIDATED_RE =
-  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been )?(?:invalidated|revoked|invalid)|invalid refresh token|missing bearer)/i;
+  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been )?(?:invalidated|revoked|invalid)|invalid refresh token)/i;
 const CODEX_OAUTH_INVALID_GRANT_RE = /\binvalid_grant\b/i;
+const CODEX_MISSING_AUTH_HEADER_RE = /(?:missing bearer(?: or basic authentication)?(?: in header)?|missing authorization header)/i;
 const CODEX_CONTEXTUAL_REFRESH_AUTH_INVALIDATED_RE =
   /(?:(?:oauth|refresh|access[_\s-]?token|bearer|credential).{0,80}(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b)|(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b).{0,80}(?:oauth|refresh|access[_\s-]?token|bearer|credential))/i;
 
@@ -165,6 +166,16 @@ export function classifyCodexAuthRefreshFailure(input: {
   errorMessage?: string | null;
 }): CodexAuthRefreshFailureClass | null {
   const haystack = buildCodexErrorHaystack(input);
+
+  // An absent request header is a credential-delivery failure, not proof of
+  // a revoked OAuth refresh token. Preserve explicit refresh-token errors.
+  if (CODEX_MISSING_AUTH_HEADER_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_INVALIDATED_RE.test(haystack)
+    && !CODEX_OAUTH_INVALID_GRANT_RE.test(haystack)) {
+    return null;
+  }
 
   if (CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)) return "refresh_token_reused";
   if (CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)) return "refresh_token_expired";

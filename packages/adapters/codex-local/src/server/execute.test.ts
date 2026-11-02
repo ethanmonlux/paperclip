@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -57,7 +57,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, resolveRunScopedCodexCredentialMount } from "./execute.js";
 
 // Mirror the sandbox core's restore closure: capture the assets `execute()`
 // declares, then during teardown invoke each asset's `restore` with an injected
@@ -339,5 +339,52 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       hostAuth: subscriptionAuth({ accountId: "acct", marker: "host" }),
     });
     expect(result.executionResult.errorMessage).toBe("provider failed first");
+  });
+});
+
+
+describe("Codex skill runtime credential sandbox", () => {
+  it("mounts only a verified temporary provider auth file, never its directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-mount-"));
+    try {
+      const provider = path.join(root, "provider");
+      const runtime = path.join(root, "skill-runtime");
+      await mkdir(provider);
+      await mkdir(runtime);
+      const credentialFile = path.join(provider, "auth.json");
+      await writeFile(credentialFile, "disposable-test-credential", { mode: 0o600 });
+      await symlink(credentialFile, path.join(runtime, "auth.json"));
+
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBe(credentialFile);
+      // No mount is needed if the source is already the run's managed home.
+      expect(await resolveRunScopedCodexCredentialMount(provider, provider)).toBeNull();
+
+      const unrelated = path.join(root, "unrelated");
+      await mkdir(unrelated);
+      await writeFile(path.join(unrelated, "auth.json"), "other-account", { mode: 0o600 });
+      // A mismatched credential path is not an authorized mount.
+      expect(await resolveRunScopedCodexCredentialMount(runtime, unrelated)).toBeNull();
+      expect(await resolveRunScopedCodexCredentialMount(runtime, null)).toBeNull();
+
+      await rm(credentialFile);
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mount an arbitrary host source for a regular managed auth file", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-regular-"));
+    try {
+      const provider = path.join(root, "provider");
+      const runtime = path.join(root, "skill-runtime");
+      await mkdir(provider);
+      await mkdir(runtime);
+      await writeFile(path.join(provider, "auth.json"), "source", { mode: 0o600 });
+      await writeFile(path.join(runtime, "auth.json"), "managed", { mode: 0o600 });
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
