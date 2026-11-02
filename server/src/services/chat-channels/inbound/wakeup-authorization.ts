@@ -1,3 +1,4 @@
+import { chatWakeAuthorityDenied } from "./wakeup-authorization-error.js";
 import { nonDirectDestinationAllowed } from "./surfaces.js";
 import { lifecycleRuntimeFence } from "./delivery-ledger.js";
 import type { DbTransaction, DbOrTransaction } from "../runtime-types.js";
@@ -45,11 +46,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
     notice?: { nonblocking: true; terminal: boolean; taskRetry?: TaskRetryWakeAuthority },
   ) {
     const payload = action.payload;
-    const deny = () =>
-      forbidden(
-        "This accepted chat message is no longer authorized to start work",
-        { code: "chat_action_authorization_changed" },
-      );
+    const deny = chatWakeAuthorityDenied;
     if (
       payload.version !== 1 ||
       typeof payload.issueId !== "string" ||
@@ -61,7 +58,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       !["user", "system"].includes(String(payload.requestedByActorType)) ||
       typeof payload.requestedByActorId !== "string"
     )
-      throw deny();
+      throw deny("source_shape");
     const issue = await tx
       .select()
       .from(issues)
@@ -80,7 +77,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       (!notice?.terminal &&
         ["backlog", "done", "cancelled"].includes(issue.status))
     )
-      throw deny();
+      throw deny("task_assignment");
     // The scheduler already owns the issue lock. Do not wait in the opposite
     // order behind an ingress transaction which owns the endpoint first.
     const endpoint = await tx
@@ -117,13 +114,11 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       delivery.endpointId !== endpoint.id ||
       delivery.conversationId !== action.conversationId ||
       delivery.principalId !== action.principalId ||
-      !currentFence ||
-      !(await runtimeCallbackEndpoint(tx as unknown as DbTransaction, endpoint.id, currentFence, [
-        "verifying",
-        "active",
-      ]))
+      !currentFence
     )
-      throw deny();
+      throw deny("delivery_binding");
+    if (!(await runtimeCallbackEndpoint(tx as unknown as DbTransaction, endpoint.id, currentFence, ["verifying", "active"])))
+      throw deny("runtime_fence");
     const conversation = await tx
       .select()
       .from(chatConversations)
@@ -143,7 +138,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       conversation.sessionGeneration !== payload.sessionGeneration ||
       !["active", "waiting"].includes(conversation.state)
     )
-      throw deny();
+      throw deny("conversation_binding");
     const resource = conversation.resourceId
       ? await tx
         .select()
@@ -163,15 +158,15 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       endpoint,
       action.principalId,
     );
-    if (notice?.taskRetry && !githubTaskRetryDestinationMatches(delivery, conversation, resource)) throw deny();
+    if (notice?.taskRetry && !githubTaskRetryDestinationMatches(delivery, conversation, resource)) throw deny("destination_binding");
     if (endpoint.provider === "github") {
       const automatic = await resolveGitHubWakeAuthority(tx, endpoint, delivery);
-      if (automatic.kind === "denied") throw deny();
+      if (automatic.kind === "denied") throw deny("automatic_policy");
       if (automatic.kind === "allowed") authorization.userId = automatic.userId;
     }
     if (!(await canActorReadIssuePrivacy(tx, authorization.userId
       ? { type: "board", userId: authorization.userId }
-      : { type: "none" }, issue))) throw deny();
+      : { type: "none" }, issue))) throw deny("task_privacy");
     const expectedUserId =
       payload.requestedByActorType === "user"
         ? payload.requestedByActorId
@@ -185,7 +180,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       (payload.requestedByActorType === "system" &&
         payload.requestedByActorId !== action.principalId)
     )
-      throw deny();
+      throw deny("principal_access");
     const source = await tx
       .select({
         authorUserId: issueComments.authorUserId,
@@ -217,7 +212,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
       (source.deletedAt && !notice?.terminal) ||
       source.authorUserId !== expectedUserId
     )
-      throw deny();
+      throw deny("source_comment");
     return { issue, delivery, endpoint, conversation, resource,
       ...(notice?.taskRetry && currentFence ? { retryRuntimeFence: currentFence } : {}) };
   }

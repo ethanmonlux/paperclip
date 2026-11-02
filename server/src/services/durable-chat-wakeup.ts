@@ -21,6 +21,21 @@ const committedChatResponseAuthorities = new WeakMap<
   CommittedChatResponseAuthority
 >();
 
+const committedChatResponseAuthorityListeners = new WeakMap<Db, Set<() => void>>();
+
+export function onCommittedChatResponseAuthorityRegistered(db: Db, listener: () => void): () => void {
+  let listeners = committedChatResponseAuthorityListeners.get(db);
+  if (!listeners) {
+    listeners = new Set();
+    committedChatResponseAuthorityListeners.set(db, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && committedChatResponseAuthorityListeners.get(db) === listeners) committedChatResponseAuthorityListeners.delete(db);
+  };
+}
+
 export class CommittedChatResponseAuthorizationError extends HttpError {
   constructor() {
     super(
@@ -41,6 +56,7 @@ export function registerCommittedChatResponseAuthority(
   authority: CommittedChatResponseAuthority,
 ): () => void {
   committedChatResponseAuthorities.set(db, authority);
+  for (const listener of committedChatResponseAuthorityListeners.get(db) ?? []) listener();
   return () => {
     if (committedChatResponseAuthorities.get(db) === authority) {
       committedChatResponseAuthorities.delete(db);
@@ -181,6 +197,19 @@ export function unadmittedChatWakeupCondition(
           and chat_admission.agent_id::text = chat_unadmitted.payload->>'agentId'
           and chat_admission.status <> 'skipped'
       )
+      and not exists (
+        select 1 from chat_actions chat_retry
+        join agent_wakeup_requests chat_retry_admission on chat_retry_admission.id = chat_retry.id
+        where chat_retry.company_id = chat_unadmitted.company_id
+          and chat_retry.endpoint_id = chat_unadmitted.endpoint_id
+          and chat_retry.conversation_id = chat_unadmitted.conversation_id
+          and chat_retry.kind = 'failed_run_retry'
+          and chat_retry.payload->'taskRetryInput'->'skippedActionIds' ? chat_unadmitted.id::text
+          and chat_retry.payload->>'issueId' = chat_unadmitted.payload->>'issueId'
+          and chat_retry_admission.company_id = chat_retry.company_id
+          and chat_retry_admission.agent_id::text = chat_retry.payload->>'agentId'
+          and chat_retry_admission.status <> 'skipped'
+      )
       and (chat_unadmitted.status <> 'failed' or not exists (
         select 1 from chat_actions chat_later
         join agent_wakeup_requests chat_later_admission on chat_later_admission.id = chat_later.id
@@ -198,6 +227,23 @@ export function unadmittedChatWakeupCondition(
   )`;
 }
 
+export interface DeferredChatWakeScope {
+  companyId: string;
+  agentId: string;
+  issueId: string;
+  requestId: string;
+}
+const deferredChatWakeOwners = new WeakMap<Db, (input: DeferredChatWakeScope) => Promise<void>>();
+
+/** The live inbound owner reauthorizes the original source. Cleanup owns no chat authority. */
+export function registerDeferredChatWakeOwner(db: Db, owner: (input: DeferredChatWakeScope) => Promise<void>) {
+  deferredChatWakeOwners.set(db, owner);
+  return () => { if (deferredChatWakeOwners.get(db) === owner) deferredChatWakeOwners.delete(db); };
+}
+export async function resumeDeferredChatWake(db: Db, input: DeferredChatWakeScope) {
+  await deferredChatWakeOwners.get(db)?.(input);
+}
+
 /** Internal authority: this object cannot be supplied through a JSON API. */
 export interface DurableChatWakeupRequest {
   readonly id: string;
@@ -210,6 +256,8 @@ export interface DurableChatWakeupRequest {
   readonly requestedAt: Date;
   readonly idempotencyKey: string;
   readonly failedRunRetry?: { readonly failedRunId: string };
+  /** Only the current inbound owner may reconsider its already saved, unconsumed receipt. */
+  readonly resumeDeferred?: true;
   readonly authorize: (tx: Db) => Promise<void>;
   readonly onAdmitted?: (tx: Db, receipt: { runId: string | null }) => Promise<void>;
 }

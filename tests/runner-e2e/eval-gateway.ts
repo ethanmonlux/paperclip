@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { once } from "node:events";
 import { braintrustGatewayRequestParent } from "./braintrust-gateway-context.js";
 import { usdToUnits } from "../../packages/shared/src/money.js";
-import { estimateProviderCost, ProviderUsageAccumulator, type EvalModelPrice, type ProviderUsageReceipt } from "./provider-usage.js";
+import { estimateProviderCost, matchesPriceResponseModel, ProviderUsageAccumulator, validatePriceResponseModels, type EvalModelPrice, type ProviderUsageReceipt } from "./provider-usage.js";
 import { EvalAdmissionError, validEvalLedgerId, type EvalChargeIdentity, type openEvalCostLedger } from "./cost-ledger.js";
 
 type Ledger = Awaited<ReturnType<typeof openEvalCostLedger>>;
@@ -34,6 +34,7 @@ const row = (value: unknown): Record<string, unknown> => value && typeof value =
 class EvalRequestError extends Error {}
 
 export function evalRequestReservation(route: EvalGatewayRoute): string {
+  validatePriceResponseModels(route.price);
   if (route.provisionalBound !== undefined) validateCostBoundEvidence(route.provisionalBound);
   if (![route.maximumInputTokens, route.maximumOutputTokens, route.timeoutMs].every(n => Number.isSafeInteger(n) && n > 0)
       || route.timeoutMs > 300_000 || route.provider !== route.price.provider || !validEvalLedgerId(route.price.version) || !validEvalLedgerId(route.price.model)) throw new Error("Invalid eval gateway limits or price identity");
@@ -150,7 +151,7 @@ export async function forwardEvalRequest(input: {
     receipt.clientDisconnected = true; receipt.outcome = "cancelled"; receipt.errorCode ??= "client_disconnected";
     return true;
   };
-  const usage = new ProviderUsageAccumulator(route.provider, body);
+  const usage = new ProviderUsageAccumulator(route.provider, body, route.price);
   const bound = modelReservationBound(route, reservation);
   await ledger.reserve(requestId, input.identity, reservation, bound);
   const abort = new AbortController();
@@ -222,7 +223,7 @@ export async function forwardEvalRequest(input: {
       receipt.errorCode ??= "invalid_usage";
     }
     const observedInput = observed.tokenBounds?.input ?? 0;
-    if (bound && (observed.tokenBounds?.valid === false || receipt.errorCode === "invalid_usage" || observed.model !== undefined && observed.model !== route.price.model
+    if (bound && (observed.tokenBounds?.valid === false || receipt.errorCode === "invalid_usage" || observed.model !== undefined && !matchesPriceResponseModel(route.price, observed.model)
         || !Number.isSafeInteger(observedInput) || observedInput > route.maximumInputTokens
         || (observed.tokenBounds?.output ?? 0) > route.maximumOutputTokens
         || route.mode === "braintrust" && (!response || receipt.endpoint !== route.endpointName

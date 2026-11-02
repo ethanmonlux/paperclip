@@ -50,6 +50,65 @@ describe("OpenCode MCP bridge", () => {
     });
   });
 
+  it("delivers a complete large assigned-tool result and replays its receipt without repeating the action", async () => {
+    const files = Array.from({ length: 27 }, (_, index) => ({
+      filename: `src/public-fixture-${index}.ts`,
+      patch: `@@ synthetic public fixture ${index} @@\n${"+ documented change\n".repeat(220)}`,
+    }));
+    const data = { items: files, page: 1, hasMore: false, receipt: "LAST_FILE_AND_RECEIPT_INTACT" };
+    const result = { content: [{ type: "text", text: JSON.stringify(data) }], data };
+    expect(JSON.stringify(result).length).toBeGreaterThan(111_877);
+    const handler = vi.fn(async () => result);
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "paperclip_call_assigned_tool", inputSchema: { type: "object" } }], handler,
+    });
+    bridges.push(bridge);
+    const request = { id: "large-result", method: "tools/call", params: { name: "paperclip_call_assigned_tool", arguments: {} } };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await (await rpc(bridge, request)).json() as { result: { content: Array<{ text: string }> } };
+      expect(JSON.parse(response.result.content[0]!.text)).toEqual(result);
+    }
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves producer-sized pages with UTF-8 and heavily escaped nested data", async () => {
+    const chunk = '\"\\\n\t\u0000😀';
+    const result = { responseText: { nextOffsetBytes: 300_000, totalBytes: 600_000 }, data: chunk.repeat(25_000) };
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(500_000);
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeGreaterThan(64 * 1024);
+    // The driver returns a controller text item, not the raw app page. Its
+    // encoded JSON must survive a second layer of escaping at this boundary.
+    const controllerResult = { text: JSON.stringify(result), type: "inputText" };
+    expect(Buffer.byteLength(JSON.stringify(controllerResult))).toBeGreaterThan(500_000);
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "read_tool_result", inputSchema: { type: "object" } }], handler: async () => controllerResult,
+    });
+    bridges.push(bridge);
+    const response = await (await rpc(bridge, { id: "page", method: "tools/call", params: { name: "read_tool_result", arguments: {} } })).json() as { result: { content: Array<{ text: string }> } };
+    const delivered = JSON.parse(response.result.content[0]!.text) as typeof controllerResult;
+    expect(delivered).toEqual(controllerResult);
+    expect(JSON.parse(delivered.text)).toEqual(result);
+  });
+
+  it.each([
+    ["UTF-8 scalar", () => ({ data: "😀".repeat(300_000) })],
+    ["escaped scalar", () => ({ data: "\u0000".repeat(200_000) })],
+    ["many fields", () => Array.from({ length: 600_000 }, () => 0)],
+  ])("rejects an oversized %s without a partial success or repeating the completed call", async (_name, makeResult) => {
+    const handler = vi.fn(async () => makeResult());
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "assigned.write", inputSchema: { type: "object" } }], handler,
+    });
+    bridges.push(bridge);
+    const request = { id: "write-receipt", method: "tools/call", params: { name: "assigned.write", arguments: {} } };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await (await rpc(bridge, request)).json()).toMatchObject({
+        result: { isError: true, content: [{ text: expect.stringContaining("may already have completed; do not repeat it") }] },
+      });
+    }
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
   it("admits runner-private extension operations without advertising them to the model", async () => {
     const handler = vi.fn(async ({ tool }) => ({ decision: tool === "__paperclip_permission" ? "accept" : "decline" }));
     const bridge = await startOpenCodeMcpBridge({
