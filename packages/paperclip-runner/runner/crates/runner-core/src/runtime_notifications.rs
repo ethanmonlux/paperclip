@@ -777,6 +777,7 @@ mod tests {
     fn publisher_crosses_real_codex_tool_boundary_without_runner_state_access() {
         use serde_json::Value;
         use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::MetadataExt;
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
         let command = std::env::var_os("CODEX_NOTIFICATION_SANDBOX_COMMAND").unwrap();
@@ -798,6 +799,33 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         let home = workspace.join("home");
         fs::create_dir(&home).unwrap();
+        // Restricted-read Codex profiles give the command a private synthetic root: exact
+        // binds sit in empty tmpfs scaffolding, so the child may create shadow files beside
+        // them without touching the host. The boundary is asserted on real host controls:
+        // the child can neither read them nor change them, and nothing it writes reaches
+        // the host.
+        let state_path = config.state_dir.join("runner-state.json");
+        let pipe_dir = server.pipe.0.parent().unwrap().to_path_buf();
+        let sentinels = [
+            config.state_dir.join("host-sentinel"),
+            pipe_dir.join("host-sentinel"),
+        ];
+        for sentinel in &sentinels {
+            fs::write(sentinel, b"host-sentinel").unwrap();
+            assert_eq!(fs::read(sentinel).unwrap(), b"host-sentinel");
+        }
+        let probes = [
+            config.state_dir.join("child-probe"),
+            pipe_dir.join("child-probe"),
+        ];
+        for probe in &probes {
+            assert!(fs::symlink_metadata(probe).is_err());
+        }
+        assert!(state_path.is_file());
+        let descriptor_before = fs::read(&paths[1]).unwrap();
+        let lock_before = fs::read(&paths[2]).unwrap();
+        let fifo_before = fs::symlink_metadata(&paths[3]).unwrap();
+        assert!(fifo_before.file_type().is_fifo());
         let profile = "paperclip-runner-workspace-only";
         let mut args = vec![
             "-c".into(),
@@ -823,10 +851,13 @@ if mv "$5" "$5.moved" 2>/dev/null; then exit 79; fi
             r#"
 [ -z "${UNRELATED_SECRET:-}" ] || exit 70
 if cat "$1" >/dev/null 2>&1; then exit 71; fi
+if cat "$2/host-sentinel" >/dev/null 2>&1; then exit 80; fi
+if cat "$3/host-sentinel" >/dev/null 2>&1; then exit 81; fi
 if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then exit 72; fi
-if touch "$2/probe" 2>/dev/null; then exit 75; fi
-if touch "$3/probe" 2>/dev/null; then exit 76; fi
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
+for target in "$1" "$2/host-sentinel" "$3/host-sentinel" "$2/child-probe" "$3/child-probe"; do
+  (printf child-write > "$target") 2>/dev/null || :
+done
 "#,
             fifo_replacement_checks,
             r#"context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
@@ -873,7 +904,7 @@ if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
                     assert!(message.get("error").is_none(), "initialize: {message}");
                     writeln!(input, "{}", json!({"method":"initialized","params":{}})).unwrap();
                     writeln!(input, "{}", json!({"id":2,"method":"command/exec","params":{
-                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap(),server.pipe.0.with_extension("lock"),server.pipe.0],
+                        "command":["/bin/sh","-c",script,"publisher",state_path,config.state_dir,pipe_dir,server.pipe.0.with_extension("lock"),server.pipe.0],
                         "cwd":workspace,"timeoutMs":10000}})).unwrap();
                 } else if message["id"] == 2 {
                     response = Some(message);
@@ -900,6 +931,50 @@ if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(state.outbox.len(), 1);
-        assert_eq!(state.outbox[0].envelope["payload"]["runId"], config.run_id);
+        let event = &state.outbox[0];
+        assert_eq!(event.event_type, "runtime.activity.recorded");
+        assert_eq!(event.envelope["payload"]["runId"], config.run_id);
+        assert_eq!(
+            event.envelope["payload"]["payload"],
+            json!({"namespace":"example.runtime","activityKey":"desktop.used"})
+        );
+        // The runner's own persistence of that event is the only change to its state file.
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap()
+        );
+        for sentinel in &sentinels {
+            assert_eq!(
+                fs::read(sentinel).unwrap(),
+                b"host-sentinel",
+                "{} changed on the host",
+                sentinel.display()
+            );
+        }
+        for probe in &probes {
+            assert_eq!(
+                fs::symlink_metadata(probe)
+                    .map_err(|error| error.kind())
+                    .err(),
+                Some(std::io::ErrorKind::NotFound),
+                "{} reached the host",
+                probe.display()
+            );
+        }
+        assert_eq!(fs::read(&paths[1]).unwrap(), descriptor_before);
+        assert_eq!(fs::read(&paths[2]).unwrap(), lock_before);
+        let fifo_after = fs::symlink_metadata(&paths[3]).unwrap();
+        assert!(fifo_after.file_type().is_fifo());
+        assert_eq!(
+            (fifo_after.dev(), fifo_after.ino()),
+            (fifo_before.dev(), fifo_before.ino())
+        );
+        let mut names = fs::read_dir(&pipe_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["activity.fifo", "activity.lock", "host-sentinel"]);
+        fs::remove_file(&sentinels[1]).unwrap();
     }
 }
