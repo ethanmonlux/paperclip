@@ -177,6 +177,16 @@ describe("classifyCodexAuthRefreshFailure", () => {
     );
   });
 
+  it("distinguishes an absent Authorization header from a revoked refresh token", () => {
+    expect(classifyCodexAuthRefreshFailure({
+      errorMessage: "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses",
+    })).toBeNull();
+    expect(classifyCodexAuthRefreshFailure({
+      stderr: "401 Unauthorized: Missing bearer or basic authentication in header",
+      stdout: "provider error: invalid_grant",
+    })).toBe("refresh_token_invalidated");
+  });
+
   it("does not classify bare 401 or quota messages as auth-refresh failures", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "chatgpt wham api returned 401" })).toBeNull();
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "You've hit your usage limit for GPT-5." })).toBeNull();
