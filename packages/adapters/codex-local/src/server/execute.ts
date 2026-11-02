@@ -1326,7 +1326,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (observabilityProfile) replaceCodexProfileArgs(args, observabilityProfile.name);
       else if (observabilityPreparationFailed) disableCodexObservabilityArgs(args);
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity));
+      // Bubblewrap supplies proxy variables after the Codex invocation is built.
+      // Preserve only its allowlisted proxy names in identity-filtered shells.
+      const shellKeys = [...new Set([
+        ...codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity)),
+        ...(localProcessSandbox?.networkScope === "allowlist"
+          ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+          : []),
+      ])].sort();
       args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
         "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =
