@@ -1,5 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { spawnSync } from "node:child_process";
+import { buildLocalProcessSandboxSpawnTarget } from "@paperclipai/adapter-utils/local-process-sandbox";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -358,6 +360,35 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
 
 
 describe("Codex skill runtime credential sandbox", () => {
+  it.runIf(process.platform === "linux")("persists refreshed fake auth through the selected file without exposing sibling credentials", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-auth-refresh-test-"));
+    let target: Awaited<ReturnType<typeof buildLocalProcessSandboxSpawnTarget>> | null = null;
+    try {
+      const provider = path.join(root, "provider"), runtime = path.join(root, "runtime"), workspace = path.join(root, "workspace");
+      await Promise.all([mkdir(provider), mkdir(runtime), mkdir(workspace)]);
+      const auth = path.join(provider, "auth.json"), sibling = path.join(provider, "other-account.json");
+      await writeFile(auth, "synthetic-old", { mode: 0o600 });
+      await writeFile(sibling, "synthetic-other", { mode: 0o600 });
+      await symlink(auth, path.join(runtime, "auth.json"));
+      const mount = await resolveRunScopedCodexCredentialMount(runtime, provider);
+      expect(mount).toEqual({ path: auth, access: "rw" });
+      target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", 'const fs=require("node:fs");fs.writeFileSync(process.argv[1],"synthetic-refreshed");if(fs.existsSync(process.argv[2]))process.exit(42);', path.join(runtime, "auth.json"), sibling],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace", homeDir: runtime,
+          managedPaths: [{ path: runtime, access: "rw" }, mount!] },
+      });
+      const result = spawnSync(target.command, target.args, { cwd: target.cwd, env: { ...process.env, ...target.env }, encoding: "utf8", timeout: 10000 });
+      expect({ status: result.status, error: result.error?.message, stderr: result.stderr }).toEqual({ status: 0, error: undefined, stderr: "" });
+      expect(await readFile(auth, "utf8")).toBe("synthetic-refreshed");
+      expect(await readFile(sibling, "utf8")).toBe("synthetic-other");
+    } finally {
+      await target?.cleanup?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("mounts only a verified temporary provider auth file, never its directory", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-mount-"));
     try {
@@ -369,7 +400,7 @@ describe("Codex skill runtime credential sandbox", () => {
       await writeFile(credentialFile, "disposable-test-credential", { mode: 0o600 });
       await symlink(credentialFile, path.join(runtime, "auth.json"));
 
-      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBe(credentialFile);
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toEqual({ path: credentialFile, access: "rw" });
       // No mount is needed if the source is already the run's managed home.
       expect(await resolveRunScopedCodexCredentialMount(provider, provider)).toBeNull();
 

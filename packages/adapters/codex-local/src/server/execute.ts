@@ -341,7 +341,7 @@ type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
 export async function resolveRunScopedCodexCredentialMount(
   effectiveCodexHome: string,
   runtimeCredentialHome: string | null,
-): Promise<string | null> {
+): Promise<{ path: string; access: "rw" } | null> {
   if (!runtimeCredentialHome || path.resolve(effectiveCodexHome) === path.resolve(runtimeCredentialHome)) {
     return null;
   }
@@ -355,7 +355,7 @@ export async function resolveRunScopedCodexCredentialMount(
     fs.stat(sourceAuthPath).catch(() => null),
   ]);
   return managedTarget && expectedSource && managedTarget === expectedSource && sourceFile?.isFile()
-    ? sourceAuthPath
+    ? { path: sourceAuthPath, access: "rw" }
     : null;
 }
 
@@ -1081,7 +1081,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             filesystemScope,
             managedPaths: [
               { path: effectiveCodexHome, access: "rw" },
-              ...(runScopedCredentialMount ? [{ path: runScopedCredentialMount, access: "ro" as const }] : []),
+              // The provider owns this per-run file. Codex must persist token refreshes
+              // for native cleanupRuntime to merge them into the selected grant.
+              ...(runScopedCredentialMount ? [runScopedCredentialMount] : []),
             ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
