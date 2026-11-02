@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
 
-export function materializePublishManifest(pkg) {
+export function materializePublishManifest(pkg, resolveWorkspaceVersion = () => pkg.version) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -24,13 +24,26 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        return [name, `${prefix}${resolveWorkspaceVersion(name)}`];
       }),
     );
   }
 
   delete publishManifest.publishConfig;
   return publishManifest;
+}
+
+// Read the frozen workspace dependency graph instead of assuming all packages
+// share the producer version. Keep the generic materializer available for
+// release tooling that deliberately supplies a uniformly stamped manifest.
+export function materializeWorkspacePublishManifest(pkg, sourceDir) {
+  return materializePublishManifest(pkg, (name) => {
+    const dependency = JSON.parse(readFileSync(resolve(sourceDir, "node_modules", name, "package.json"), "utf8"));
+    if (dependency.name !== name || typeof dependency.version !== "string" || !dependency.version) {
+      throw new Error(`Invalid workspace dependency ${name} for ${pkg.name}`);
+    }
+    return dependency.version;
+  });
 }
 
 export function createBundledInstallManifest(publishManifest, bundledDependencies) {
@@ -394,7 +407,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializeWorkspacePublishManifest(sourcePackage, sourceDir);
   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
   const profileData = bundledDependencies.includes("@agentclientprotocol/codex-acp")
     ? JSON.parse(readFileSync(resolve(sourceRoot, "packages/paperclip-runner/acpx-profiles.json"), "utf8")) : undefined;
