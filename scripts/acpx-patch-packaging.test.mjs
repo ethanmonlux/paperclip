@@ -706,7 +706,7 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
     process.execPath,
     [
       "--input-type=module", "-e",
-      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3], preserveWorkspaceVersions: true });`,
       sourceDir,
       destinationDir,
       fixtureSourceRoot,
@@ -768,6 +768,23 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
       `${specifier} receives its own full configured patch`,
     );
   }
+
+  // Public release verifiers stage only publish files and deliberately stamp
+  // every package to one release version, without a source node_modules graph.
+  rmSync(join(sourceDir, "node_modules"), { recursive: true });
+  const releaseDestination = join(fixtureDir, "release-destination");
+  execFileSync(process.execPath, [
+    "--input-type=module", "-e",
+    `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+    sourceDir, releaseDestination, fixtureSourceRoot,
+  ], {
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, FAKE_CALL_LOG: callLog,
+      FAKE_SOURCE_PACKAGE: join(sourceDir, "package.json"), FAKE_NATIVE_ARTIFACTS: fixtureArtifacts },
+    stdio: "pipe",
+  });
+  const releaseManifest = JSON.parse(readFileSync(join(releaseDestination, "package.json"), "utf8"));
+  assert.equal(releaseManifest.dependencies["@paperclipai/plugin-sdk"], serverPackage.version);
+
 });
 
 test("bundled package dry runs preview without querying published versions", () => {

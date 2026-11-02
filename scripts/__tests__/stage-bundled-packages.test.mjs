@@ -25,7 +25,8 @@ test('the children run the CLI entry release.sh uses, never an in-process call',
   assert.ok(existsSync(PREPARE_BUNDLED_PACKAGE_SCRIPT));
   const source = readFileSync(PREPARE_BUNDLED_PACKAGE_SCRIPT, 'utf8');
   assert.ok(source.includes('if (process.argv[1] === fileURLToPath(import.meta.url))'));
-  assert.ok(source.includes('prepareBundledPackage(resolve(sourceDir), resolve(destinationDir))'));
+  assert.ok(source.includes('prepareBundledPackage(resolve(sourceDir), resolve(destinationDir), { preserveWorkspaceVersions:'));
+  assert.ok(source.includes('process.argv.includes("--preserve-workspace-versions")'));
   const release = readFileSync(new URL('../release.sh', import.meta.url), 'utf8');
   assert.match(release, /node "\$REPO_ROOT\/scripts\/prepare-bundled-package\.mjs" "\$REPO_ROOT\/\$pkg_dir" "\$publish_dir"/);
 });

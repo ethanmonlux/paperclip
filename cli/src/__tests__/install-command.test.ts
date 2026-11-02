@@ -230,6 +230,7 @@ describe("managed install commands", () => {
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && args[1]?.endsWith("/server")) {
         expect(fs.readFileSync(path.join(checkout, "server/ui-dist/index.html"), "utf8")).toContain("native-ui");
         expect(fs.readFileSync(path.join(checkout, "server/skills/paperclip/SKILL.md"), "utf8")).toBe("native-runtime-skill");
+        expect(args).toContain("--preserve-workspace-versions");
         verified = true;
       }
       if (file === "npm" && args[0] === "pack" && args[1]?.endsWith("workspace-package-2")) {
