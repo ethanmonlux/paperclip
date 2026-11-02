@@ -1980,6 +1980,11 @@ async function expireStaleRequestConfirmationTarget(
     snapshot,
   });
   const expireInTransaction = async (tx: Db | any) => {
+    // Dispatch and verdicts lock issue before interaction. Expiry must use the
+    // same order: touchIssue below also takes this issue row's write lock.
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, args.row.issueId), eq(issues.companyId, args.row.companyId)))
+      .for("update");
     await notifyChatConfirmationResolution(tx, args.row);
     if (args.row.kind === "request_confirmation") await notifyChatRunMilestones(tx, args.row);
     else await notifyIssueReviewState(tx, args.row);
