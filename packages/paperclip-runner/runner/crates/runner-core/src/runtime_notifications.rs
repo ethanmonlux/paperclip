@@ -666,6 +666,107 @@ mod tests {
         fs::remove_dir_all(pipe.parent().unwrap()).unwrap();
     }
     #[test]
+    fn codex_profile_grants_notification_paths_read_only_including_the_fifo() {
+        // Codex treats every `write` entry as a writable root and binds protected
+        // `.git`/`.agents`/`.codex`/`.aws` names beneath it without a directory check,
+        // so a `write` grant on the activity FIFO aborts sandbox setup (ENOTDIR) before
+        // any tool runs. A `read` grant is a read-only bind: opening the FIFO for writing
+        // still delivers frames (read-only mounts do not apply EROFS to FIFOs), while
+        // replacing, unlinking or creating entries beside it is denied.
+        let profiles = [
+            "paperclip-runner-workspace-only",
+            "paperclip-runner-workspace-read-only",
+        ];
+        let mut args = vec!["shell_environment_policy.include_only=[\"PATH\"]".to_owned()];
+        for profile in profiles {
+            args.push(format!(
+                "permissions.{profile}.filesystem={{\":root\"=\"none\",\":workspace_roots\"={{\".\"=\"write\"}}}}"
+            ));
+        }
+        let paths = [
+            PathBuf::from("/runtime/runnerd"),
+            PathBuf::from("/state/private/runtime-notifications.json"),
+            PathBuf::from("/tmp/runtime-activity-test/activity.lock"),
+            PathBuf::from("/tmp/runtime-activity-test/activity.fifo"),
+        ];
+        let extra =
+            crate::codex_provider::runtime_notification_codex_args(&args, profiles[0], &paths);
+        for profile in profiles {
+            let prefix = format!("permissions.{profile}.filesystem=");
+            let value = extra
+                .iter()
+                .find_map(|arg| arg.strip_prefix(&prefix))
+                .unwrap();
+            let config = format!("filesystem={value}")
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            let filesystem = config["filesystem"].as_inline_table().unwrap();
+            for path in &paths {
+                assert_eq!(
+                    filesystem
+                        .get(path.to_str().unwrap())
+                        .and_then(toml_edit::Value::as_str),
+                    Some("read"),
+                    "{profile} must grant {} read-only",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                filesystem.get(":root").and_then(toml_edit::Value::as_str),
+                Some("none")
+            );
+            assert_eq!(
+                filesystem
+                    .get(":workspace_roots")
+                    .and_then(toml_edit::Value::as_inline_table)
+                    .and_then(|roots| roots.get("."))
+                    .and_then(toml_edit::Value::as_str),
+                Some("write")
+            );
+        }
+    }
+    #[test]
+    fn writable_regular_file_endpoint_is_rejected_without_receiving_a_frame() {
+        let (_directory, config, _store, _state, server) = setup();
+        let pipe = server.pipe.0.clone();
+        fs::remove_file(&pipe).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pipe)
+            .unwrap();
+        let error = publish(
+            &context_path(&config.state_dir),
+            &activity(&server.context, "desktop.used"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid activity pipe"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&pipe).unwrap(), b"");
+    }
+    #[test]
+    fn symlink_endpoint_is_not_followed() {
+        let (directory, config, _store, _state, server) = setup();
+        let pipe = server.pipe.0.clone();
+        let target = directory.directory.join("symlink-target");
+        fs::write(&target, b"unchanged").unwrap();
+        fs::remove_file(&pipe).unwrap();
+        std::os::unix::fs::symlink(&target, &pipe).unwrap();
+        assert!(publish(
+            &context_path(&config.state_dir),
+            &activity(&server.context, "desktop.used")
+        )
+        .is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        assert!(fs::symlink_metadata(&pipe)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+    #[test]
     #[ignore = "requires CODEX_NOTIFICATION_SANDBOX_COMMAND and PAPERCLIP_RUNTIME_NOTIFICATION_HELPER"]
     fn publisher_crosses_real_codex_tool_boundary_without_runner_state_access() {
         use serde_json::Value;
@@ -710,6 +811,8 @@ if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then
 if touch "$2/probe" 2>/dev/null; then exit 75; fi
 if touch "$3/probe" 2>/dev/null; then exit 76; fi
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
+if rm -f "$5" 2>/dev/null; then exit 78; fi
+if mv "$5" "$5.moved" 2>/dev/null; then exit 79; fi
 context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
 "$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" record-activity "$context" example.runtime desktop.used || exit 74
 "#;
@@ -752,7 +855,7 @@ context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit
                     assert!(message.get("error").is_none(), "initialize: {message}");
                     writeln!(input, "{}", json!({"method":"initialized","params":{}})).unwrap();
                     writeln!(input, "{}", json!({"id":2,"method":"command/exec","params":{
-                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap(),server.pipe.0.with_extension("lock")],
+                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap(),server.pipe.0.with_extension("lock"),server.pipe.0],
                         "cwd":workspace,"timeoutMs":10000}})).unwrap();
                 } else if message["id"] == 2 {
                     response = Some(message);
