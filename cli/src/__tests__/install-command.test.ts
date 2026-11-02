@@ -28,6 +28,12 @@ import {
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
+// Temporary HOME does not isolate the inherited systemd user bus.
+vi.mock("../services/service-manager.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/service-manager.js")>("../services/service-manager.js");
+  return { ...actual, detectServiceManager: vi.fn(async () => ({ supported: true as const, manager: { status: vi.fn(async () => ({ installed: false, active: false })), uninstall: vi.fn(async () => { throw new Error("unexpected service uninstall in isolated test"); }) } })) };
+});
+
 const ORIGINAL_ENV = { ...process.env };
 
 describe("managed install commands", () => {
@@ -193,9 +199,50 @@ describe("managed install commands", () => {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
       expect(env, `${call[0]} ${call[1].join(" ")} must not inherit NODE_ENV`).not.toHaveProperty("NODE_ENV");
+      expect(env?.PAPERCLIP_BUILD_COMMIT).toBe(sha);
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("prepares UI and runtime skills before staging a bundled server from a cold checkout", async () => {
+    const sha = "e".repeat(40);
+    const base = createGitCheckoutRunCommand(sha);
+    let checkout = "";
+    let verified = false;
+    const runner: CommandRunner = async (file, args, options) => {
+      if (file === "tar") {
+        const result = await base(file, args, options);
+        checkout = args[args.indexOf("-C") + 1];
+        const manifestPath = path.join(checkout, "server/package.json");
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, bundleDependencies: ["fixture"], files: ["ui-dist", "skills"] }));
+        fs.mkdirSync(path.join(checkout, "skills/paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills/paperclip/SKILL.md"), "native-runtime-skill");
+        return result;
+      }
+      if (file === "corepack" && args.includes("prepare:ui-dist")) {
+        expect(fs.existsSync(path.join(checkout, "server/ui-dist"))).toBe(false);
+        fs.mkdirSync(path.join(checkout, "server/ui-dist"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "server/ui-dist/index.html"), "<html>native-ui</html>");
+        return { stdout: "", stderr: "" };
+      }
+      if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && args[1]?.endsWith("/server")) {
+        expect(fs.readFileSync(path.join(checkout, "server/ui-dist/index.html"), "utf8")).toContain("native-ui");
+        expect(fs.readFileSync(path.join(checkout, "server/skills/paperclip/SKILL.md"), "utf8")).toBe("native-runtime-skill");
+        expect(args).toContain("--preserve-workspace-versions");
+        verified = true;
+      }
+      if (file === "npm" && args[0] === "pack" && args[1]?.endsWith("workspace-package-2")) {
+        // Prepared bundles have no source checkout for lifecycle rebuilds.
+        expect(args).toContain("--ignore-scripts");
+        fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], "paperclipai-server-0.3.1.tgz"), "package");
+        return { stdout: "", stderr: "" };
+      }
+      return base(file, args, options);
+    };
+    await installGitPayload("paperclipai/paperclip", sha, runner, resolveInstallStorePaths());
+    expect(verified).toBe(true);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
