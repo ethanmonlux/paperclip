@@ -335,7 +335,7 @@ type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
  * A run-selected subscription home may be a short-lived provider directory.
  * Managed skill homes symlink its auth.json, but the filesystem sandbox only
  * mounts the managed home by default. Bind exactly that verified source file,
- * read-only, so the symlink resolves without exposing the provider directory.
+ * writable for native token refresh, without exposing the provider directory.
  * Never select an unrelated account or a missing/expired temporary source.
  */
 export async function resolveRunScopedCodexCredentialMount(
