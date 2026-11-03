@@ -581,3 +581,35 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.costUsd).toBeNull();
   });
 });
+
+
+describe("login evidence provenance", () => {
+  it.each(["assistant", "user", "system", "tool"])('ignores %s protocol content mentioning login', (type) => {
+    const stdout = JSON.stringify({ type, message: { content: [{ type: "tool_use", name: "Bash", input: { command: 'grep source_unauthorized worker.ts; echo "Please run /login"' } }] } });
+    expect(detectClaudeLoginRequired({parsed:null, stdout, stderr:""}).requiresLogin).toBe(false);
+  });
+  it("ignores successful result prose", () => {
+    const parsed={type:"result",subtype:"success",is_error:false,result:"Documented unauthorized and Please run /login"};
+    expect(detectClaudeLoginRequired({parsed,stdout:JSON.stringify(parsed),stderr:""}).requiresLogin).toBe(false);
+  });
+  it("preserves failed terminal login evidence", () => {
+    const parsed={type:"result",subtype:"error_during_execution",is_error:true,result:"Not logged in. Please run /login"};
+    expect(detectClaudeLoginRequired({parsed,stdout:JSON.stringify(parsed),stderr:""}).requiresLogin).toBe(true);
+  });
+  it("preserves plaintext CLI login prompts", () => {
+    expect(detectClaudeLoginRequired({parsed:null,stdout:"Please run /login",stderr:""}).requiresLogin).toBe(true);
+  });
+  it("does not reinterpret truncated protocol content as plaintext", () => {
+    expect(detectClaudeLoginRequired({parsed:null,stdout:'{"type":"assistant","message":"unauthorized',stderr:""}).requiresLogin).toBe(false);
+  });
+});
+
+it("does not source login URLs from protocol payloads", () => {
+  const stdout=JSON.stringify({type:"user",message:{content:[{type:"tool_result",content:"unauthorized https://untrusted.example/auth"}]}});
+  expect(detectClaudeLoginRequired({parsed:null,stdout,stderr:"Please run /login https://claude.ai/login"})).toEqual({requiresLogin:true,loginUrl:"https://claude.ai/login"});
+});
+
+it.each(["https://claude.ai/oauth/authorize", "Open this URL: https://claude.ai/oauth/authorize"])("preserves explicit login URL: %s", (stderr) => {
+  const stdout=JSON.stringify({type:"assistant",message:{content:[{type:"text",text:"https://untrusted.example/auth"}]}});
+  expect(detectClaudeLoginRequired({parsed:null,stdout,stderr})).toEqual({requiresLogin:false,loginUrl:"https://claude.ai/oauth/authorize"});
+});
