@@ -72,6 +72,11 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/redaction.test.ts",
   "server/src/__tests__/routines-e2e.test.ts",
 ]);
+// Suite-specific external URLs can also name a shared mutable database.
+// Owned database factories use PAPERCLIP_TEST_POSTGRES_ADMIN_URL instead.
+const hasSharedTestDatabase = Object.entries(process.env).some(([key, value]) =>
+  key.startsWith("PAPERCLIP_") && key.endsWith("_TEST_DATABASE_URL") && value?.trim(),
+);
 let invocationIndex = 0;
 const serializedModeName = "serialized";
 const generalModeName = "general";
@@ -481,7 +486,7 @@ async function runProjectGroup(projects, groupName, shardIndex = null, shardCoun
 }
 
 function chatShardWorkers(index, count) {
-  const workers = count > 1 && !process.env.PAPERCLIP_TEST_DATABASE_URL ? 2 : 1;
+  const workers = count > 1 && !hasSharedTestDatabase ? 2 : 1;
   return Array.from({ length: workers }, (_, offset) => ({
     index: (index ?? 0) * workers + offset,
     count: (count ?? 1) * workers,
@@ -502,7 +507,12 @@ async function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCo
   }
   if (groupName === generalServerNativeRunnerGroupName) {
     await runVitest(
-      ["--project", "@paperclipai/server", ...serializedServerVitestArgs, ...nativeRunnerSuites],
+      ["--project", "@paperclipai/server",
+        // Each file owns its database, home, and processes. Keep cases serial,
+        // but overlap long real lease windows in four isolated fork workers.
+        ...(hasSharedTestDatabase ? serializedServerVitestArgs
+          : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=4"]),
+        ...nativeRunnerSuites],
       "native runner vertical-slice suite",
     );
     return;
@@ -531,7 +541,7 @@ async function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCo
           // Files have separate fork processes and isolated homes/configs.
           // Keep each file's cases serial; overlap only two independent files.
           // An explicit shared test database cannot be isolated this way.
-          ...(process.env.PAPERCLIP_TEST_DATABASE_URL
+          ...(hasSharedTestDatabase
             ? serializedServerVitestArgs
             : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2"]),
           ...shardFiles,
@@ -645,7 +655,7 @@ if (selection && options.dryRun) {
   writeFileSync(1, JSON.stringify({ selection }));
   process.exit(0);
 }
-const defaultChatShards = !selection && options.group === null && options.mode !== serializedModeName && !process.env.PAPERCLIP_TEST_DATABASE_URL
+const defaultChatShards = !selection && options.group === null && options.mode !== serializedModeName && !hasSharedTestDatabase
   ? Array.from({ length: 6 }, (_, index) => ({ index, count: 6 }))
   : null;
 if (options.dryRun) {
@@ -708,7 +718,7 @@ try {
   if (selection) {
     for (const [project, files] of Object.entries(selection)) {
       const serverArgs = project !== "@paperclipai/server" ? []
-        : options.mode === serializedModeName || process.env.PAPERCLIP_TEST_DATABASE_URL
+        : options.mode === serializedModeName || hasSharedTestDatabase
           ? ["--pool=forks", "--isolate", ...serializedServerVitestArgs]
           : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2"];
       await runVitest(["--project", project, ...serverArgs, ...files],
