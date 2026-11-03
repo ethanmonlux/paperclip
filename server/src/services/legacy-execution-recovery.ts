@@ -1,3 +1,4 @@
+import { isPreDispatchAssignmentRejectionVerified } from "./pre-dispatch-assignment-rejection.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
@@ -85,7 +86,8 @@ export function legacyExecutionNeedsReconciliation(
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
-      && !(await isPreDispatchExecutionWaitVerified(db, run)));
+      && !(await isPreDispatchExecutionWaitVerified(db, run))
+      && !(await isPreDispatchAssignmentRejectionVerified(db, run)));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */

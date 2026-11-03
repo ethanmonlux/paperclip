@@ -1,6 +1,6 @@
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -152,8 +152,32 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { ...seeded, interaction, context };
   }
 
-  it.each(["cleanup", "restart"])("recovers one addressed invitation on %s without changing the source owner", async mode => {
+  it.each(["cleanup", "restart", "rejected_admission", "started_admission", "provider_admission", "operator_admission", "process_admission", "binding_admission"])("recovers one addressed invitation on %s without changing the source owner", async mode => {
     const seeded = await strandedInvitation();
+    const admission = mode.endsWith("_admission");
+    if (admission) {
+      const [oldCard] = await db.insert(issueThreadInteractions).values({
+        companyId: seeded.company.id, issueId: seeded.issue.id, kind: "request_confirmation",
+        status: "rejected", createdByAgentId: seeded.agent.id, addresseeAgentId: seeded.recipient.id,
+        sourceRunId: seeded.run.id, payload: { version: 1, prompt: "Obsolete routing request" },
+      }).returning();
+      const [otherIssue] = await db.insert(issues).values({ companyId: seeded.company.id, title: "Other task" }).returning();
+      const [rejected] = await db.insert(heartbeatRuns).values({
+        companyId: seeded.company.id, agentId: seeded.recipient.id, status: "cancelled",
+        invocationSource: "automation", runtimeMode: "legacy", finishedAt: new Date(),
+        createdAt: new Date(Date.now() + 1), errorCode: "issue_assignee_changed",
+        startedAt: mode === "started_admission" ? new Date() : null,
+        processPid: mode === "process_admission" ? 123 : null,
+        issueId: mode === "binding_admission" ? otherIssue.id : null,
+        resultJson: { stopReason: "issue_assignee_changed", timeoutSource: "stale_queued_run_gate",
+          ...(mode === "operator_admission" ? { executionCancellation: { state: "acknowledged" } } : {}) },
+        contextSnapshot: { ...seeded.context, interactionId: oldCard.id },
+      }).returning();
+      if (mode === "provider_admission") await db.insert(heartbeatRunEvents).values({
+        companyId: seeded.company.id, runId: rejected.id, agentId: seeded.recipient.id,
+        seq: 1, eventType: "adapter.invoke", stream: "system", payload: {},
+      });
+    }
     const deps = callbacks(db);
     // Exercise durable promotion independently of the provider launch mocked
     // by this fixture; final invitation dispatch has its own admission tests.
@@ -168,7 +192,7 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     deps.releaseIssueExecutionAndPromote.mockImplementation(createHeartbeatRunControl(db, controlDeps).releaseIssueExecutionAndPromote);
     const recover = async () => {
       const queue = createHeartbeatQueue(db, deps);
-      if (mode === "restart") await queue.resumeQueuedRuns();
+      if (mode !== "cleanup") await queue.resumeQueuedRuns();
       else {
         const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.run.id));
         await queue.resumeTaskInputAfterLegacyCleanup(source);
@@ -176,12 +200,17 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     };
     await recover();
     const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    if (admission && mode !== "rejected_admission") {
+      expect(receipt.runId).toBeNull();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.company.id))).toHaveLength(2);
+      return;
+    }
     expect(receipt.runId).not.toBeNull();
     const [recipientRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
     expect(recipientRun).toMatchObject({ agentId: seeded.recipient.id, contextSnapshot: seeded.context });
     expect((await db.select().from(issues).where(eq(issues.id, seeded.issue.id)))[0].assigneeAgentId).toBe(seeded.agent.id);
     await recover();
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.company.id))).toHaveLength(2);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.company.id))).toHaveLength(admission ? 3 : 2);
   });
 
   it.each([true, false])("preserves interrupt ownership during cleanup: same agent %s", async sameAgent => {
