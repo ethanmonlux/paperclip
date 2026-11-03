@@ -1,6 +1,6 @@
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -134,6 +134,87 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     }).returning();
     return { ...seeded, recipient, pending };
   }
+
+
+  async function strandedInvitation() {
+    const seeded = await strandedMention();
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: seeded.company.id, issueId: seeded.issue.id, kind: "request_confirmation",
+      createdByAgentId: seeded.agent.id, addresseeAgentId: seeded.recipient.id,
+      sourceRunId: seeded.run.id, payload: { version: 1, prompt: "Route the frozen artifact for review" },
+    }).returning();
+    const context = { issueId: seeded.issue.id, taskId: seeded.issue.id,
+      source: "issue.interaction.created", wakeReason: "interaction_pending",
+      interactionKind: "request_confirmation", interactionId: interaction.id, sourceRunId: seeded.run.id };
+    await db.update(agentWakeupRequests).set({ payload: { issueId: seeded.issue.id,
+      mutation: "interaction", _paperclipWakeContext: context } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, seeded.issue.id));
+    return { ...seeded, interaction, context };
+  }
+
+  it.each(["cleanup", "restart"])("recovers one addressed invitation on %s without changing the source owner", async mode => {
+    const seeded = await strandedInvitation();
+    const deps = callbacks(db);
+    // Exercise durable promotion independently of the provider launch mocked
+    // by this fixture; final invitation dispatch has its own admission tests.
+    deps.getAgent.mockResolvedValue({ ...seeded.recipient, status: "paused" });
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "responsible-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const controlDeps = runControlCallbacks(db);
+    vi.mocked(controlDeps.wakeQueue.releaseIssueExecution).mockImplementation(release);
+    deps.releaseIssueExecutionAndPromote.mockImplementation(createHeartbeatRunControl(db, controlDeps).releaseIssueExecutionAndPromote);
+    const recover = async () => {
+      const queue = createHeartbeatQueue(db, deps);
+      if (mode === "restart") await queue.resumeQueuedRuns();
+      else {
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.run.id));
+        await queue.resumeTaskInputAfterLegacyCleanup(source);
+      }
+    };
+    await recover();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    expect(receipt.runId).not.toBeNull();
+    const [recipientRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+    expect(recipientRun).toMatchObject({ agentId: seeded.recipient.id, contextSnapshot: seeded.context });
+    expect((await db.select().from(issues).where(eq(issues.id, seeded.issue.id)))[0].assigneeAgentId).toBe(seeded.agent.id);
+    await recover();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.company.id))).toHaveLength(2);
+  });
+
+  it.each([true, false])("preserves interrupt ownership during cleanup: same agent %s", async sameAgent => {
+    const seeded = await strandedInvitation();
+    await db.update(agentWakeupRequests).set({ agentId: sameAgent ? seeded.agent.id : seeded.recipient.id,
+      payload: { issueId: seeded.issue.id, queuedCommentInterrupt: { runId: seeded.run.id } },
+    }).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.run.id));
+    const deps = callbacks(db);
+    await createHeartbeatQueue(db, deps).resumeTaskInputAfterLegacyCleanup(source);
+    if (sameAgent) {
+      expect(deps.resumeQueuedCommentInterrupt).toHaveBeenCalledExactlyOnceWith(seeded.company.id, seeded.pending.id);
+      expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    } else {
+      expect(deps.resumeQueuedCommentInterrupt).not.toHaveBeenCalled();
+      expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(source, { suppressImmediateRecovery: true });
+    }
+  });
+
+  it.each(["rejected", "expired", "wrong_recipient", "human_only", "source_mismatch"])(
+    "does not recover a %s pending invitation", async invalid => {
+      const seeded = await strandedInvitation();
+      if (invalid === "wrong_recipient") await db.update(issueThreadInteractions).set({ addresseeAgentId: seeded.agent.id }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+      else if (invalid === "human_only") await db.update(issueThreadInteractions).set({ effectiveResolverPolicy: "human_only" }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+      else if (invalid === "source_mismatch") await db.update(issueThreadInteractions).set({ sourceRunId: null }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+      else await db.update(issueThreadInteractions).set({ status: invalid }).where(eq(issueThreadInteractions.id, seeded.interaction.id));
+      const deps = callbacks(db);
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      expect(deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+      expect(deps.executeRun).not.toHaveBeenCalled();
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.pending.id)))[0])
+        .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    });
 
   async function addStrandedMessages(seeded: Awaited<ReturnType<typeof strandedMention>>) {
     const messages = [seeded.pending];

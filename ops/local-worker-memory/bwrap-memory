@@ -1,0 +1,9 @@
+#!/bin/sh
+# Instance adapter executable: preserve bwrap arguments and stdio, fail closed.
+set -eu
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+slice=paperclip-workers.slice
+test "$(systemctl --user show "$slice" --property=MemoryMax --value)" = 8589934592
+test "$(systemctl --user show "$slice" --property=MemorySwapMax --value)" = 0
+exec systemd-run --user --scope --quiet --collect --slice="$slice" \
+  --property=MemoryMax=4G --property=MemorySwapMax=0 /usr/bin/bwrap "$@"

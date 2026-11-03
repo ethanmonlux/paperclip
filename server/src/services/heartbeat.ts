@@ -3937,7 +3937,8 @@ export function heartbeatService(
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
-      // owner gone; retry pending input for ordinary completions as well as Stop.
+      // owner gone; retry task-wide input, including addressed handoffs to another
+      // agent, for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
           latestRun.contextSnapshot?.explicitUserContinuation) {
         // Re-run the same queue-first recovery decision after cleanup. Its
@@ -3947,18 +3948,7 @@ export function heartbeatService(
           logger.error({ err, runId: run.id }, "failed to settle explicit continuation after cleanup");
         });
       }
-      if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
-        const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
-          eq(agentWakeupRequests.status, "deferred_issue_execution"),
-          sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
-        )).limit(1);
-        if (pending) await (pending.payload?.queuedCommentInterrupt
-          ? resumeQueuedCommentInterrupt(run.companyId, pending.id)
-          : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {
-          logger.error({ err, runId: run.id }, "failed to promote legacy comment queue after cleanup");
-        });
-      }
+      if (latestRun) await heartbeatQueue.resumeTaskInputAfterLegacyCleanup(latestRun);
       if (
         !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled &&
