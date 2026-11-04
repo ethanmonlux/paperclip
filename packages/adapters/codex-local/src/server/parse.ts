@@ -143,6 +143,22 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
+function codexDiagnosticOutput(output: string | null | undefined): string {
+  const text = output?.trim() ?? "";
+  const event = parseJson(text);
+  if (event) return parseCodexJsonl(JSON.stringify(event)).errorMessage ?? "";
+
+  let sawProtocol = false;
+  return text.split(/\r?\n/).map((rawLine) => {
+    const line = rawLine.trim();
+    if (/^[{["]/.test(line)) {
+      sawProtocol = true;
+      return parseCodexJsonl(line).errorMessage ?? "";
+    }
+    return sawProtocol ? "" : line;
+  }).filter(Boolean).join("\n");
+}
+
 function buildCodexErrorHaystack(input: {
   stdout?: string | null;
   stderr?: string | null;
@@ -150,8 +166,8 @@ function buildCodexErrorHaystack(input: {
 }): string {
   return [
     input.errorMessage ?? "",
-    input.stdout ?? "",
-    input.stderr ?? "",
+    codexDiagnosticOutput(input.stdout),
+    codexDiagnosticOutput(input.stderr),
   ]
     .join("\n")
     .split(/\r?\n/)

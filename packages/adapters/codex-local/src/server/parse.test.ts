@@ -162,6 +162,34 @@ describe("isCodexHarnessCrash", () => {
 });
 
 describe("classifyCodexAuthRefreshFailure", () => {
+  it.each(["refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated", "invalid_grant"])("keeps a capacity failure with quoted tool auth marker %s out of authentication recovery", marker => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-real-capacity" }),
+      JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "source audit fixture: " + marker, exit_code: 0, status: "completed" } }),
+      JSON.stringify({ type: "turn.failed", error: { message: "Selected model is at capacity. Please try a different model." } }),
+    ].join("\n");
+    const parsed = parseCodexJsonl(stdout);
+    expect(classifyCodexAuthRefreshFailure({ stdout, stderr: "", errorMessage: parsed.errorMessage })).toBeNull();
+    expect(isCodexProviderQuotaError({ stdout, stderr: "", errorMessage: parsed.errorMessage })).toBe(true);
+  });
+
+  it.each([
+    JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "OAuth failed: invalid_grant" } }, null, 2),
+    '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"refresh_token_invalidated',
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "The test expects refresh_token_reused." } }),
+    JSON.stringify({ type: "tool_result", content: "credential refresh returned 401 Unauthorized" }),
+  ])("ignores pretty, interrupted and quoted protocol output as auth evidence: %s", stdout => {
+    expect(classifyCodexAuthRefreshFailure({ stdout, errorMessage: "Selected model is at capacity." })).toBeNull();
+    expect(classifyCodexAuthRefreshFailure({ stderr: stdout, errorMessage: "Selected model is at capacity." })).toBeNull();
+  });
+
+  it.each([
+    JSON.stringify({ type: "error", message: "OAuth failed: invalid_grant" }),
+    JSON.stringify({ type: "turn.failed", error: { message: "OAuth failed: invalid_grant" } }, null, 2),
+  ])("preserves a genuine terminal JSON authentication failure: %s", stdout => {
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBe("refresh_token_invalidated");
+  });
+
   it("classifies explicit refresh-token failure messages", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "provider error: refresh_token_reused" })).toBe(
       "refresh_token_reused",
