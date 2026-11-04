@@ -153,6 +153,23 @@ it.each([
   expect(classifyCodexTerminalSessionFailure({ category, title }, now)).toBeNull();
 });
 
+it("classifies refresh-token auth from a typed terminal failure after capacity and quota", () => {
+  const reused = "Your refresh token has already been used to generate a new access token.";
+  expect(classifyCodexTerminalSessionFailure({ category: "access", title: reused }, now))
+    .toEqual({ errorCode: "refresh_token_reused", errorFamily: "refresh_token_reused" });
+  expect(classifyCodexTerminalSessionFailure({ category: "service", title: "Codex turn failed", details: reused }, now))
+    .toEqual({ errorCode: "refresh_token_reused", errorFamily: "refresh_token_reused" });
+  expect(classifyCodexTerminalSessionFailure({
+    category: "service",
+    title: "Selected model is at capacity. Please try a different model.",
+    details: reused,
+  }, now)).toEqual({ errorCode: "codex_transient_upstream", errorFamily: "transient_upstream" });
+  expect(classifyCodexTerminalSessionFailure({ category: "limit", title: "Usage limit reached", details: reused }, now))
+    .toEqual({ errorCode: "provider_quota", errorFamily: "provider_quota" });
+  expect(classifyCodexTerminalSessionFailure({ category: "access", title: "Missing bearer authentication in header" }, now))
+    .toBeNull();
+});
+
 it("keeps the historical generic terminal-service error unclassified", () => {
   expect(classifyCodexTerminalSessionFailure({
     category: "service",

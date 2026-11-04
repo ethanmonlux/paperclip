@@ -11,9 +11,13 @@ import {
   parseCodexJsonl,
 } from "./parse.js";
 
-// Provider text as admitted from an untyped ACP turn failure.
-const provider = (message: string) =>
-  codexAcpFailureDiagnostic({ exitCode: 1, timedOut: false, errorCode: "acpx_turn_failed", errorMessage: message });
+// The engine's record of a JSON-RPC error response from the ACP agent process.
+const agentRpcErrorMeta = { errorName: "RequestError", rpcCode: -32603, phase: "turn" };
+
+// Provider text as admitted from an untyped ACP agent error response.
+const provider = (message: string) => codexAcpFailureDiagnostic({
+  exitCode: 1, timedOut: false, errorCode: "acpx_turn_failed", errorMessage: message, errorMeta: agentRpcErrorMeta,
+});
 
 describe("parseCodexJsonl", () => {
   it.each(["turn.failed", "error", "turn.completed"])("does not invent zero usage for %s without counters", (type) => {
@@ -317,10 +321,10 @@ describe("isCodexTransientUpstreamError", () => {
 });
 
 describe("codexAcpFailureDiagnostic", () => {
-  const base = { exitCode: 1, timedOut: false, errorMessage: "OAuth failed: refresh_token_reused" };
+  const base = { exitCode: 1, timedOut: false, errorMessage: "OAuth failed: refresh_token_reused", errorMeta: agentRpcErrorMeta };
 
   it.each(["acpx_turn_failed", "acpx_auth_required", "acpx_session_init_failed", "acpx_session_config_failed", "acpx_protocol_error"])(
-    "admits the provider message of an untyped %s failure",
+    "admits the agent error response of an untyped %s failure",
     (errorCode) => {
       expect(classifyCodexAuthRefreshFailure({ diagnostic: codexAcpFailureDiagnostic({ ...base, errorCode }) }))
         .toBe("refresh_token_reused");
@@ -341,5 +345,17 @@ describe("codexAcpFailureDiagnostic", () => {
     ["success", { errorCode: null, exitCode: 0 }],
   ])("keeps a %s outcome out of provider diagnostics", (_label, overrides) => {
     expect(codexAcpFailureDiagnostic({ ...base, ...overrides })).toBeNull();
+  });
+
+  it.each([
+    ["a failed turn's normalized error", undefined],
+    ["a local exception", { errorName: "Error", phase: "ensure_session" }],
+    ["a local exception with a string code", { errorName: "Error", phase: "configure_session", rpcCode: "ENOENT" }],
+    ["an ACP runtime error", { errorName: "AcpRuntimeError", acpCode: "ACP_SESSION_INIT_FAILED", category: "protocol" }],
+    ["a non-integer RPC code", { errorName: "RequestError", rpcCode: 1.5 }],
+  ])("does not admit %s under an agent-error phase code", (_label, errorMeta) => {
+    for (const errorCode of ["acpx_turn_failed", "acpx_auth_required", "acpx_session_init_failed", "acpx_session_config_failed"]) {
+      expect(codexAcpFailureDiagnostic({ ...base, errorCode, errorMeta })).toBeNull();
+    }
   });
 });

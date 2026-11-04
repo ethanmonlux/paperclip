@@ -190,10 +190,10 @@ export class CodexProviderDiagnostic {
   }
 }
 
-// Untyped ACP failures whose message the engine builds from the agent
-// process's provider or protocol error. Host-typed outcomes (timeouts, channel
-// loss, stalled tools, cancellation) and already-classified provider outcomes
-// keep their disposition, and the run summary is agent output, never evidence.
+// Untyped ACP failures that can carry the agent process's provider or protocol
+// error. Host-typed outcomes (timeouts, channel loss, stalled tools,
+// cancellation) and already-classified provider outcomes keep their
+// disposition, and the run summary is agent output, never evidence.
 const CODEX_ACP_PROVIDER_FAILURE_CODES = new Set([
   "acpx_turn_failed",
   "acpx_auth_required",
@@ -202,11 +202,19 @@ const CODEX_ACP_PROVIDER_FAILURE_CODES = new Set([
   "acpx_protocol_error",
 ]);
 
+/**
+ * The message of an ACP failure the engine recorded from a JSON-RPC error
+ * response of the agent process. The engine gives local exceptions (spawn,
+ * runtime, host callbacks) the same phase codes, so the code alone is not
+ * provenance; a failed turn's normalized error keeps no RPC record either.
+ */
 export function codexAcpFailureDiagnostic(
-  result: Pick<AdapterExecutionResult, "exitCode" | "timedOut" | "errorCode" | "errorMessage">,
+  result: Pick<AdapterExecutionResult, "exitCode" | "timedOut" | "errorCode" | "errorMessage" | "errorMeta">,
 ): CodexProviderDiagnostic | null {
   if ((result.exitCode ?? 0) === 0 || result.timedOut) return null;
   if (!CODEX_ACP_PROVIDER_FAILURE_CODES.has(result.errorCode ?? "")) return null;
+  const meta = result.errorMeta ?? {};
+  if (meta.errorName !== "RequestError" || !Number.isSafeInteger(meta.rpcCode)) return null;
   return admitDiagnostic(result.errorMessage);
 }
 
