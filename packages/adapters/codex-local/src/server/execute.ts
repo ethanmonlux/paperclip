@@ -1568,8 +1568,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
         : null;
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-      // The fallback is reported and classified, so derive it only from
-      // diagnostic stderr text, never from a quoted structured record.
+      // Report the fallback from diagnostic stderr text, never from a quoted
+      // structured record. Classification reads the same diagnostics directly
+      // from stdout/stderr, so the display message is never trusted input.
       const stderrLine = firstMeaningfulStderrLine(extractCodexDiagnosticText(attempt.proc.stderr));
       const fallbackErrorMessage =
         parsedError ||
@@ -1580,7 +1581,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? extractCodexRetryNotBefore({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
-              errorMessage: fallbackErrorMessage,
             })
           : null;
       const authRefreshFailure =
@@ -1588,7 +1588,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? classifyCodexAuthRefreshFailure({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
-              errorMessage: fallbackErrorMessage,
             })
           : null;
       const providerQuota =
@@ -1597,7 +1596,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         isCodexProviderQuotaError({
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
@@ -1606,7 +1604,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         isCodexTransientUpstreamError({
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
         });
       const harnessCrash =
         !authRefreshFailure &&

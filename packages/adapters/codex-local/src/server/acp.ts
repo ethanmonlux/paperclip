@@ -40,7 +40,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { normalizeCodexModel } from "../index.js";
-import { classifyCodexAuthRefreshFailure, extractCodexRetryNotBefore } from "./parse.js";
+import {
+  classifyCodexAuthRefreshFailure,
+  codexAcpFailureDiagnostic,
+  codexTerminalSessionFailureDiagnostic,
+  extractCodexRetryNotBefore,
+} from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
   buildCodexHomeRefreshProvision,
@@ -283,11 +288,13 @@ export function classifyCodexTerminalSessionFailure(
   // Require explicit usage exhaustion; the CLI's broader capacity matcher would
   // also match a context/storage capacity limit and defer the wrong failure.
   if (failure.category !== "limit") return null;
-  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
-  if (!/\b(?:you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded))\b/i.test(surface.errorMessage)) {
+  const text = [failure.title, failure.details].filter(Boolean).join("\n");
+  if (!/\b(?:you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded))\b/i.test(text)) {
     return null;
   }
-  const retryNotBefore = extractCodexRetryNotBefore(surface, now)?.toISOString();
+  const retryNotBefore = extractCodexRetryNotBefore({
+    diagnostic: codexTerminalSessionFailureDiagnostic(failure),
+  }, now)?.toISOString();
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
@@ -308,15 +315,7 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
 }
 
 function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
-  if ((result.exitCode ?? 0) === 0) return result;
-  const resultJson = parseObject(result.resultJson);
-  const stopReason = asString(resultJson.stopReason, "");
-  const authFailure = classifyCodexAuthRefreshFailure({
-    errorMessage: [result.errorMessage ?? "", result.summary ?? "", stopReason]
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .join("\n"),
-  });
+  const authFailure = classifyCodexAuthRefreshFailure({ diagnostic: codexAcpFailureDiagnostic(result) });
   if (!authFailure) return result;
 
   return {
