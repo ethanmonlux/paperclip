@@ -956,6 +956,19 @@ export async function runAdapterExecutionTargetProcess(
       ? sanitizeRemoteExecutionEnv(options.env)
       : options.env;
 
+  const localProcessSandbox =
+    target?.kind === "local" || !target ? options.localProcessSandbox : null;
+  const launcherDirectory = localProcessSandbox && env.PAPERCLIP_GITHUB_LAUNCHER_DIR
+    ? githubOperationLauncherDirectory({ runId, target: null })
+    : null;
+  const scopedLocalProcessSandbox =
+    localProcessSandbox && launcherDirectory && env.PAPERCLIP_GITHUB_LAUNCHER_DIR === launcherDirectory
+      ? { ...localProcessSandbox, managedPaths: [
+          ...(localProcessSandbox.managedPaths ?? []),
+          { path: launcherDirectory, access: "ro" as const },
+        ] }
+      : localProcessSandbox;
+
   const result = await runChildProcess(runId, command, args, {
     cwd: options.cwd,
     env,
@@ -965,7 +978,7 @@ export async function runAdapterExecutionTargetProcess(
     onLog: options.onLog,
     onSpawn: options.onSpawn,
     terminalResultCleanup: options.terminalResultCleanup,
-    localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
+    localProcessSandbox: scopedLocalProcessSandbox,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote

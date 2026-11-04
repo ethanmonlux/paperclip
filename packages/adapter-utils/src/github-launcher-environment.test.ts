@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -539,5 +540,63 @@ describe("managed GitHub launcher environment", () => {
       runId: "run-failure", target: fixture.target, cwd: fixture.root, env: {},
     })).rejects.toThrow("Could not resolve remote PATH for managed GitHub launchers");
     expect(fixture.runner.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("local managed launcher isolation", () => {
+  const available = process.platform === "linux" && spawnSync("bwrap", ["--version"]).status === 0;
+  const probe = String.raw`
+const fs = require("node:fs");
+const cp = require("node:child_process");
+const path = require("node:path");
+const selected = process.env.PAPERCLIP_GITHUB_LAUNCHER_DIR;
+const visible = fs.existsSync(path.join(selected, "git"));
+let writeDenied = false;
+try { fs.writeFileSync(path.join(selected, "sandbox-write"), "forbidden"); } catch { writeDenied = true; }
+const version = visible ? cp.execFileSync(path.join(selected, "git"), ["--version"], { encoding: "utf8" }).trim() : null;
+console.log(JSON.stringify({ visible, siblingVisible: fs.existsSync(process.argv[1]), writeDenied, version }));
+`;
+
+  async function runProbe(runId: string, workspace: string, env: Record<string, string>, sibling: string) {
+    return runAdapterExecutionTargetProcess(runId, null, process.execPath, ["-e", probe, sibling], {
+      cwd: workspace,
+      env,
+      timeoutSec: 10,
+      graceSec: 1,
+      onLog: async () => undefined,
+      localProcessSandbox: { workspaceDir: workspace, filesystemScope: "workspace" },
+    });
+  }
+
+  it.skipIf(!available)("executes only the selected run's read-only launchers inside a real local sandbox", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-launcher-"));
+    roots.push(workspace);
+    const runId = randomUUID();
+    const baseEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: workspace, PAPERCLIP_GITHUB_AUTH_MODE: "managed" };
+    const selected = await prepareGitHubOperationLaunchers({ runId, target: null, cwd: workspace, env: baseEnv });
+    const sibling = await prepareGitHubOperationLaunchers({ runId: randomUUID(), target: null, cwd: workspace, env: baseEnv });
+    roots.push(selected.PAPERCLIP_GITHUB_LAUNCHER_DIR, sibling.PAPERCLIP_GITHUB_LAUNCHER_DIR);
+    const result = await runProbe(runId, workspace, selected, sibling.PAPERCLIP_GITHUB_LAUNCHER_DIR);
+    expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false });
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      visible: true,
+      siblingVisible: false,
+      writeDenied: true,
+      version: expect.stringMatching(/^git version /),
+    });
+    expect(await readdir(selected.PAPERCLIP_GITHUB_LAUNCHER_DIR)).not.toContain("sandbox-write");
+  });
+
+  it.skipIf(!available)("does not mount a launcher directory selected only through a forged environment", async () => {
+    const workspace = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-launcher-forged-"));
+    roots.push(workspace);
+    const foreign = await prepareGitHubOperationLaunchers({
+      runId: randomUUID(), target: null, cwd: workspace,
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: workspace },
+    });
+    roots.push(foreign.PAPERCLIP_GITHUB_LAUNCHER_DIR);
+    const result = await runProbe(randomUUID(), workspace, foreign, foreign.PAPERCLIP_GITHUB_LAUNCHER_DIR);
+    expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false });
+    expect(JSON.parse(result.stdout.trim())).toMatchObject({ visible: false, siblingVisible: false, writeDenied: true });
   });
 });
