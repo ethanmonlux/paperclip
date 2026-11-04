@@ -583,6 +583,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       const register = coordinator.register.bind(coordinator);
       let initial: Awaited<ReturnType<typeof states>> | undefined;
       let releaseFirstPass!: () => void;
+      let observeFirstPass!: () => void;
+      const firstPassObserved = new Promise<void>(resolve => { observeFirstPass = resolve; });
       const firstPassHeld = new Promise<void>(resolve => { releaseFirstPass = resolve; });
       vi.spyOn(coordinator, "register").mockImplementation((queue, task) => register(queue, {
         ...task,
@@ -592,6 +594,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
           const cancelled = (await states()).filter(row => row.status === "cancelled");
           if (cancelled.length === 0) return result;
           initial = cancelled;
+          observeFirstPass();
           await firstPassHeld;
           return result;
         },
@@ -603,7 +606,8 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
         work.push({ id: earlierId });
         await writeIntent({ companyId: a.companyId, retryRunId: earlierId });
         await vi.advanceTimersByTimeAsync(1000);
-        await expect.poll(() => initial).toBeDefined();
+        await firstPassObserved;
+        expect(initial).toBeDefined();
         expect(initial).toHaveLength(20);
         expect(new Set(initial!.map(row => row.companyId)).size).toBe(2);
         releaseFirstPass();
