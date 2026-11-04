@@ -331,13 +331,6 @@ function managedMcpGatewaysFromContext(context: Record<string, unknown>): Manage
 type ResolvedExecutionTarget = ReturnType<typeof readAdapterExecutionTarget>;
 type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
 
-/**
- * A run-selected subscription home may be a short-lived provider directory.
- * Managed skill homes symlink its auth.json, but the filesystem sandbox only
- * mounts the managed home by default. Bind exactly that verified source file,
- * writable for native token refresh, without exposing the provider directory.
- * Never select an unrelated account or a missing/expired temporary source.
- */
 export async function resolveRunScopedCodexCredentialMount(
   effectiveCodexHome: string,
   runtimeCredentialHome: string | null,
@@ -1081,8 +1074,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             filesystemScope,
             managedPaths: [
               { path: effectiveCodexHome, access: "rw" },
-              // The provider owns this per-run file. Codex must persist token refreshes
-              // for native cleanupRuntime to merge them into the selected grant.
               ...(runScopedCredentialMount ? [runScopedCredentialMount] : []),
             ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
@@ -1328,8 +1319,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (observabilityProfile) replaceCodexProfileArgs(args, observabilityProfile.name);
       else if (observabilityPreparationFailed) disableCodexObservabilityArgs(args);
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      // Bubblewrap supplies proxy variables after the Codex invocation is built.
-      // Preserve only its allowlisted proxy names in identity-filtered shells.
       const shellKeys = [...new Set([
         ...codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity)),
         ...(localProcessSandbox?.networkScope === "allowlist"

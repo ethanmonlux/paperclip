@@ -108,8 +108,6 @@ async function withOwnedChildren(root, action) {
   }
 }
 
-// Use argv0-independent executables: on newer Ubuntu /bin/sleep and /bin/echo
-// are links to the same multicall binary and fail when renamed for staging.
 test("atomically publishes while the previous executable is running", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");

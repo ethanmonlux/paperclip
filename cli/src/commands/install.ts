@@ -287,8 +287,6 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
-        // Bundled-package staging bypasses server prepack. Prepare the same
-        // self-contained UI and runtime skills as the native release path.
         if (workspacePackage.dir === "server") {
           await runCommand("corepack", ["pnpm", "--dir", "server", "run", "prepare:ui-dist"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
           fs.cpSync(path.join(checkoutPath, "skills"), path.join(packageDir, "skills"), { recursive: true });

@@ -97,6 +97,10 @@ const nativeRunnerSuites = [
   "server/src/__tests__/dot-runner.test.ts",
   // These process cases otherwise skip in server shards without Runner binaries.
   "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts",
+  "server/src/services/native-runtime/native-runner-restart-lease-renewal.integration.test.ts",
+  "server/src/services/native-runtime/native-runner-restart-preparation.integration.test.ts",
+  "server/src/services/native-runtime/native-runner-restart-checkpoint-cost.integration.test.ts",
+  "server/src/services/native-runtime/native-runner-restart-diskless.integration.test.ts",
   "server/src/services/native-runtime/native-usage-delivery.integration.test.ts",
 ];
 // In the PR workflow (pr.yml, the caller of pr-trusted.yml — reusable
@@ -539,11 +543,11 @@ async function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCo
           "--project",
           "@paperclipai/server",
           // Files have separate fork processes and isolated homes/configs.
-          // Keep each file's cases serial; overlap only two independent files.
+          // Keep each file's cases serial; overlap three independent files.
           // An explicit shared test database cannot be isolated this way.
           ...(hasSharedTestDatabase
             ? serializedServerVitestArgs
-            : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2"]),
+            : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=3"]),
           ...shardFiles,
         ],
         `${groupName} shard ${shardIndex + 1}/${shardCount}`,
@@ -720,7 +724,7 @@ try {
       const serverArgs = project !== "@paperclipai/server" ? []
         : options.mode === serializedModeName || hasSharedTestDatabase
           ? ["--pool=forks", "--isolate", ...serializedServerVitestArgs]
-          : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2"];
+          : ["--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=3"];
       await runVitest(["--project", project, ...serverArgs, ...files],
         `selected ${project}: ${files.length} files`, null, true);
     }

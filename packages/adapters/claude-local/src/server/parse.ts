@@ -7,9 +7,8 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// CLI login markers are matched only against qualified terminal diagnostics.
 const CLAUDE_LOGIN_PROMPT_RE =
-  /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
+  /^(?:error:\s*)?(?:not\s+logged\s+in\b|please\s+log\s+in\b|please\s+run\s+(?:\x60?claude\s+login\x60?|\/login)|login\s+required\b|requires\s+login\b|authentication\s+required\b|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
 // The token-failure markers. An assistant or model event can print these same
 // words as ordinary prose, so the detector matches them only against the parsed
@@ -243,27 +242,18 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  // Protocol payloads include arbitrary source, tool output and model prose.
-  // Only failed terminal fields and standalone CLI diagnostics are auth evidence.
-  // Reject JSON-looking fragments too: truncation must not turn model content
-  // into a trusted plaintext login prompt.
   const terminalText = parsed && claudeResultIndicatesAuthFailure(parsed)
     ? collectClaudeTerminalText(parsed)
     : "";
   const plainLines = [input.stdout, input.stderr]
-    .flatMap((stream) => stream.split(/\r?\n/))
+    .flatMap((stream) => /^[{[]/.test(stream.trimStart()) ? [] : stream.split(/\r?\n/))
     .map((line) => line.trim())
-    .filter((line) => line && !/^[{[]/.test(line) && !parseJson(line));
-  const promptLines = [terminalText, ...plainLines];
+    .filter((line) => line && !/^[{["]/.test(line) && !parseJson(line));
+  const promptLines = [...terminalText.split(/\r?\n/), ...plainLines];
   const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
-
-  // The token-failure markers match only against the parsed terminal fields of
-  // a failed run. The raw stdout is untrusted, so a model that prints a token
-  // phrase, or a successful run that repeats one, does not flip the classifier.
-  const tokenFailure =
-    parsed !== null &&
-    claudeResultIndicatesAuthFailure(parsed) &&
-    CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
+  const tokenFailure = parsed !== null
+    && claudeResultIndicatesAuthFailure(parsed)
+    && CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
 
   return {
     requiresLogin: loginPrompt || tokenFailure,

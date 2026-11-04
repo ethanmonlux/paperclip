@@ -769,8 +769,6 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
     );
   }
 
-  // Public release verifiers stage only publish files and deliberately stamp
-  // every package to one release version, without a source node_modules graph.
   rmSync(join(sourceDir, "node_modules"), { recursive: true });
   const releaseDestination = join(fixtureDir, "release-destination");
   execFileSync(process.execPath, [

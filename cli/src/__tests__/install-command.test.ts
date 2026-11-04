@@ -28,7 +28,6 @@ import {
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
-// Temporary HOME does not isolate the inherited systemd user bus.
 vi.mock("../services/service-manager.js", async () => {
   const actual = await vi.importActual<typeof import("../services/service-manager.js")>("../services/service-manager.js");
   return { ...actual, detectServiceManager: vi.fn(async () => ({ supported: true as const, manager: { status: vi.fn(async () => ({ installed: false, active: false })), uninstall: vi.fn(async () => { throw new Error("unexpected service uninstall in isolated test"); }) } })) };
@@ -234,7 +233,6 @@ describe("managed install commands", () => {
         verified = true;
       }
       if (file === "npm" && args[0] === "pack" && args[1]?.endsWith("workspace-package-2")) {
-        // Prepared bundles have no source checkout for lifecycle rebuilds.
         expect(args).toContain("--ignore-scripts");
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], "paperclipai-server-0.3.1.tgz"), "package");
         return { stdout: "", stderr: "" };

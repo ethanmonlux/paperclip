@@ -1,7 +1,0 @@
-[Unit]
-Description=Paperclip local worker aggregate memory limit
-
-[Slice]
-MemoryAccounting=yes
-MemoryMax=8G
-MemorySwapMax=0

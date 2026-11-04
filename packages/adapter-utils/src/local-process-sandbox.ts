@@ -49,7 +49,6 @@ interface NetworkAllowlistProxy {
 }
 
 const SYSTEM_READ_PATHS = [
-  // WSL merged-/usr must exist before its /bin and /sbin aliases are mounted.
   "/usr",
   "/bin",
   "/sbin",
@@ -293,7 +292,6 @@ export async function startNetworkAllowlistProxy(
   const sockets = new Set<net.Socket>();
   server.on("connection", (socket) => {
     sockets.add(socket);
-    // Preserve an error owner after HTTP CONNECT detaches its handler.
     socket.on("error", () => socket.destroy());
     socket.on("close", () => sockets.delete(socket));
   });
@@ -333,9 +331,6 @@ const server = net.createServer((client) => {
   upstream.on("error", close);
 });
 server.listen(${proxyPort}, "127.0.0.1", () => {
-  // Node may make its own output descriptors nonblocking. Do not let a
-  // synchronous native CLI inherit those descriptors: a full pipe is EAGAIN.
-  // Fresh child pipes plus Node stream backpressure preserve the byte stream.
   const child = spawn(executable, args, { stdio: ["inherit", "pipe", "pipe"], env: process.env });
   child.stdout.pipe(process.stdout, { end: false });
   child.stderr.pipe(process.stderr, { end: false });
@@ -345,9 +340,6 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
   const finish = (code, signal) => {
     if (finished) return;
     finished = true;
-    // A background descendant can retain output pipes and proxy sockets.
-    // Bound that drain. Exiting this bridge ends the enclosing Bubblewrap PID
-    // namespace, which owns and terminates all remaining sandbox descendants.
     child.stdout.destroy();
     child.stderr.destroy();
     for (const socket of connections) socket.destroy();
@@ -376,15 +368,11 @@ server.listen(${proxyPort}, "127.0.0.1", () => {
   child.on("exit", (code, signal) => {
     exited = true;
     drainTimer = setTimeout(() => {
-      // Pending destination writes can keep Node alive after source EOF.
-      // Fail closed if the consumer cannot drain; never report a successful
-      // provider result after abandoning queued output.
       if (process.stdout.writableLength || process.stderr.writableLength) process.exit(75);
       finish(code, signal);
     }, 5000);
     drainTimer.unref();
   });
-  // close follows output EOF. exitCode lets pending forwarded output drain.
   child.on("close", finish);
 });
 `;

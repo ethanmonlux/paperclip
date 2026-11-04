@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, symlink, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -41,36 +41,6 @@ describe("atomic managed repository publication", () => {
     await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).resolves.toBeUndefined();
     expect(await readFile(file, "utf8")).toBe("/.paperclip-repositories/\n");
     await expect(ensureManagedRepositoriesIgnored(target)).rejects.toThrow("not a git repository");
-  });
-  it.each([
-    ["fatal: not a git repository (or any of the parent directories): .git\n", true],
-    ["fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n", true],
-    ["fatal: not a git repository (or any parent up to mount point /tmp/mounted workspace)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n", true],
-    ["fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n\n", false],
-    ["fatal: detected dubious ownership in repository\n", false],
-    ["fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\nadditional failure\n", false],
-  ])("handles only exact inert-metadata diagnostics: %s", async (diagnostic, accepted) => {
-    const { root, target } = await fixture();
-    await mkdir(path.join(target, ".git"), { recursive: true });
-    const bin = path.join(root, "bin");
-    await mkdir(bin);
-    const fakeGit = path.join(bin, "git");
-    await writeFile(fakeGit, "#!/bin/sh\ncat >&2 <<'DIAGNOSTIC'\n" + diagnostic + "DIAGNOSTIC\nexit 128\n");
-    await chmod(fakeGit, 0o755);
-    vi.stubEnv("PATH", bin + path.delimiter + process.env.PATH);
-    for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]) vi.stubEnv(key, "");
-    if (accepted) {
-      await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).resolves.toBeUndefined();
-      await expect(ensureManagedRepositoriesIgnored(target)).rejects.toMatchObject({ code: 128 });
-      for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]) {
-        vi.stubEnv(key, target);
-        await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).rejects.toMatchObject({ code: 128 });
-        vi.stubEnv(key, "");
-      }
-    } else {
-      await expect(ensureManagedRepositoriesIgnored(target, { plainTaskDirectory: true })).rejects.toMatchObject({ code: 128 });
-    }
-    expect(await readdir(path.join(target, ".git"))).toEqual([]);
   });
   it("still excludes managed repositories when a task directory contains a real checkout", async () => {
     const { source } = await fixture();

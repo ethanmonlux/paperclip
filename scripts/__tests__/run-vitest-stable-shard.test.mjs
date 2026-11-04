@@ -324,6 +324,8 @@ const usageDeliverySuitePath = "server/src/services/native-runtime/native-usage-
 const dotRunnerSuitePath = "server/src/__tests__/dot-runner.test.ts";
 const restartRecoverySuitePath =
   "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts";
+const restartWaitSuites = ["lease-renewal", "preparation", "checkpoint-cost", "diskless"]
+  .map(name => `server/src/services/native-runtime/native-runner-restart-${name}.integration.test.ts`);
 
 // Mirrors pr-trusted.yml (12 shards, called by pr.yml so GITHUB_WORKFLOW is
 // "PR"): the chat suite runs in its dedicated lanes and the cargo-dependent
@@ -365,7 +367,7 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   assert.ok(!files.includes(dotRunnerSuitePath));
   assert.ok(!files.includes(restartRecoverySuitePath));
   assert.ok(!files.includes(usageDeliverySuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, usageDeliverySuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, dotRunnerSuitePath, restartRecoverySuitePath, ...restartWaitSuites, usageDeliverySuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
@@ -414,6 +416,7 @@ test("the native-runner lane runs exactly the cargo-dependent suites", () => {
     "server/src/services/native-runtime/native-codex-runner.integration.test.ts",
     dotRunnerSuitePath,
     restartRecoverySuitePath,
+    ...restartWaitSuites,
     usageDeliverySuitePath,
   ]);
 });
@@ -726,7 +729,7 @@ test("a failed chat child fails the job after its sibling finishes", { skip: pro
 
 for (const [group, parallelWorkers, shardArgs] of [
   ["general-server-native-runner", 4, []],
-  ["general-server-without-chat-or-native-runner", 2, ["--shard-index", "0", "--shard-count", "12"]],
+  ["general-server-without-chat-or-native-runner", 3, ["--shard-index", "0", "--shard-count", "12"]],
 ]) test(`${group} files overlap only when their database fixtures are isolated`, { skip: process.platform === "win32" }, () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "native-file-workers-"));
   const receipt = path.join(directory, "args.json");
@@ -752,7 +755,7 @@ for (const [group, parallelWorkers, shardArgs] of [
       assert.ok(args.includes(workers > 1 ? "--fileParallelism" : "--no-file-parallelism"));
       if (workers > 1) assert.ok(args.includes("--pool=forks") && args.includes("--isolate"));
       if (group === "general-server-native-runner") {
-        for (const file of [restartRecoverySuitePath]) assert.ok(args.includes(file));
+        for (const file of [restartRecoverySuitePath, ...restartWaitSuites]) assert.ok(args.includes(file));
       }
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }

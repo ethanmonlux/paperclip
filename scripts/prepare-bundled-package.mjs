@@ -33,9 +33,6 @@ export function materializePublishManifest(pkg, resolveWorkspaceVersion = () => 
   return publishManifest;
 }
 
-// Read the frozen workspace dependency graph instead of assuming all packages
-// share the producer version. Keep the generic materializer available for
-// release tooling that deliberately supplies a uniformly stamped manifest.
 export function materializeWorkspacePublishManifest(pkg, sourceDir) {
   return materializePublishManifest(pkg, (name) => {
     const dependency = JSON.parse(readFileSync(resolve(sourceDir, "node_modules", name, "package.json"), "utf8"));
@@ -407,8 +404,6 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  // Release callers deliberately stage uniformly stamped manifests without an
-  // installed source graph. Managed Git installs preserve independent versions.
   const publishManifest = preserveWorkspaceVersions
     ? materializeWorkspacePublishManifest(sourcePackage, sourceDir)
     : materializePublishManifest(sourcePackage);

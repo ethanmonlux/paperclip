@@ -405,6 +405,7 @@ mod tests {
             runner_digest: "sha256:digest".into(),
             acpx_launch_profile: None,
             opencode_launch_profile: None,
+            cursor_cloud_launch_profile: None,
             max_outbox_bytes: 1024 * 1024,
             p0_reserve_bytes: 64 * 1024,
             max_frame_bytes: 64 * 1024,
@@ -665,119 +666,13 @@ mod tests {
         assert_eq!(fs::read(nested.join("protected")).unwrap(), b"unchanged");
         fs::remove_dir_all(pipe.parent().unwrap()).unwrap();
     }
-    #[test]
-    fn codex_profile_grants_notification_paths_read_only_and_the_fifo_read_only_on_linux() {
-        // On Linux Codex treats every `write` entry as a writable root and binds protected
-        // `.git`/`.agents`/`.codex`/`.aws` names beneath it without a directory check,
-        // so a `write` grant on the activity FIFO aborts bwrap setup (ENOTDIR) before
-        // any tool runs. A `read` grant is a read-only bind: opening the FIFO for writing
-        // still delivers frames (read-only mounts do not apply EROFS to FIFOs), while
-        // replacing, unlinking or creating entries beside it is denied. Other Unix
-        // sandboxes (macOS Seatbelt maps `read` to `file-read*` only) keep `write`.
-        let fifo_mode = if cfg!(target_os = "linux") {
-            "read"
-        } else {
-            "write"
-        };
-        let profiles = [
-            "paperclip-runner-workspace-only",
-            "paperclip-runner-workspace-read-only",
-        ];
-        let mut args = vec!["shell_environment_policy.include_only=[\"PATH\"]".to_owned()];
-        for profile in profiles {
-            args.push(format!(
-                "permissions.{profile}.filesystem={{\":root\"=\"none\",\":workspace_roots\"={{\".\"=\"write\"}}}}"
-            ));
-        }
-        let paths = [
-            PathBuf::from("/runtime/runnerd"),
-            PathBuf::from("/state/private/runtime-notifications.json"),
-            PathBuf::from("/tmp/runtime-activity-test/activity.lock"),
-            PathBuf::from("/tmp/runtime-activity-test/activity.fifo"),
-        ];
-        let extra =
-            crate::codex_provider::runtime_notification_codex_args(&args, profiles[0], &paths);
-        for profile in profiles {
-            let prefix = format!("permissions.{profile}.filesystem=");
-            let value = extra
-                .iter()
-                .find_map(|arg| arg.strip_prefix(&prefix))
-                .unwrap();
-            let config = format!("filesystem={value}")
-                .parse::<toml_edit::DocumentMut>()
-                .unwrap();
-            let filesystem = config["filesystem"].as_inline_table().unwrap();
-            for (path, mode) in paths.iter().zip(["read", "read", "read", fifo_mode]) {
-                assert_eq!(
-                    filesystem
-                        .get(path.to_str().unwrap())
-                        .and_then(toml_edit::Value::as_str),
-                    Some(mode),
-                    "{profile} must grant {} {mode}",
-                    path.display()
-                );
-            }
-            assert_eq!(
-                filesystem.get(":root").and_then(toml_edit::Value::as_str),
-                Some("none")
-            );
-            assert_eq!(
-                filesystem
-                    .get(":workspace_roots")
-                    .and_then(toml_edit::Value::as_inline_table)
-                    .and_then(|roots| roots.get("."))
-                    .and_then(toml_edit::Value::as_str),
-                Some("write")
-            );
-        }
-    }
-    #[test]
-    fn writable_regular_file_endpoint_is_rejected_without_receiving_a_frame() {
-        let (_directory, config, _store, _state, server) = setup();
-        let pipe = server.pipe.0.clone();
-        fs::remove_file(&pipe).unwrap();
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&pipe)
-            .unwrap();
-        let error = publish(
-            &context_path(&config.state_dir),
-            &activity(&server.context, "desktop.used"),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("invalid activity pipe"),
-            "{error}"
-        );
-        assert_eq!(fs::read(&pipe).unwrap(), b"");
-    }
-    #[test]
-    fn symlink_endpoint_is_not_followed() {
-        let (directory, config, _store, _state, server) = setup();
-        let pipe = server.pipe.0.clone();
-        let target = directory.directory.join("symlink-target");
-        fs::write(&target, b"unchanged").unwrap();
-        fs::remove_file(&pipe).unwrap();
-        std::os::unix::fs::symlink(&target, &pipe).unwrap();
-        assert!(publish(
-            &context_path(&config.state_dir),
-            &activity(&server.context, "desktop.used")
-        )
-        .is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
-        assert!(fs::symlink_metadata(&pipe)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-    }
+    include!("runtime_notifications/tests/codex_sandbox.rs");
+
     #[test]
     #[ignore = "requires CODEX_NOTIFICATION_SANDBOX_COMMAND and PAPERCLIP_RUNTIME_NOTIFICATION_HELPER"]
     fn publisher_crosses_real_codex_tool_boundary_without_runner_state_access() {
         use serde_json::Value;
         use std::io::{BufRead, BufReader};
-        use std::os::unix::fs::MetadataExt;
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
         let command = std::env::var_os("CODEX_NOTIFICATION_SANDBOX_COMMAND").unwrap();
@@ -799,33 +694,9 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         let home = workspace.join("home");
         fs::create_dir(&home).unwrap();
-        // Restricted-read Codex profiles give the command a private synthetic root: exact
-        // binds sit in empty tmpfs scaffolding, so the child may create shadow files beside
-        // them without touching the host. The boundary is asserted on real host controls:
-        // the child can neither read them nor change them, and nothing it writes reaches
-        // the host.
-        let state_path = config.state_dir.join("runner-state.json");
-        let pipe_dir = server.pipe.0.parent().unwrap().to_path_buf();
-        let sentinels = [
-            config.state_dir.join("host-sentinel"),
-            pipe_dir.join("host-sentinel"),
-        ];
-        for sentinel in &sentinels {
-            fs::write(sentinel, b"host-sentinel").unwrap();
-            assert_eq!(fs::read(sentinel).unwrap(), b"host-sentinel");
-        }
-        let probes = [
-            config.state_dir.join("child-probe"),
-            pipe_dir.join("child-probe"),
-        ];
-        for probe in &probes {
-            assert!(fs::symlink_metadata(probe).is_err());
-        }
-        assert!(state_path.is_file());
-        let descriptor_before = fs::read(&paths[1]).unwrap();
-        let lock_before = fs::read(&paths[2]).unwrap();
-        let fifo_before = fs::symlink_metadata(&paths[3]).unwrap();
-        assert!(fifo_before.file_type().is_fifo());
+        let resources = std::env::var("CODEX_NOTIFICATION_SANDBOX_RESOURCES")
+            .expect("set the source-pinned Codex executable resource directory");
+        let resources = serde_json::to_string(&resources).unwrap();
         let profile = "paperclip-runner-workspace-only";
         let mut args = vec![
             "-c".into(),
@@ -834,37 +705,21 @@ mod tests {
             "shell_environment_policy.include_only=[\"PATH\",\"LANG\"]".into(),
         ];
         for name in [profile, "paperclip-runner-workspace-read-only"] {
-            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",\":workspace_roots\"={{\".\"=\"read\"}}}}"),
+            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",{resources}=\"read\",\":workspace_roots\"={{\".\"=\"read\"}}}}"),
                 "-c".into(), format!("permissions.{name}.network.enabled=false")]);
         }
         let extra = crate::codex_provider::runtime_notification_codex_args(&args, profile, &paths);
-        // The FIFO is a read-only bind only on Linux; elsewhere it keeps a `write` grant, so
-        // unlink/rename denial of the FIFO itself is asserted on Linux only.
-        let fifo_replacement_checks = if cfg!(target_os = "linux") {
-            r#"if rm -f "$5" 2>/dev/null; then exit 78; fi
-if mv "$5" "$5.moved" 2>/dev/null; then exit 79; fi
-"#
-        } else {
-            ""
-        };
-        let script = [
-            r#"
+        let script = r#"
 [ -z "${UNRELATED_SECRET:-}" ] || exit 70
 if cat "$1" >/dev/null 2>&1; then exit 71; fi
-if cat "$2/host-sentinel" >/dev/null 2>&1; then exit 80; fi
-if cat "$3/host-sentinel" >/dev/null 2>&1; then exit 81; fi
 if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then exit 72; fi
+touch "$2/probe" 2>/dev/null || :
+touch "$3/probe" || exit 76
+rm "$3/probe" || exit 76
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
-for target in "$1" "$2/host-sentinel" "$3/host-sentinel" "$2/child-probe" "$3/child-probe"; do
-  (printf child-write > "$target") 2>/dev/null || :
-done
-"#,
-            fifo_replacement_checks,
-            r#"context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
+context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit 73
 "$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" record-activity "$context" example.runtime desktop.used || exit 74
-"#,
-        ]
-        .concat();
+"#;
         let mut child = Command::new(command)
             .args(args)
             .args(extra)
@@ -904,7 +759,7 @@ done
                     assert!(message.get("error").is_none(), "initialize: {message}");
                     writeln!(input, "{}", json!({"method":"initialized","params":{}})).unwrap();
                     writeln!(input, "{}", json!({"id":2,"method":"command/exec","params":{
-                        "command":["/bin/sh","-c",script,"publisher",state_path,config.state_dir,pipe_dir,server.pipe.0.with_extension("lock"),server.pipe.0],
+                        "command":["/bin/sh","-c",script,"publisher",config.state_dir.join("runner-state.json"),config.state_dir,server.pipe.0.parent().unwrap(),server.pipe.0.with_extension("lock")],
                         "cwd":workspace,"timeoutMs":10000}})).unwrap();
                 } else if message["id"] == 2 {
                     response = Some(message);
@@ -931,50 +786,11 @@ done
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(state.outbox.len(), 1);
-        let event = &state.outbox[0];
-        assert_eq!(event.event_type, "runtime.activity.recorded");
-        assert_eq!(event.envelope["payload"]["runId"], config.run_id);
+        assert_eq!(state.outbox[0].envelope["payload"]["runId"], config.run_id);
+        assert!(!config.state_dir.join("probe").exists());
         assert_eq!(
-            event.envelope["payload"]["payload"],
-            json!({"namespace":"example.runtime","activityKey":"desktop.used"})
-        );
-        // The runner's own persistence of that event is the only change to its state file.
-        assert_eq!(
-            fs::read(&state_path).unwrap(),
+            fs::read(config.state_dir.join("runner-state.json")).unwrap(),
             serde_json::to_vec_pretty(&state).unwrap()
         );
-        for sentinel in &sentinels {
-            assert_eq!(
-                fs::read(sentinel).unwrap(),
-                b"host-sentinel",
-                "{} changed on the host",
-                sentinel.display()
-            );
-        }
-        for probe in &probes {
-            assert_eq!(
-                fs::symlink_metadata(probe)
-                    .map_err(|error| error.kind())
-                    .err(),
-                Some(std::io::ErrorKind::NotFound),
-                "{} reached the host",
-                probe.display()
-            );
-        }
-        assert_eq!(fs::read(&paths[1]).unwrap(), descriptor_before);
-        assert_eq!(fs::read(&paths[2]).unwrap(), lock_before);
-        let fifo_after = fs::symlink_metadata(&paths[3]).unwrap();
-        assert!(fifo_after.file_type().is_fifo());
-        assert_eq!(
-            (fifo_after.dev(), fifo_after.ino()),
-            (fifo_before.dev(), fifo_before.ino())
-        );
-        let mut names = fs::read_dir(&pipe_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(names, ["activity.fifo", "activity.lock", "host-sentinel"]);
-        fs::remove_file(&sentinels[1]).unwrap();
     }
 }

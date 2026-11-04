@@ -167,8 +167,6 @@ export function classifyCodexAuthRefreshFailure(input: {
 }): CodexAuthRefreshFailureClass | null {
   const haystack = buildCodexErrorHaystack(input);
 
-  // An absent request header is a credential-delivery failure, not proof of
-  // a revoked OAuth refresh token. Preserve explicit refresh-token errors.
   if (CODEX_MISSING_AUTH_HEADER_RE.test(haystack)
     && !CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)
     && !CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)
