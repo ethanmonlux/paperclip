@@ -143,7 +143,15 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
-function codexDiagnosticOutput(output: string | null | undefined): string {
+// JSON-shaped lines only; adapter notes such as `[paperclip] ...` stay plain.
+const CODEX_STRUCTURED_LINE_RE = /^(?:[{"]|\[\s*(?:$|[[{"\]\d-]|true\b|false\b|null\b))/;
+
+/**
+ * Text that may serve as a provider diagnostic: plain CLI lines before any
+ * structured record, plus terminal protocol errors. Tool, agent and other
+ * structured records are untrusted quoted content and never become diagnostics.
+ */
+export function extractCodexDiagnosticText(output: string | null | undefined): string {
   const text = output?.trim() ?? "";
   const event = parseJson(text);
   if (event) return parseCodexJsonl(JSON.stringify(event)).errorMessage ?? "";
@@ -151,7 +159,7 @@ function codexDiagnosticOutput(output: string | null | undefined): string {
   let sawProtocol = false;
   return text.split(/\r?\n/).map((rawLine) => {
     const line = rawLine.trim();
-    if (/^[{["]/.test(line)) {
+    if (CODEX_STRUCTURED_LINE_RE.test(line)) {
       sawProtocol = true;
       return parseCodexJsonl(line).errorMessage ?? "";
     }
@@ -166,8 +174,8 @@ function buildCodexErrorHaystack(input: {
 }): string {
   return [
     input.errorMessage ?? "",
-    codexDiagnosticOutput(input.stdout),
-    codexDiagnosticOutput(input.stderr),
+    extractCodexDiagnosticText(input.stdout),
+    extractCodexDiagnosticText(input.stderr),
   ]
     .join("\n")
     .split(/\r?\n/)

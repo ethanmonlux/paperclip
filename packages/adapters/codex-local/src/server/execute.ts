@@ -69,6 +69,7 @@ import {
 import {
   parseCodexJsonl, createCodexJsonlParser,
   classifyCodexAuthRefreshFailure,
+  extractCodexDiagnosticText,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
   isCodexProviderQuotaError,
@@ -1567,7 +1568,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
         : null;
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-      const stderrLine = firstMeaningfulStderrLine(attempt.proc.stderr);
+      // The fallback is reported and classified, so derive it only from
+      // diagnostic stderr text, never from a quoted structured record.
+      const stderrLine = firstMeaningfulStderrLine(extractCodexDiagnosticText(attempt.proc.stderr));
       const fallbackErrorMessage =
         parsedError ||
         stderrLine ||

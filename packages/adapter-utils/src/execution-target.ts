@@ -961,17 +961,23 @@ export async function runAdapterExecutionTargetProcess(
   const launcherDirectory = localProcessSandbox && env.PAPERCLIP_GITHUB_LAUNCHER_DIR
     ? githubOperationLauncherDirectory({ runId, target: null })
     : null;
-  const scopedLocalProcessSandbox =
-    localProcessSandbox && launcherDirectory && env.PAPERCLIP_GITHUB_LAUNCHER_DIR === launcherDirectory
-      ? { ...localProcessSandbox, managedPaths: [
-          ...(localProcessSandbox.managedPaths ?? []),
-          { path: launcherDirectory, access: "ro" as const },
-        ] }
-      : localProcessSandbox;
+  const mountsLauncher =
+    localProcessSandbox && launcherDirectory && env.PAPERCLIP_GITHUB_LAUNCHER_DIR === launcherDirectory;
+  const scopedLocalProcessSandbox = mountsLauncher
+    ? { ...localProcessSandbox, managedPaths: [
+        ...(localProcessSandbox.managedPaths ?? []),
+        { path: launcherDirectory, access: "ro" as const },
+      ] }
+    : localProcessSandbox;
+  // The read-only launcher bind also covers its gh-config root. A workspace
+  // sandbox mounts a private /tmp, so per-operation scratch is created there.
+  const sandboxEnv = mountsLauncher && localProcessSandbox.filesystemScope === "workspace"
+    ? { ...env, GH_CONFIG_DIR: GITHUB_SANDBOX_OPERATION_CONFIG_ROOT }
+    : env;
 
   const result = await runChildProcess(runId, command, args, {
     cwd: options.cwd,
-    env,
+    env: sandboxEnv,
     stdin: options.stdin,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
@@ -1628,6 +1634,9 @@ export function runtimeAssetDir(
 ): string {
   return prepared.assetDirs[key] ?? path.posix.join(fallbackRemoteCwd, ".paperclip-runtime", key);
 }
+
+/** Lives on the sandbox's private /tmp, never on a host path. */
+const GITHUB_SANDBOX_OPERATION_CONFIG_ROOT = "/tmp/paperclip-github-operation-config";
 
 type GitHubLauncherLocation = {
   runId: string; target: AdapterExecutionTarget | null | undefined;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyCodexAuthRefreshFailure,
+  extractCodexDiagnosticText,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
   isCodexProviderQuotaError,
@@ -188,6 +189,13 @@ describe("classifyCodexAuthRefreshFailure", () => {
     JSON.stringify({ type: "turn.failed", error: { message: "OAuth failed: invalid_grant" } }, null, 2),
   ])("preserves a genuine terminal JSON authentication failure: %s", stdout => {
     expect(classifyCodexAuthRefreshFailure({ stdout })).toBe("refresh_token_invalidated");
+  });
+
+  it("keeps plain CLI stderr after an adapter note as diagnostic text", () => {
+    const stderr = "[paperclip] Confining Codex with workspace scope.\nOAuth failed: refresh token has expired";
+    expect(classifyCodexAuthRefreshFailure({ stderr })).toBe("refresh_token_expired");
+    expect(extractCodexDiagnosticText(stderr)).toBe(stderr);
+    expect(extractCodexDiagnosticText('[{"type":"tool_result"}]\nOAuth failed: invalid_grant')).toBe("");
   });
 
   it("classifies explicit refresh-token failure messages", () => {
