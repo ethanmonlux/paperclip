@@ -617,6 +617,28 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
     } finally { await fs.rm(cwd, { recursive: true, force: true }); }
   });
 
+  it.each([
+    ["filesystem boundary", "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n", true],
+    ["additional diagnostic", "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\nfatal: cannot read repository\n", false],
+    ["extra blank line", "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n\n", false],
+  ] as const)("preserves configuration ownership for only the exact Git diagnostic: %s", async (_name, diagnostic, expected) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-boundary-policy-"));
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-boundary-git-"));
+    try {
+      await fs.writeFile(path.join(bin, "git"), `#!/bin/sh\nprintf '%s' '${diagnostic}' >&2\nexit 128\n`, { mode: 0o755 });
+      vi.stubEnv("PATH", bin);
+      const failure = await assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd)).catch((error) => error);
+      expect(failure.code).toBe("workspace_validation_failed");
+      expect(failure.resultJson.workspaceValidation.reason).toBe("git_worktree_base_not_git_checkout");
+      expect(failure.resultJson.workspaceValidation.configurationReason)
+        .toBe(expected ? "local_path_requires_git_checkout" : undefined);
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(bin, { recursive: true, force: true });
+    }
+  });
+
   it.each(["legacy", "repository", "fallback", "materialization", "session", "unbound"])(
     "does not mark ambiguous non-Git workspace evidence as a configuration-only failure: %s", async (kind) => {
       const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ambiguous-workspace-"));
