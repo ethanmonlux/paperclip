@@ -1,5 +1,9 @@
+import { asStringArray } from "@paperclipai/adapter-utils/server-utils";
+import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
+import { prepareCodexObservabilityProfile, selectedCodexProfile, replaceCodexProfileArgs, disableCodexObservabilityArgs } from "@paperclipai/adapter-utils/codex-observability-profile";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +13,7 @@ import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
   ensureCodexAuthCacheEntryDir,
   isCodexAuthCacheEnabled,
+  readSubscriptionAccountId,
   resolveCodexAuthCacheEntryPath,
   selectVendCredential,
 } from "./codex-auth-cache.js";
@@ -31,7 +36,6 @@ import {
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
-  localGitHubLauncherSandboxPaths,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -110,6 +114,7 @@ import {
   createCodexAcpExecutor,
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
+import { codexShellEnvironmentKeys } from "@paperclipai/adapter-utils/codex-shell-environment";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -325,6 +330,27 @@ function managedMcpGatewaysFromContext(context: Record<string, unknown>): Manage
 
 type ResolvedExecutionTarget = ReturnType<typeof readAdapterExecutionTarget>;
 type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
+
+export async function resolveRunScopedCodexCredentialMount(
+  effectiveCodexHome: string,
+  runtimeCredentialHome: string | null,
+): Promise<{ path: string; access: "rw" } | null> {
+  if (!runtimeCredentialHome || path.resolve(effectiveCodexHome) === path.resolve(runtimeCredentialHome)) {
+    return null;
+  }
+  const managedAuthPath = path.join(effectiveCodexHome, "auth.json");
+  const sourceAuthPath = path.join(runtimeCredentialHome, "auth.json");
+  const managedAuth = await fs.lstat(managedAuthPath).catch(() => null);
+  if (!managedAuth?.isSymbolicLink()) return null;
+  const [managedTarget, expectedSource, sourceFile] = await Promise.all([
+    fs.realpath(managedAuthPath).catch(() => null),
+    fs.realpath(sourceAuthPath).catch(() => null),
+    fs.stat(sourceAuthPath).catch(() => null),
+  ]);
+  return managedTarget && expectedSource && managedTarget === expectedSource && sourceFile?.isFile()
+    ? { path: sourceAuthPath, access: "rw" }
+    : null;
+}
 
 type SandboxCodexAuthProbeResult = "present" | "absent" | "unknown";
 
@@ -643,27 +669,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof envConfig.CODEX_HOME === "string" && envConfig.CODEX_HOME.trim().length > 0
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
-  const connectorSourceHome = configuredCodexHome;
-  const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
-    && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
-  if (connectorSkillDigest) {
-    // Never mount assignment-specific skills into the shared company/user home.
-    // A different skill revision gets a new home, so revoked/changed resources
-    // cannot survive as stale symlinks or bleed into another agent's session.
-    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
-      "connector-runtimes", agent.id, connectorSkillDigest);
-  }
-  const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
-    // A missing-source entry would become a dangling skill symlink; skip it.
-    .filter((entry) => !isPaperclipSkillSourceMissing(entry));
-  const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
-  }
   const configuredOpenAiApiKey =
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
       : null;
+  const skillSourceHome = configuredCodexHome;
+  const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
+    && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
+  const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
+    .filter((entry) => !isPaperclipSkillSourceMissing(entry));
+  const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
+  const desiredSet = new Set(desiredSkillNames);
+  // An explicit inventory is the server's authorized execution selection. Include
+  // empty inventories: revocation must not fall back to a previously populated home.
+  let runtimeSkillDigest = Array.isArray(config.paperclipRuntimeSkills)
+    ? createHash("sha256").update(JSON.stringify({ connectorSkillDigest,
+      skills: codexSkillEntries.filter(entry => desiredSet.has(entry.key))
+        .map(entry => [entry.key, entry.source]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    })).digest("hex")
+    : connectorSkillDigest;
+  const runtimeCredentialHome = runtimeSkillDigest
+    ? skillSourceHome ?? await prepareManagedCodexHome(process.env, onLog, agent.companyId, { apiKey: configuredOpenAiApiKey })
+    : null;
+  if (runtimeSkillDigest) {
+    const credentialHome = runtimeCredentialHome!;
+    const credentialBytes = await fs.readFile(path.join(credentialHome, "auth.json")).catch(() => null);
+    const selectedConfig = await fs.readFile(path.join(credentialHome, "config.toml")).catch(() => null);
+    // Keep selected-home provider/MCP edits (and removals) in the launched home.
+    const selectedConfigDigest = selectedConfig ? createHash("sha256").update(selectedConfig).digest("hex") : null;
+    // Copy-back may retain a refreshed regular credential in a generated home.
+    // Account switches must select a different home, while token refreshes for
+    // the same subscription identity preserve its cache and session state.
+    const credentialIdentity = credentialBytes
+      ? readSubscriptionAccountId(credentialBytes) ?? createHash("sha256").update(credentialBytes).digest("hex") : null;
+    runtimeSkillDigest = createHash("sha256").update(JSON.stringify({
+      runtimeSkillDigest, credentialHome, credentialIdentity, selectedConfigDigest, apiKey: envConfig.OPENAI_API_KEY ?? null,
+    })).digest("hex");
+    // Different authorized versions/assignments get separate homes, including
+    // session state. Previously permitted private links cannot survive revocation.
+    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
+      connectorSkillDigest ? "connector-runtimes" : "skill-runtimes", agent.id, runtimeSkillDigest);
+  }
+  if (!executionTargetIsRemote) {
+    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  }
   // A configured CODEX_HOME that lives under the Paperclip-managed company tree
   // (the per-agent home set by the server isolation guard) still needs auth
   // seeded — it ships with no credentials and OPENAI_API_KEY="" by default.
@@ -698,14 +747,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void error;
     });
   }
-  if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
+  if (configuredCodexHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
     });
   }
   if (configuredHomeIsManaged && configuredCodexHome) {
-    const seedEnv = connectorSkillDigest ? {
-      ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+    const seedEnv = runtimeSkillDigest ? {
+      ...process.env, CODEX_HOME: runtimeCredentialHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
     } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
@@ -738,7 +787,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
   // target, so both local and sandboxed Codex processes pick up the routing.
-  // An explicit env.CODEX_HOME override is treated as user-managed and skipped.
+  // A caller-owned home stays untouched. A generated skill home receives the
+  // configured provider routing even when it seeds credentials from that home.
   const envConfigStrings = Object.fromEntries(
     Object.entries(envConfig).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -746,13 +796,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
     env: envConfigStrings,
-    codexHome: configuredCodexHome ? null : effectiveCodexHome,
+    codexHome: configuredCodexHome && !runtimeSkillDigest ? null : effectiveCodexHome,
   });
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  let observabilityProfile: Awaited<ReturnType<typeof prepareCodexObservabilityProfile>> | null = null;
+  let observabilityPreparationFailed = false;
   try {
+    if (ctx.observability) {
+      if (isManagedCodexHomePath(process.env, agent.companyId, effectiveCodexHome)) {
+        try {
+          observabilityProfile = await prepareCodexObservabilityProfile({ home: effectiveCodexHome, runId,
+            launch: ctx.observability, sourceProfile: selectedCodexProfile(buildCodexExecArgs(config).args) });
+        } catch {
+          observabilityPreparationFailed = true;
+          await onLog("stderr", "[paperclip] Company observability configuration could not be prepared; execution continues with export disabled.\n");
+        }
+      } else await onLog("stderr", "[paperclip] Company observability is unavailable for a caller-owned Codex home.\n");
+    }
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
     }
@@ -813,7 +876,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // the single-use `auth.json`) are dereferenced to bytes. This drops the
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
-          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+          stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId, additionalFiles: observabilityProfile ? [observabilityProfile.filename] : [] });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,
@@ -971,6 +1034,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
     }
     env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
+    if (ctx.observability && (observabilityProfile || observabilityPreparationFailed)) applyObservabilityEnvironment(env, ctx.observability);
     if (authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
@@ -1000,13 +1064,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScopedCredentialMount = filesystemScope && runtimeSkillDigest
+      ? await resolveRunScopedCodexCredentialMount(effectiveCodexHome, runtimeCredentialHome)
+      : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" },
-              ...await localGitHubLauncherSandboxPaths({ runId, env })],
+            managedPaths: [
+              { path: effectiveCodexHome, access: "rw" },
+              ...(runScopedCredentialMount ? [runScopedCredentialMount] : []),
+            ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -1049,6 +1118,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+    if (observabilityProfile) {
+      let qualified = false;
+      try {
+        const version = await runAdapterExecutionTargetProcess(`${runId}-observability-version`, executionTarget, command, ["--version"], {
+          cwd, env: runtimeEnv, timeoutSec: 5, graceSec: 1, onLog: async () => {},
+        });
+        qualified = version.exitCode === 0 && /^codex-cli 0\.160\.0\s*$/.test(version.stdout.trim());
+      } catch { /* Export qualification must not block baseline work. */ }
+      if (!qualified) {
+        await observabilityProfile.cleanup();
+        observabilityProfile = null;
+        await onLog("stderr", "[paperclip] Company observability was not applied: this Codex executable is not the qualified 0.160.0 release.\n");
+      }
+    }
     const loggedEnv = buildInvocationEnvForLogs(env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
@@ -1233,25 +1316,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         },
       );
       const args = execArgs.args;
+      if (observabilityProfile) replaceCodexProfileArgs(args, observabilityProfile.name);
+      else if (observabilityPreparationFailed) disableCodexObservabilityArgs(args);
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      if (ctx.agentIdentity) {
-        const identityNames = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"];
-        const shellKeys = [...new Set([
-          "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
-          // Keep Codex's default secret-name exclusions except for the scoped
-          // Paperclip API token used by the agent skill. Never include host env.
-          ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_GITHUB_BROKER_TOKEN" || !/key|secret|token/i.test(key)),
-          ...identityNames,
-          // The outer local sandbox injects these after this command is built.
-          // Keep its bridge reachable from Codex child shells without inheriting
-          // arbitrary host environment or changing the network allowlist.
-          ...(localProcessSandbox?.networkScope === "allowlist"
-            ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
-            : []),
-        ])];
-        args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
-          "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
-      }
+      const shellKeys = [...new Set([
+        ...codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity)),
+        ...(localProcessSandbox?.networkScope === "allowlist"
+          ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+          : []),
+      ])].sort();
+      args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
+        "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =
         execArgs.fastModeIgnoredReason == null
           ? commandNotes
@@ -1680,6 +1755,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
+    await observabilityProfile?.cleanup();
     await preparedRuntimeConfig.cleanup();
   }
 }

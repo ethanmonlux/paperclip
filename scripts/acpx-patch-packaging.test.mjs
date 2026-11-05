@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  cpSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -24,6 +25,7 @@ import {
   createBundledInstallManifest,
   configureBundledProviderOverrides,
   materializePublishManifest,
+  materializeWorkspacePublishManifest,
   selectBundledDependencyPatches,
   stageBundledEsbuildOptionalDependencies,
   stageBundledProviderOptionalDependencies,
@@ -56,6 +58,33 @@ function esbuildFixture(t) {
 }
 const codexTargets = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"];
 const codexOptional = Object.fromEntries(codexTargets.map(target => [`@openai/codex-${target}`, `npm:@openai/codex@0.160.0-${target}`]));
+const claudeTargets = [...codexTargets, "linux-x64-musl", "linux-arm64-musl"];
+const claudeOptional = Object.fromEntries(claudeTargets.map(target => [`@anthropic-ai/claude-agent-sdk-${target}`, "0.3.286"]));
+function claudeFixture(t) {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "paperclip-bundled-claude-")));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const graph = join(directory, "node_modules");
+  const writePackage = (location, metadata) => {
+    mkdirSync(location, { recursive: true });
+    writeFileSync(join(location, "package.json"), JSON.stringify(metadata));
+    return location;
+  };
+  const bridge = writePackage(join(graph, "@agentclientprotocol/claude-agent-acp"), {
+    name: "@agentclientprotocol/claude-agent-acp", version: "0.73.0", dependencies: { "@anthropic-ai/claude-agent-sdk": "0.3.286" },
+  });
+  writeFileSync(join(bridge, "index.js"), "export {};\n");
+  const runtime = writePackage(join(graph, "@anthropic-ai/claude-agent-sdk"), {
+    name: "@anthropic-ai/claude-agent-sdk", version: "0.3.286", exports: { ".": "./sdk.mjs" }, optionalDependencies: claudeOptional,
+  });
+  writeFileSync(join(runtime, "sdk.mjs"), "// official JavaScript fixture, never executed\n");
+  const producer = writePackage(join(graph, "@anthropic-ai/claude-agent-sdk-linux-x64"), {
+    name: "@anthropic-ai/claude-agent-sdk-linux-x64", version: "0.3.286", os: ["linux"], cpu: ["x64"],
+  });
+  writeFileSync(join(producer, "claude"), "producer native fixture, never executed");
+  const profiles = [{ agent: "claude", ...profileData.profiles.claude }];
+  const publish = { name: "paperclip-claude-pack-fixture", version: "1.0.0", dependencies: { "@agentclientprotocol/claude-agent-acp": "0.73.0" }, bundleDependencies: ["@agentclientprotocol/claude-agent-acp"] };
+  return { directory, graph, bridge, runtime, producer, profiles, publish, writePackage };
+}
 function codexFixture(t) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "paperclip-bundled-codex-")));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -176,13 +205,26 @@ test("published packages preserve the patched ACPX runtime", () => {
   assert.equal(cliEsbuildConfig.external.includes("acpx"), false);
 });
 
+test("published Claude bridge pins its qualified SDK and provider dependency closure", () => {
+  const published = materializePublishManifest(serverPackage);
+  const { installManifest } = configureBundledProviderOverrides(
+    createBundledInstallManifest(published, serverPackage.bundleDependencies),
+    serverPackage.bundleDependencies, rootPackage, profileData,
+  );
+  assert.deepEqual(installManifest.overrides["@agentclientprotocol/claude-agent-acp@0.73.0"], {
+    "@anthropic-ai/claude-agent-sdk": "0.3.286",
+    "@agentclientprotocol/sdk": "1.4.0",
+    zod: "4.4.3",
+  });
+});
+
 test("published Codex bridge uses its qualified producer closure without consumer overrides", () => {
   const published = materializePublishManifest(serverPackage);
   const { installManifest, profiles } = configureBundledProviderOverrides(
     createBundledInstallManifest(published, serverPackage.bundleDependencies),
     serverPackage.bundleDependencies, rootPackage, profileData,
   );
-  assert.equal(profiles.length, 1);
+  assert.deepEqual(profiles.map(profile => profile.agent), ["codex", "claude"]);
   for (const profile of profiles) {
     assert.equal(published.dependencies[profile.agentServerPackage], profile.agentServerVersion);
     assert.ok(published.bundleDependencies.includes(profile.agentServerPackage));
@@ -199,6 +241,58 @@ test("published Codex bridge uses its qualified producer closure without consume
   const conflict = createBundledInstallManifest(published, serverPackage.bundleDependencies);
   conflict.overrides = { "@agentclientprotocol/codex-acp@1.6.2": { "@openai/codex": "0.156.1" } };
   assert.throws(() => configureBundledProviderOverrides(conflict, serverPackage.bundleDependencies, rootPackage, profileData), /conflicting producer override/);
+});
+
+test("Linux-produced Claude bundles retain the SDK and install native packages for the consumer platform", (t) => {
+  const { directory, bridge, runtime, producer, profiles, publish } = claudeFixture(t);
+  const bridgeBefore = readFileSync(join(bridge, "package.json"), "utf8");
+  const staged = stageBundledProviderOptionalDependencies(directory, publish, profiles);
+  assert.deepEqual(staged.optionalDependencies, claudeOptional);
+  assert.equal(existsSync(producer), false);
+  assert.equal(JSON.parse(readFileSync(join(runtime, "package.json"), "utf8")).optionalDependencies, undefined);
+  assert.equal(readFileSync(join(bridge, "package.json"), "utf8"), bridgeBefore);
+  assert.deepEqual(stageBundledProviderOptionalDependencies(directory, staged, profiles), staged);
+  writeFileSync(join(directory, "package.json"), JSON.stringify(staged));
+  const packs = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--offline", "--json"], {
+    cwd: directory, encoding: "utf8", timeout: 30_000,
+    env: { ...process.env, HOME: directory, npm_config_cache: join(directory, "cache"), npm_config_update_notifier: "false" },
+  }));
+  const paths = packs[0].files.map(file => file.path);
+  assert.ok(paths.some(path => path.endsWith("@anthropic-ai/claude-agent-sdk/sdk.mjs")));
+  assert.equal(paths.some(path => /@anthropic-ai\/claude-agent-sdk-(?:linux|darwin|win32)-/.test(path)), false);
+});
+
+test("Claude bundle validation rejects unqualified declarations before removing native payloads", (t) => {
+  const { directory, runtime, producer, profiles, publish } = claudeFixture(t);
+  const file = join(runtime, "package.json"), original = JSON.parse(readFileSync(file, "utf8"));
+  for (const metadata of [
+    { ...original, version: "0.3.285" },
+    { ...original, optionalDependencies: { ...claudeOptional, "@anthropic-ai/claude-agent-sdk-darwin-arm64": "latest" } },
+    { ...original, optionalDependencies: {} },
+  ]) {
+    writeFileSync(file, JSON.stringify(metadata));
+    assert.throws(() => stageBundledProviderOptionalDependencies(directory, publish, profiles), /version mismatch|not qualified/);
+    assert.equal(existsSync(producer), true);
+  }
+});
+
+test("mixed provider bundles validate both runtimes before removing either producer executable", (t) => {
+  const codex = codexFixture(t), claude = claudeFixture(t);
+  for (const name of ["@agentclientprotocol/claude-agent-acp", "@anthropic-ai/claude-agent-sdk", "@anthropic-ai/claude-agent-sdk-linux-x64"]) {
+    cpSync(join(claude.graph, name), join(codex.graph, name), { recursive: true });
+  }
+  const profiles = [...codex.profiles, ...claude.profiles];
+  const publish = { ...codex.publish, dependencies: { ...codex.publish.dependencies, ...claude.publish.dependencies },
+    bundleDependencies: [...codex.publish.bundleDependencies, ...claude.publish.bundleDependencies] };
+  const file = join(codex.graph, "@anthropic-ai/claude-agent-sdk/package.json");
+  const metadata = JSON.parse(readFileSync(file, "utf8"));
+  writeFileSync(file, JSON.stringify({ ...metadata, version: "0.3.285" }));
+  assert.throws(() => stageBundledProviderOptionalDependencies(codex.directory, publish, profiles), /Claude runtime version mismatch/);
+  assert.equal(existsSync(codex.producer), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(codex.runtime, "package.json"), "utf8")).optionalDependencies, codexOptional);
+  writeFileSync(file, JSON.stringify(metadata));
+  const staged = stageBundledProviderOptionalDependencies(codex.directory, publish, profiles);
+  assert.deepEqual(staged.optionalDependencies, { ...codexOptional, ...claudeOptional });
 });
 
 test("Codex bundles retain pinned JavaScript and delegate official consumer platform aliases without native payloads", (t) => {
@@ -370,6 +464,40 @@ test("bundled package staging materializes workspace dependency versions", () =>
   });
 });
 
+test("frozen workspace staging resolves the actual SDK manifest and fails closed on missing or mismatched packages", t => {
+  const root = mkdtempSync(join(tmpdir(), "paperclip-workspace-manifest-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceDir = join(root, "server");
+  const sdk = join(root, "sdk");
+  mkdirSync(join(sourceDir, "node_modules", "@paperclipai"), { recursive: true });
+  mkdirSync(sdk);
+  const sdkManifest = join(sdk, "package.json");
+  writeFileSync(sdkManifest, JSON.stringify({ name: "@paperclipai/plugin-sdk", version: "1.0.0" }));
+  symlinkSync(sdk, join(sourceDir, "node_modules", "@paperclipai", "plugin-sdk"), "junction");
+  const source = { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/plugin-sdk": "workspace:*" } };
+  assert.equal(materializeWorkspacePublishManifest(source, sourceDir).dependencies["@paperclipai/plugin-sdk"], "1.0.0");
+  writeFileSync(sdkManifest, JSON.stringify({ name: "wrong-package", version: "1.0.0" }));
+  assert.throws(() => materializeWorkspacePublishManifest(source, sourceDir), /Invalid workspace dependency/);
+  rmSync(sdkManifest);
+  assert.throws(() => materializeWorkspacePublishManifest(source, sourceDir), /ENOENT/);
+});
+
+test("bundled staging preserves independent workspace dependency versions", () => {
+  const source = {
+    name: "@paperclipai/server",
+    version: "0.3.1",
+    dependencies: { "@paperclipai/plugin-sdk": "workspace:*", caret: "workspace:^" },
+    optionalDependencies: { tilde: "workspace:~" },
+    peerDependencies: { peer: "workspace:*" },
+  };
+  const versions = { "@paperclipai/plugin-sdk": "1.0.0", caret: "2.0.0", tilde: "3.0.0", peer: "4.0.0" };
+  const staged = materializePublishManifest(source, name => versions[name]);
+  assert.deepEqual(staged.dependencies, { "@paperclipai/plugin-sdk": "1.0.0", caret: "^2.0.0" });
+  assert.deepEqual(staged.optionalDependencies, { tilde: "~3.0.0" });
+  assert.deepEqual(staged.peerDependencies, { peer: "4.0.0" });
+  assert.equal(source.dependencies["@paperclipai/plugin-sdk"], "workspace:*");
+});
+
 test("bundled package staging installs only dependencies included in the tarball", () => {
   const publishManifest = {
     name: "@paperclipai/db",
@@ -496,6 +624,16 @@ test("server package staging applies every bundled runtime patch and preserves t
     join(sourceDir, "package.json"),
     JSON.stringify({ ...serverPackage, files: ["dist"] }),
   );
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const [name, specifier] of Object.entries(serverPackage[section] ?? {})) {
+      if (!specifier.startsWith("workspace:")) continue;
+      const dependency = join(sourceDir, "node_modules", name);
+      mkdirSync(dependency, { recursive: true });
+      writeFileSync(join(dependency, "package.json"), JSON.stringify({
+        name, version: name === "@paperclipai/plugin-sdk" ? "1.0.0" : serverPackage.version,
+      }));
+    }
+  }
   writeFileSync(callLog, "");
   mkdirSync(fixtureArtifacts);
   const nativePackage = join(fixtureArtifacts, "@openai/codex-linux-x64");
@@ -530,7 +668,7 @@ mkdir -p "$destination/node_modules/.pnpm"
 set -euo pipefail
 printf 'npm %s\\n' "$*" >> "$FAKE_CALL_LOG"
 [ "$*" = "install --omit=dev --ignore-scripts --no-audit --no-fund" ]
-node -e 'const fs = require("node:fs"); const pkg = require("./package.json"); if ("devDependencies" in pkg) process.exit(1); for (const [name, version] of Object.entries(pkg.dependencies)) { const dir = "node_modules/" + name; fs.mkdirSync(dir + "/dist", { recursive: true }); fs.writeFileSync(dir + "/package.json", JSON.stringify({ name, version })); } for (const [bridge, runtimes] of Object.entries(pkg.overrides ?? {})) { for (const [name, version] of Object.entries(runtimes)) { const dir = "node_modules/" + name; fs.mkdirSync(dir, { recursive: true }); const native = name === "@openai/codex"; const optionalDependencies = native ? Object.fromEntries(["linux-x64","linux-arm64","darwin-x64","darwin-arm64","win32-x64","win32-arm64"].map(target => [name+"-"+target,"npm:"+name+"@"+version+"-"+target])) : undefined; fs.writeFileSync(dir + "/package.json", JSON.stringify({ name, version, optionalDependencies })); } }'
+node -e 'const fs = require("node:fs"); const pkg = require("./package.json"); if ("devDependencies" in pkg) process.exit(1); for (const [name, version] of Object.entries(pkg.dependencies)) { const dir = "node_modules/" + name; fs.mkdirSync(dir + "/dist", { recursive: true }); fs.writeFileSync(dir + "/package.json", JSON.stringify({ name, version })); } for (const [bridge, runtimes] of Object.entries(pkg.overrides ?? {})) { for (const [name, version] of Object.entries(runtimes)) { const dir = "node_modules/" + name; fs.mkdirSync(dir, { recursive: true }); const native = name === "@openai/codex"; const targets = ["linux-x64","linux-arm64","darwin-x64","darwin-arm64","win32-x64","win32-arm64"]; const optionalDependencies = native ? Object.fromEntries(targets.map(target => [name+"-"+target,"npm:"+name+"@"+version+"-"+target])) : name === "@anthropic-ai/claude-agent-sdk" ? Object.fromEntries([...targets,"linux-x64-musl","linux-arm64-musl"].map(target => [name+"-"+target,version])) : undefined; fs.writeFileSync(dir + "/package.json", JSON.stringify({ name, version, optionalDependencies })); } }'
 node -e 'const fs=require("node:fs");fs.cpSync(process.env.FAKE_NATIVE_ARTIFACTS+"/@openai/codex-linux-x64","node_modules/@openai/codex-linux-x64",{recursive:true});fs.mkdirSync("node_modules/@openai/codex/vendor",{recursive:true});fs.writeFileSync("node_modules/@openai/codex/vendor/codex","producer fallback fixture");'
 mkdir -p node_modules/acpx/dist
 node -e 'const fs=require("node:fs");fs.mkdirSync("node_modules/esbuild",{recursive:true});fs.writeFileSync("node_modules/esbuild/package.json",JSON.stringify({name:"esbuild",version:"0.28.2",scripts:{postinstall:"node install.js"},optionalDependencies:Object.fromEntries(["linux-x64","darwin-arm64","darwin-x64"].map(target=>["@esbuild/"+target,"0.28.2"]))}));fs.mkdirSync("node_modules/@esbuild/linux-x64",{recursive:true});fs.writeFileSync("node_modules/@esbuild/linux-x64/package.json",JSON.stringify({name:"@esbuild/linux-x64",version:"0.28.2",os:["linux"],cpu:["x64"]}));'
@@ -568,7 +706,7 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
     process.execPath,
     [
       "--input-type=module", "-e",
-      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3], preserveWorkspaceVersions: true });`,
       sourceDir,
       destinationDir,
       fixtureSourceRoot,
@@ -590,7 +728,8 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
   assert.equal(lstatSync(stagedAcpxDir).isSymbolicLink(), false);
   assert.equal(existsSync(join(destinationDir, "node_modules/.pnpm")), false);
   const stagedManifest = JSON.parse(readFileSync(join(destinationDir, "package.json"), "utf8"));
-  for (const [name, version] of Object.entries(codexOptional)) {
+  assert.equal(stagedManifest.dependencies["@paperclipai/plugin-sdk"], "1.0.0");
+  for (const [name, version] of Object.entries({ ...codexOptional, ...claudeOptional })) {
     assert.equal(stagedManifest.optionalDependencies[name], version);
     assert.equal(existsSync(join(destinationDir, "node_modules", name)), false);
     assert.equal(stagedManifest.bundleDependencies.includes(name), false);
@@ -629,6 +768,21 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
       `${specifier} receives its own full configured patch`,
     );
   }
+
+  rmSync(join(sourceDir, "node_modules"), { recursive: true });
+  const releaseDestination = join(fixtureDir, "release-destination");
+  execFileSync(process.execPath, [
+    "--input-type=module", "-e",
+    `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+    sourceDir, releaseDestination, fixtureSourceRoot,
+  ], {
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, FAKE_CALL_LOG: callLog,
+      FAKE_SOURCE_PACKAGE: join(sourceDir, "package.json"), FAKE_NATIVE_ARTIFACTS: fixtureArtifacts },
+    stdio: "pipe",
+  });
+  const releaseManifest = JSON.parse(readFileSync(join(releaseDestination, "package.json"), "utf8"));
+  assert.equal(releaseManifest.dependencies["@paperclipai/plugin-sdk"], serverPackage.version);
+
 });
 
 test("bundled package dry runs preview without querying published versions", () => {

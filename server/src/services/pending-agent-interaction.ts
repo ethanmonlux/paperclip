@@ -36,14 +36,6 @@ export function isPendingAgentInteractionAddressee(input: {
   return policy === "anyone" || policy === "not_creator";
 }
 
-/**
- * Re-read the persisted invitation at every dispatch boundary. This authorizes
- * only the named response participant, never checkout, reassignment, source work,
- * acceptance of a stale target, or a governed action. Those API gates still run.
- * Lock the invitation through the caller transaction's provider handoff so a
- * concurrent cancellation cannot revoke authority between read and dispatch.
- * A payload flag or a wake reason alone is never authority.
- */
 export async function pendingAgentInteractionAddressee(db: Db, input: {
   companyId: string; issueId: string; agentId: string;
   contextSnapshot: Record<string, unknown>;

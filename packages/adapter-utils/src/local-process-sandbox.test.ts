@@ -100,6 +100,16 @@ describe("local process sandbox", () => {
     expect(target.args).toContain("--tmpfs");
     expect(target.args).toContain(workspace);
     expect(target.args).toContain(managedHome);
+    // Merged-usr hosts have /bin, /sbin and /lib symlinks into /usr.
+    // Bubblewrap must mount /usr before trying to mount those aliases.
+    const readMounts = target.args.flatMap((arg, index) =>
+      arg === "--ro-bind" ? [target.args[index + 1]] : [],
+    );
+    const usrIndex = readMounts.indexOf("/usr");
+    expect(usrIndex).toBeGreaterThanOrEqual(0);
+    for (const alias of ["/bin", "/sbin", "/lib", "/lib64"]) {
+      if (readMounts.includes(alias)) expect(usrIndex).toBeLessThan(readMounts.indexOf(alias));
+    }
     expect(target.args.slice(-3)).toEqual([process.execPath, "-e", "console.log('ok')"]);
   });
 

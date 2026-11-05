@@ -45,8 +45,6 @@ it.skipIf(process.platform === "win32").each([true, false])(
       accepted = await connected;
       const [data] = await response;
       expect(data.toString()).toContain(allowed ? "200 Connection Established" : "403 Forbidden");
-      // A peer can close while a pipe is writing. The accepted socket must have
-      // a lifecycle owner even after HTTP detaches it for a CONNECT tunnel.
       expect(() => accepted!.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow();
       expect(accepted.destroyed).toBe(true);
     } finally {

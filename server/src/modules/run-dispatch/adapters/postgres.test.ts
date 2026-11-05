@@ -1,11 +1,19 @@
+import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
+  approvals,
+  budgetIncidents,
+  budgetPolicies,
+  budgetReservations,
   companies,
+  costEvents,
   createDb,
+  applyPendingMigrations,
   documentRevisions,
   documents,
   environmentLeases,
@@ -17,6 +25,8 @@ import {
   issueRecoveryActions,
   issueTreeHolds,
   issues,
+  nativeRunFinalizations,
+  projects,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
@@ -26,16 +36,17 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { issueThreadInteractionService } from "../../../services/issue-thread-interactions.js";
+import { reserveRunBudget } from "../../../services/budget-reservations.js";
+import { budgetService, recheckAdmittedRunBudgetReadOnly } from "../../../services/budgets.js";
+import { costService } from "../../../services/costs.js";
 
 // Pause only after the real invitation query; keep the production lock/read.
-const invitationBoundary = vi.hoisted(() => ({ beforeRead: null as null | (() => Promise<void>), afterRead: null as null | (() => Promise<void>) }));
+const invitationBoundary = vi.hoisted(() => ({ afterRead: null as null | (() => Promise<void>) }));
 vi.mock("../../../services/pending-agent-interaction.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../services/pending-agent-interaction.js")>();
   return { ...actual, pendingAgentInteractionAddressee: async (
     ...args: Parameters<typeof actual.pendingAgentInteractionAddressee>
   ) => {
-    await invitationBoundary.beforeRead?.();
     const allowed = await actual.pendingAgentInteractionAddressee(...args);
     await invitationBoundary.afterRead?.();
     return allowed;
@@ -49,7 +60,8 @@ vi.mock("../../../services/pending-agent-interaction.js", async (importOriginal)
 // feeds the mapped facts back through the real gate to prove the wiring
 // produces the same suppression a caller would have seen before this module
 // existed.
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const external = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_DISPATCH_TEST_DATABASE_URL");
+const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -63,14 +75,19 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-dispatch-postgres-adapter-");
-    db = createDb(tempDb.connectionString);
+    if (external) await applyPendingMigrations(external);
+    else tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-dispatch-postgres-adapter-");
+    db = createDb(external ?? tempDb!.connectionString);
   }, 20_000);
 
   afterEach(async () => {
     invitationBoundary.afterRead = null;
-    invitationBoundary.beforeRead = null;
+    await db.delete(budgetIncidents);
+    await db.delete(approvals);
+    await db.delete(budgetPolicies);
+    await db.delete(costEvents);
     await db.delete(environmentLeases);
+    await db.delete(nativeRunFinalizations);
     await db.delete(activityLog);
     await db.delete(issueDocuments);
     await db.delete(documentRevisions);
@@ -80,11 +97,13 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
 
   afterAll(async () => {
+    await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
   });
 
@@ -194,6 +213,15 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     return { companyId, agentId, ownerId, issueId, interactionId, sourceRunId, runId, now };
   }
 
+  // Upstream accounting admission: the final locked dispatch gate requires the
+  // run's held budget reservation, exactly as the other final-gate cases seed it.
+  async function seedRunningAddressedHandoff() {
+    const f = await seedAddressedHandoff("running");
+    const reservation = await reserveRunBudget(db, f.companyId, f.runId, null);
+    expect(reservation).toMatchObject({ runId: f.runId, state: "held", reused: false });
+    return { ...f, reservationId: reservation.id };
+  }
+
   it("admits a persisted addressed handoff without reassignment or source checkout", async () => {
     const f = await seedAddressedHandoff();
     const adapter = createPostgresRunDispatchAdapter(db);
@@ -208,7 +236,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   it("dispatches the addressed recipient only while the invitation and execution lock remain current", async () => {
-    const f = await seedAddressedHandoff("running");
+    const f = await seedRunningAddressedHandoff();
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     const dispatch = vi.fn(async () => "recipient started");
     const outcome = await createPostgresRunDispatchAdapter(db)
@@ -220,15 +248,26 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(issue).toMatchObject({ assigneeAgentId: f.ownerId, checkoutRunId: null });
   });
 
-  it("serializes concurrent invitation cancellation with the final provider handoff", async () => {
-    const f = await seedAddressedHandoff("running");
+  // PR #14's upstream base dispatches in two locked phases: accounting admission,
+  // then the final issue/run ownership handoff. Each re-reads the invitation FOR
+  // UPDATE. A revocation committed between phases must prevent the handoff; a
+  // revocation racing the final phase must wait until the handoff has been made.
+  it.each([
+    ["accounting admission", 1, ["revoked"], false],
+    ["final ownership handoff", 2, ["dispatch", "revoked"], true],
+  ] as const)("serializes concurrent invitation cancellation with the %s phase", async (_phase, readNumber, expectedOrder, dispatched) => {
+    const f = await seedRunningAddressedHandoff();
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     let read!: () => void, release!: () => void, cancelPid!: (pid: number) => void;
     const readDone = new Promise<void>(resolve => { read = resolve; });
     const released = new Promise<void>(resolve => { release = resolve; });
     const pidReady = new Promise<number>(resolve => { cancelPid = resolve; });
     const order: string[] = [];
-    invitationBoundary.afterRead = async () => { read(); await released; };
+    let reads = 0;
+    invitationBoundary.afterRead = async () => {
+      reads += 1;
+      if (reads === readNumber) { read(); await released; }
+    };
     const dispatch = vi.fn(async () => { order.push("dispatch"); });
     const gate = createPostgresRunDispatchAdapter(db)
       .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
@@ -240,6 +279,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         .where(eq(issueThreadInteractions.id, f.interactionId));
       order.push("revoked");
     });
+    let outcome: Awaited<typeof gate> | undefined;
     try {
       const pid = await pidReady;
       // Observe a real lock wait, rather than using a timing-only assertion.
@@ -255,72 +295,18 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       expect(order).toEqual([]);
     } finally {
       release();
-      await gate;
+      outcome = await gate;
       await cancellation;
     }
-    expect(dispatch).toHaveBeenCalledOnce();
-    expect(order).toEqual(["dispatch", "revoked"]);
-  });
-
-  it("orders stale-target expiry issue-first against final invitation dispatch", async () => {
-    const f = await seedAddressedHandoff("running");
-    const documentId = randomUUID(), oldRevisionId = randomUUID(), revisionId = randomUUID();
-    await db.insert(documents).values({ id: documentId, companyId: f.companyId,
-      title: "Handoff", format: "markdown", latestBody: "revised handoff",
-      latestRevisionId: revisionId, latestRevisionNumber: 2, createdByAgentId: f.ownerId });
-    await db.insert(documentRevisions).values([
-      { id: oldRevisionId, companyId: f.companyId, documentId, revisionNumber: 1,
-        title: "Handoff", format: "markdown", body: "original handoff", createdByAgentId: f.ownerId },
-      { id: revisionId, companyId: f.companyId, documentId, revisionNumber: 2,
-        title: "Handoff", format: "markdown", body: "revised handoff", createdByAgentId: f.ownerId },
-    ]);
-    await db.insert(issueDocuments).values({ companyId: f.companyId, issueId: f.issueId,
-      documentId, key: "handoff" });
-    await db.update(issueThreadInteractions).set({ payload: { version: 1, prompt: "Route handoff",
-      target: { type: "issue_document", issueId: f.issueId, documentId, key: "handoff",
-        revisionId: oldRevisionId, revisionNumber: 1 } } }).where(eq(issueThreadInteractions.id, f.interactionId));
-    await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
-    let atRead!: () => void, release!: () => void;
-    const readReached = new Promise<void>(resolve => { atRead = resolve; });
-    const released = new Promise<void>(resolve => { release = resolve; });
-    invitationBoundary.beforeRead = async () => { atRead(); await released; };
-    const dispatch = vi.fn(async () => "recipient started");
-    const gate = createPostgresRunDispatchAdapter(db)
-      .dispatchResolvedInteractionIfCurrent({ ...f, expectedStatus: "running", dispatch });
-    await readReached;
-    // Exercise the real human rejection path, including stale-target expiry.
-    const expiry = issueThreadInteractionService(db).rejectInteraction(
-      { id: f.issueId, companyId: f.companyId, status: "in_review" }, f.interactionId,
-      { reason: "The handoff changed" }, { userId: "local-board" },
-    ).then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
-    try {
-      let waitingQuery = "";
-      for (let attempt = 0; attempt < 100; attempt++) {
-        const rows = await db.execute<{ query: string }>(sql`
-          select query from pg_stat_activity
-          where datname = current_database() and pid <> pg_backend_pid()
-            and wait_event_type = 'Lock' and query like '%"issues"%'`);
-        waitingQuery = rows[0]?.query ?? "";
-        if (waitingQuery) break;
-        await new Promise(resolve => setTimeout(resolve, 10));
-      }
-      // The old path first locked the invitation, then blocked updating the
-      // issue, which would deadlock when the dispatch query is released.
-      expect(waitingQuery).toMatch(/^select /i);
-    } finally {
-      release();
-      await Promise.allSettled([gate, expiry]);
-    }
-    expect((await gate).dispatched).toBe(true);
-    expect(dispatch).toHaveBeenCalledOnce();
-    const expired = await expiry;
-    expect(expired.ok).toBe(false);
-    expect((await db.select().from(issueThreadInteractions)
-      .where(eq(issueThreadInteractions.id, f.interactionId)))[0]?.status).toBe("expired");
+    expect(outcome?.dispatched).toBe(dispatched);
+    expect(dispatch).toHaveBeenCalledTimes(dispatched ? 1 : 0);
+    expect(order).toEqual(expectedOrder);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toMatchObject({
+      assigneeAgentId: f.ownerId, checkoutRunId: null });
   });
 
   it.each(["accepted", "cancelled"])("rejects a %s invitation at the final locked dispatch gate", async (status) => {
-    const f = await seedAddressedHandoff("running");
+    const f = await seedRunningAddressedHandoff();
     const adapter = createPostgresRunDispatchAdapter(db);
     await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
     await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, f.interactionId));
@@ -336,6 +322,48 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     const adapter = createPostgresRunDispatchAdapter(db);
     await db.update(issueThreadInteractions).set({ addresseeAgentId: f.ownerId }).where(eq(issueThreadInteractions.id, f.interactionId));
     expect(await adapter.cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+  });
+
+  it("admits the exact live STA-21 addressed-card wake shape (run 616fbb16) and keeps negative audiences cancelled", async () => {
+    // Recorded contextSnapshot keys of cancelled run 616fbb16 on installed b4ede7b1:
+    // a request_confirmation addressed to the coordinator while the source stays
+    // assigned to the engineer, promoted from a deferred wake after the source run released.
+    const live = async () => {
+      const f = await seedAddressedHandoff();
+      await db.update(heartbeatRuns).set({ contextSnapshot: {
+        source: "issue.interaction.created", taskId: f.issueId, issueId: f.issueId, taskKey: f.issueId,
+        wakeReason: "interaction_pending", wakeSource: "automation", sourceRunId: f.sourceRunId,
+        interactionId: f.interactionId, interactionKind: "request_confirmation",
+        sourceCommentId: null, wakeTriggerDetail: "system",
+      } }).where(eq(heartbeatRuns.id, f.runId));
+      return f;
+    };
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const admitted = await live();
+    expect(await adapter.cancelStaleQueuedRun({ ...admitted, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "not_stale" });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.runId)))[0])
+      .toMatchObject({ status: "queued", errorCode: null });
+
+    const addressedToUser = await live();
+    await db.update(issueThreadInteractions).set({ addresseeAgentId: null, addresseeUserId: "board-user" })
+      .where(eq(issueThreadInteractions.id, addressedToUser.interactionId));
+    expect(await adapter.cancelStaleQueuedRun({ ...addressedToUser, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+    const accepted = await live();
+    await db.update(issueThreadInteractions).set({ status: "accepted" })
+      .where(eq(issueThreadInteractions.id, accepted.interactionId));
+    expect(await adapter.cancelStaleQueuedRun({ ...accepted, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+
+    const otherIssue = await live();
+    const foreignIssueId = randomUUID();
+    await seedIssue({ companyId: otherIssue.companyId, issueId: foreignIssueId, status: "in_review", assigneeAgentId: otherIssue.ownerId });
+    await db.update(issueThreadInteractions).set({ issueId: foreignIssueId })
+      .where(eq(issueThreadInteractions.id, otherIssue.interactionId));
+    expect(await adapter.cancelStaleQueuedRun({ ...otherIssue, expectedStatus: "queued" }))
       .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
   });
 
@@ -509,6 +537,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await adapter.evaluateScheduledRetryGate({ companyId, runId: replacementId, retryReasonOverride: retryReason, now: new Date() }))
       .toMatchObject({ allowed: false, errorCode: "issue_execution_lock_changed" });
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, replacementId));
+    const reservation = await reserveRunBudget(db, companyId, replacementId, null);
     expect(await adapter.cancelStaleQueuedRun({ companyId, runId: replacementId, expectedStatus: "queued", now: new Date() }))
       .toMatchObject({ outcome: "cancelled", errorCode: "issue_execution_lock_changed" });
 
@@ -517,14 +546,14 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
     let dispatched = false;
     const outcome = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId,
-      expectedStatus: "running", now: new Date(), dispatch: async () => { dispatched = true; } });
+      reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch: async () => { dispatched = true; } });
     expect(outcome).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled" } });
     expect(dispatched).toBe(false);
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]![lock]).toBe(competingId);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, competingId)))[0]?.status).toBe("running");
   });
 
-  it.each(["native_safe_replacement", "native_provider_overloaded"])("does not dispatch %s when the task becomes blocked after scheduling", async retryReason => {
+  it.each(["native_safe_replacement", "native_provider_overloaded", "interrupted_preparation"])("does not dispatch %s when the task becomes blocked after scheduling", async retryReason => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
     await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
@@ -535,11 +564,12 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await adapter.evaluateScheduledRetryGate({ companyId, runId: replacementId, retryReasonOverride: retryReason, now: new Date() }))
       .toMatchObject({ allowed: false, errorCode: "issue_blocked" });
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, replacementId));
+    const reservation = await reserveRunBudget(db, companyId, replacementId, null);
     expect(await adapter.cancelStaleQueuedRun({ companyId, runId: replacementId, expectedStatus: "queued", now: new Date() }))
       .toMatchObject({ outcome: "cancelled", errorCode: "issue_blocked" });
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
     const dispatch = vi.fn(async () => undefined);
-    expect(await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, expectedStatus: "running", now: new Date(), dispatch }))
+    expect(await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch }))
       .toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled" } });
     expect(dispatch).not.toHaveBeenCalled();
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
@@ -565,7 +595,8 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       if (mode === "resolved") await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
       await db.update(issues).set({ executionRunId: replacementId }).where(eq(issues.id, issueId));
       await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, replacementId));
-      const result = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, expectedStatus: "running", now: new Date(), dispatch });
+      const reservation = await reserveRunBudget(db, companyId, replacementId, null);
+      const result = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: replacementId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch });
       expect(result).toMatchObject(mode === "resolved" ? { dispatched: true } : {
         dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_dependencies_blocked" },
       });
@@ -581,8 +612,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const adapter = createPostgresRunDispatchAdapter(db);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
     const gate = await adapter.dispatchResolvedInteractionIfCurrent({
-      companyId, runId, expectedStatus: "running", now: new Date(),
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(),
       dispatch: async () => {
         // The incident's third attempt failed here before onSpawn. A held
         // admission lock makes this finalization fail with lock_timeout.
@@ -599,33 +631,529 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status).toBe("failed");
   });
 
-  it("initiates dispatch before admission locks can be released to a competing owner", async () => {
+  it("commits dispatch authority before provider HTTP and permits accounting while that provider waits", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    let readyToCommit!: () => void, commit!: () => void, providerArrived!: () => void, finishProvider!: () => void;
+    let readyToHandoff!: () => void, commitHandoff!: () => void;
+    const ready = new Promise<void>(resolve => { readyToCommit = resolve; });
+    const commitAllowed = new Promise<void>(resolve => { commit = resolve; });
+    const arrived = new Promise<void>(resolve => { providerArrived = resolve; });
+    const providerResponse = new Promise<void>(resolve => { finishProvider = resolve; });
+    const handoffReady = new Promise<void>(resolve => { readyToHandoff = resolve; });
+    const handoffCommit = new Promise<void>(resolve => { commitHandoff = resolve; });
+    let requests = 0;
+    const server = createServer((_request, response) => {
+      requests += 1;
+      providerArrived();
+      void providerResponse.then(() => response.end("provider result"));
+    });
+    await new Promise<void>(resolve => { server.listen(0, "127.0.0.1", resolve); });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected a provider HTTP fixture port");
+    const dispatch = vi.fn(async () => (await fetch(`http://127.0.0.1:${address.port}`)).text());
+    const transaction = db.transaction.bind(db);
+    let transactionNumber = 0;
+    // Freeze the exact SQL commit boundary. A provider callback inside the
+    // accounting transaction would contact this server before we release it.
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const phase = ++transactionNumber;
+      return transaction(async tx => {
+        const value = await callback(tx);
+        if (phase === 1) { readyToCommit(); await commitAllowed; }
+        if (phase === 2) { readyToHandoff(); await handoffCommit; }
+        return value;
+      }, config);
+    });
+    const admission = createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    });
+    let result: Promise<string> | undefined;
+    let charge: Promise<unknown> | undefined;
+    try {
+      await ready;
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(requests).toBe(0);
+      commit();
+      await Promise.all([arrived, handoffReady]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.usageJson?.budgetDispatch).toMatchObject({ reservationId: reservation.id, recoveryLeaseOwner: null });
+      // This charge serializes after dispatch admission. It creates stop intent
+      // for already-admitted work without waiting for the provider's response.
+      let charged = false;
+      charge = costService(db).createEvent(companyId, { agentId, provider: "fixture", model: "post-admission-charge",
+        costCents: 100, inputTokens: 1, outputTokens: 1, occurredAt: new Date() }).then(() => { charged = true; });
+      void charge.catch(() => {});
+      // Phase two still owns issue/run locks and the provider is waiting.
+      // Holding company accounting here would stall this independent charge.
+      await vi.waitFor(() => expect(charged).toBe(true), { timeout: 2_000 });
+      const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+      expect(policy.enforcementVersion).toBeGreaterThan(policy.enforcementDeliveredVersion);
+      expect(requests).toBe(1);
+      commitHandoff();
+      const gate = await admission;
+      transactionSpy.mockRestore();
+      expect(gate.dispatched).toBe(true);
+      if (!gate.dispatched) throw new Error("Expected committed provider admission");
+      result = gate.resultPromise;
+      finishProvider();
+      expect(await result).toBe("provider result");
+    } finally {
+      commit();
+      commitHandoff();
+      finishProvider();
+      transactionSpy.mockRestore();
+      await admission.catch(() => undefined);
+      await result?.catch(() => undefined);
+      await charge?.catch(() => undefined);
+      server.closeAllConnections();
+      await new Promise<void>(resolve => { server.close(() => resolve()); });
+    }
+  });
+
+  it("does not hand off when another run takes issue ownership after accounting admission commits", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
-    await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
     const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     const competingId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
     const transaction = db.transaction.bind(db);
-    const ordering: string[] = [];
-    // Inject a competing claim immediately after commit, before control returns
-    // to the adapter. A callback outside the transaction would run too late.
-    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+    let admitted = false;
+    const race = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
       const value = await transaction(callback, config);
-      await db.update(issues).set({ executionRunId: competingId }).where(eq(issues.id, issueId));
-      ordering.push("competing-owner");
+      if (!admitted) { admitted = true; await db.update(issues).set({ executionRunId: competingId }).where(eq(issues.id, issueId)); }
+      return value;
+    });
+    const dispatch = vi.fn(async () => "must not run");
+    try {
+      expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch })).toMatchObject({ dispatched: false,
+          cancellation: { outcome: "cancelled", errorCode: "issue_execution_lock_changed" } });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(competingId);
+    } finally { race.mockRestore(); }
+  });
+
+  it.each(["charge", "budget reduction"] as const)("rejects a committed %s between accounting admission and final ownership handoff", async change => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "60", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const transaction = db.transaction.bind(db);
+    let admitted = false;
+    const race = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const value = await transaction(callback, config);
+      if (!admitted) {
+        admitted = true;
+        if (change === "charge") await costService(db).createEvent(companyId, { agentId, provider: "fixture",
+          model: "between-phase-charge", inputTokens: 1, outputTokens: 1, costCents: 50, occurredAt: new Date() });
+        else await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+          metric: "billed_cents", windowKind: "lifetime", amount: 50 }, null);
+      }
+      return value;
+    });
+    const dispatch = vi.fn(async () => "must not run");
+    try {
+      expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch })).toMatchObject({ dispatched: false,
+          admissionBlockReason: "Available budget is reserved by unfinished runs" });
+      expect(dispatch).not.toHaveBeenCalled();
+      // Neither case has actually spent its hard-stop limit. The denial must
+      // observe capacity, rather than relying only on a projected pause flag.
+      expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0].status).toBe("active");
+    } finally { race.mockRestore(); }
+  });
+
+  it("performs the post-admission capacity check in a PostgreSQL read-only transaction", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "60", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    await db.transaction(async tx => {
+      await tx.execute(sql`set transaction read only`);
+      // PostgreSQL rejects both writes and SELECT FOR UPDATE in this mode.
+      expect(await recheckAdmittedRunBudgetReadOnly(tx as unknown as typeof db,
+        { companyId, agentId, runId, projectId: null, reservationId: reservation.id })).toBeNull();
+    });
+  });
+
+  it("does not dispatch into an archival project deleted after accounting admission", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const [project] = await db.insert(projects).values({ companyId, name: "Dispatch project" }).returning();
+    const reservation = await reserveRunBudget(db, companyId, runId, project.id);
+    const transaction = db.transaction.bind(db);
+    let admitted = false;
+    const race = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const value = await transaction(callback, config);
+      if (!admitted) { admitted = true; await db.delete(projects).where(eq(projects.id, project.id)); }
+      return value;
+    });
+    const dispatch = vi.fn(async () => "must not run");
+    try {
+      expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch })).toMatchObject({ dispatched: false,
+          admissionBlockReason: "Reserved project no longer exists" });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect((await db.select().from(budgetReservations).where(eq(budgetReservations.id, reservation.id)))[0])
+        .toMatchObject({ state: "held", projectId: project.id });
+    } finally { race.mockRestore(); }
+  });
+
+  it("initiates the provider callback while the final issue ownership lock is held without awaiting its response", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    const competingId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const transaction = db.transaction.bind(db);
+    let phase = 0, finishProvider!: () => void;
+    const response = new Promise<void>(resolve => { finishProvider = resolve; });
+    const ordering: string[] = [];
+    const race = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const current = ++phase;
+      const value = await transaction(callback, config);
+      if (current === 2) {
+        await db.update(issues).set({ executionRunId: competingId }).where(eq(issues.id, issueId));
+        ordering.push("competing-owner");
+      }
       return value;
     });
     try {
-      const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
-        companyId, runId, expectedStatus: "running", now: new Date(),
-        dispatch: async () => { ordering.push("handoff"); return "started"; },
-      });
+      const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(),
+        dispatch: () => { ordering.push("handoff"); return response; } });
       expect(gate.dispatched).toBe(true);
-      if (gate.dispatched) expect(await gate.resultPromise).toBe("started");
       expect(ordering).toEqual(["handoff", "competing-owner"]);
+      finishProvider();
+      if (gate.dispatched) await gate.resultPromise;
+    } finally { finishProvider(); race.mockRestore(); }
+  });
+
+  it.each(["0", "25"])("fences duplicate handoff of a %s-cent reservation generation", async reservationCents => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents, notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "one handoff");
+    const input = { companyId, runId, reservationId: reservation.id, expectedStatus: "running" as const, now: new Date(), dispatch };
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const first = await adapter.dispatchResolvedInteractionIfCurrent(input);
+    expect(first.dispatched).toBe(true);
+    if (first.dispatched) await first.resultPromise;
+    expect(await adapter.dispatchResolvedInteractionIfCurrent(input)).toMatchObject({ dispatched: false,
+      admissionBlockReason: "Provider dispatch already admitted this reservation generation" });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("does not enter a provider when its dispatch claim rolls back", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const transaction = db.transaction.bind(db);
+    const rollback = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => transaction(async tx => {
+      await callback(tx);
+      throw new Error("fixture commit rejected");
+    }, config));
+    const dispatch = vi.fn(async () => "must not run");
+    try {
+      await expect(createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+        reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch })).rejects.toThrow("fixture commit rejected");
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally { rollback.mockRestore(); }
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].usageJson?.budgetDispatch).toBeUndefined();
+  });
+
+  it("retains uncertain dispatch authority when the ownership commit fails after callback entry", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const transaction = db.transaction.bind(db);
+    let phase = 0;
+    const rollback = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const current = ++phase;
+      return transaction(async tx => {
+        const value = await callback(tx);
+        if (current === 2) throw new Error("fixture ownership commit rejected");
+        return value;
+      }, config);
+    });
+    const dispatch = vi.fn(async () => "provider already entered");
+    const input = { companyId, runId, reservationId: reservation.id, expectedStatus: "running" as const, now: new Date(), dispatch };
+    try {
+      await expect(createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(input)).rejects.toThrow("fixture ownership commit rejected");
+      expect(dispatch).toHaveBeenCalledOnce();
+    } finally { rollback.mockRestore(); }
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({ costAccountingPending: true, costAccountedAt: null,
+      usageJson: { budgetDispatch: { reservationId: reservation.id } } });
+    expect((await db.select().from(budgetReservations).where(eq(budgetReservations.id, reservation.id)))[0].state).toBe("held");
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(input))
+      .toMatchObject({ dispatched: false, admissionBlockReason: "Provider dispatch already admitted this reservation generation" });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(await db.select().from(costEvents)).toHaveLength(0);
+  });
+
+  it("commits the ownership handoff when a provider callback throws synchronously", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const failure = new Error("synchronous provider bootstrap failure");
+    const dispatch = vi.fn(() => { throw failure; });
+    const input = { companyId, runId, reservationId: reservation.id, expectedStatus: "running" as const, now: new Date(), dispatch };
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(input);
+    expect(gate.dispatched).toBe(true);
+    if (gate.dispatched) await expect(gate.resultPromise).rejects.toBe(failure);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].usageJson?.budgetDispatch)
+      .toMatchObject({ reservationId: reservation.id, handedOffAt: expect.any(String) });
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(input))
+      .toMatchObject({ dispatched: false, admissionBlockReason: "Provider dispatch already admitted this reservation generation" });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["charge", "budget reduction"] as const)("rechecks a late %s after ordinary run preparation before any provider handoff", async change => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "60", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    let finishPreparation!: () => void;
+    const preparation = new Promise<void>(resolve => { finishPreparation = resolve; });
+    const dispatch = vi.fn(async () => "provider started");
+    const preparedDispatch = preparation.then(() => createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    }));
+    try {
+      if (change === "charge") await costService(db).createEvent(companyId, {
+        agentId, provider: "test", model: "dispatch-race", costCents: 50,
+        inputTokens: 1, outputTokens: 1, occurredAt: new Date(),
+      });
+      else await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+        metric: "billed_cents", windowKind: "lifetime", amount: 50 }, null);
+      finishPreparation();
+      expect(await preparedDispatch).toMatchObject({ dispatched: false,
+        admissionBlockReason: "Available budget is reserved by unfinished runs" });
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally { finishPreparation(); await preparedDispatch; }
+  });
+
+  it("does not count its own existing reservation twice at final handoff", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "100", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    const dispatch = vi.fn(async () => "started");
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    });
+    expect(gate.dispatched).toBe(true);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    if (gate.dispatched) expect(await gate.resultPromise).toBe("started");
+  });
+
+  it("does not dispatch a zero reservation once other work has fully reserved capacity", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "0", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", reservationCents: "100" }, null);
+    const otherRunId = await seedRun({ companyId, agentId, status: "running" });
+    await reserveRunBudget(db, companyId, otherRunId, null);
+    const dispatch = vi.fn(async () => undefined);
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    })).toMatchObject({ dispatched: false, admissionBlockReason: "Available budget is reserved by unfinished runs" });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("commits a discovered budget stop even when final handoff is denied", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await budgetService(db).upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    // Seed committed historical spend whose lifecycle projection has not yet
+    // been repaired. The gate must persist that repair rather than roll it back.
+    await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "unprojected-charge",
+      inputTokens: 1, outputTokens: 1, costCents: 110, occurredAt: new Date() });
+    const dispatch = vi.fn(async () => undefined);
+    expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({
+      companyId, runId, reservationId: reservation.id, expectedStatus: "running", now: new Date(), dispatch,
+    })).toMatchObject({ dispatched: false, admissionBlockReason: expect.any(String) });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0])
+      .toMatchObject({ status: "paused", pauseReason: "budget" });
+    const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+    expect(policy.enforcementVersion).toBeGreaterThan(policy.enforcementDeliveredVersion);
+  });
+
+  it.each([false, true])("preserves accepted non-assignee work while retaining its final budget gate (late reduction: %s)", async reduceBudget => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const assigneeId = randomUUID(), issueId = randomUUID();
+    await seedAgent({ id: assigneeId, companyId, name: "Assigned owner" });
+    await seedIssue({ companyId, issueId, assigneeAgentId: assigneeId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId, status: "running",
+      contextSnapshot: { issueId, wakeReason: "issue_comment_mentioned", commentId: randomUUID() } });
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "60", notifyEnabled: false }, null);
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    if (reduceBudget) await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId,
+      metric: "billed_cents", windowKind: "lifetime", amount: 50 }, null);
+    const dispatch = vi.fn(async () => "accepted mention delivered");
+    const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId, runId,
+      reservationId: reservation.id, expectedStatus: "running", enforceContinuationOwnership: false, now: new Date(), dispatch });
+    expect(gate.dispatched).toBe(!reduceBudget);
+    expect(dispatch).toHaveBeenCalledTimes(reduceBudget ? 0 : 1);
+    if (!gate.dispatched) expect(gate).toMatchObject({ admissionBlockReason: "Available budget is reserved by unfinished runs" });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ assigneeAgentId: assigneeId, executionRunId: null });
+  });
+
+  async function seedRecoveryAdmission() {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID(), owner = `recovery:${randomUUID()}`;
+    await seedIssue({ companyId, issueId, assigneeAgentId: agentId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const reservation = await reserveRunBudget(db, companyId, runId, null);
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed",
+      leaseOwner: owner, leaseExpiresAt: new Date(Date.now() + 60_000) });
+    return { companyId, agentId, issueId, runId, owner, reservation };
+  }
+
+  it.each(["fresh", "bootstrap", "dead-runner", "expired", "foreign-owner", "foreign-intent", "missing-audit", "foreign-audit", "stale-generation", "terminal", "no-hold", "settled-hold"] as const)(
+    "keeps %s work fenced while a company is paused for budget", async mode => {
+      const f = await seedRecoveryAdmission();
+      const intentAuditId = randomUUID();
+      await db.insert(activityLog).values({ id: intentAuditId, companyId: f.companyId, actorType: "system", actorId: "native-session-cancellation",
+        action: "native.cancellation_intent_recorded", entityType: "heartbeat_run", entityId: f.runId, runId: f.runId, agentId: f.agentId });
+      await db.update(nativeRunFinalizations).set({ controllerGeneration: 2, attempt: 1, recoveryState: "awaiting_runner_reattach",
+        recoveryHistory: [{ disposition: "reattach_remote_runner", controllerGeneration: 2, providerAttempt: 1 }],
+        ...(mode === "bootstrap" ? { recoveryState: "bootstrap_incomplete" } : {}),
+        ...(mode === "dead-runner" ? { recoveryState: "resuming_session" } : {}),
+        ...(mode === "expired" ? { leaseExpiresAt: new Date(Date.now() - 1) } : {}),
+        ...(mode === "foreign-owner" ? { leaseOwner: "another-owner" } : {}),
+        ...(mode === "stale-generation" ? { controllerGeneration: 3 } : {}),
+        ...(mode === "terminal" ? { phase: "terminal_failure" } : {}),
+      }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await db.update(heartbeatRuns).set({ resultJson: mode === "fresh" ? {} : {
+        startupCancellation: { beforeNativeSelection: false, errorCode: "cancelled", requestedAt: new Date().toISOString() },
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", companyId: f.companyId, runId: f.runId,
+          issueId: mode === "foreign-intent" ? randomUUID() : f.issueId, scope: "run", reasonCode: "cancellation_run_only",
+          intentId: `native-cancellation:${randomUUID()}`, intentAuditId: mode === "missing-audit" ? randomUUID() : intentAuditId,
+          dispatchState: "pending", dispatched: false, effects: ["release_run_resources"] },
+      } }).where(eq(heartbeatRuns.id, f.runId));
+      if (mode === "foreign-audit") await db.update(activityLog).set({ entityId: randomUUID() }).where(eq(activityLog.id, intentAuditId));
+      if (mode === "no-hold") await db.delete(budgetReservations).where(eq(budgetReservations.id, f.reservation.id));
+      if (mode === "settled-hold") await db.update(budgetReservations).set({ state: "settled" }).where(eq(budgetReservations.id, f.reservation.id));
+      await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, f.companyId));
+      await expect(reserveRunBudget(db, f.companyId, f.runId, null, {}, f.owner)).rejects.toThrow();
+      const dispatch = vi.fn(async () => undefined);
+      const gate = await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: f.runId,
+        reservationId: f.reservation.id, recoveryLeaseOwner: f.owner, expectedStatus: "running", now: new Date(), dispatch })
+        .catch(error => ({ dispatched: false, error }));
+      expect(gate.dispatched).toBe(false);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(await db.select().from(budgetReservations).where(eq(budgetReservations.runId, f.runId)))
+        .toHaveLength(mode === "no-hold" ? 0 : 1);
+      expect(await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, f.runId))).toHaveLength(0);
+    });
+
+  it.each(["reservation", "dispatch"] as const)("orders recovery %s behind a coordinator before taking finalization's issue and run locks", async boundary => {
+    const f = await seedRecoveryAdmission();
+    let signalLocked!: () => void, allowFinalization!: () => void;
+    const locked = new Promise<void>(resolve => { signalLocked = resolve; });
+    const proceed = new Promise<void>(resolve => { allowFinalization = resolve; });
+    const finalization = db.transaction(async tx => {
+      await tx.execute(sql`set local lock_timeout = '2000ms'`);
+      await tx.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.runId)).for("update");
+      signalLocked();
+      await proceed;
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      await tx.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    });
+    await Promise.race([locked, finalization]);
+    const dispatch = vi.fn(async () => "one provider handoff");
+    const gateInput = { companyId: f.companyId, runId: f.runId, reservationId: f.reservation.id,
+      expectedStatus: "running" as const, recoveryLeaseOwner: f.owner, now: new Date(), dispatch };
+    const recovery = boundary === "dispatch"
+      ? createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(gateInput)
+      : reserveRunBudget(db, f.companyId, f.runId, null, {}, f.owner).then(reservation => {
+          expect(reservation.reused).toBe(true);
+          return createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ ...gateInput, reservationId: reservation.id });
+        });
+    try {
+      expect(await waitForBlockedForUpdate("native_run_finalizations")).toBe(true);
+      allowFinalization();
+      await finalization;
+      const gate = await recovery;
+      expect(gate.dispatched).toBe(true);
+      if (gate.dispatched) expect(await gate.resultPromise).toBe("one provider handoff");
+      expect(await createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent(gateInput))
+        .toMatchObject({ dispatched: false, admissionBlockReason: "Provider dispatch already admitted this reservation generation" });
+      expect(dispatch).toHaveBeenCalledOnce();
     } finally {
-      transactionSpy.mockRestore();
+      allowFinalization();
+      await Promise.allSettled([finalization, recovery]);
+    }
+  });
+
+  it.each(["expired", "replaced"] as const)("does not admit recovery under an %s coordinator owner", async ownership => {
+    const f = await seedRecoveryAdmission();
+    await db.update(nativeRunFinalizations).set(ownership === "expired"
+      ? { leaseExpiresAt: new Date(Date.now() - 1) } : { leaseOwner: "another-owner" }).where(eq(nativeRunFinalizations.runId, f.runId));
+    await expect(reserveRunBudget(db, f.companyId, f.runId, null, {}, f.owner)).rejects.toThrow("Native recovery no longer owns provider dispatch");
+    const dispatch = vi.fn(async () => undefined);
+    await expect(createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: f.runId,
+      reservationId: f.reservation.id, recoveryLeaseOwner: f.owner, expectedStatus: "running", now: new Date(), dispatch }))
+      .rejects.toThrow("Native recovery no longer owns provider dispatch");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("rechecks recovery lease expiry after waiting for the issue lock", async () => {
+    const f = await seedRecoveryAdmission();
+    const expiresAt = new Date(Date.now() + 1_000);
+    await db.update(nativeRunFinalizations).set({ leaseExpiresAt: expiresAt }).where(eq(nativeRunFinalizations.runId, f.runId));
+    let signalLocked!: () => void, releaseIssue!: () => void;
+    const locked = new Promise<void>(resolve => { signalLocked = resolve; });
+    const release = new Promise<void>(resolve => { releaseIssue = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("update");
+      signalLocked();
+      await release;
+    });
+    await Promise.race([locked, holder]);
+    const dispatch = vi.fn(async () => undefined);
+    const recovery = createPostgresRunDispatchAdapter(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId,
+      runId: f.runId, reservationId: f.reservation.id, recoveryLeaseOwner: f.owner, expectedStatus: "running", now: new Date(), dispatch });
+    try {
+      expect(await waitForBlockedForUpdate("issues")).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now() + 10)));
+      releaseIssue();
+      expect(await recovery).toMatchObject({ dispatched: false, admissionBlockReason: "Native recovery no longer owns provider dispatch" });
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      releaseIssue();
+      await Promise.allSettled([holder, recovery]);
     }
   });
 

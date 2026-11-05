@@ -1,3 +1,5 @@
+import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
+import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
@@ -24,7 +26,6 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
-  localGitHubLauncherSandboxPaths,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -67,7 +68,6 @@ import {
   claudeModelUsageTotals,
   claudeModelReceipts,
   parseClaudeStreamJson, createClaudeStreamParser,
-  createClaudeTerminalResultTracker, hasCurrentClaudeTerminalResult,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -92,8 +92,8 @@ import {
   claudeCommandLooksLike,
   claudeCommandSupportsEffortFlag,
   minimumClaudeCliVersionForModel,
-  readClaudeCommandVersion,
 } from "./cli-capabilities.js";
+import { prepareCompatibleClaudeCommand } from "./sandbox-cli-version.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
@@ -309,6 +309,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env[key] = value;
   }
 
+  if (isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
+    env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);
+  }
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
@@ -471,7 +474,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     authToken,
     onLog,
   });
-  const {
+  let {
     command,
     resolvedCommand,
     cwd,
@@ -485,7 +488,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     extraArgs,
   } = runtimeConfig;
   Object.assign(env, claudeSandboxPermissionEnv({ dangerouslySkipPermissions, targetIsSandbox: executionTargetIsSandbox }));
-  let loggedEnv = initialLoggedEnv;
+  if (ctx.observability) applyObservabilityEnvironment(env, ctx.observability);
+  let loggedEnv = buildInvocationEnvForLogs(env, {
+    runtimeEnv: initialLoggedEnv,
+    includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
+    resolvedCommand,
+  });
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const terminalResultCleanupGraceMs = Math.max(
     0,
@@ -581,7 +589,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           workspaceDir: effectiveExecutionCwd,
           filesystemScope,
           managedPaths: [
-            ...await localGitHubLauncherSandboxPaths({ runId, env }),
             { path: sharedClaudeConfigDir, access: "rw" },
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
@@ -751,24 +758,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
   let effectiveEffort = effort;
-  if (executionTargetIsSandbox && effort) {
-    const supportsEffort = await claudeCommandSupportsEffortFlag({
-      runId,
-      command,
-      target: runtimeExecutionTarget,
-      cwd,
-      env,
-      timeoutSec,
-      graceSec,
-    });
-    if (supportsEffort === false) {
-      effectiveEffort = "";
-      await onLog(
-        "stderr",
-        `[paperclip] Claude CLI in the environment does not advertise --effort; omitting configured effort "${effort}". Upgrade the environment CLI/image to restore reasoning-effort control.\n`,
-      );
-    }
-  }
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);
   const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
@@ -976,7 +965,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
     });
-    const observeTerminalResult = createClaudeTerminalResultTracker();
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       onProcessStopped: providerStop.beginInvocation(),
       cwd,
@@ -991,8 +979,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => hasCurrentClaudeTerminalResult(stdout),
-        observeOutput: observeTerminalResult,
+        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
     });
@@ -1012,11 +999,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
     const { proc, parsedStream, parsed } = attempt;
-    const incompleteTerminalCleanup =
-      proc.terminalResultCleanup?.orderedOutputObserved === true &&
-      (!proc.terminalResultCleanup.terminalResultSeen ||
-        !hasCurrentClaudeTerminalResult(proc.stdout));
-    const incompleteTerminalCleanupMessage = "Claude continued activity during terminal-result cleanup; completion is unproven. Reconcile task effects before continuation.";
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1051,11 +1033,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
-      const fallbackErrorMessage = incompleteTerminalCleanup
-        ? incompleteTerminalCleanupMessage
-        : parseFallbackErrorMessage(proc);
+      const fallbackErrorMessage = parseFallbackErrorMessage(proc);
       const providerQuota =
-        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
@@ -1065,7 +1044,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
-        !incompleteTerminalCleanup &&
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1089,8 +1067,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // surfaces the typed `duplex_channel_lost` code before any provider
         // classification, so the CLI lane and the ACP lane report it alike.
         ? proc.errorCode
-        : incompleteTerminalCleanup
-        ? "unmanaged_background_task_stopped"
         : loginMeta.requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
@@ -1173,8 +1149,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedIsError = asBoolean(parsed.is_error, false);
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const failed = incompleteTerminalCleanup ||
-      (!parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError));
+    const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1200,14 +1175,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = incompleteTerminalCleanup
-      ? incompleteTerminalCleanupMessage
-      : failed
-        ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
-        : null;
+    const errorMessage = failed
+      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+      : null;
     const providerQuota =
       failed &&
-      !incompleteTerminalCleanup &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1219,7 +1191,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     const transientUpstream =
       failed &&
-      !incompleteTerminalCleanup &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
@@ -1243,11 +1214,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
-      : incompleteTerminalCleanup
-      ? "unmanaged_background_task_stopped"
       : loginMeta.requiresLogin
       ? "claude_auth_required"
-      : failed && isClaudeModelNotFoundError({
+      // Structured CLI signals outrank the model-not-found detector, which
+      // scans the run's full stdout for a literal "model not found" phrase.
+      // An agent's own tool output (grepping runtime source, tailing logs,
+      // echoing an issue body) lands in that stdout, so a genuine
+      // error_max_turns run that merely *mentions* the phrase would otherwise
+      // be sealed as model_not_found. Same guard the providerQuota and
+      // transientUpstream branches above already apply.
+      : failed && !clearSessionForMaxTurns && !poisonedPreviousMessageId && isClaudeModelNotFoundError({
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,
@@ -1272,26 +1248,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : claudeRefusal
       ? "model_refusal"
       : null;
-    // The process controller deliberately stops a lingering CLI after a terminal
-    // frame. Its signal is cleanup evidence, not a provider execution failure.
-    // Only normalize that exact, successful cleanup; real signals, timeouts,
-    // error frames, refusals and transport failures retain their disposition.
-    const successfulTerminalCleanup =
-      parsedSucceeded &&
-      hasCurrentClaudeTerminalResult(proc.stdout) &&
-      !failed &&
-      !claudeRefusal &&
-      !clearSessionForMaxTurns &&
-      !poisonedPreviousMessageId &&
-      !resolvedErrorCode &&
-      !proc.timedOut &&
-      proc.exitCode === null &&
-      (proc.signal === "SIGTERM" || proc.signal === "SIGKILL") &&
-      proc.terminalResultCleanup?.kind === "terminal_result_cleanup" &&
-      proc.terminalResultCleanup.stopped === true &&
-      proc.terminalResultCleanup.terminalResultSeen === true &&
-      proc.terminalResultCleanup.orderedOutputObserved === true &&
-      proc.terminalResultCleanup.signal === proc.signal;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
@@ -1302,18 +1258,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
-      ...(successfulTerminalCleanup
-        ? { adapterCompletion: {
-            reason: "successful_terminal_result_cleanup",
-            processExitCode: proc.exitCode,
-            processSignal: proc.signal,
-          } }
-        : {}),
     };
 
     return {
-      exitCode: successfulTerminalCleanup ? 0 : proc.exitCode,
-      signal: successfulTerminalCleanup ? null : proc.signal,
+      exitCode: proc.exitCode,
+      signal: proc.signal,
       timedOut: false,
       usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,
@@ -1349,7 +1298,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? minimumClaudeCliVersionForModel(model)
       : null;
     if (minimumCliVersion) {
-      const detectedCliVersion = await readClaudeCommandVersion({
+      const prepared = await prepareCompatibleClaudeCommand({
         runId,
         command,
         target: runtimeExecutionTarget,
@@ -1357,7 +1306,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         env,
         timeoutSec,
         graceSec,
+        minimumVersion: minimumCliVersion,
       });
+      if (prepared.check) {
+        await onLog("stderr", `[paperclip] ${prepared.check.message} ${prepared.check.detail ?? ""}\n`);
+      }
+      command = prepared.command;
+      resolvedCommand = prepared.command === "claude" ? resolvedCommand : prepared.command;
+      loggedEnv = buildInvocationEnvForLogs(env, {
+        runtimeEnv: loggedEnv,
+        includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
+        resolvedCommand,
+      });
+      const detectedCliVersion = prepared.version;
       if (
         !detectedCliVersion ||
         !claudeCliVersionAtLeast(detectedCliVersion, minimumCliVersion)
@@ -1385,6 +1346,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             detectedClaudeCodeVersion: detectedCliVersion,
           },
         };
+      }
+    }
+
+    if (executionTargetIsSandbox && effort) {
+      const supportsEffort = await claudeCommandSupportsEffortFlag({
+        runId,
+        command,
+        target: runtimeExecutionTarget,
+        cwd,
+        env,
+        timeoutSec,
+        graceSec,
+      });
+      if (supportsEffort === false) {
+        effectiveEffort = "";
+        await onLog(
+          "stderr",
+          `[paperclip] Claude CLI in the environment does not advertise --effort; omitting configured effort "${effort}". Upgrade the environment CLI/image to restore reasoning-effort control.\n`,
+        );
       }
     }
 

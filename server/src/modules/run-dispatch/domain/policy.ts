@@ -76,7 +76,6 @@ export type GateDecision =
     };
 
 export type ScheduledRetryFacts = {
-  /** Verified from the current persisted pending invitation, not wake payload claims. */
   isPendingInteractionAddressee?: boolean;
   runId: string;
   runAgentId: string;
@@ -132,7 +131,6 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
-  /** Revalidated at queued and final pre-dispatch gates. */
   isPendingInteractionAddressee?: boolean;
   pendingResponse?: "interaction" | "approval" | null;
   /** Rechecked for automatic native replacements immediately before dispatch. */

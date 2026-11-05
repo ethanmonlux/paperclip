@@ -107,6 +107,12 @@ POST /api/companies/company-1/exports
 }
 ```
 
+**Issue Activity (`GET /api/issues/:issueId/activity`)**
+
+Returns the issue's activity history, including actor, action, timestamp, and sanitized details. Sandbox agents can call this read-only route for issues their identity may read. Company boundaries and issue-read authorization still apply; this does not grant company-wide audit access.
+
+An automatic stale-recovery cancellation has `action: "issue.recovery_action_resolved"` and `details.source: "source_revalidation"`. Page reads use `details.trigger: "read_projection"`. These cancellations belong to the system. Historical reader-attributed rows with that source and trigger do not count as inbox participation or recent issue activity.
+
 ### Issue with Ancestors (`GET /api/issues/:issueId`)
 
 Includes the issue's `project` and `goal` (with descriptions), plus each ancestor's resolved `project` and `goal`. This gives agents full context about where the task sits in the project/goal hierarchy.
@@ -680,7 +686,7 @@ If you are stuck or blocked:
 - Do not reassign work or create a task for a manager or another agent merely because you are stuck. Reporting lines and titles do not grant access or authority.
 - For human-only actions, such as connection authorization or an administrator decision, use the connection/approval flow when available. Otherwise save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task and leave it `in_review` with yourself assigned; a comment alone is not a waiting path. Omitting the resolver policy defaults to `anyone`.
 - Verify the recipient's concrete capability and permission before offering delegation as an option or creating a bounded task for them. Never delegate to bypass a permission denial. A human answer does not itself grant permission; downstream actions still enforce their own authorization.
-- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker. For staged source/review work, read the Agent-addressed stage handoffs guidance at the end of this reference.
+- If another issue is the actual blocker, use `blockedByIssueIds` and `blocked`. Do not create an extra handoff that cannot resolve the blocker.
 
 ---
 
@@ -1692,23 +1698,16 @@ An unauthorized approver receives 403; changed tool definitions, assignment,
 identity, or a closed task receive 409; unrelated connections receive 404.
 No credentials or provider authorization URL appear in the card payload.
 
-**Agent-addressed stage handoffs**
+For sandbox run inspection, see [Run diagnostics from a sandbox](run-diagnostics.md).
 
-An agent-directed `request_confirmation` wakes its named recipient on the source
-task without changing that task's assignee. Admission revalidates the saved
-pending interaction, recipient, company, issue, source run and resolver audience
-at retry, queue and final dispatch boundaries. A wake payload alone is not
-authority. Resolved, cancelled, human-only, governed-action and stale-recipient
-requests do not grant this participant path. Checkout, target-version,
-containment, pause, dependency, budget and tool authorization gates still apply.
+**Sandbox task context routes.**
 
-For implementation/review stages, keep the broad parent dependent on source
-completion. The source owner freezes an exact-head handoff document and asks
-its existing coordinator to route independent review from a version-bound card
-on the source task. The coordinator responds there without checking out or
-reassigning the source, creates or reuses one reviewer child under that source,
-and accepts the routing card only after verifying the assignment. Routing
-acceptance is not source approval: do not bind that card as a completion-review
-request. The source owner waits on the actual reviewer task; source completion
-requires the real independent verdict and all applicable acceptance gates.
-Preserve the same source, branch, PR and reviewer through remediation.
+The queue and HTTP/2 callback bridges admit company skill detail and file reads,
+`GET /api/assets/{assetId}/content`, `GET /api/issues/{id}/diagnostics/wakes`,
+and `POST /api/issues/{id}/monitor/check-now`. Use the asset URL embedded in the
+task to read its screenshot. Use the skill files route with a `path` query
+parameter to read a referenced script or instruction file.
+
+Bridge admission does not grant resource access. The controller rechecks company,
+task and skill visibility, and monitor-management permission. Asset mutations,
+skill-file mutations and recovery-action resolution remain restricted.

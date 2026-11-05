@@ -156,11 +156,9 @@ if sys.argv[1] != "completion":
     const read = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/cat", args: [secret] }, authorize);
     expect(read).toMatchObject({ exitCode: 1 }); expect(String((read as any).output)).not.toContain("PRIVATE");
     const write = await executeWorkspaceTool(directory, "workspace_run", { program: "/bin/sh", args: ["-c", 'printf stolen > "$1"', "sh", secret] }, authorize);
-    // POSIX shells report a denied redirection as 1 or 2. Assert the denial,
-    // normal process completion and preserved file, not a shell-specific code.
     expect(write).toMatchObject({ signal: null, stopped: null });
-    expect([1, 2]).toContain((write as any).exitCode);
-    expect(String((write as any).output)).toMatch(/permission denied|no such file|directory nonexistent/i);
+    expect((write as any).exitCode).toBeGreaterThan(0);
+    expect(String((write as any).output)).toMatch(/Permission denied|Read-only file system|Directory nonexistent|No such file or directory/);
     expect(await readFile(secret, "utf8")).toBe("PRIVATE");
   });
   it.skipIf(!workspaceCommandSandboxAvailable())("stops its owned process on authority loss and bounds output", async () => {

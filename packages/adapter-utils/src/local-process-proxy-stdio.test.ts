@@ -31,8 +31,6 @@ async function start(
   roots.push(root);
   const bridge = path.join(root, "bridge.cjs");
   const worker = path.join(root, "worker.cjs");
-  // Model the inherited descriptor state that caused synchronous native CLI
-  // output to throw EAGAIN. This is a fixture, never a production workaround.
   await fs.writeFile(
     bridge,
     'const cp=require("node:child_process");const originalSpawn=cp.spawn;cp.spawn=(...args)=>{const child=originalSpawn(...args);process.stdout._handle.setBlocking(false);process.stderr._handle.setBlocking(false);' +
@@ -218,8 +216,6 @@ it
 it.runIf(process.platform === "linux").each(["timeout", "cancel"])(
   "terminates after provider exit when destination writes cannot drain (%s)",
   async (reason) => {
-    // Queue a large tail in the bridge only after the provider has exited.
-    // Keeping the outer consumer paused models blocked pending destination writes.
     const run = await start(
       "process.stdout.write('result');",
       "",
