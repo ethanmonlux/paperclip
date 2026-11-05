@@ -17,7 +17,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { fetchCodexQuota, fetchCodexRpcQuota, getQuotaWindows } from "./quota.js";
+import { CodexQuotaAuthError, fetchCodexQuota, fetchCodexRpcQuota, getQuotaWindows, readCodexQuotaErrorFamily } from "./quota.js";
 
 function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
@@ -59,6 +59,16 @@ function createRpcChild(response?: (request: RpcRequest) => unknown) {
   });
   Object.assign(child, { pid: 12345, stdout, stderr, stdin, kill });
   return { child, stdout, stderr, stdin, kill };
+}
+
+// The app-server reports provider failures on stderr before it exits.
+function createChildThatExitsWithStderr(text: string): ChildProcess {
+  const probe = createRpcChild(() => undefined);
+  queueMicrotask(() => {
+    probe.stderr.emit("data", text);
+    probe.child.emit("exit", 1);
+  });
+  return probe.child;
 }
 
 describe("CodexRpcClient spawn failures", () => {
@@ -247,7 +257,7 @@ describe("CodexRpcClient spawn failures", () => {
   });
 
   it("classifies app-server refresh-token failures as quota probe auth errors", async () => {
-    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("OAuth failed: refresh token has expired")));
+    mockSpawn.mockImplementation(() => createChildThatExitsWithStderr("OAuth failed: refresh token has expired\n"));
 
     const result = await getQuotaWindows();
 
@@ -268,7 +278,7 @@ describe("CodexRpcClient spawn failures", () => {
       }),
       "utf8",
     );
-    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("OAuth failed: refresh token has expired")));
+    mockSpawn.mockImplementation(() => createChildThatExitsWithStderr("OAuth failed: refresh token has expired\n"));
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(
@@ -293,6 +303,31 @@ describe("CodexRpcClient spawn failures", () => {
         resetsAt: "2024-03-22T12:38:31.000Z",
       }),
     ]);
+  });
+
+  it("does not treat local process errors as provider authentication failures", async () => {
+    mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("spawn /opt/refresh_token_reused/codex ENOENT")));
+    expect((await getQuotaWindows()).errorFamily).toBeUndefined();
+
+    const probe = createRpcChild(() => undefined);
+    mockSpawn.mockReturnValue(probe.child);
+    const result = fetchCodexRpcQuota().catch((error: unknown) => error);
+    probe.stdin.emit("error", new Error("write EPIPE after OAuth failed: invalid_grant"));
+    expect(readCodexQuotaErrorFamily(await result)).toBeNull();
+  });
+
+  it("ignores structured records on app-server stderr", async () => {
+    mockSpawn.mockImplementation(() => createChildThatExitsWithStderr(
+      '{"type":"tool_result","output":"OAuth failed: refresh_token_reused"}\n',
+    ));
+    expect((await getQuotaWindows()).errorFamily).toBeUndefined();
+  });
+
+  it("reads only qualified quota auth errors, never arbitrary error text", () => {
+    expect(readCodexQuotaErrorFamily(new Error("OAuth failed: refresh_token_reused"))).toBeNull();
+    expect(readCodexQuotaErrorFamily("refresh token has expired")).toBeNull();
+    expect(readCodexQuotaErrorFamily(new CodexQuotaAuthError("chatgpt wham api returned 401", "refresh_token_expired")))
+      .toBe("refresh_token_expired");
   });
 
   it("classifies WHAM refresh-token response bodies without returning the body text", async () => {

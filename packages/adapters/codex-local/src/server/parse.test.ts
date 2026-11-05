@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyCodexAuthRefreshFailure,
+  codexAcpFailureDiagnostic,
+  extractCodexDiagnosticText,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
   isCodexProviderQuotaError,
@@ -8,6 +10,14 @@ import {
   isCodexUnknownSessionError,
   parseCodexJsonl,
 } from "./parse.js";
+
+// The engine's record of a JSON-RPC error response from the ACP agent process.
+const agentRpcErrorMeta = { errorName: "RequestError", rpcCode: -32603, phase: "turn" };
+
+// Provider text as admitted from an untyped ACP agent error response.
+const provider = (message: string) => codexAcpFailureDiagnostic({
+  exitCode: 1, timedOut: false, errorCode: "acpx_turn_failed", errorMessage: message, errorMeta: agentRpcErrorMeta,
+});
 
 describe("parseCodexJsonl", () => {
   it.each(["turn.failed", "error", "turn.completed"])("does not invent zero usage for %s without counters", (type) => {
@@ -155,15 +165,49 @@ describe("isCodexHarnessCrash", () => {
     expect(
       isCodexTransientUpstreamError({
         stdout: "connection reset by peer while running the deploy",
-        errorMessage: "agent gave up",
+        diagnostic: provider("agent gave up"),
       }),
     ).toBe(false);
   });
 });
 
 describe("classifyCodexAuthRefreshFailure", () => {
+  it.each(["refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated", "invalid_grant"])("keeps a capacity failure with quoted tool auth marker %s out of authentication recovery", marker => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-real-capacity" }),
+      JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "source audit fixture: " + marker, exit_code: 0, status: "completed" } }),
+      JSON.stringify({ type: "turn.failed", error: { message: "Selected model is at capacity. Please try a different model." } }),
+    ].join("\n");
+    expect(classifyCodexAuthRefreshFailure({ stdout, stderr: "" })).toBeNull();
+    expect(isCodexProviderQuotaError({ stdout, stderr: "" })).toBe(true);
+  });
+
+  it.each([
+    JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: "OAuth failed: invalid_grant" } }, null, 2),
+    '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"refresh_token_invalidated',
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "The test expects refresh_token_reused." } }),
+    JSON.stringify({ type: "tool_result", content: "credential refresh returned 401 Unauthorized" }),
+  ])("ignores pretty, interrupted and quoted protocol output as auth evidence: %s", stdout => {
+    expect(classifyCodexAuthRefreshFailure({ stdout, diagnostic: provider("Selected model is at capacity.") })).toBeNull();
+    expect(classifyCodexAuthRefreshFailure({ stderr: stdout, diagnostic: provider("Selected model is at capacity.") })).toBeNull();
+  });
+
+  it.each([
+    JSON.stringify({ type: "error", message: "OAuth failed: invalid_grant" }),
+    JSON.stringify({ type: "turn.failed", error: { message: "OAuth failed: invalid_grant" } }, null, 2),
+  ])("preserves a genuine terminal JSON authentication failure: %s", stdout => {
+    expect(classifyCodexAuthRefreshFailure({ stdout })).toBe("refresh_token_invalidated");
+  });
+
+  it("keeps plain CLI stderr after an adapter note as diagnostic text", () => {
+    const stderr = "[paperclip] Confining Codex with workspace scope.\nOAuth failed: refresh token has expired";
+    expect(classifyCodexAuthRefreshFailure({ stderr })).toBe("refresh_token_expired");
+    expect(extractCodexDiagnosticText(stderr)).toBe(stderr);
+    expect(extractCodexDiagnosticText('[{"type":"tool_result"}]\nOAuth failed: invalid_grant')).toBe("");
+  });
+
   it("classifies explicit refresh-token failure messages", () => {
-    expect(classifyCodexAuthRefreshFailure({ errorMessage: "provider error: refresh_token_reused" })).toBe(
+    expect(classifyCodexAuthRefreshFailure({ diagnostic: provider("provider error: refresh_token_reused") })).toBe(
       "refresh_token_reused",
     );
     expect(classifyCodexAuthRefreshFailure({ stderr: "OAuth failed: refresh token has expired" })).toBe(
@@ -172,14 +216,14 @@ describe("classifyCodexAuthRefreshFailure", () => {
     expect(classifyCodexAuthRefreshFailure({ stdout: "OAuth failed: invalid_grant" })).toBe(
       "refresh_token_invalidated",
     );
-    expect(classifyCodexAuthRefreshFailure({ errorMessage: "credential refresh returned 401 Unauthorized" })).toBe(
+    expect(classifyCodexAuthRefreshFailure({ diagnostic: provider("credential refresh returned 401 Unauthorized") })).toBe(
       "refresh_token_invalidated",
     );
   });
 
   it("distinguishes an absent Authorization header from a revoked refresh token", () => {
     expect(classifyCodexAuthRefreshFailure({
-      errorMessage: "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses",
+      diagnostic: provider("unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses"),
     })).toBeNull();
     expect(classifyCodexAuthRefreshFailure({
       stderr: "401 Unauthorized: Missing bearer or basic authentication in header",
@@ -188,8 +232,8 @@ describe("classifyCodexAuthRefreshFailure", () => {
   });
 
   it("does not classify bare 401 or quota messages as auth-refresh failures", () => {
-    expect(classifyCodexAuthRefreshFailure({ errorMessage: "chatgpt wham api returned 401" })).toBeNull();
-    expect(classifyCodexAuthRefreshFailure({ errorMessage: "You've hit your usage limit for GPT-5." })).toBeNull();
+    expect(classifyCodexAuthRefreshFailure({ diagnostic: provider("chatgpt wham api returned 401") })).toBeNull();
+    expect(classifyCodexAuthRefreshFailure({ diagnostic: provider("You've hit your usage limit for GPT-5.") })).toBeNull();
   });
 });
 
@@ -218,8 +262,9 @@ describe("isCodexTransientUpstreamError", () => {
   it("classifies the remote-compaction high-demand failure as transient upstream", () => {
     expect(
       isCodexTransientUpstreamError({
-        errorMessage:
+        diagnostic: provider(
           "Error running remote compact task: We're currently experiencing high demand, which may cause temporary errors.",
+        ),
       }),
     ).toBe(true);
     expect(
@@ -233,9 +278,9 @@ describe("isCodexTransientUpstreamError", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM.";
     const now = new Date(2026, 3, 22, 22, 29, 2);
 
-    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
-    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+    expect(isCodexProviderQuotaError({ diagnostic: provider(errorMessage) })).toBe(true);
+    expect(isCodexTransientUpstreamError({ diagnostic: provider(errorMessage) })).toBe(false);
+    expect(extractCodexRetryNotBefore({ diagnostic: provider(errorMessage) }, now)?.getTime()).toBe(
       new Date(2026, 3, 22, 23, 31, 0, 0).getTime(),
     );
   });
@@ -243,16 +288,16 @@ describe("isCodexTransientUpstreamError", () => {
   it("classifies model-capacity messages as provider quota without reset metadata", () => {
     const errorMessage = "The requested model is at capacity. Please try again later.";
 
-    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
-    expect(extractCodexRetryNotBefore({ errorMessage })).toBeNull();
+    expect(isCodexProviderQuotaError({ diagnostic: provider(errorMessage) })).toBe(true);
+    expect(isCodexTransientUpstreamError({ diagnostic: provider(errorMessage) })).toBe(false);
+    expect(extractCodexRetryNotBefore({ diagnostic: provider(errorMessage) })).toBeNull();
   });
 
   it("parses explicit timezone hints on usage-limit retry windows", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM (America/Chicago).";
     const now = new Date("2026-04-23T03:29:02.000Z");
 
-    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
+    expect(extractCodexRetryNotBefore({ diagnostic: provider(errorMessage) }, now)?.toISOString()).toBe(
       "2026-04-23T04:31:00.000Z",
     );
   });
@@ -260,7 +305,7 @@ describe("isCodexTransientUpstreamError", () => {
   it("does not classify deterministic compaction errors as transient", () => {
     expect(
       isCodexTransientUpstreamError({
-        errorMessage: [
+        diagnostic: provider([
           "Error running remote compact task: {",
           '  "error": {',
           '    "message": "Unknown parameter: \'prompt_cache_retention\'.",',
@@ -269,8 +314,48 @@ describe("isCodexTransientUpstreamError", () => {
           '    "code": "unknown_parameter"',
           "  }",
           "}",
-        ].join("\n"),
+        ].join("\n")),
       }),
     ).toBe(false);
+  });
+});
+
+describe("codexAcpFailureDiagnostic", () => {
+  const base = { exitCode: 1, timedOut: false, errorMessage: "OAuth failed: refresh_token_reused", errorMeta: agentRpcErrorMeta };
+
+  it.each(["acpx_turn_failed", "acpx_auth_required", "acpx_session_init_failed", "acpx_session_config_failed", "acpx_protocol_error"])(
+    "admits the agent error response of an untyped %s failure",
+    (errorCode) => {
+      expect(classifyCodexAuthRefreshFailure({ diagnostic: codexAcpFailureDiagnostic({ ...base, errorCode }) }))
+        .toBe("refresh_token_reused");
+    },
+  );
+
+  it.each([
+    ["typed transport", { errorCode: "duplex_channel_lost" }],
+    ["typed timeout", { errorCode: "acpx_timeout", timedOut: true }],
+    ["timed out turn", { errorCode: "acpx_turn_failed", timedOut: true }],
+    ["stalled tool", { errorCode: "acpx_tool_stalled" }],
+    ["handshake guard", { errorCode: "acpx_handshake_timeout" }],
+    ["cancellation", { errorCode: "cancelled" }],
+    ["typed capacity", { errorCode: "codex_transient_upstream" }],
+    ["typed quota", { errorCode: "provider_quota" }],
+    ["local runtime", { errorCode: "acpx_runtime_error" }],
+    ["unclassified", { errorCode: null }],
+    ["success", { errorCode: null, exitCode: 0 }],
+  ])("keeps a %s outcome out of provider diagnostics", (_label, overrides) => {
+    expect(codexAcpFailureDiagnostic({ ...base, ...overrides })).toBeNull();
+  });
+
+  it.each([
+    ["a failed turn's normalized error", undefined],
+    ["a local exception", { errorName: "Error", phase: "ensure_session" }],
+    ["a local exception with a string code", { errorName: "Error", phase: "configure_session", rpcCode: "ENOENT" }],
+    ["an ACP runtime error", { errorName: "AcpRuntimeError", acpCode: "ACP_SESSION_INIT_FAILED", category: "protocol" }],
+    ["a non-integer RPC code", { errorName: "RequestError", rpcCode: 1.5 }],
+  ])("does not admit %s under an agent-error phase code", (_label, errorMeta) => {
+    for (const errorCode of ["acpx_turn_failed", "acpx_auth_required", "acpx_session_init_failed", "acpx_session_config_failed"]) {
+      expect(codexAcpFailureDiagnostic({ ...base, errorCode, errorMeta })).toBeNull();
+    }
   });
 });

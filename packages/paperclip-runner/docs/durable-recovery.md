@@ -99,6 +99,13 @@ after a failed resume, it opens a fresh provider session as before. Otherwise th
 run fails with `native_provider_state_incompatible` and is not retried. A board
 Retry then continues the task in a fresh provider session in the same workspace.
 
+Saved OpenCode and Cursor Cloud provider state binds the digest of its own
+qualified launch profile (command, proxy script and, for OpenCode, the
+executable, each by path and SHA-256). These providers do not re-bind. A changed
+profile fails restore with the same `provider_state_incompatible`
+classification and follows the same disposition, so the controller does not
+retry the restore or try to reattach a runner that already rejected it.
+
 ## Profile identity
 
 Every ACPX provider's `commandDigest` attests only its own upstream release.
@@ -163,6 +170,22 @@ released records remain unchanged and readable; exact current digest admission
 refuses their old launch identities.
 
 ## External controller checkpoints
+
+New controllers create `paperclip.runner.durable.control-plane-state.v2` with
+`paperclip.runner.bootstrap-history.v1`. This history retains its original full
+run identity, issued credential count and adoption flag across run rotations.
+Every launch persists credential issuance before handing the ticket to a process.
+Credential pruning cannot remove this history. Older controllers reject v2 state;
+current controllers can still restore v1 state without granting it this proof.
+Checkpoint decoding and external persistence never add missing origin history.
+
+`inspectUnclaimedBootstrapCheckpoint` validates the complete four-part bootstrap
+journal and exact identity. Only pending `run.prepare` and `session.open` commands
+are allowed. Any credential issuance, connection, command delivery, event, warm
+transition or unsupported history prevents the proof. Its fingerprint lets an
+embedding owner recheck the exact revision under its execution fence. The proof
+describes provider usage only. It does not authorize replay or prove that a
+sandbox, callback bridge or other process has terminated.
 
 The optional controller persistence callback stores recovery control state, not
 an output transcript. Text deltas do not trigger callbacks; usage updates are

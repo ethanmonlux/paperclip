@@ -40,7 +40,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { normalizeCodexModel } from "../index.js";
-import { classifyCodexAuthRefreshFailure, extractCodexRetryNotBefore } from "./parse.js";
+import {
+  classifyCodexAuthRefreshFailure,
+  codexAcpFailureDiagnostic,
+  codexTerminalSessionFailureDiagnostic,
+  extractCodexRetryNotBefore,
+} from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 import {
   buildCodexHomeRefreshProvision,
@@ -269,7 +274,34 @@ async function prepareCodexRemoteManagedHome(
 const CODEX_MODEL_CAPACITY_RE =
   /\b(?:selected model is at capacity|model is at capacity|at capacity for this model|serverOverloaded|server overloaded)\b/i;
 
+const CODEX_PROVIDER_AUTH_RE =
+  /\b(?:401 unauthorized|invalid_api_key|(?:incorrect|invalid) api key)\b/i;
+
+/**
+ * Classify the provider's typed terminal session failure. Capacity and quota
+ * keep precedence; otherwise its text is the one turn-phase diagnostic that
+ * may report refresh-token auth, since a failed turn's normalized error can
+ * come from a local exception. A typed `access` rejection of the credential
+ * itself routes to sign-in recovery.
+ */
 export function classifyCodexTerminalSessionFailure(
+  failure: AcpxTerminalSessionFailure,
+  now: Date,
+): AcpxTerminalFailureClassification | null {
+  const typed = classifyCodexCapacityOrQuotaFailure(failure, now);
+  if (typed) return typed;
+  const authFailure = classifyCodexAuthRefreshFailure({
+    diagnostic: codexTerminalSessionFailureDiagnostic(failure),
+  });
+  if (authFailure) return { errorCode: authFailure, errorFamily: authFailure };
+  if (failure.category === "access") {
+    const text = [failure.title, failure.details].filter(Boolean).join("\n");
+    return CODEX_PROVIDER_AUTH_RE.test(text) ? { errorCode: "acpx_auth_required" } : null;
+  }
+  return null;
+}
+
+function classifyCodexCapacityOrQuotaFailure(
   failure: AcpxTerminalSessionFailure,
   now: Date,
 ): AcpxTerminalFailureClassification | null {
@@ -283,11 +315,13 @@ export function classifyCodexTerminalSessionFailure(
   // Require explicit usage exhaustion; the CLI's broader capacity matcher would
   // also match a context/storage capacity limit and defer the wrong failure.
   if (failure.category !== "limit") return null;
-  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
-  if (!/\b(?:you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded))\b/i.test(surface.errorMessage)) {
+  const text = [failure.title, failure.details].filter(Boolean).join("\n");
+  if (!/\b(?:you(?:'|’)ve hit your usage limit|usage limit (?:reached|exceeded))\b/i.test(text)) {
     return null;
   }
-  const retryNotBefore = extractCodexRetryNotBefore(surface, now)?.toISOString();
+  const retryNotBefore = extractCodexRetryNotBefore({
+    diagnostic: codexTerminalSessionFailureDiagnostic(failure),
+  }, now)?.toISOString();
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
@@ -308,15 +342,7 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
 }
 
 function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
-  if ((result.exitCode ?? 0) === 0) return result;
-  const resultJson = parseObject(result.resultJson);
-  const stopReason = asString(resultJson.stopReason, "");
-  const authFailure = classifyCodexAuthRefreshFailure({
-    errorMessage: [result.errorMessage ?? "", result.summary ?? "", stopReason]
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .join("\n"),
-  });
+  const authFailure = classifyCodexAuthRefreshFailure({ diagnostic: codexAcpFailureDiagnostic(result) });
   if (!authFailure) return result;
 
   return {

@@ -167,6 +167,117 @@ describe("codex_local stderr fallback error derivation", () => {
   });
 });
 
+describe("codex_local stderr fallback diagnostic provenance", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const toolRecord = (content: string) => JSON.stringify({ type: "tool_result", content });
+
+  it.each([
+    ["OAuth failed: invalid_grant"],
+    ["refresh token has been invalidated"],
+    ["refresh_token_reused"],
+  ])("does not classify a structured stderr tool record quoting %s as authentication", async (quoted) => {
+    mockFailedProcess(`${YOLO_WARNING}\n${toolRecord(quoted)}`);
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.errorFamily ?? null).toBeNull();
+    expect(result.errorMessage).not.toContain("tool_result");
+    expect(result.errorMessage).not.toContain(quoted);
+  });
+
+  it("does not classify quoted quota or reset text in a structured stderr record as provider quota", async () => {
+    mockFailedProcess(
+      toolRecord("You've hit your usage limit for GPT-5. Switch to another model now, or try again at 4:00 PM."),
+    );
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.errorFamily ?? null).toBeNull();
+    expect(result.retryNotBefore ?? null).toBeNull();
+  });
+
+  it.each([
+    ["compact", undefined],
+    ["pretty-printed", 2],
+  ])("does not classify quoted high-demand text in a %s stderr record as transient upstream", async (_label, indent) => {
+    mockFailedProcess(JSON.stringify({
+      type: "tool_result",
+      content: "remote compact task: We're currently experiencing high demand",
+    }, null, indent));
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.errorFamily ?? null).toBeNull();
+  });
+
+  it("keeps a genuine plain CLI stderr authentication failure", async () => {
+    mockFailedProcess(`${YOLO_WARNING}\nError: refresh token has been invalidated. Please log in again.`);
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("refresh_token_invalidated");
+    expect(result.errorFamily).toBe("refresh_token_invalidated");
+    expect(result.errorMessage).toBe("Error: refresh token has been invalidated. Please log in again.");
+  });
+
+  it("keeps a genuine plain CLI authentication failure after an adapter note", async () => {
+    mockFailedProcess(
+      "[paperclip] Confining Codex with workspace scope.\nError: refresh token has been invalidated. Please log in again.",
+    );
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("refresh_token_invalidated");
+    expect(result.errorMessage).toBe("Error: refresh token has been invalidated. Please log in again.");
+  });
+
+  it("keeps a terminal JSON stderr authentication error", async () => {
+    mockFailedProcess(JSON.stringify({ type: "error", message: "unexpected status 401 Unauthorized: invalid_grant" }));
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("refresh_token_invalidated");
+    expect(result.errorMessage).toBe("unexpected status 401 Unauthorized: invalid_grant");
+  });
+
+  it("keeps a terminal JSON stdout authentication error ahead of untrusted stderr", async () => {
+    runAdapterExecutionTargetProcess.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout: `${JSON.stringify({ type: "turn.failed", error: { message: "refresh_token_reused" } })}\n`,
+      stderr: toolRecord("model at capacity"),
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    }));
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("refresh_token_reused");
+    expect(result.errorMessage).toBe("refresh_token_reused");
+  });
+
+  it("keeps genuine plain CLI quota reset and transient upstream controls", async () => {
+    mockFailedProcess(
+      "Error: You've hit your usage limit for GPT-5. Switch to another model now, or try again at 4:00 PM.",
+    );
+    const quota = await execute(buildContext() as never);
+    expect(quota.errorCode).toBe("provider_quota");
+    expect(quota.retryNotBefore).toEqual(expect.any(String));
+
+    mockFailedProcess("Error: remote compact task failed: We're currently experiencing high demand");
+    const transient = await execute(buildContext() as never);
+    expect(transient.errorCode).toBe("codex_transient_upstream");
+  });
+});
+
 describe("firstMeaningfulStderrLine", () => {
   it("returns the first line that is not a known benign warning", () => {
     expect(firstMeaningfulStderrLine(`${YOLO_WARNING}\nError: boom`)).toBe("Error: boom");
