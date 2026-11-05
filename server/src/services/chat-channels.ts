@@ -145,6 +145,7 @@ import { chatCredentialMutationLease } from "./chat-credential-mutation-lease.js
 import type { AgentAvatarRequest } from "./agent-avatars.js";
 
 import { canPublishIssueToChatAudience } from "./authorization.js";
+import { createFounderFallbackNotices, founderFallbackSettingsFromEnv, isFounderFallbackPublication } from "./founder-fallback-notices.js";
 
 import { buildChatCommunicationGuidance } from "./chat-communication-guidance.js";
 import { assertChatTaskCreationAccess, resolveChatExecutionDefaults } from "./chat-execution-defaults.js";
@@ -332,6 +333,8 @@ type ConversationRow = typeof chatConversations.$inferSelect;
 type DeliveryRow = typeof chatDeliveries.$inferSelect;
 
 export interface ChatChannelServiceOptions {
+  /** Test override; production reads the default-off FAC-597 fallback settings from the environment. */
+  founderFallbackNotices?: ReturnType<typeof createFounderFallbackNotices>;
   /**
    * Provider webhooks await only the durable ingress write, then finish task
    * processing outside the provider response budget. Tests may leave this off
@@ -498,6 +501,7 @@ function absoluteBaseUrl(value: string | null | undefined): string | null {
 
 export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   const runtime = options.runtime ?? createChatRuntime();
+  const founderFallbackNotices = options.founderFallbackNotices ?? createFounderFallbackNotices(db, founderFallbackSettingsFromEnv());
   const githubManualMessages = new WeakMap<object, { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" }>();
   const githubAutomaticMessages = new WeakMap<object, { context: GitHubReviewEventContext; revision: number; policy: GitHubReviewPolicy }>();
   const githubIssueMessages = new WeakMap<object, { context: GitHubIssueEventContext; revision: number; policy: GitHubReviewPolicy }>();
@@ -1280,6 +1284,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     publication: typeof chatPublications.$inferSelect,
   ): Promise<boolean> {
     if (!(await canPublishIssueToChatAudience(tx, publication))) return false;
+    if (isFounderFallbackPublication(publication)) {
+      return founderFallbackNotices.authorizeFounderFallbackPublication(tx as unknown as Db, publication);
+    }
     if (publication.idempotencyKey.startsWith("fast-response:")) {
       const [request] = await tx.select().from(fastResponseRequests).where(and(eq(fastResponseRequests.companyId, publication.companyId), eq(fastResponseRequests.id, publication.idempotencyKey.slice("fast-response:".length))));
       if (!request || request.commentId !== publication.commentId || request.endpointId !== publication.endpointId || request.conversationId !== publication.conversationId || !(await fastResponseSourceCurrent(tx as unknown as Db, request))) return false;

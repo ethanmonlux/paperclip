@@ -5,6 +5,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { chatActions, chatConversations, chatDeliveries, chatEndpoints, chatPublications, chatTeamsFileTransfers, issueThreadInteractions } from "@paperclipai/db";
 import { conflict, notFound } from "../../../errors.js";
+import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "../../chat-publication-errors.js";
 import { logActivity } from "../../activity-log.js";
 import type { EndpointRecord } from "../runtime-types.js";
 import type { chatCredentialMutationLease } from "../../chat-credential-mutation-lease.js";
@@ -241,8 +242,7 @@ export function createChatPublicationResolution(db: Db, options: ResolutionOptio
                   : {
                     state: "cancelled",
                     nextAttemptAt: null,
-                    redactedError:
-                      "Cancelled by an operator after an unconfirmed provider delivery",
+                    redactedError: OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION,
                     updatedAt: now,
                   },
             )
