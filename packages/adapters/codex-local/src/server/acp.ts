@@ -274,11 +274,15 @@ async function prepareCodexRemoteManagedHome(
 const CODEX_MODEL_CAPACITY_RE =
   /\b(?:selected model is at capacity|model is at capacity|at capacity for this model|serverOverloaded|server overloaded)\b/i;
 
+const CODEX_PROVIDER_AUTH_RE =
+  /\b(?:401 unauthorized|invalid_api_key|(?:incorrect|invalid) api key)\b/i;
+
 /**
  * Classify the provider's typed terminal session failure. Capacity and quota
  * keep precedence; otherwise its text is the one turn-phase diagnostic that
  * may report refresh-token auth, since a failed turn's normalized error can
- * come from a local exception.
+ * come from a local exception. A typed `access` rejection of the credential
+ * itself routes to sign-in recovery.
  */
 export function classifyCodexTerminalSessionFailure(
   failure: AcpxTerminalSessionFailure,
@@ -289,7 +293,12 @@ export function classifyCodexTerminalSessionFailure(
   const authFailure = classifyCodexAuthRefreshFailure({
     diagnostic: codexTerminalSessionFailureDiagnostic(failure),
   });
-  return authFailure ? { errorCode: authFailure, errorFamily: authFailure } : null;
+  if (authFailure) return { errorCode: authFailure, errorFamily: authFailure };
+  if (failure.category === "access") {
+    const text = [failure.title, failure.details].filter(Boolean).join("\n");
+    return CODEX_PROVIDER_AUTH_RE.test(text) ? { errorCode: "acpx_auth_required" } : null;
+  }
+  return null;
 }
 
 function classifyCodexCapacityOrQuotaFailure(
