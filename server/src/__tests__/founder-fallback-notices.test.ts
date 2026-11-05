@@ -16,6 +16,7 @@ import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "../services/chat-pub
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { publishLiveEvent } from "../services/live-events.js";
+import { idleWorkSnapshot, isIdleTaskDrainActive, startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
 
 const MINUTE = 60_000;
 const BOUND = 20 * MINUTE;
@@ -711,6 +712,169 @@ const support = await getEmbeddedPostgresTestSupport();
       } finally {
         await h.close();
       }
+    });
+
+    // The production predicates: idle drain reconciles without dispatching,
+    // warm standby does neither. Neither may consume an owed sweep.
+    describe("admission gates", () => {
+      let standby = false;
+      afterEach(() => { stopTaskDrain(); standby = false; });
+      const open = () => !standby && !isIdleTaskDrainActive();
+
+      function gated(service: ReturnType<typeof createFounderFallbackNotices>, retryMs: number, hooks: {
+        beforeRead?: () => Promise<void>;
+      } = {}) {
+        const sweeps: { inserted: number; awaitingOutbox: boolean }[] = [];
+        const errors: unknown[] = [];
+        const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: open, canReconcile: () => !standby,
+          onError: error => { errors.push(error); } });
+        const wrapped = { ...service, sweep: async (signal?: AbortSignal) => {
+          const before = hooks.beforeRead; hooks.beforeRead = undefined;
+          await before?.();
+          const result = await service.sweep(signal);
+          sweeps.push(result);
+          return result;
+        } };
+        const worker = registerFounderFallbackNoticeWork(coordinator, wrapped, open, retryMs, db);
+        return { worker, coordinator, sweeps, errors, async close() { await worker.stop(); await coordinator.stop(); } };
+      }
+
+      async function settlesQuietly(h: ReturnType<typeof gated>) {
+        await quiet();
+        const settled = h.sweeps.length;
+        await quiet();
+        expect(h.sweeps).toHaveLength(settled);
+        expect(h.sweeps.at(-1)).toMatchObject({ inserted: 0, awaitingOutbox: false });
+        expect(h.coordinator.nextWakeAt()).toBeNull();
+        expect(h.errors).toEqual([]);
+      }
+
+      // Reviewer fixture (STA-48 round 8), with the production retry interval
+      // too: the end of the drain resumes the owed sweep, not a later retry.
+      it.each([20, 60_000])("retains a settlement observed during idle drain until it ends (retry %ims)", async retryMs => {
+        const f = await inFlightRecovery();
+        const h = gated(f.service, retryMs);
+        try {
+          await h.worker.ready;
+          expect(h.sweeps).toHaveLength(1);
+          startTaskDrain({ purpose: "idle" });
+          await settleAgentNotice(f);
+          await quiet();
+          expect(h.sweeps).toHaveLength(1);
+          expect(await recovered(f)).toHaveLength(0);
+          stopTaskDrain();
+          await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+          await settlesQuietly(h);
+        } finally {
+          await h.close();
+        }
+      });
+
+      it("retains the first relevant producer hint seen during idle drain", async () => {
+        const f = await fixture();
+        await failAgent(f, start);
+        at(21);
+        expect((await f.service.sweep()).inserted).toBe(1);
+        await db.update(chatPublications).set({ state: "published", publishedAt: new Date() })
+          .where(eq(chatPublications.companyId, f.companyId));
+        const h = gated(f.service, 60_000);
+        try {
+          await h.worker.ready;
+          expect(h.sweeps).toEqual([expect.objectContaining({ inserted: 0, awaitingOutbox: false })]);
+          startTaskDrain({ purpose: "idle" });
+          await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+          publishLiveEvent({ companyId: f.companyId, type: "agent.status", payload: { agentId: f.agentId, status: "idle" } });
+          await quiet();
+          expect(h.sweeps).toHaveLength(1);
+          stopTaskDrain();
+          await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+          await settlesQuietly(h);
+        } finally {
+          await h.close();
+        }
+      });
+
+      it("keeps a failed sweep's obligation when its retry falls in idle drain", async () => {
+        const f = await inFlightRecovery();
+        const h = gated(f.service, 20, { beforeRead: async () => {
+          startTaskDrain({ purpose: "idle" });
+          throw new Error("transient read failure");
+        } });
+        try {
+          await vi.waitFor(() => expect(h.errors).toHaveLength(1), { timeout: 3000, interval: 10 });
+          await settleAgentNotice(f);
+          await quiet();
+          // Retries pass through the drain without reading.
+          expect(h.sweeps).toEqual([]);
+          expect(await recovered(f)).toHaveLength(0);
+          stopTaskDrain();
+          await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+          h.errors.length = 0;
+          await settlesQuietly(h);
+        } finally {
+          await h.close();
+        }
+      });
+
+      it("runs a deadline that falls due during idle drain once it ends", async () => {
+        const f = await fixture();
+        await failAgent(f, new Date());
+        const service = createFounderFallbackNotices(db, { enabled: true, boundMs: 120 });
+        const h = gated(service, 60_000);
+        try {
+          await h.worker.ready;
+          expect(h.sweeps).toEqual([expect.objectContaining({ inserted: 0 })]);
+          startTaskDrain({ purpose: "idle" });
+          await quiet();
+          await quiet();
+          expect(h.sweeps).toHaveLength(1);
+          stopTaskDrain();
+          await vi.waitFor(() => expect(h.sweeps.map(sweep => sweep.inserted)).toContain(1), { timeout: 3000, interval: 25 });
+          await settlesQuietly(h);
+          expect((await rows(f)).map(row => row.idempotencyKey.split(":")[3])).toEqual(["agent"]);
+        } finally {
+          await h.close();
+        }
+      });
+
+      it("retains a settlement observed during warm standby until it ends", async () => {
+        const f = await inFlightRecovery();
+        const h = gated(f.service, 20);
+        try {
+          await h.worker.ready;
+          standby = true;
+          await settleAgentNotice(f);
+          await quiet();
+          expect(h.sweeps).toHaveLength(1);
+          expect(await recovered(f)).toHaveLength(0);
+          standby = false;
+          await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+          await settlesQuietly(h);
+        } finally {
+          await h.close();
+        }
+      });
+
+      it("adds no sweep or tracked work to an idle probe when nothing is owed", async () => {
+        const f = await fixture();
+        const h = gated(f.service, 20);
+        try {
+          await h.worker.ready;
+          await quiet();
+          expect(h.sweeps).toHaveLength(1);
+          const before = idleWorkSnapshot();
+          startTaskDrain({ purpose: "idle" });
+          await quiet();
+          expect(idleWorkSnapshot()).toEqual(before);
+          stopTaskDrain();
+          await quiet();
+          expect(idleWorkSnapshot()).toEqual(before);
+          expect(h.sweeps).toHaveLength(1);
+          expect(h.coordinator.nextWakeAt()).toBeNull();
+        } finally {
+          await h.close();
+        }
+      });
     });
   });
 

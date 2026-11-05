@@ -66,9 +66,15 @@ The sweep is not a poll. It runs:
   the worker removes it.
 
 With no endpoint, an idle endpoint, or only completed history, no deadline
-remains, so the worker issues no further queries until a hint arrives. During
-drain or warm standby a hinted run is held without querying, and it runs once
-admission reopens.
+remains, so the worker issues no further queries until a hint arrives.
+
+Each hint, settlement or failed sweep records an owed sweep, and only a sweep
+that starts while admission is open clears it. Idle drain and warm standby
+skip the sweep without consuming that obligation. While it is owed, the worker
+retries without querying and reports pending work, so an idle check does not
+see it as quiet. The end of an idle drain runs it at once, and a deadline that
+fell due during the gate runs too. An idle drain with nothing owed adds no
+sweep and no tracked work.
 
 The wake hints are process-local. A change made by another replica or by a
 direct SQL writer is picked up on the next hint, deadline or restart.

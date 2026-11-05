@@ -22,6 +22,7 @@ import { publicChatTaskUrl } from "./chat-task-url.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "./delivery-work-notifications.js";
 import { subscribeAllCompanyLiveEvents } from "./live-events.js";
+import { subscribeTaskDrainChanges } from "./task-admission.js";
 
 /**
  * Deterministic founder fallback (FAC-597 B1).
@@ -531,8 +532,14 @@ export function isFounderFallbackWakeEvent(event: Pick<LiveEvent, "type" | "payl
 
 /**
  * Runs once at startup to reconstruct from durable rows, then only on a wake
- * hint or at the sweep's own next deadline. A skipped run (drain, standby) is
- * retained without querying and runs when admission reopens.
+ * hint or at the sweep's own next deadline.
+ *
+ * Every hint records an owed sweep, which only a sweep that starts while
+ * admission is open clears, and a failed sweep restores. Admission may skip the
+ * run altogether (idle drain reconciles without dispatching, warm standby skips
+ * it), so the obligation lives here rather than in the run: while it is owed
+ * the coordinator retries without querying, and the end of a drain wakes the
+ * worker at once. Without one, a pass makes no query unless the deadline is due.
  *
  * Outbox settlement is observed from before each sweep's read until a sweep
  * finds no notice in flight. A row that settles while the sweep runs marks the
@@ -549,35 +556,60 @@ export function registerFounderFallbackNoticeWork(
     wake => subscribeDeliveryWork(owner, DELIVERY_QUEUES.chatPublications, wake),
 ) {
   let next: number | null = null;
-  let deferred = false;
+  // Startup reconstruction is the first obligation.
+  let owed = true;
   let stopped = false;
   let stopOutbox: (() => void) | null = null;
   const releaseOutbox = () => { stopOutbox?.(); stopOutbox = null; };
+  const due = () => next !== null && next <= Date.now();
   const worker = coordinator.register(DELIVERY_QUEUES.founderFallbackNotices, {
     retryMs,
     pausePassiveMaintenance: true,
     run: async signal => {
       if (stopped) return;
-      if (!canRun()) { deferred = true; return; }
-      deferred = false;
+      if (!canRun()) {
+        // A due deadline becomes an obligation, retried without querying.
+        if (due()) { owed = true; next = null; }
+        return;
+      }
+      if (!owed && !due()) return;
+      // Cleared before the read, so a hint during the sweep is owed again.
+      owed = false;
       next = null;
-      stopOutbox ??= subscribeOutbox(worker.wake);
-      const result = await service.sweep(signal);
+      stopOutbox ??= subscribeOutbox(wake);
+      let result: Awaited<ReturnType<typeof service.sweep>>;
+      try {
+        result = await service.sweep(signal);
+      } catch (error) {
+        owed = true;
+        throw error;
+      }
       if (stopped) { releaseOutbox(); return; }
       next = result.nextDueAt;
       if (!result.awaitingOutbox) releaseOutbox();
     },
-    hasPending: async () => deferred,
+    hasPending: async () => !stopped && owed,
+    // Settlement of this queue's own outer transactions.
+    onSettled: () => { if (!stopped) owed = true; },
     nextRunAt: () => stopped ? null : next,
   });
+  function wake() {
+    if (stopped) return;
+    owed = true;
+    worker.wake();
+  }
   const unsubscribes = [
-    subscribeAllCompanyLiveEvents(event => { if (isFounderFallbackWakeEvent(event)) worker.wake(); }),
+    subscribeAllCompanyLiveEvents(event => { if (isFounderFallbackWakeEvent(event)) wake(); }),
     // Lifecycle writers that change agent status without a live event.
     ...[DELIVERY_QUEUES.agentLifecycle, DELIVERY_QUEUES.strandedAgentStatus]
-      .map(queue => subscribeDeliveryWork(owner, queue, worker.wake)),
+      .map(queue => subscribeDeliveryWork(owner, queue, wake)),
+    // Resume a retained obligation as soon as the drain ends. Drain start and
+    // an empty resume wake nothing, so an idle probe sees no tracked work.
+    subscribeTaskDrainChanges(() => { if (!stopped && canRun() && (owed || due())) worker.wake(); }),
   ];
   return {
     ...worker,
+    wake,
     async stop() {
       stopped = true;
       for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
