@@ -853,7 +853,10 @@ async function probeGitWorktreeBase(cwd: string) {
     // corruption and I/O failures must remain reportable in Sentry.
     const notRepository = failure.code === 128 && failure.signal == null &&
       typeof failure.stderr === "string" &&
-      /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) &&
+      (
+        /^fatal: not a git repository \(or any of the parent directories\): \.git\r?\n?$/.test(failure.stderr) ||
+        /^fatal: not a git repository \(or any parent up to mount point \/[^\r\n]*\)\nStopping at filesystem boundary \(GIT_DISCOVERY_ACROSS_FILESYSTEM not set\)\.\n(?![\s\S])/.test(failure.stderr)
+      ) &&
       !process.env.GIT_DIR && !process.env.GIT_WORK_TREE && !process.env.GIT_COMMON_DIR &&
       await hasNoGitMetadataInWorkspaceAncestors(cwd);
     return { isCheckout: false, notRepository };

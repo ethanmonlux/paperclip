@@ -1,3 +1,4 @@
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   asString,
   parseObject,
@@ -16,8 +17,9 @@ const CODEX_REFRESH_TOKEN_REUSED_RE =
 const CODEX_REFRESH_TOKEN_EXPIRED_RE =
   /(?:refresh[_\s-]?token[_\s-]?expired|refresh token (?:has )?expired|expired refresh token)/i;
 const CODEX_REFRESH_TOKEN_INVALIDATED_RE =
-  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been )?(?:invalidated|revoked|invalid)|invalid refresh token|missing bearer)/i;
+  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been )?(?:invalidated|revoked|invalid)|invalid refresh token)/i;
 const CODEX_OAUTH_INVALID_GRANT_RE = /\binvalid_grant\b/i;
+const CODEX_MISSING_AUTH_HEADER_RE = /(?:missing bearer(?: or basic authentication)?(?: in header)?|missing authorization header)/i;
 const CODEX_CONTEXTUAL_REFRESH_AUTH_INVALIDATED_RE =
   /(?:(?:oauth|refresh|access[_\s-]?token|bearer|credential).{0,80}(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b)|(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b).{0,80}(?:oauth|refresh|access[_\s-]?token|bearer|credential))/i;
 
@@ -142,15 +144,109 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
-function buildCodexErrorHaystack(input: {
+// JSON-shaped lines only; adapter notes such as `[paperclip] ...` stay plain.
+const CODEX_STRUCTURED_LINE_RE = /^(?:[{"]|\[\s*(?:$|[[{"\]\d-]|true\b|false\b|null\b))/;
+
+/**
+ * Text that may serve as a provider diagnostic: plain CLI lines before any
+ * structured record, plus terminal protocol errors. Tool, agent and other
+ * structured records are untrusted quoted content and never become diagnostics.
+ */
+export function extractCodexDiagnosticText(output: string | null | undefined): string {
+  const text = output?.trim() ?? "";
+  const event = parseJson(text);
+  if (event) return parseCodexJsonl(JSON.stringify(event)).errorMessage ?? "";
+
+  let sawProtocol = false;
+  return text.split(/\r?\n/).map((rawLine) => {
+    const line = rawLine.trim();
+    if (CODEX_STRUCTURED_LINE_RE.test(line)) {
+      sawProtocol = true;
+      return parseCodexJsonl(line).errorMessage ?? "";
+    }
+    return sawProtocol ? "" : line;
+  }).filter(Boolean).join("\n");
+}
+
+let admitDiagnostic!: (text: string | null | undefined) => CodexProviderDiagnostic | null;
+let diagnosticText!: (diagnostic: CodexProviderDiagnostic | null | undefined) => string;
+
+/**
+ * Failure text admitted from a provider or protocol producer below. Agent
+ * output, tool records and run summaries cannot construct one, so callers can
+ * no longer hand the classifiers arbitrary text as a trusted diagnostic.
+ */
+export class CodexProviderDiagnostic {
+  readonly #text: string;
+  private constructor(text: string) {
+    this.#text = text;
+  }
+  static {
+    admitDiagnostic = (text) => {
+      const trimmed = text?.trim();
+      return trimmed ? new CodexProviderDiagnostic(trimmed) : null;
+    };
+    diagnosticText = (diagnostic) => (diagnostic ? diagnostic.#text : "");
+  }
+}
+
+// Untyped ACP failures that can carry the agent process's provider or protocol
+// error. Host-typed outcomes (timeouts, channel loss, stalled tools,
+// cancellation) and already-classified provider outcomes keep their
+// disposition, and the run summary is agent output, never evidence.
+const CODEX_ACP_PROVIDER_FAILURE_CODES = new Set([
+  "acpx_turn_failed",
+  "acpx_auth_required",
+  "acpx_session_init_failed",
+  "acpx_session_config_failed",
+  "acpx_protocol_error",
+]);
+
+/**
+ * The message of an ACP failure the engine recorded from a JSON-RPC error
+ * response of the agent process. The engine gives local exceptions (spawn,
+ * runtime, host callbacks) the same phase codes, so the code alone is not
+ * provenance; a failed turn's normalized error keeps no RPC record either.
+ */
+export function codexAcpFailureDiagnostic(
+  result: Pick<AdapterExecutionResult, "exitCode" | "timedOut" | "errorCode" | "errorMessage" | "errorMeta">,
+): CodexProviderDiagnostic | null {
+  if ((result.exitCode ?? 0) === 0 || result.timedOut) return null;
+  if (!CODEX_ACP_PROVIDER_FAILURE_CODES.has(result.errorCode ?? "")) return null;
+  const meta = result.errorMeta ?? {};
+  if (meta.errorName !== "RequestError" || !Number.isSafeInteger(meta.rpcCode)) return null;
+  return admitDiagnostic(result.errorMessage);
+}
+
+/** A typed ACP terminal session failure reported by the provider. */
+export function codexTerminalSessionFailureDiagnostic(failure: {
+  title?: string;
+  details?: string;
+}): CodexProviderDiagnostic | null {
+  return admitDiagnostic([failure.title, failure.details].filter(Boolean).join("\n"));
+}
+
+/** The status and bounded body of a failed ChatGPT usage endpoint response. */
+export function codexWhamHttpFailureDiagnostic(status: number, body: string): CodexProviderDiagnostic | null {
+  return admitDiagnostic([`chatgpt wham api returned ${status}`, body].filter(Boolean).join("\n"));
+}
+
+/** The error member of a matched Codex app-server JSON-RPC response. */
+export function codexAppServerRpcErrorDiagnostic(response: Record<string, unknown>): CodexProviderDiagnostic | null {
+  return admitDiagnostic(asString(parseObject(response.error).message, ""));
+}
+
+type CodexFailureEvidence = {
   stdout?: string | null;
   stderr?: string | null;
-  errorMessage?: string | null;
-}): string {
+  diagnostic?: CodexProviderDiagnostic | null;
+};
+
+function buildCodexErrorHaystack(input: CodexFailureEvidence): string {
   return [
-    input.errorMessage ?? "",
-    input.stdout ?? "",
-    input.stderr ?? "",
+    diagnosticText(input.diagnostic),
+    extractCodexDiagnosticText(input.stdout),
+    extractCodexDiagnosticText(input.stderr),
   ]
     .join("\n")
     .split(/\r?\n/)
@@ -159,12 +255,16 @@ function buildCodexErrorHaystack(input: {
     .join("\n");
 }
 
-export function classifyCodexAuthRefreshFailure(input: {
-  stdout?: string | null;
-  stderr?: string | null;
-  errorMessage?: string | null;
-}): CodexAuthRefreshFailureClass | null {
+export function classifyCodexAuthRefreshFailure(input: CodexFailureEvidence): CodexAuthRefreshFailureClass | null {
   const haystack = buildCodexErrorHaystack(input);
+
+  if (CODEX_MISSING_AUTH_HEADER_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)
+    && !CODEX_REFRESH_TOKEN_INVALIDATED_RE.test(haystack)
+    && !CODEX_OAUTH_INVALID_GRANT_RE.test(haystack)) {
+    return null;
+  }
 
   if (CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)) return "refresh_token_reused";
   if (CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)) return "refresh_token_expired";
@@ -308,22 +408,14 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
   return retryAt;
 }
 
-export function extractCodexRetryNotBefore(input: {
-  stdout?: string | null;
-  stderr?: string | null;
-  errorMessage?: string | null;
-}, now = new Date()): Date | null {
+export function extractCodexRetryNotBefore(input: CodexFailureEvidence, now = new Date()): Date | null {
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
   if (!usageLimitMatch) return null;
   return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
 }
 
-export function isCodexTransientUpstreamError(input: {
-  stdout?: string | null;
-  stderr?: string | null;
-  errorMessage?: string | null;
-}): boolean {
+export function isCodexTransientUpstreamError(input: CodexFailureEvidence): boolean {
   const haystack = buildCodexErrorHaystack(input);
 
   if (isCodexProviderQuotaError(input)) return false;
@@ -333,11 +425,7 @@ export function isCodexTransientUpstreamError(input: {
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
 }
 
-export function isCodexProviderQuotaError(input: {
-  stdout?: string | null;
-  stderr?: string | null;
-  errorMessage?: string | null;
-}): boolean {
+export function isCodexProviderQuotaError(input: CodexFailureEvidence): boolean {
   const haystack = buildCodexErrorHaystack(input);
   return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
 }

@@ -200,4 +200,37 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
     expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
   });
+
+  it.each([
+    ["JSONL tool result", { stdout: JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: "fixture: model_not_found; No API credentials were found" }] } }) }],
+    ["pretty protocol", { stdout: JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: "API key is not set" }] } }, null, 2) }],
+    ["interrupted protocol", { stdout: '{"type":"user","message":{"content":[{"type":"tool_result","content":"model_not_found' }],
+    ["quoted source", { stdout: 'expect(error).toContain("No API credentials were found");' }],
+    ["nested tool output", { toolResult: { error: "API key is not set" } }],
+    ["protocol stderr", { stderr: JSON.stringify({ type: "tool_result", content: "model_not_found" }) }],
+    ["quota source", { stdout: JSON.stringify({ type: "tool_result", content: "provider quota exceeded" }) }],
+  ])("ignores saved evidence from %s when classifying an adapter failure", (_surface, resultJson) => {
+    const run = { errorCode: "adapter_failed", error: "Failed to parse claude JSON output", resultJson };
+    expect(classifyAdapterFailureForRecovery(run)).toBeNull();
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "transient_infra", maxAttempts: 3 });
+    expect(isConfigurationIncompleteFailedRun(run)).toBe(false);
+  });
+
+  it("preserves typed provider quota and its reset despite configuration words in saved tool output", () => {
+    const now = new Date("2026-11-04T10:00:00.000Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "ACP agent reported a terminal limit failure.",
+      resultJson: {
+        errorFamily: "provider_quota",
+        retryNotBefore: "2026-11-04T11:00:00.000Z",
+        stdout: JSON.stringify({ type: "tool_result", content: "source fixture: model_not_found" }),
+      },
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-11-04T11:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
 });

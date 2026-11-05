@@ -581,3 +581,87 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.costUsd).toBeNull();
   });
 });
+
+
+describe("login evidence provenance", () => {
+  it.each(["assistant", "user", "system", "tool"])('ignores %s protocol content mentioning login', (type) => {
+    const stdout = JSON.stringify({ type, message: { content: [{ type: "tool_use", name: "Bash", input: { command: 'grep source_unauthorized worker.ts; echo "Please run /login"' } }] } });
+    expect(detectClaudeLoginRequired({parsed:null, stdout, stderr:""}).requiresLogin).toBe(false);
+  });
+  it("ignores successful result prose", () => {
+    const parsed={type:"result",subtype:"success",is_error:false,result:"Documented unauthorized and Please run /login"};
+    expect(detectClaudeLoginRequired({parsed,stdout:JSON.stringify(parsed),stderr:""}).requiresLogin).toBe(false);
+  });
+  it("preserves failed terminal login evidence", () => {
+    const parsed={type:"result",subtype:"error_during_execution",is_error:true,result:"Not logged in. Please run /login"};
+    expect(detectClaudeLoginRequired({parsed,stdout:JSON.stringify(parsed),stderr:""}).requiresLogin).toBe(true);
+  });
+  it("preserves plaintext CLI login prompts", () => {
+    expect(detectClaudeLoginRequired({parsed:null,stdout:"Please run /login",stderr:""}).requiresLogin).toBe(true);
+  });
+  it("does not reinterpret truncated protocol content as plaintext", () => {
+    expect(detectClaudeLoginRequired({parsed:null,stdout:'{"type":"assistant","message":"unauthorized',stderr:""}).requiresLogin).toBe(false);
+  });
+});
+
+it("does not source login URLs from protocol payloads", () => {
+  const stdout=JSON.stringify({type:"user",message:{content:[{type:"tool_result",content:"unauthorized https://untrusted.example/auth"}]}});
+  expect(detectClaudeLoginRequired({parsed:null,stdout,stderr:"Please run /login https://claude.ai/login"})).toEqual({requiresLogin:true,loginUrl:"https://claude.ai/login"});
+});
+
+it.each(["https://claude.ai/oauth/authorize", "Open this URL: https://claude.ai/oauth/authorize"])("preserves explicit login URL: %s", (stderr) => {
+  const stdout=JSON.stringify({type:"assistant",message:{content:[{type:"text",text:"https://untrusted.example/auth"}]}});
+  expect(detectClaudeLoginRequired({parsed:null,stdout,stderr})).toEqual({requiresLogin:false,loginUrl:"https://claude.ai/oauth/authorize"});
+});
+
+describe("interrupted execution authentication evidence", () => {
+  it.each(["SIGTERM", "SIGKILL", "OOM", "cancelled"])(
+    "keeps a valid account when %s interrupts source inspection",
+    (stopReason) => {
+      const stdout = [
+        { type: "system", subtype: "init", session_id: "retained-task-session" },
+        {
+          type: "user",
+          message: {
+            content: [{
+              type: "tool_result",
+              content: "Audit: source_unauthorized must not revoke credentials. Please run /login is fixture text.",
+            }],
+          },
+        },
+        { type: "system", subtype: "task_started", description: stopReason },
+      ].map((event) => JSON.stringify(event)).join("\n");
+      expect(parseClaudeStreamJson(stdout).resultJson).toBeNull();
+      expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }))
+        .toEqual({ requiresLogin: false, loginUrl: null });
+    },
+  );
+
+  it("ignores multiline protocol source after interruption", () => {
+    const stdout = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: "unauthorized fixture" }] },
+    }, null, 2);
+    expect(detectClaudeLoginRequired({ parsed: null, stdout, stderr: "" }).requiresLogin)
+      .toBe(false);
+  });
+
+  it("does not treat a failed task summary about auth code as a provider diagnostic", () => {
+    const parsed = {
+      type: "result",
+      subtype: "error_max_turns",
+      is_error: true,
+      result: "Stopped while reviewing source_unauthorized and the Please run /login fixture.",
+    };
+    expect(detectClaudeLoginRequired({ parsed, stdout: JSON.stringify(parsed), stderr: "" }).requiresLogin)
+      .toBe(false);
+  });
+
+  it("does not classify source-like plaintext as a CLI login prompt", () => {
+    expect(detectClaudeLoginRequired({
+      parsed: null,
+      stdout: "grep source_unauthorized worker.ts; echo Please run /login",
+      stderr: "",
+    }).requiresLogin).toBe(false);
+  });
+});

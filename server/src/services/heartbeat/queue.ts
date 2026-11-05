@@ -36,6 +36,7 @@ import {
   isCompletedOnboardingHandoffWake,
 } from "../chat-completion-delivery.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { pendingAgentInteractionAddressee } from "../pending-agent-interaction.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
   isConversation,
@@ -1732,7 +1733,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
-          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
+          and(sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,source}' = 'issue.interaction.created'`,
+            sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'interaction_pending'`,
+            sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,interactionKind}' = 'request_confirmation'`))))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
@@ -1753,7 +1757,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
-          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload) &&
+          !await pendingAgentInteractionAddressee(db, {
+            companyId: wake.companyId, issueId: String(wake.payload?.issueId), agentId: wake.agentId,
+            contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]),
+          })) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -2082,6 +2090,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         activeWakeupPromises.delete(promise);
       });
     return promise;
+  }
+
+  async function resumeTaskInputAfterLegacyCleanup(run: HeartbeatRun) {
+    const issueId = readNonEmptyString(run.contextSnapshot?.issueId);
+    if (run.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(run.status) || !issueId) return;
+    const [pending] = await db.select({ id: agentWakeupRequests.id, agentId: agentWakeupRequests.agentId,
+      payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, run.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(1);
+    if (!pending) return;
+    await (pending.agentId === run.agentId && pending.payload?.queuedCommentInterrupt
+      ? resumeQueuedCommentInterrupt(run.companyId, pending.id)
+      : releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true })).catch(err => {
+      logger.error({ err, runId: run.id }, "failed to promote legacy task queue after cleanup");
+    });
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
@@ -4958,6 +4983,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   return {
+    resumeTaskInputAfterLegacyCleanup,
     enqueueWakeup,
     dispatchPendingNativeStatusWakeups,
     createNativeStatusWakeBatch,

@@ -614,7 +614,6 @@ export function classifyAdapterFailureForRecovery(
   const error = [
     latestRun.errorCode ?? "",
     latestRun.error ?? "",
-    JSON.stringify(resultJson),
   ].join("\n");
   if (
     latestRun.errorCode === "configuration_incomplete" ||

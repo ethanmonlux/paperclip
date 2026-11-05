@@ -694,6 +694,9 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         let home = workspace.join("home");
         fs::create_dir(&home).unwrap();
+        let resources = std::env::var("CODEX_NOTIFICATION_SANDBOX_RESOURCES")
+            .expect("set the source-pinned Codex executable resource directory");
+        let resources = serde_json::to_string(&resources).unwrap();
         let profile = "paperclip-runner-workspace-only";
         let mut args = vec![
             "-c".into(),
@@ -702,7 +705,7 @@ mod tests {
             "shell_environment_policy.include_only=[\"PATH\",\"LANG\"]".into(),
         ];
         for name in [profile, "paperclip-runner-workspace-read-only"] {
-            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",\":workspace_roots\"={{\".\"=\"read\"}}}}"),
+            args.extend(["-c".into(), format!("permissions.{name}.filesystem={{\":root\"=\"none\",\":minimal\"=\"read\",\":tmpdir\"=\"none\",{resources}=\"read\",\":workspace_roots\"={{\".\"=\"read\"}}}}"),
                 "-c".into(), format!("permissions.{name}.network.enabled=false")]);
         }
         let extra = crate::codex_provider::runtime_notification_codex_args(&args, profile, &paths);
@@ -710,7 +713,7 @@ mod tests {
 [ -z "${UNRELATED_SECRET:-}" ] || exit 70
 if cat "$1" >/dev/null 2>&1; then exit 71; fi
 if /bin/sh -c ': >> "$PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT"' 2>/dev/null; then exit 72; fi
-if touch "$2/probe" 2>/dev/null; then exit 75; fi
+touch "$2/probe" 2>/dev/null || :
 touch "$3/probe" || exit 76
 rm "$3/probe" || exit 76
 if /bin/sh -c ': >> "$1"' ignored "$4" 2>/dev/null; then exit 77; fi
@@ -784,5 +787,10 @@ context=$("$PAPERCLIP_RUNTIME_NOTIFICATION_HELPER" notification-context) || exit
         }
         assert_eq!(state.outbox.len(), 1);
         assert_eq!(state.outbox[0].envelope["payload"]["runId"], config.run_id);
+        assert!(!config.state_dir.join("probe").exists());
+        assert_eq!(
+            fs::read(config.state_dir.join("runner-state.json")).unwrap(),
+            serde_json::to_vec_pretty(&state).unwrap()
+        );
     }
 }

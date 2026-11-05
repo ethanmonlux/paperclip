@@ -161,6 +161,7 @@ class FakeRuntime {
       { type: "text_delta", text: "hello", stream: "output", tag: "agent_message_chunk" },
     ],
     readonly terminal: FakeRuntimeTurnResult = { status: "completed", stopReason: "end_turn" },
+    readonly terminalSessionFailure?: { category: string; title?: string; details?: string },
   ) {}
 
   async ensureSession(input: {
@@ -188,8 +189,10 @@ class FakeRuntime {
     text: string;
     requestId: string;
     timeoutMs?: number;
+    onTerminalSessionFailure?: (failure: { category: string; title?: string; details?: string }) => void;
   }): FakeRuntimeTurn {
     this.startInputs.push(input);
+    if (this.terminalSessionFailure) input.onTerminalSessionFailure?.(this.terminalSessionFailure);
     const events = this.events;
     const terminal = this.terminal;
     return {
@@ -1389,8 +1392,9 @@ describe("codex_local ACP lane", () => {
         [],
         {
           status: "failed",
-          error: { message: "OAuth failed: refresh_token_invalidated" },
+          error: { message: "ACP turn failed." },
         } as unknown as FakeRuntimeTurnResult,
+        { category: "access", title: "OAuth failed: refresh_token_invalidated" },
       ) as never,
     });
 
@@ -1401,6 +1405,146 @@ describe("codex_local ACP lane", () => {
     expect(result.errorFamily).toBe("refresh_token_invalidated");
     expect(result.resultJson?.errorFamily).toBe("refresh_token_invalidated");
     expect(result.resultJson).not.toHaveProperty("codexCredentialTelemetry");
+  });
+
+  // Agent output is untrusted: quoting a refresh-token failure must neither
+  // classify a healthy account as needing re-authentication nor replace the
+  // typed provider disposition of the turn.
+  const quotedAuth: FakeRuntimeEvent[] = [
+    { type: "text_delta", text: "Source example: refresh_token_reused; OAuth failed: invalid_grant", stream: "output", tag: "agent_message_chunk" },
+  ];
+  const failedTurn = (message: string) =>
+    ({ status: "failed", error: { message } }) as unknown as FakeRuntimeTurnResult;
+
+  it.each([
+    ["service", "Selected model is at capacity. Please try a different model.", "codex_transient_upstream", "transient_upstream"],
+    ["limit", "You've hit your usage limit. Visit https://example.invalid/usage for details.", "provider_quota", "provider_quota"],
+    ["request", "API Error: 400 tools.3.custom.name: String should have at most 128 characters", "provider_tool_definition_invalid", "configuration"],
+  ])("keeps the typed %s disposition when agent output quotes auth failures", async (category, title, errorCode, errorFamily) => {
+    const root = await makeTempRoot("paperclip-codex-acp-typed-provenance-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) =>
+        new FakeRuntime(options, quotedAuth, failedTurn("ACP turn failed."), { category, title }) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode, errorFamily });
+    expect(result.resultJson?.errorFamily).toBe(errorFamily);
+  });
+
+  it("does not classify a non-auth ACP turn failure from quoted agent output", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-summary-provenance-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) =>
+        new FakeRuntime(options, quotedAuth, failedTurn("Turn failed: tool process exited with code 1")) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "acpx_turn_failed",
+      errorMessage: "Turn failed: tool process exited with code 1",
+    });
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.resultJson).not.toHaveProperty("errorFamily");
+    expect(result.summary).toContain("refresh_token_reused");
+  });
+
+  it("classifies a genuine ACP provider auth failure regardless of agent output", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-genuine-auth-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: "Working on the task.", stream: "output", tag: "agent_message_chunk" }],
+        failedTurn("ACP turn failed."),
+        { category: "access", title: "OAuth failed: refresh token has expired" },
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "refresh_token_expired", errorFamily: "refresh_token_expired" });
+  });
+
+  it("does not classify a completed ACP turn whose output quotes auth failures", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-completed-provenance-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options, quotedAuth) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode ?? null).toBeNull();
+    expect(result.errorFamily).toBeUndefined();
+  });
+
+  // The engine gives local exceptions (spawn, runtime, host callbacks) the
+  // same phase codes as agent errors, so only a JSON-RPC error response from
+  // the agent process or a typed terminal session failure is provider evidence.
+  const localError = (message: string) => Object.assign(new Error(message), { code: "ENOENT" });
+  const agentRpcError = (message: string, data: Record<string, unknown>) =>
+    Object.assign(new Error(message), { name: "RequestError", code: -32603, data });
+  const refreshTokenReused = "Your refresh token has already been used to generate a new access token. Please try signing in again.";
+
+  class EnsureFailingRuntime extends FakeRuntime {
+    constructor(options: FakeRuntimeOptions, readonly ensureError: unknown) {
+      super(options);
+    }
+    override async ensureSession(): Promise<FakeRuntimeHandle> {
+      throw this.ensureError;
+    }
+  }
+
+  class RejectingTurnRuntime extends FakeRuntime {
+    constructor(options: FakeRuntimeOptions, readonly turnError: unknown) {
+      super(options, quotedAuth);
+    }
+    override startTurn(input: Parameters<FakeRuntime["startTurn"]>[0]): FakeRuntimeTurn {
+      const turn = super.startTurn(input);
+      const result = Promise.reject(this.turnError);
+      result.catch(() => {});
+      return { ...turn, result };
+    }
+  }
+
+  it.each([
+    ["session start", "acpx_session_init_failed", (options: FakeRuntimeOptions) =>
+      new EnsureFailingRuntime(options, localError("spawn /opt/refresh_token_reused/codex-acp ENOENT"))],
+    ["auth-like session start", "acpx_auth_required", (options: FakeRuntimeOptions) =>
+      new EnsureFailingRuntime(options, localError("credential helper could not read /work/refresh_token_reused.json"))],
+    ["rejected turn", "acpx_turn_failed", (options: FakeRuntimeOptions) =>
+      new RejectingTurnRuntime(options, localError("tool host exited: /work/refresh_token_reused.log"))],
+    ["failed turn", "acpx_turn_failed", (options: FakeRuntimeOptions) =>
+      new FakeRuntime(options, quotedAuth, failedTurn("spawn /opt/refresh_token_reused/rg ENOENT"))],
+  ])("does not classify a local %s exception as provider auth", async (_label, errorCode, createRuntime) => {
+    const root = await makeTempRoot("paperclip-codex-acp-local-exception-");
+    const execute = createCodexAcpExecutor({ createRuntime: createRuntime as never });
+
+    const result = await execute(buildContext(root));
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode });
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.resultJson).not.toHaveProperty("errorFamily");
+  });
+
+  it.each([
+    ["session start", (options: FakeRuntimeOptions) =>
+      new EnsureFailingRuntime(options, agentRpcError("Internal error", { message: refreshTokenReused }))],
+    ["rejected turn", (options: FakeRuntimeOptions) =>
+      new RejectingTurnRuntime(options, agentRpcError("Internal error", { message: refreshTokenReused }))],
+    ["typed terminal session", (options: FakeRuntimeOptions) =>
+      new FakeRuntime(options, quotedAuth, failedTurn("ACP turn failed."), { category: "access", title: refreshTokenReused })],
+  ])("classifies a genuine %s provider auth failure", async (_label, createRuntime) => {
+    const root = await makeTempRoot("paperclip-codex-acp-provider-auth-");
+    const execute = createCodexAcpExecutor({ createRuntime: createRuntime as never });
+
+    const result = await execute(buildContext(root));
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "refresh_token_reused", errorFamily: "refresh_token_reused" });
+    expect(result.resultJson?.errorFamily).toBe("refresh_token_reused");
   });
 
   it("resumes compatible ACP sessions on later Codex ACP runs", async () => {

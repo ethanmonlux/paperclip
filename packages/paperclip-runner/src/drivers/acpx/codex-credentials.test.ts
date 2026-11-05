@@ -1165,7 +1165,7 @@ describe("managed Codex credentials", () => {
   ])(
     "permanently fences a home when helper kill %s",
     async (_label, killImplementation) => {
-      const fixture = await credentialFixture();
+      const [fixture] = await credentialFixturesWithAvailableQuorum(1);
       const actualFs =
         await vi.importActual<typeof import("node:fs/promises")>(
           "node:fs/promises",

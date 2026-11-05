@@ -1,5 +1,7 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { spawnSync } from "node:child_process";
+import { buildLocalProcessSandboxSpawnTarget } from "@paperclipai/adapter-utils/local-process-sandbox";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -57,7 +59,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, resolveRunScopedCodexCredentialMount } from "./execute.js";
 
 // Mirror the sandbox core's restore closure: capture the assets `execute()`
 // declares, then during teardown invoke each asset's `restore` with an injected
@@ -118,7 +120,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; env?: Record<string, string> }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void>; withIdentity?: boolean; env?: Record<string, string>; localAllowlist?: boolean }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -157,6 +159,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       config: {
         command: "codex",
         engine: "cli",
+        ...(input.localAllowlist ? { networkScope: "allowlist", networkAllowlist: ["paperclip.test"] } : {}),
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
         env: { CODEX_HOME: sharedHostHome, ...input.env },
@@ -167,7 +170,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           source: "project_primary",
         },
       },
-      executionTransport: {
+      ...(input.localAllowlist ? {} : { executionTransport: {
         remoteExecution: {
           host: "127.0.0.1",
           port: 2222,
@@ -178,7 +181,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
           strictHostKeyChecking: true,
         },
-      },
+      } }),
       onLog: async () => {},
     });
 
@@ -207,6 +210,19 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
     expect(commandArgs.join(" ")).not.toContain("assigned-tool-token");
+  });
+
+  it("preserves sandbox proxy variables in identity-filtered Codex task shells", async () => {
+    vi.stubEnv("HOST_DATABASE_PASSWORD", "host-password");
+    const { commandArgs } = await runTeardown({
+      sandboxAuth: "{}", hostAuth: "{}", withIdentity: true, localAllowlist: true,
+    });
+    const policy = commandArgs.find(arg => arg.startsWith("shell_environment_policy.include_only="));
+    const keys = policy ? JSON.parse(policy.slice(policy.indexOf("=") + 1)) as string[] : [];
+    expect(keys).toEqual(expect.arrayContaining([
+      "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy", "PAPERCLIP_API_KEY",
+    ]));
+    expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
   });
 
   it("collects stopped-provider instruction edits before a throwing remote restore", async () => {
@@ -339,5 +355,81 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       hostAuth: subscriptionAuth({ accountId: "acct", marker: "host" }),
     });
     expect(result.executionResult.errorMessage).toBe("provider failed first");
+  });
+});
+
+
+describe("Codex skill runtime credential sandbox", () => {
+  it.runIf(process.platform === "linux")("persists refreshed fake auth through the selected file without exposing sibling credentials", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-auth-refresh-test-"));
+    let target: Awaited<ReturnType<typeof buildLocalProcessSandboxSpawnTarget>> | null = null;
+    try {
+      const provider = path.join(root, "provider"), runtime = path.join(root, "runtime"), workspace = path.join(root, "workspace");
+      await Promise.all([mkdir(provider), mkdir(runtime), mkdir(workspace)]);
+      const auth = path.join(provider, "auth.json"), sibling = path.join(provider, "other-account.json");
+      await writeFile(auth, "synthetic-old", { mode: 0o600 });
+      await writeFile(sibling, "synthetic-other", { mode: 0o600 });
+      await symlink(auth, path.join(runtime, "auth.json"));
+      const mount = await resolveRunScopedCodexCredentialMount(runtime, provider);
+      expect(mount).toEqual({ path: auth, access: "rw" });
+      target = await buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", 'const fs=require("node:fs");fs.writeFileSync(process.argv[1],"synthetic-refreshed");if(fs.existsSync(process.argv[2]))process.exit(42);', path.join(runtime, "auth.json"), sibling],
+        cwd: workspace,
+        options: { workspaceDir: workspace, filesystemScope: "workspace", homeDir: runtime,
+          managedPaths: [{ path: runtime, access: "rw" }, mount!] },
+      });
+      const result = spawnSync(target.command, target.args, { cwd: target.cwd, env: { ...process.env, ...target.env }, encoding: "utf8", timeout: 10000 });
+      expect({ status: result.status, error: result.error?.message, stderr: result.stderr }).toEqual({ status: 0, error: undefined, stderr: "" });
+      expect(await readFile(auth, "utf8")).toBe("synthetic-refreshed");
+      expect(await readFile(sibling, "utf8")).toBe("synthetic-other");
+    } finally {
+      await target?.cleanup?.();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("mounts only a verified temporary provider auth file, never its directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-mount-"));
+    try {
+      const provider = path.join(root, "provider");
+      const runtime = path.join(root, "skill-runtime");
+      await mkdir(provider);
+      await mkdir(runtime);
+      const credentialFile = path.join(provider, "auth.json");
+      await writeFile(credentialFile, "disposable-test-credential", { mode: 0o600 });
+      await symlink(credentialFile, path.join(runtime, "auth.json"));
+
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toEqual({ path: credentialFile, access: "rw" });
+      // No mount is needed if the source is already the run's managed home.
+      expect(await resolveRunScopedCodexCredentialMount(provider, provider)).toBeNull();
+
+      const unrelated = path.join(root, "unrelated");
+      await mkdir(unrelated);
+      await writeFile(path.join(unrelated, "auth.json"), "other-account", { mode: 0o600 });
+      // A mismatched credential path is not an authorized mount.
+      expect(await resolveRunScopedCodexCredentialMount(runtime, unrelated)).toBeNull();
+      expect(await resolveRunScopedCodexCredentialMount(runtime, null)).toBeNull();
+
+      await rm(credentialFile);
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mount an arbitrary host source for a regular managed auth file", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-auth-regular-"));
+    try {
+      const provider = path.join(root, "provider");
+      const runtime = path.join(root, "skill-runtime");
+      await mkdir(provider);
+      await mkdir(runtime);
+      await writeFile(path.join(provider, "auth.json"), "source", { mode: 0o600 });
+      await writeFile(path.join(runtime, "auth.json"), "managed", { mode: 0o600 });
+      expect(await resolveRunScopedCodexCredentialMount(runtime, provider)).toBeNull();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

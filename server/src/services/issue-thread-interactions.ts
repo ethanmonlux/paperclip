@@ -1983,6 +1983,9 @@ async function expireStaleRequestConfirmationTarget(
     snapshot,
   });
   const expireInTransaction = async (tx: Db | any) => {
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, args.row.issueId), eq(issues.companyId, args.row.companyId)))
+      .for("update");
     await notifyChatConfirmationResolution(tx, args.row);
     if (args.row.kind === "request_confirmation") await notifyChatRunMilestones(tx, args.row);
     else await notifyIssueReviewState(tx, args.row);
