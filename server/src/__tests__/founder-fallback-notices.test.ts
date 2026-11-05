@@ -8,9 +8,14 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
-  FOUNDER_FALLBACK_KEY_PREFIX, createFounderFallbackNotices, founderFallbackKey, founderFallbackSettingsFromEnv,
-  isFounderFallbackPublication, parseFounderFallbackKey,
+  FOUNDER_FALLBACK_KEY_PREFIX, MAX_FOUNDER_FALLBACK_REARMS, createFounderFallbackNotices, founderFallbackDefinitelyUnsent,
+  founderFallbackKey, founderFallbackSettingsFromEnv, isFounderFallbackPublication, isFounderFallbackWakeEvent,
+  parseFounderFallbackKey, registerFounderFallbackNoticeWork,
 } from "../services/founder-fallback-notices.js";
+import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "../services/chat-publication-errors.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
+import { publishLiveEvent } from "../services/live-events.js";
 
 const MINUTE = 60_000;
 const BOUND = 20 * MINUTE;
@@ -24,6 +29,8 @@ describe("founder fallback keys and settings", () => {
       { endpointId, kind: "agent", agentId, anchor: "paused.1793732233969" },
       { endpointId, kind: "recovered", agentId, anchor: "terminated" },
       { endpointId, kind: "item", interactionId },
+      { endpointId, kind: "item", interactionId, attempt: 1 },
+      { endpointId, kind: "agent", agentId, anchor: "terminated", attempt: 20 },
     ] as const) {
       const value = founderFallbackKey(key);
       expect(value.startsWith(FOUNDER_FALLBACK_KEY_PREFIX)).toBe(true);
@@ -33,11 +40,37 @@ describe("founder fallback keys and settings", () => {
     for (const value of [
       `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:agent:${agentId}:error.x`,
       `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:item:${interactionId}:extra`,
+      `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:item:${interactionId}:a0`,
+      `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:item:${interactionId}:a1000`,
       `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId.toUpperCase()}:item:${interactionId}`,
       `founder-fallback:v2:${endpointId}:item:${interactionId}`,
       `fast-response:${interactionId}`,
     ]) expect(parseFounderFallbackKey(value)).toBeNull();
     expect(isFounderFallbackPublication({ idempotencyKey: `fast-response:${interactionId}` })).toBe(false);
+  });
+
+  it("treats only a pre-I/O cancellation as definitely unsent", () => {
+    const base = { state: "cancelled", publishedAt: null, providerMessageId: null, redactedError: "Destination is disabled in Paperclip" } as const;
+    expect(founderFallbackDefinitelyUnsent(base)).toBe(true);
+    expect(founderFallbackDefinitelyUnsent({ ...base, redactedError: OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION })).toBe(false);
+    expect(founderFallbackDefinitelyUnsent({ ...base, providerMessageId: "m-1" })).toBe(false);
+    expect(founderFallbackDefinitelyUnsent({ ...base, publishedAt: new Date() })).toBe(false);
+    for (const state of ["pending", "retry", "streaming", "published", "delivery_unknown", "failed", "awaiting_consent"] as const) {
+      expect(founderFallbackDefinitelyUnsent({ ...base, state })).toBe(false);
+    }
+  });
+
+  it("wakes only on agent, run, interaction and chat-configuration changes", () => {
+    const activity = (payload: Record<string, unknown>) => ({ type: "activity.logged" as const, payload });
+    expect(isFounderFallbackWakeEvent({ type: "agent.status", payload: {} })).toBe(true);
+    expect(isFounderFallbackWakeEvent({ type: "heartbeat.run.status", payload: {} })).toBe(true);
+    for (const action of ["issue.thread_interaction_created", "issue.interaction_cancelled", "agent.paused", "agent.resumed",
+      "chat_endpoint.paused", "chat_endpoint.resumed", "chat.setup_completed", "company_member.updated"]) {
+      expect(isFounderFallbackWakeEvent(activity({ action }))).toBe(true);
+    }
+    expect(isFounderFallbackWakeEvent(activity({ action: "anything", entityType: "agent" }))).toBe(true);
+    expect(isFounderFallbackWakeEvent(activity({ action: "issue.comment_added", entityType: "issue" }))).toBe(false);
+    expect(isFounderFallbackWakeEvent({ type: "heartbeat.run.log", payload: {} })).toBe(false);
   });
 
   it("is off unless explicitly enabled and clamps the bound", () => {
@@ -132,7 +165,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await fixture();
     await interaction(f, { addresseeAgentId: f.agentId });
     at(5);
-    expect(await f.service.sweep()).toEqual({ targets: 1, inserted: 0 });
+    expect(await f.service.sweep()).toMatchObject({ targets: 1, inserted: 0 });
     await failAgent(f, now);
     at(5 + 19);
     expect((await f.service.sweep()).inserted).toBe(0);
@@ -147,7 +180,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await interaction(f, { addresseeAgentId: f.workerId, title: "Not for the founder" });
     const run = await failAgent(f, start);
     at(21);
-    expect(await f.service.sweep()).toEqual({ targets: 1, inserted: 3 });
+    expect(await f.service.sweep()).toMatchObject({ targets: 1, inserted: 3 });
     const published = await rows(f);
     expect(published.map(row => row.idempotencyKey).sort()).toEqual([
       founderFallbackKey({ endpointId: f.endpointId, kind: "agent", agentId: f.agentId, anchor: `error.${run.id}` }),
@@ -188,7 +221,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // A disabled service never authorizes, even for an existing row.
     const disabled = createFounderFallbackNotices(db, { enabled: false, boundMs: BOUND }, () => now);
     expect(await disabled.authorizeFounderFallbackPublication(db, agentNotice)).toBe(false);
-    expect(await disabled.sweep()).toEqual({ targets: 0, inserted: 0 });
+    expect(await disabled.sweep()).toEqual({ targets: 0, inserted: 0, nextDueAt: null, awaitingOutbox: false });
     // A key moved to another conversation, issue or endpoint does not authorize.
     expect(await f.service.authorizeFounderFallbackPublication(db, { ...agentNotice, conversationId: randomUUID() })).toBe(false);
     expect(await f.service.authorizeFounderFallbackPublication(db, { ...agentNotice, issueId: f.otherIssueId })).toBe(false);
@@ -210,19 +243,19 @@ const support = await getEmbeddedPostgresTestSupport();
     await failAgent(f, start);
     at(21);
     await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, f.companyId));
-    expect(await f.service.sweep()).toEqual({ targets: 0, inserted: 0 });
+    expect(await f.service.sweep()).toMatchObject({ targets: 0, inserted: 0 });
     await db.update(companyMemberships).set({ membershipRole: "owner" }).where(eq(companyMemberships.companyId, f.companyId));
 
     await addSender({ companyId: f.companyId, endpointId: f.endpointId, conversationId: f.conversationId,
       principalId: randomUUID(), userId: `someone-${randomUUID()}` });
-    expect(await f.service.sweep()).toEqual({ targets: 0, inserted: 0 });
+    expect(await f.service.sweep()).toMatchObject({ targets: 0, inserted: 0 });
 
     expect(await rows(f)).toEqual([]);
 
     // Once every sender links to the founder again the notice goes out, and a
     // later revocation fails its transport re-proof.
     await db.update(chatIdentityLinks).set({ paperclipUserId: f.founderUserId }).where(eq(chatIdentityLinks.companyId, f.companyId));
-    expect(await f.service.sweep()).toEqual({ targets: 1, inserted: 1 });
+    expect(await f.service.sweep()).toMatchObject({ targets: 1, inserted: 1 });
     const [notice] = await rows(f);
     expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
     const [link] = await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.companyId, f.companyId)).limit(1);
@@ -303,28 +336,240 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(text((await rows(f)).at(-1)!)).toContain("Master Builder has been terminated.");
   });
 
-  it("flags an escalation the available agent never picked up, and stays quiet once it starts work", async () => {
+  it("flags an escalation the available agent never picked up on its task, and stays quiet once it does", async () => {
     const f = await fixture();
     const pickedUp = await interaction(f, { addresseeAgentId: f.agentId, title: "Picked-up escalation" });
     const unread = await interaction(f, { addresseeAgentId: f.agentId, title: "Unread escalation", createdAt: new Date(start.getTime() + MINUTE) });
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.otherIssueId, status: "succeeded",
       createdAt: new Date(start.getTime() + 2 * MINUTE), startedAt: new Date(start.getTime() + 2 * MINUTE) });
-    // A run started after both escalations, so neither was missed.
+    // A run on their task started after both escalations, so neither was missed.
     at(30);
     expect((await f.service.sweep()).inserted).toBe(0);
 
-    // With the only run between them, just the later escalation was missed.
+    // With the only task run between them, just the later escalation was missed.
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.otherIssueId, status: "succeeded",
       createdAt: new Date(start.getTime() + MINUTE / 2), startedAt: new Date(start.getTime() + MINUTE / 2) });
     expect((await f.service.sweep()).inserted).toBe(1);
     const [notice] = await rows(f);
     expect(notice!.idempotencyKey).toBe(founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: unread.id }));
     expect(notice!.idempotencyKey).not.toContain(pickedUp.id);
-    expect(text(notice!)).toContain("Master Builder has not started any work since this escalation reached it 29 min ago.");
+    expect(text(notice!)).toContain("Master Builder has not started a run on that task since this escalation reached it 29 min ago.");
 
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", createdAt: now, startedAt: now });
+    // A run bound to the task through its context snapshot is pickup as well.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", createdAt: now, startedAt: now,
+      contextSnapshot: { issueId: f.otherIssueId } });
     expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+  });
+
+  it("does not mistake runs on other tasks or on no task for pickup of the escalation", async () => {
+    const f = await fixture();
+    const escalation = await interaction(f, { addresseeAgentId: f.agentId, title: "Unhandled escalation" });
+    // The same agent works its DM task and an unbound turn after the escalation reached it.
+    for (const issueId of [f.dmIssueId, null]) {
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId, status: "succeeded",
+        createdAt: new Date(start.getTime() + MINUTE), startedAt: new Date(start.getTime() + MINUTE),
+        contextSnapshot: issueId ? { issueId } : {} });
+    }
+    at(30);
+    expect((await f.service.sweep()).inserted).toBe(1);
+    const key = founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: escalation.id });
+    expect((await rows(f)).map(row => row.idempotencyKey)).toEqual([key]);
+
+    // After a restart the still-pending escalation is not queued twice.
+    const restarted = createFounderFallbackNotices(db, { enabled: true, boundMs: BOUND }, () => now);
+    at(45);
+    expect((await restarted.sweep()).inserted).toBe(0);
+    expect(await rows(f)).toHaveLength(1);
+
+    // Actual addressed pickup on the escalation's task withdraws the queued notice at its claim.
+    const [notice] = await rows(f);
+    expect(await restarted.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.otherIssueId, status: "running",
+      createdAt: now, startedAt: now });
+    expect(await restarted.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+  });
+
+  it("re-arms an item cancelled before delivery when the same pending item qualifies again", async () => {
+    const f = await fixture();
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+    await failAgent(f, start);
+    at(21);
+    await f.service.sweep();
+    const notice = (await rows(f)).find(row => row.idempotencyKey.endsWith(decision.id))!;
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice)).toBe(false);
+    // The native transport claim cancels each row that fails its re-proof before provider I/O.
+    await db.update(chatPublications).set({ state: "cancelled", redactedError: "Task control requester or destination is no longer authorized" })
+      .where(eq(chatPublications.companyId, f.companyId));
+    at(30);
+    await failAgent(f, now);
+    at(40);
+    // Not yet past the bound of the new outage: nothing re-armed early.
+    expect((await f.service.sweep()).inserted).toBe(0);
+    at(51);
+    expect((await f.service.sweep()).inserted).toBe(2);
+    const itemRows = (await rows(f)).filter(row => row.idempotencyKey.includes(decision.id));
+    expect(itemRows.map(row => [row.idempotencyKey, row.state])).toEqual([
+      [founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id }), "cancelled"],
+      [founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id, attempt: 1 }), "pending"],
+    ]);
+    expect(await f.service.authorizeFounderFallbackPublication(db, itemRows[1]!)).toBe(true);
+    at(60);
+    expect((await f.service.sweep()).inserted).toBe(0);
+  });
+
+  it("re-arms a definitely-unsent agent notice once endpoint authority is restored within the same outage", async () => {
+    const f = await fixture();
+    await failAgent(f, start);
+    at(21);
+    await f.service.sweep();
+    const [notice] = await rows(f);
+    await db.update(chatEndpoints).set({ status: "paused" }).where(eq(chatEndpoints.id, f.endpointId));
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+    await db.update(chatPublications).set({ state: "cancelled", redactedError: "Destination is disabled in Paperclip" })
+      .where(eq(chatPublications.id, notice!.id));
+    expect((await f.service.sweep()).targets).toBe(0);
+    await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, f.endpointId));
+    at(25);
+    expect((await f.service.sweep()).inserted).toBe(1);
+    expect((await rows(f)).map(row => row.state)).toEqual(["cancelled", "pending"]);
+    expect((await rows(f))[1]!.idempotencyKey).toBe(`${notice!.idempotencyKey}:a1`);
+  });
+
+  it("never re-arms a notice that may have reached the founder or failed", async () => {
+    for (const outcome of [
+      { state: "cancelled" as const, redactedError: OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION },
+      { state: "cancelled" as const, providerMessageId: "provider-message" },
+      { state: "delivery_unknown" as const },
+      { state: "published" as const },
+      { state: "failed" as const, redactedError: "Discord rejected the message" },
+    ]) {
+      const f = await fixture();
+      const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+      await failAgent(f, start);
+      at(21);
+      await f.service.sweep();
+      const notice = (await rows(f)).find(row => row.idempotencyKey.endsWith(decision.id))!;
+      await db.update(chatPublications).set(outcome).where(eq(chatPublications.id, notice.id));
+      at(40);
+      expect((await f.service.sweep()).inserted).toBe(0);
+      expect((await rows(f)).filter(row => row.idempotencyKey.includes(decision.id))).toHaveLength(1);
+      for (const table of [chatPublications, chatDeliveries, chatIdentityLinks, chatExternalPrincipals, chatConversations,
+        chatEndpoints, toolConnections, toolApplications, issueThreadInteractions, heartbeatRuns, issues, companyMemberships,
+        agents, companies]) await db.delete(table);
+    }
+  });
+
+  it("re-arms once under concurrent sweeps and restarts, and stops after the re-arm limit", async () => {
+    const f = await fixture();
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+    await failAgent(f, start);
+    at(21);
+    await f.service.sweep();
+    const base = founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id });
+    const cancelAll = () => db.update(chatPublications).set({ state: "cancelled", redactedError: "Destination is disabled in Paperclip" })
+      .where(like(chatPublications.idempotencyKey, `${base}%`));
+    await cancelAll();
+    const restarted = createFounderFallbackNotices(db, { enabled: true, boundMs: BOUND }, () => now);
+    const results = await Promise.all([f.service.sweep(), restarted.sweep(), restarted.sweep()]);
+    expect(results.reduce((sum, result) => sum + result.inserted, 0)).toBe(1);
+    expect((await rows(f)).filter(row => row.idempotencyKey.startsWith(base)).map(row => row.idempotencyKey).sort())
+      .toEqual([base, `${base}:a1`]);
+
+    for (let attempt = 2; attempt <= MAX_FOUNDER_FALLBACK_REARMS; attempt += 1) {
+      await cancelAll();
+      expect((await restarted.sweep()).inserted).toBe(1);
+    }
+    await cancelAll();
+    expect((await restarted.sweep()).inserted).toBe(0);
+    const itemRows = (await rows(f)).filter(row => row.idempotencyKey.startsWith(base));
+    expect(itemRows).toHaveLength(MAX_FOUNDER_FALLBACK_REARMS + 1);
+    expect(itemRows.every(row => row.state === "cancelled")).toBe(true);
+  });
+
+  it("reports the real next deadline and no deadline when idle", async () => {
+    const f = await fixture();
+    expect(await f.service.sweep()).toEqual({ targets: 1, inserted: 0, nextDueAt: null, awaitingOutbox: false });
+    await interaction(f, { addresseeUserId: f.founderUserId, createdAt: new Date(start.getTime() + 2 * MINUTE) });
+    expect((await f.service.sweep()).nextDueAt).toBeNull();
+    const escalation = await interaction(f, { addresseeAgentId: f.agentId, createdAt: new Date(start.getTime() + 3 * MINUTE) });
+    at(10);
+    expect((await f.service.sweep()).nextDueAt).toBe(escalation.createdAt.getTime() + BOUND);
+    await failAgent(f, new Date(start.getTime() + 5 * MINUTE));
+    // While the agent is down its bound replaces the escalation deadline.
+    expect((await f.service.sweep()).nextDueAt).toBe(start.getTime() + 25 * MINUTE);
+    at(26);
+    const due = await f.service.sweep();
+    expect(due).toMatchObject({ inserted: 3, nextDueAt: null });
+    expect((await f.service.sweep())).toMatchObject({ inserted: 0, nextDueAt: null });
+    // Recovery with the agent notice still queued waits for the outbox, not a timer.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    expect(await f.service.sweep()).toMatchObject({ inserted: 0, nextDueAt: null, awaitingOutbox: true });
+  });
+
+  it("stays idle without repeated sweeps and wakes on real producers and deadlines", async () => {
+    const sweeps: { inserted: number }[] = [];
+    const quiet = () => new Promise(resolve => setTimeout(resolve, 150));
+    async function run(service: ReturnType<typeof createFounderFallbackNotices>, body: (wake: () => void) => Promise<void>) {
+      sweeps.length = 0;
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+      const wrapped = { ...service, sweep: async (signal?: AbortSignal) => { const result = await service.sweep(signal); sweeps.push(result); return result; } };
+      const worker = registerFounderFallbackNoticeWork(coordinator, wrapped, () => true, 20, db);
+      try {
+        await worker.ready;
+        await body(worker.wake);
+      } finally {
+        await worker.stop();
+        await coordinator.stop();
+      }
+    }
+    const real = (boundMs = BOUND) => createFounderFallbackNotices(db, { enabled: true, boundMs });
+
+    // No configuration: one startup reconstruction, then quiet.
+    await run(real(), async () => { await quiet(); expect(sweeps).toHaveLength(1); });
+
+    // Configured and idle, then irrelevant and relevant producer events.
+    const f = await fixture();
+    await run(real(), async () => {
+      await quiet();
+      expect(sweeps).toHaveLength(1);
+      publishLiveEvent({ companyId: f.companyId, type: "activity.logged", payload: { action: "issue.comment_added", entityType: "issue" } });
+      await quiet();
+      expect(sweeps).toHaveLength(1);
+      publishLiveEvent({ companyId: f.companyId, type: "agent.status", payload: { agentId: f.agentId, status: "idle" } });
+      await quiet();
+      expect(sweeps).toHaveLength(2);
+    });
+
+    // A failure crosses the bound at its own deadline: one notice, then quiet.
+    await failAgent(f, new Date());
+    await run(real(120), async () => {
+      await quiet();
+      await quiet();
+      expect(sweeps.map(sweep => sweep.inserted)).toEqual([0, 1]);
+    });
+
+    // Recovery with the notice in flight waits for that outbox row's settlement.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    await run(real(120), async () => {
+      await quiet();
+      expect(sweeps).toHaveLength(1);
+      await db.transaction(async tx => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatPublications);
+        await tx.update(chatPublications).set({ state: "published", publishedAt: new Date() })
+          .where(like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:agent:%`));
+      });
+      await quiet();
+      // The recovery notice's own outbox write is the last hint observed, and
+      // the sweep it triggers finds nothing in flight.
+      expect(sweeps.map(sweep => sweep.inserted)).toEqual([0, 1, 0]);
+      // Completed history alone keeps nothing scheduled, including outbox churn.
+      await db.transaction(async tx => notifyDeliveryWork(tx, DELIVERY_QUEUES.chatPublications));
+      await quiet();
+      expect(sweeps).toHaveLength(3);
+    });
+    expect((await rows(f)).map(row => row.idempotencyKey.split(":")[3])).toEqual(["agent", "recovered"]);
   });
 
   it("bounds item notices per sweep and finishes the rest on the next sweep", async () => {

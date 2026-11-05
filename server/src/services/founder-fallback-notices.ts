@@ -1,4 +1,5 @@
-import { and, asc, desc, eq, inArray, isNull, like, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, like, sql } from "drizzle-orm";
+import type { LiveEvent } from "@paperclipai/shared";
 import {
   agents,
   chatConversations,
@@ -14,11 +15,13 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { authorizationService } from "./authorization.js";
+import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "./chat-publication-errors.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
-import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "./delivery-work-notifications.js";
+import { subscribeAllCompanyLiveEvents } from "./live-events.js";
 
 /**
  * Deterministic founder fallback (FAC-597 B1).
@@ -29,6 +32,10 @@ import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
  * outbox, so retry, UNKNOWN, restart and idempotency stay native. A notice is
  * re-proved at the transport claim and cancelled before any I/O when its
  * condition no longer holds. Disabled unless explicitly configured.
+ *
+ * The sweep is not a poll. It runs at startup, on wake hints from agent, run,
+ * interaction and chat-configuration changes, and at the real deadline when a
+ * known condition crosses the bound. With no such deadline it stays idle.
  */
 
 export const FOUNDER_FALLBACK_KEY_PREFIX = "founder-fallback:v1:";
@@ -38,6 +45,9 @@ const MAX_BOUND_MINUTES = 360;
 const MAX_ITEMS_PER_SWEEP = 5;
 const FAILED_RUN_STATUSES = ["failed", "timed_out"];
 const OPEN_PUBLICATION_STATES: (typeof chatPublications.$inferSelect.state)[] = ["pending", "retry", "streaming", "published", "delivery_unknown"];
+const IN_FLIGHT_STATES: (typeof chatPublications.$inferSelect.state)[] = ["pending", "retry", "streaming"];
+/** Re-arms of one notice cancelled before any provider I/O; later cancellations stay final and visible. */
+export const MAX_FOUNDER_FALLBACK_REARMS = 20;
 
 export type FounderFallbackSettings = { enabled: boolean; boundMs: number };
 
@@ -62,27 +72,55 @@ type Target = {
 };
 type Unavailability = { anchor: string; state: "error" | "paused" | "terminated"; since: Date; runId: string | null };
 
+/**
+ * `attempt` is absent on the first notice. A notice cancelled before any
+ * provider I/O is re-armed as a new row with the next attempt suffix, so each
+ * row keeps its own effect identity and the unique key still deduplicates.
+ */
 export type FounderFallbackKey =
-  | { endpointId: string; kind: "agent" | "recovered"; agentId: string; anchor: string }
-  | { endpointId: string; kind: "item"; interactionId: string };
+  | { endpointId: string; kind: "agent" | "recovered"; agentId: string; anchor: string; attempt?: number }
+  | { endpointId: string; kind: "item"; interactionId: string; attempt?: number };
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const KEY_RE = new RegExp(
-  `^founder-fallback:v1:(${UUID}):(?:(agent|recovered):(${UUID}):(error\\.(?:${UUID}|none)|paused\\.\\d{1,15}|terminated)|item:(${UUID}))$`,
+  `^founder-fallback:v1:(${UUID}):(?:(agent|recovered):(${UUID}):(error\\.(?:${UUID}|none)|paused\\.\\d{1,15}|terminated)|item:(${UUID}))(?::a([1-9]\\d{0,2}))?$`,
 );
 
 export function founderFallbackKey(key: FounderFallbackKey): string {
-  return key.kind === "item"
+  const base = key.kind === "item"
     ? `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:item:${key.interactionId}`
     : `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:${key.kind}:${key.agentId}:${key.anchor}`;
+  return key.attempt ? `${base}:a${key.attempt}` : base;
 }
 
 export function parseFounderFallbackKey(value: string): FounderFallbackKey | null {
   const match = KEY_RE.exec(value);
   if (!match) return null;
+  const attempt = match[6] ? { attempt: Number(match[6]) } : {};
   return match[5]
-    ? { endpointId: match[1]!, kind: "item", interactionId: match[5] }
-    : { endpointId: match[1]!, kind: match[2] as "agent" | "recovered", agentId: match[3]!, anchor: match[4]! };
+    ? { endpointId: match[1]!, kind: "item", interactionId: match[5], ...attempt }
+    : { endpointId: match[1]!, kind: match[2] as "agent" | "recovered", agentId: match[3]!, anchor: match[4]!, ...attempt };
+}
+
+function withoutAttempt(key: FounderFallbackKey): FounderFallbackKey {
+  const { attempt: _attempt, ...base } = key;
+  return base as FounderFallbackKey;
+}
+
+function withAttempt(base: string, attempt: number) {
+  return attempt ? `${base}:a${attempt}` : base;
+}
+
+type PublicationOutcome = Pick<typeof chatPublications.$inferSelect, "state" | "publishedAt" | "providerMessageId" | "redactedError">;
+
+/**
+ * Only a cancellation the outbox made before provider I/O proves the founder
+ * never saw the notice. An operator's cancellation of `delivery_unknown` may
+ * follow a real delivery, so it is never re-armed; neither are failed rows.
+ */
+export function founderFallbackDefinitelyUnsent(row: PublicationOutcome) {
+  return row.state === "cancelled" && !row.publishedAt && !row.providerMessageId
+    && row.redactedError !== OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION;
 }
 
 export function isFounderFallbackPublication(publication: { idempotencyKey: string }) {
@@ -182,13 +220,23 @@ function eligible(state: Unavailability | null, now: Date, boundMs: number): sta
   return !!state && now.getTime() - state.since.getTime() >= boundMs;
 }
 
-/** The agent never started a run after this escalation reached it. */
+/**
+ * The addressed agent never started a run on the escalation's own task after
+ * the escalation was created. A native addressed interaction wakes its
+ * addressee on that task, so only such a run is attributable pickup. Runs on
+ * other tasks, or bound to no task, prove nothing about this escalation.
+ */
 async function escalationMissed(tx: Tx, agent: Agent, interaction: Interaction, now: Date, boundMs: number) {
   if (now.getTime() - interaction.createdAt.getTime() < boundMs) return false;
   const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, agent.companyId),
     eq(heartbeatRuns.agentId, agent.id),
     sql`${heartbeatRuns.startedAt} >= ${interaction.createdAt.toISOString()}::timestamptz`,
+    sql`(${heartbeatRuns.issueId} = ${interaction.issueId}::uuid or coalesce(
+      ${heartbeatRuns.nativeIssueId}::text,
+      nullif(${heartbeatRuns.contextSnapshot}->>'issueId', ''),
+      nullif(${heartbeatRuns.contextSnapshot}->>'taskId', '')
+    ) = ${interaction.issueId}::text)`,
   )).limit(1);
   return !run;
 }
@@ -250,7 +298,7 @@ async function itemNoticeText(tx: Tx, target: Target, interaction: Interaction, 
   const toFounder = interaction.addresseeUserId === target.founderUserId;
   const why = reason.kind === "unavailable"
     ? stateSentence(target.agent, reason.state)
-    : `${name} has not started any work since this escalation reached it ${Math.floor((now.getTime() - interaction.createdAt.getTime()) / 60_000)} min ago.`;
+    : `${name} has not started a run on that task since this escalation reached it ${Math.floor((now.getTime() - interaction.createdAt.getTime()) / 60_000)} min ago.`;
   const url = publicChatTaskUrl(interaction.issueId);
   return [
     header(target.agent),
@@ -314,11 +362,44 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     });
   }
 
-  async function existing(keys: string[]) {
-    if (!keys.length) return new Set<string>();
-    const rows = await db.select({ key: chatPublications.idempotencyKey }).from(chatPublications)
-      .where(inArray(chatPublications.idempotencyKey, keys));
-    return new Set(rows.map(row => row.key));
+  const outcomeColumns = {
+    key: chatPublications.idempotencyKey,
+    state: chatPublications.state,
+    publishedAt: chatPublications.publishedAt,
+    providerMessageId: chatPublications.providerMessageId,
+    redactedError: chatPublications.redactedError,
+  };
+
+  /**
+   * For each base key, the attempt to insert next, or null when a row of that
+   * notice is still open, may have reached the founder, failed, or used up its
+   * re-arms. Re-arming applies only while every earlier row was cancelled
+   * before provider I/O.
+   */
+  async function nextAttempts(companyId: string, bases: string[]) {
+    const plan = new Map<string, number | null>();
+    if (!bases.length) return plan;
+    const firsts = new Map((await db.select(outcomeColumns).from(chatPublications).where(and(
+      eq(chatPublications.companyId, companyId),
+      inArray(chatPublications.idempotencyKey, bases),
+    ))).map(row => [row.key, row]));
+    for (const base of bases) {
+      const first = firsts.get(base);
+      if (!first) { plan.set(base, 0); continue; }
+      if (!founderFallbackDefinitelyUnsent(first)) { plan.set(base, null); continue; }
+      const retries = (await db.select(outcomeColumns).from(chatPublications).where(and(
+        eq(chatPublications.companyId, companyId),
+        like(chatPublications.idempotencyKey, `${base}:a%`),
+      ))).flatMap(row => {
+        const key = parseFounderFallbackKey(row.key);
+        return key?.attempt && founderFallbackKey(withoutAttempt(key)) === base ? [{ row, attempt: key.attempt }] : [];
+      });
+      const settled = retries.every(({ row }) => founderFallbackDefinitelyUnsent(row));
+      plan.set(base, settled && retries.length < MAX_FOUNDER_FALLBACK_REARMS
+        ? Math.max(0, ...retries.map(retry => retry.attempt)) + 1
+        : null);
+    }
+    return plan;
   }
 
   /**
@@ -326,7 +407,8 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
    * queues its recovery notice. A new anchor of the same kind while it is open
    * (another failed retry, a re-pause) is the same unavailability, not a new
    * alert; a change of kind (error to paused, paused to terminated) is. A
-   * cancelled or failed notice never reached the founder, so it holds nothing.
+   * cancelled or failed notice never reached the founder, so it holds nothing,
+   * and a recovery notice cancelled before I/O does not close the episode.
    */
   async function openAgentEpisode(target: Target, state: Unavailability) {
     const [last] = await db.select({ key: chatPublications.idempotencyKey }).from(chatPublications).where(and(
@@ -336,55 +418,76 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     )).orderBy(desc(chatPublications.createdAt), desc(chatPublications.id)).limit(1);
     const episode = last ? parseFounderFallbackKey(last.key) : null;
     if (!episode || episode.kind !== "agent" || !episode.anchor.startsWith(state.state)) return false;
-    return !(await existing([founderFallbackKey({ ...episode, kind: "recovered" })])).size;
+    const recovered = founderFallbackKey({ ...withoutAttempt(episode), kind: "recovered" } as FounderFallbackKey);
+    return (await nextAttempts(target.endpoint.companyId, [recovered])).get(recovered) !== null;
   }
 
   async function sweepTarget(target: Target, now: Date) {
     let inserted = 0;
+    let awaitingOutbox = false;
+    let dueAt: number | null = null;
+    const due = (at: number) => { dueAt = dueAt === null ? at : Math.min(dueAt, at); };
+    const companyId = target.endpoint.companyId;
     const state = await unavailability(db, target.agent);
     const endpointId = target.endpoint.id;
+    const boundAt = state ? state.since.getTime() + settings.boundMs : null;
+    if (boundAt !== null && boundAt > now.getTime()) due(boundAt);
     if (eligible(state, now, settings.boundMs)) {
       const key = founderFallbackKey({ endpointId, kind: "agent", agentId: target.agent.id, anchor: state.anchor });
-      if (!(await existing([key])).has(key) && !(await openAgentEpisode(target, state))) {
-        inserted += await insert(target, key, () => agentNoticeText(db, target, state));
+      const attempt = (await nextAttempts(companyId, [key])).get(key);
+      if (attempt != null && !(await openAgentEpisode(target, state))) {
+        inserted += await insert(target, withAttempt(key, attempt), () => agentNoticeText(db, target, state));
       }
     }
     if (!state) {
       // Close only the most recent delivered (or possibly delivered) episode.
-      const [last] = await db.select({ key: chatPublications.idempotencyKey }).from(chatPublications).where(and(
-        eq(chatPublications.companyId, target.endpoint.companyId),
+      const [last] = await db.select({ key: chatPublications.idempotencyKey, state: chatPublications.state }).from(chatPublications).where(and(
+        eq(chatPublications.companyId, companyId),
         like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:agent:${target.agent.id}:%`),
-        inArray(chatPublications.state, ["published", "delivery_unknown"]),
+        inArray(chatPublications.state, [...IN_FLIGHT_STATES, "published", "delivery_unknown"]),
       )).orderBy(desc(chatPublications.createdAt), desc(chatPublications.id)).limit(1);
       const episode = last ? parseFounderFallbackKey(last.key) : null;
-      if (episode && episode.kind === "agent") {
-        const key = founderFallbackKey({ ...episode, kind: "recovered" });
-        if (!(await existing([key])).has(key)) inserted += await insert(target, key, () => recoveredText(target.agent));
+      if (last && IN_FLIGHT_STATES.includes(last.state)) {
+        // The outbox settles this row: cancelled at its claim, or delivered.
+        // Its settlement, not a timer, decides whether a recovery notice follows.
+        awaitingOutbox = true;
+      } else if (episode && episode.kind === "agent") {
+        const key = founderFallbackKey({ ...withoutAttempt(episode), kind: "recovered" } as FounderFallbackKey);
+        const attempt = (await nextAttempts(companyId, [key])).get(key);
+        if (attempt != null) inserted += await insert(target, withAttempt(key, attempt), () => recoveredText(target.agent));
       }
     }
     const pending = await db.select().from(issueThreadInteractions).where(and(
-      eq(issueThreadInteractions.companyId, target.endpoint.companyId),
+      eq(issueThreadInteractions.companyId, companyId),
       eq(issueThreadInteractions.status, "pending"),
       sql`(${issueThreadInteractions.addresseeAgentId} = ${target.agent.id} or ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})`,
-      lte(issueThreadInteractions.createdAt, now),
     )).orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
     const keyed = pending.map(interaction => ({ interaction, key: founderFallbackKey({ endpointId, kind: "item", interactionId: interaction.id }) }));
-    const done = await existing(keyed.map(item => item.key));
+    const plan = await nextAttempts(companyId, keyed.map(item => item.key));
     let items = 0;
     for (const { interaction, key } of keyed) {
-      if (items >= MAX_ITEMS_PER_SWEEP) break;
-      if (done.has(key)) continue;
+      const attempt = plan.get(key);
+      if (attempt == null) continue;
+      const missedAt = interaction.createdAt.getTime() + settings.boundMs;
+      if (!state && interaction.addresseeAgentId === target.agent.id && missedAt > now.getTime()) due(missedAt);
+      if (interaction.createdAt > now) continue;
+      if (items >= MAX_ITEMS_PER_SWEEP) { due(now.getTime()); continue; }
       const reason = await itemReason(db, target, interaction, state, now, settings.boundMs);
       if (!reason) continue;
-      const count = await insert(target, key, () => itemNoticeText(db, target, interaction, reason, now));
+      const count = await insert(target, withAttempt(key, attempt), () => itemNoticeText(db, target, interaction, reason, now));
       items += count;
       inserted += count;
     }
-    return inserted;
+    return { inserted, awaitingOutbox, dueAt: dueAt as number | null };
   }
 
-  async function sweep(signal?: AbortSignal) {
-    if (!settings.enabled) return { targets: 0, inserted: 0 };
+  /**
+   * `nextDueAt` is the earliest real deadline of a known condition, or null.
+   * `awaitingOutbox` means a recovered agent's notice is still in flight, so
+   * the outcome of that outbox row decides the next step.
+   */
+  async function sweep(signal?: AbortSignal): Promise<{ targets: number; inserted: number; nextDueAt: number | null; awaitingOutbox: boolean }> {
+    if (!settings.enabled) return { targets: 0, inserted: 0, nextDueAt: null, awaitingOutbox: false };
     const now = clock();
     const endpoints = await db.select({ endpoint: chatEndpoints }).from(chatEndpoints)
       .innerJoin(companies, eq(companies.id, chatEndpoints.companyId))
@@ -395,36 +498,80 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
         sql`${chatEndpoints.assignedAgentId} is not null`,
       ))
       .orderBy(asc(chatEndpoints.id));
-    let targets = 0, inserted = 0;
+    let targets = 0, inserted = 0, awaitingOutbox = false;
+    let nextDueAt: number | null = null;
     for (const { endpoint } of endpoints) {
       signal?.throwIfAborted();
       const target = await resolveTarget(db, endpoint);
       if (!target) continue;
       targets += 1;
-      inserted += await sweepTarget(target, now);
+      const result = await sweepTarget(target, now);
+      inserted += result.inserted;
+      awaitingOutbox ||= result.awaitingOutbox;
+      if (result.dueAt !== null) nextDueAt = nextDueAt === null ? result.dueAt : Math.min(nextDueAt, result.dueAt);
     }
-    return { targets, inserted };
+    return { targets, inserted, nextDueAt, awaitingOutbox };
   }
 
   return { authorizeFounderFallbackPublication, sweep };
 }
 
+/**
+ * Wake hints for facts the sweep reads: agent status, run starts and failures
+ * (including pickup of an escalation), interactions, and chat endpoint, link
+ * or membership changes. Rows remain the source of truth.
+ */
+export function isFounderFallbackWakeEvent(event: Pick<LiveEvent, "type" | "payload">) {
+  if (event.type === "agent.status" || event.type === "heartbeat.run.status") return true;
+  if (event.type !== "activity.logged") return false;
+  const action = typeof event.payload.action === "string" ? event.payload.action : "";
+  return event.payload.entityType === "agent" || action.includes("interaction")
+    || /^(agent|chat|company_member)[._]/.test(action);
+}
+
+/**
+ * Runs once at startup to reconstruct from durable rows, then only on a wake
+ * hint or at the sweep's own next deadline. Outbox settlement is observed only
+ * while an in-flight notice needs it. A skipped run (drain, standby) is
+ * retained without querying and runs when admission reopens.
+ */
 export function registerFounderFallbackNoticeWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
   service: ReturnType<typeof createFounderFallbackNotices>,
   canRun: () => boolean,
-  intervalMs: number,
+  retryMs: number,
+  owner: object,
 ) {
   let next: number | null = null;
-  return coordinator.register(DELIVERY_QUEUES.founderFallbackNotices, {
-    retryMs: intervalMs,
+  let deferred = false;
+  let stopOutbox: (() => void) | null = null;
+  const worker = coordinator.register(DELIVERY_QUEUES.founderFallbackNotices, {
+    retryMs,
     pausePassiveMaintenance: true,
     run: async signal => {
-      next = Date.now() + intervalMs;
-      if (!canRun()) return;
-      await service.sweep(signal);
+      if (!canRun()) { deferred = true; return; }
+      deferred = false;
+      next = null;
+      const result = await service.sweep(signal);
+      next = result.nextDueAt;
+      if (result.awaitingOutbox) stopOutbox ??= subscribeDeliveryWork(owner, DELIVERY_QUEUES.chatPublications, worker.wake);
+      else { stopOutbox?.(); stopOutbox = null; }
     },
-    hasPending: async () => false,
+    hasPending: async () => deferred,
     nextRunAt: () => next,
   });
+  const unsubscribes = [
+    subscribeAllCompanyLiveEvents(event => { if (isFounderFallbackWakeEvent(event)) worker.wake(); }),
+    // Lifecycle writers that change agent status without a live event.
+    ...[DELIVERY_QUEUES.agentLifecycle, DELIVERY_QUEUES.strandedAgentStatus]
+      .map(queue => subscribeDeliveryWork(owner, queue, worker.wake)),
+  ];
+  return {
+    ...worker,
+    async stop() {
+      for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
+      stopOutbox?.(); stopOutbox = null;
+      await worker.stop();
+    },
+  };
 }

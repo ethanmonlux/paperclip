@@ -11606,7 +11606,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const [failed] = await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.assignedAgentId,
       status: "failed", startedAt: failedAt, finishedAt: failedAt }).returning();
     await db.update(agents).set({ status: "error", updatedAt: failedAt }).where(eq(agents.id, fixture.assignedAgentId));
-    expect(await notices.sweep()).toEqual({ targets: 1, inserted: 1 });
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
     await service.processPendingPublications();
     const agentKey = founderFallbackKey({ endpointId: endpoint.id, kind: "agent", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
     const [published] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, agentKey));
@@ -11618,13 +11618,25 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // claim: the claim re-proof cancels the row and nothing reaches Slack.
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
     now = new Date(now.getTime() + 60_000);
-    expect(await notices.sweep()).toEqual({ targets: 1, inserted: 1 });
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
     await db.update(agents).set({ status: "paused", pausedAt: now }).where(eq(agents.id, fixture.assignedAgentId));
     await service.processPendingPublications();
     const recoveredKey = founderFallbackKey({ endpointId: endpoint.id, kind: "recovered", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
     const [stale] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, recoveredKey));
     expect(stale?.state).toBe("cancelled");
     expect(posts()).toHaveLength(1);
+
+    // That cancellation was definitely before I/O, so once the agent is
+    // available again the recovery notice is re-armed and delivered once.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
+    now = new Date(now.getTime() + 60_000);
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
+    await service.processPendingPublications();
+    const [rearmed] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, `${recoveredKey}:a1`));
+    expect(rearmed).toMatchObject({ state: "published", conversationId: conversation!.id });
+    expect(posts()).toHaveLength(2);
+    expect(JSON.stringify(posts()[1])).toContain("is available again");
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 0 });
     await service.shutdown();
   });
 

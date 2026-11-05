@@ -1,5 +1,8 @@
 import { HttpError } from "../errors.js";
 
+/** Recorded when an operator cancels a `delivery_unknown` publication; it may have been delivered. */
+export const OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION = "Cancelled by an operator after an unconfirmed provider delivery";
+
 export type ChatPublicationErrorDisposition =
   | {
       kind: "retry";

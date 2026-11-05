@@ -1798,10 +1798,14 @@ async function startServerWithDatabaseTeardown(
         () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
       const founderFallbackSettings = founderFallbackSettingsFromEnv();
       if (founderFallbackSettings.enabled) {
-        await step("founder_fallback_notices", () => registerFounderFallbackNoticeWork(deliveryWork,
-          createFounderFallbackNotices(db as any, founderFallbackSettings),
-          () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
-          Math.max(60_000, config.heartbeatSchedulerIntervalMs)).ready);
+        await step("founder_fallback_notices", () => {
+          const worker = registerFounderFallbackNoticeWork(deliveryWork,
+            createFounderFallbackNotices(db as any, founderFallbackSettings),
+            () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
+            Math.max(60_000, config.heartbeatSchedulerIntervalMs), db);
+          server.on("close", worker.stop);
+          return worker.ready;
+        });
       }
     };
 
