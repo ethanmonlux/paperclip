@@ -118,6 +118,7 @@ export const DELIVERY_QUEUES = {
   chatInteractionContinuations: "chat-interaction-continuations",
   chatTerminalConfirmations: "chat-terminal-confirmations",
   chatFailedRetryNotices: "chat-failed-retry-notices",
+  founderFallbackNotices: "founder-fallback-notices",
   chatRunMilestones: "chat-run-milestones",
   chatReceipts: "chat-slack-receipts",
   browser: "browser-use",
