@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, like } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals, chatIdentityLinks,
   chatPublications, companies, companyMemberships, createDb, heartbeatRuns, issueThreadInteractions, issues,
@@ -14,7 +14,7 @@ import {
 } from "../services/founder-fallback-notices.js";
 import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "../services/chat-publication-errors.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
-import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { publishLiveEvent } from "../services/live-events.js";
 
 const MINUTE = 60_000;
@@ -547,7 +547,11 @@ const support = await getEmbeddedPostgresTestSupport();
     await run(real(120), async () => {
       await quiet();
       await quiet();
-      expect(sweeps.map(sweep => sweep.inserted)).toEqual([0, 1]);
+      // The notice's own outbox write settles while that sweep observes the
+      // outbox, so one final sweep confirms nothing remains and stops.
+      expect(sweeps.map(sweep => sweep.inserted)).toEqual([0, 1, 0]);
+      await quiet();
+      expect(sweeps).toHaveLength(3);
     });
 
     // Recovery with the notice in flight waits for that outbox row's settlement.
@@ -570,6 +574,144 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(sweeps).toHaveLength(3);
     });
     expect((await rows(f)).map(row => row.idempotencyKey.split(":")[3])).toEqual(["agent", "recovered"]);
+  });
+
+  describe("outbox settlement observation", () => {
+    // A recovered agent whose notice is still in the outbox: the sweep reports
+    // awaitingOutbox, and that row's settlement decides the recovery notice.
+    async function inFlightRecovery() {
+      const f = await fixture();
+      await failAgent(f, start);
+      at(21);
+      expect((await f.service.sweep()).inserted).toBe(1);
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+      return f;
+    }
+    const settleAgentNotice = (f: { companyId: string }) => db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.chatPublications);
+      await tx.update(chatPublications).set({ state: "published", publishedAt: new Date() }).where(and(
+        eq(chatPublications.companyId, f.companyId), like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:agent:%`)));
+    });
+    const recovered = async (f: { companyId: string }) => (await rows(f)).filter(row => row.idempotencyKey.includes(":recovered:"));
+    const quiet = () => new Promise(resolve => setTimeout(resolve, 150));
+
+    function harness(service: ReturnType<typeof createFounderFallbackNotices>, hooks: {
+      beforeRead?: () => Promise<void>; afterRead?: () => Promise<void>;
+    } = {}) {
+      const sweeps: { inserted: number; awaitingOutbox: boolean }[] = [];
+      const errors: unknown[] = [];
+      const observers = { live: 0, max: 0 };
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { errors.push(error); } });
+      const wrapped = { ...service, sweep: async (signal?: AbortSignal) => {
+        const before = hooks.beforeRead; hooks.beforeRead = undefined;
+        await before?.();
+        const result = await service.sweep(signal);
+        sweeps.push(result);
+        const after = hooks.afterRead; hooks.afterRead = undefined;
+        await after?.();
+        return result;
+      } };
+      const worker = registerFounderFallbackNoticeWork(coordinator, wrapped, () => true, 20, db, wake => {
+        observers.live += 1;
+        observers.max = Math.max(observers.max, observers.live);
+        const off = subscribeDeliveryWork(db, DELIVERY_QUEUES.chatPublications, wake);
+        return () => { observers.live -= 1; off(); };
+      });
+      return { worker, coordinator, sweeps, errors, observers, async close() { await worker.stop(); await coordinator.stop(); } };
+    }
+
+    it("recovers when the in-flight notice settles after the read but before the sweep returns", async () => {
+      const f = await inFlightRecovery();
+      const h = harness(f.service, { afterRead: () => settleAgentNotice(f) });
+      try {
+        await h.worker.ready;
+        await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+        await quiet();
+        expect(h.sweeps[0]).toMatchObject({ inserted: 0, awaitingOutbox: true });
+        expect(h.sweeps.at(-1)).toMatchObject({ inserted: 0, awaitingOutbox: false });
+        expect(h.sweeps.reduce((sum, sweep) => sum + sweep.inserted, 0)).toBe(1);
+        expect(h.observers).toEqual({ live: 0, max: 1 });
+        // Released after the final sweep: unrelated outbox churn no longer sweeps.
+        const settled = h.sweeps.length;
+        await db.transaction(async tx => notifyDeliveryWork(tx, DELIVERY_QUEUES.chatPublications));
+        await quiet();
+        expect(h.sweeps).toHaveLength(settled);
+        expect(h.errors).toEqual([]);
+      } finally {
+        await h.close();
+      }
+      expect(await recovered(f)).toHaveLength(1);
+    });
+
+    it("recovers when the notice settled before the read, without any later hint", async () => {
+      const f = await inFlightRecovery();
+      const h = harness(f.service, { beforeRead: () => settleAgentNotice(f) });
+      try {
+        await h.worker.ready;
+        await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+        await quiet();
+        expect(h.sweeps[0]).toMatchObject({ inserted: 1, awaitingOutbox: false });
+        expect(h.observers).toEqual({ live: 0, max: 1 });
+        expect(h.errors).toEqual([]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("leaves no observer, deadline or later sweep when stopped during a sweep", async () => {
+      const f = await inFlightRecovery();
+      let release!: () => void;
+      let reached!: () => void;
+      const blocked = new Promise<void>(resolve => { reached = resolve; });
+      const h = harness(f.service, { afterRead: () => { reached(); return new Promise<void>(resolve => { release = resolve; }); } });
+      await blocked;
+      const observedDuringSweep = h.observers.live;
+      const stopping = h.worker.stop();
+      const observedOnceStopping = h.observers.live;
+      await settleAgentNotice(f);
+      release();
+      await stopping;
+      // The late sweep result must not attach an observer after stop.
+      expect(h.observers.live).toBe(0);
+      await h.worker.stop();
+      await h.coordinator.stop();
+      await quiet();
+      expect(h.observers.live).toBe(0);
+      expect([observedDuringSweep, observedOnceStopping, h.observers.max]).toEqual([1, 0, 1]);
+      expect(h.coordinator.nextWakeAt()).toBeNull();
+      expect(h.sweeps).toEqual([expect.objectContaining({ awaitingOutbox: true })]);
+      expect(await recovered(f)).toEqual([]);
+    });
+
+    it("never sweeps or observes when stopped before its first run", async () => {
+      const f = await inFlightRecovery();
+      const h = harness(f.service);
+      await h.worker.stop();
+      await h.worker.stop();
+      await h.coordinator.stop();
+      await quiet();
+      expect(h.sweeps).toEqual([]);
+      expect(h.observers).toEqual({ live: 0, max: 0 });
+    });
+
+    it("keeps the obligation through a failed sweep and releases the observer once it settles", async () => {
+      const f = await inFlightRecovery();
+      const h = harness(f.service, { beforeRead: async () => { throw new Error("transient read failure"); } });
+      try {
+        await vi.waitFor(() => expect(h.sweeps.length).toBeGreaterThanOrEqual(1), { timeout: 3000, interval: 10 });
+        expect(h.errors).toHaveLength(1);
+        expect(h.sweeps[0]).toMatchObject({ awaitingOutbox: true });
+        expect(h.observers.live).toBe(1);
+        await settleAgentNotice(f);
+        await vi.waitFor(async () => expect(await recovered(f)).toHaveLength(1), { timeout: 3000, interval: 25 });
+        await quiet();
+        expect(h.sweeps.at(-1)).toMatchObject({ awaitingOutbox: false });
+        expect(h.observers).toEqual({ live: 0, max: 1 });
+        expect(h.errors).toHaveLength(1);
+      } finally {
+        await h.close();
+      }
+    });
   });
 
   it("bounds item notices per sweep and finishes the rest on the next sweep", async () => {

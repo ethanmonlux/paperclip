@@ -60,7 +60,10 @@ The sweep is not a poll. It runs:
 - at the earliest real deadline it found: the moment an agent's unavailability
   or an escalation without pickup crosses the bound;
 - while a recovered agent's notice is still in flight, on the outbox's own
-  settlement signal. That subscription ends once the row settles.
+  settlement signal. Each sweep subscribes before it reads, so a row that
+  settles during the sweep triggers one more sweep instead of being missed.
+  The subscription ends after a sweep finds nothing in flight, and stopping
+  the worker removes it.
 
 With no endpoint, an idle endpoint, or only completed history, no deadline
 remains, so the worker issues no further queries until a hint arrives. During

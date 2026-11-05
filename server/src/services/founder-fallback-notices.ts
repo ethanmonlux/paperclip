@@ -531,9 +531,13 @@ export function isFounderFallbackWakeEvent(event: Pick<LiveEvent, "type" | "payl
 
 /**
  * Runs once at startup to reconstruct from durable rows, then only on a wake
- * hint or at the sweep's own next deadline. Outbox settlement is observed only
- * while an in-flight notice needs it. A skipped run (drain, standby) is
+ * hint or at the sweep's own next deadline. A skipped run (drain, standby) is
  * retained without querying and runs when admission reopens.
+ *
+ * Outbox settlement is observed from before each sweep's read until a sweep
+ * finds no notice in flight. A row that settles while the sweep runs marks the
+ * worker dirty, and the coordinator sweeps again; one that settled earlier is
+ * already in the read. Once stopped, no sweep starts or attaches an observer.
  */
 export function registerFounderFallbackNoticeWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
@@ -541,24 +545,30 @@ export function registerFounderFallbackNoticeWork(
   canRun: () => boolean,
   retryMs: number,
   owner: object,
+  subscribeOutbox: (wake: () => void) => () => void =
+    wake => subscribeDeliveryWork(owner, DELIVERY_QUEUES.chatPublications, wake),
 ) {
   let next: number | null = null;
   let deferred = false;
+  let stopped = false;
   let stopOutbox: (() => void) | null = null;
+  const releaseOutbox = () => { stopOutbox?.(); stopOutbox = null; };
   const worker = coordinator.register(DELIVERY_QUEUES.founderFallbackNotices, {
     retryMs,
     pausePassiveMaintenance: true,
     run: async signal => {
+      if (stopped) return;
       if (!canRun()) { deferred = true; return; }
       deferred = false;
       next = null;
+      stopOutbox ??= subscribeOutbox(worker.wake);
       const result = await service.sweep(signal);
+      if (stopped) { releaseOutbox(); return; }
       next = result.nextDueAt;
-      if (result.awaitingOutbox) stopOutbox ??= subscribeDeliveryWork(owner, DELIVERY_QUEUES.chatPublications, worker.wake);
-      else { stopOutbox?.(); stopOutbox = null; }
+      if (!result.awaitingOutbox) releaseOutbox();
     },
     hasPending: async () => deferred,
-    nextRunAt: () => next,
+    nextRunAt: () => stopped ? null : next,
   });
   const unsubscribes = [
     subscribeAllCompanyLiveEvents(event => { if (isFounderFallbackWakeEvent(event)) worker.wake(); }),
@@ -569,8 +579,9 @@ export function registerFounderFallbackNoticeWork(
   return {
     ...worker,
     async stop() {
+      stopped = true;
       for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
-      stopOutbox?.(); stopOutbox = null;
+      releaseOutbox();
       await worker.stop();
     },
   };
