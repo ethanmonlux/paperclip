@@ -1,3 +1,4 @@
+import { pendingAgentInteractionAddressee } from "../services/pending-agent-interaction.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { readTaskPanelActivations } from "../services/plugin-task-panels.js";
 import { enqueueNativeRuntimeResponse } from "../services/native-runtime/native-runtime-response-delivery.js";
@@ -6125,6 +6126,7 @@ export function agentRoutes(
     let wakePayload = req.body.payload ?? null;
     let retryConversationContext: Record<string, unknown> = {};
     let retryNativeReviewContext: NativeReviewAssignmentContext | null = null;
+    let retryPendingAddresseeContext: Record<string, unknown> | null = null;
     if (req.body.failedRunId) {
       assertBoard(req);
       if (
@@ -6191,7 +6193,24 @@ export function agentRoutes(
           }
           retryNativeReviewContext = savedReviewContext;
         }
-        if (issue.assigneeAgentId !== agent.id && !retryNativeReviewContext) {
+        // An addressee wake (for example a Coordinator asked to confirm on a
+        // child task its Engineer owns) is never the assignee. Dispatch already
+        // admits it while the interaction is pending; the board exact retry must
+        // use the same verifier, or a failed addressee run can never be resumed.
+        if (issue.assigneeAgentId !== agent.id && !retryNativeReviewContext &&
+            await pendingAgentInteractionAddressee(db, {
+              companyId: agent.companyId, issueId: issue.id, agentId: agent.id,
+              contextSnapshot: failedContext,
+            })) {
+          // Carry only the server-owned addressee identity so dispatch re-verifies
+          // the same pending interaction under the issue lock.
+          retryPendingAddresseeContext = Object.fromEntries(
+            ["source", "wakeReason", "interactionId", "interactionKind", "sourceRunId", "sourceCommentId"].flatMap((key) =>
+              typeof failedContext[key] === "string" ? [[key, failedContext[key]]] : [],
+            ),
+          );
+        }
+        if (issue.assigneeAgentId !== agent.id && !retryNativeReviewContext && !retryPendingAddresseeContext) {
           throw conflict("The task is no longer assigned to this agent.");
         }
         if (issue.conversationAgentId) {
@@ -6303,6 +6322,7 @@ export function agentRoutes(
         // Only the selected server-owned run can carry review authority into
         // an exact retry. Dispatch revalidates the current review assignment.
         ...retryNativeReviewContext,
+        ...retryPendingAddresseeContext,
         triggeredBy: req.actor.type,
         originIdentityContextId: req.actor.identityContextId ?? null,
         responsibleUserId: req.actor.type === "agent" ? req.actor.onBehalfOfUserId ?? null : req.actor.userId ?? null,
