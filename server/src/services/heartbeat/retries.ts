@@ -26,6 +26,7 @@ import { REUSABLE_SANDBOX_RESUME_FAILED_CODE } from "../reusable-sandbox-resume-
 import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "../plugin-worker-unavailable-error.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE } from "../legacy-controller-lease.js";
 import { randomUUID } from "node:crypto";
+import { pendingAgentInteractionAddressee } from "../pending-agent-interaction.js";
 import {
   and,
   asc,
@@ -143,6 +144,17 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
+
+/**
+ * A run woken to answer a pending interaction addressed to it (for example a
+ * Coordinator asked to confirm on its Engineer's child task) is not the
+ * task's assignee. If it fails, nothing else re-wakes it: the generic retry
+ * rewrites wakeReason and dispatch then cancels it as reassigned, and the
+ * addressee's own task is usually blocked by that same child. Retry it with
+ * its addressee identity intact, spaced to outlast a provider reconnect.
+ */
+export const PENDING_ADDRESSEE_RETRY_REASON = "pending_addressee_retry";
+export const PENDING_ADDRESSEE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
 
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = [
   "scheduled_retry",
@@ -1676,6 +1688,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     agent: typeof agents.$inferSelect,
   ) {
     if (await hasCaseHandoffForRun(run)) return null;
+    const addresseeRetry = await schedulePendingAddresseeRetryIfEligible(run, agent);
+    if (addresseeRetry) return addresseeRetry;
     if (!run.wakeupRequestId) return null;
     if (!isResolvedInteractionContinuationWakeContext(run.contextSnapshot))
       return null;
@@ -1704,6 +1718,29 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       retryReason: INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
       wakeReason: INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
       maxAttempts: INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
+    });
+  }
+
+  async function schedulePendingAddresseeRetryIfEligible(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    if (context.wakeReason !== "interaction_pending") return null;
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return null;
+    if (!await pendingAgentInteractionAddressee(db, {
+      companyId: run.companyId, issueId, agentId: run.agentId, contextSnapshot: context,
+    })) return null;
+    const attempt = executionRetryAttemptCount(run, PENDING_ADDRESSEE_RETRY_REASON);
+    if (attempt >= PENDING_ADDRESSEE_RETRY_DELAYS_MS.length) return null;
+    return scheduleBoundedRetryForRun(run, agent, {
+      retryReason: PENDING_ADDRESSEE_RETRY_REASON,
+      // Keep the addressee identity: dispatch admits a non-assignee only for
+      // a verified interaction_pending wake.
+      wakeReason: "interaction_pending",
+      maxAttempts: PENDING_ADDRESSEE_RETRY_DELAYS_MS.length,
+      delayMs: PENDING_ADDRESSEE_RETRY_DELAYS_MS[attempt],
     });
   }
 
