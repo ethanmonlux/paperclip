@@ -232,7 +232,7 @@ else process.exit(3);
       const output = path.join(directory, "output");
       writeFileSync(output, "");
       const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
-        ...process.env, PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
+        ...process.env, GITHUB_REPOSITORY: "paperclipai/paperclip", PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
         RUNNER_TEMP: directory, FULL_CI: "true", PROFILE_CI: "false", FORCE_FULL_CI: "false",
         CI_INCREMENTAL_MODE: "enabled", STACK_JSON: "null", EVENT_BASE_SHA: "b".repeat(40), EVENT_HEAD_SHA: prHead, EVENT_MERGE_SHA: merge,
         TEST_GIT_REPOSITORY: repository,
@@ -301,4 +301,23 @@ test("complete merge trees handle more than 300 files, base advancement, renames
   assert.throws(() => mergeDiff(head, base, directory), /expected PR head/);
   assert.throws(() => mergeDiff(prHead, prHead, directory), /merge commit/);
   assert.throws(() => mergeDiff("f".repeat(40), prHead, directory));
+});
+
+test("a fork routing step falls back to its own default matrix", () => {
+  const workflow = readFileSync(new URL(".github/workflows/ci-routing.yml", root), "utf8");
+  const block = workflow.split("      - name: Plan affected CI tasks from trusted definitions\n")[1];
+  const shell = block.split("        run: |\n")[1].split("\n").map((line) => line.slice(10)).join("\n");
+  const directory = mkdtempSync(path.join(tmpdir(), "ci-routing-fork-"));
+  try {
+    const output = path.join(directory, "output");
+    writeFileSync(output, "");
+    const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
+      ...process.env, GITHUB_REPOSITORY: "someone/paperclip-fork", GITHUB_OUTPUT: output, FULL_CI: "true",
+      EVENT_HEAD_SHA: "a".repeat(40), EVENT_MERGE_SHA: "b".repeat(40),
+    } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(output, "utf8"), "plan=\n");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
