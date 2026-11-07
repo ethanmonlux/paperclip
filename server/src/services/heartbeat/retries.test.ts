@@ -276,7 +276,7 @@ describePostgres("heartbeat retry module database wiring", () => {
 
   // A Coordinator woken to confirm on its Engineer's child task fails before
   // work. Nothing else re-wakes it, and its own task is blocked by the child.
-  async function addresseeFixture(interactionStatus: "pending" | "accepted") {
+  async function addresseeFixture(interactionStatus: "pending" | "accepted", kind: "request_confirmation" | "ask_user_questions" = "request_confirmation") {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Addressee", issuePrefix: `A${companyId.slice(0, 8)}` });
     const [coordinator, engineer] = await db.insert(agents).values([
@@ -290,7 +290,7 @@ describePostgres("heartbeat retry module database wiring", () => {
     }).returning();
     const interactionId = randomUUID();
     await db.insert(issueThreadInteractions).values({
-      id: interactionId, companyId, issueId: child.id, kind: "request_confirmation", status: interactionStatus,
+      id: interactionId, companyId, issueId: child.id, kind, status: interactionStatus,
       addresseeAgentId: coordinator.id, createdByAgentId: engineer.id, sourceRunId: engineerRun.id,
       continuationPolicy: "wake_assignee",
       payload: { version: 1, prompt: "Route the review." } as never,
@@ -301,7 +301,7 @@ describePostgres("heartbeat retry module database wiring", () => {
       resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       contextSnapshot: {
         issueId: child.id, taskId: child.id, source: "issue.interaction.created", wakeReason: "interaction_pending",
-        interactionId, interactionKind: "request_confirmation", sourceRunId: engineerRun.id,
+        interactionId, interactionKind: kind, sourceRunId: engineerRun.id,
       },
     }).returning();
     return { companyId, coordinator, child, failed, interactionId };
@@ -320,6 +320,14 @@ describePostgres("heartbeat retry module database wiring", () => {
     });
     const dueInMs = Date.parse(String(successor!.scheduledRetryAt)) - Date.parse(String(successor!.createdAt));
     expect(dueInMs).toBeGreaterThanOrEqual(extracted.PENDING_ADDRESSEE_RETRY_DELAYS_MS[0] - 1_000);
+  });
+
+  it("automatically retries a failed addressee wake for an ordinary question", async () => {
+    const { coordinator, failed, interactionId } = await addresseeFixture("pending", "ask_user_questions");
+    const result = await boundRetries().retries.scheduleInteractionContinuationInfrastructureRetryIfEligible(failed, coordinator);
+    expect(result, JSON.stringify(result)).toMatchObject({ outcome: "scheduled" });
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id));
+    expect(successor!.contextSnapshot).toMatchObject({ wakeReason: "interaction_pending", interactionId, interactionKind: "ask_user_questions" });
   });
 
   it("does not retry the addressee once its confirmation is resolved", async () => {

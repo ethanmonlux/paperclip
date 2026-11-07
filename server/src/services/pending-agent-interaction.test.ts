@@ -46,4 +46,19 @@ describe("pending agent interaction admission", () => {
       expect(permits({ ...f, interaction: { ...f.interaction, payload } } as unknown as Parameters<typeof permits>[0])).toBe(false);
     }
   });
+  it.each(["ask_user_questions", "request_checkbox_confirmation", "request_item_verdicts", "suggest_tasks"])(
+    "permits a Coordinator addressed with %s on a task it does not own", (kind) => {
+      const f = fixture();
+      expect(permits({ ...f, contextSnapshot: { ...f.contextSnapshot, interactionKind: kind },
+        interaction: { ...f.interaction, kind } } as unknown as Parameters<typeof permits>[0])).toBe(true);
+    });
+  it("keeps credential connection intents out of addressee admission", () => {
+    const f = fixture();
+    expect(permits({ ...f, contextSnapshot: { ...f.contextSnapshot, interactionKind: "connection_intent" },
+      interaction: { ...f.interaction, kind: "connection_intent" } } as unknown as Parameters<typeof permits>[0])).toBe(false);
+  });
+  it("rejects a wake whose kind does not match the persisted interaction", () => {
+    const f = fixture();
+    expect(permits({ ...f, contextSnapshot: { ...f.contextSnapshot, interactionKind: "ask_user_questions" } })).toBe(false);
+  });
 });
