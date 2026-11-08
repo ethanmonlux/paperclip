@@ -237,6 +237,7 @@ import { companyService } from "../services/companies.js";
 import { ensureProjectAccessMember } from "../services/projects.js";
 import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { createFounderFallbackNotices, founderFallbackKey } from "../services/founder-fallback-notices.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { NativeChatAttachmentReadScope } from "../services/native-runtime/chat-attachment-read.js";
@@ -1569,6 +1570,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "discordGatewayLeaseRenewalIntervalMs"
         | "discordGatewayLeaseTtlMs"
         | "discordGatewayLeaseWaitMs"
+        | "founderFallbackNotices"
         | "githubWebhookAuthenticationBarrier"
         | "githubWebhookReplayBarrier"
         | "githubWebhookResponseBudgetMs"
@@ -1956,6 +1958,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         | "conversationLeaseRenewalIntervalMs"
         | "deferWebhookProcessing"
         | "fetch"
+        | "founderFallbackNotices"
         | "questionFormOpenAuthorizationBarrier"
         | "questionResolutionPersistBarrier"
         | "reactionLinkPreflightBarrier"
@@ -11594,6 +11597,67 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ slackUserId: "UBOARD" });
     await service.update(endpoint.id, { requireAtMention: true });
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ slackUserId: "UBOARD" });
+  });
+
+  it("delivers a FAC-597 founder fallback notice through the native outbox and cancels a stale one before I/O", async () => {
+    await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
+    const fixture = await seedCompany();
+    await db.update(companyMemberships).set({ membershipRole: "owner" })
+      .where(and(eq(companyMemberships.companyId, fixture.companyId), eq(companyMemberships.principalId, "owner-user")));
+    let now = new Date();
+    const notices = createFounderFallbackNotices(db, { enabled: true, boundMs: 20 * 60_000 }, () => now);
+    const { callbacks, endpoint, runtime, service } = await configuredSlackEndpoint(fixture,
+      { linkedBoardUser: true, allowUnlinkedPeople: false, founderFallbackNotices: notices });
+    const thread = makeThread({ channelId: "D-FALLBACK", id: "slack:D-FALLBACK:7600.1", isDM: true });
+    await deliverMessage({ callbacks, endpointId: endpoint.id, thread: thread.thread,
+      message: makeMessage({ id: "7600.1", text: "Keep me posted", userId: "UBOARD" }), trigger: "direct_message" });
+    const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
+    expect(conversation).toMatchObject({ isDirectMessage: true });
+    // Activate the endpoint through the native setup round trip, answered by the founder in this DM.
+    await qualifySetupRoundTrip(service, endpoint.id, "UBOARD");
+    await service.test(endpoint.id);
+    expect((await service.get(endpoint.id)).status).toBe("active");
+    await service.processPendingPublications();
+    const posts = () => (runtime.endpoints.get(endpoint.id)?.posts ?? [])
+      .filter(post => JSON.stringify(post).includes("Paperclip fallback notice"));
+    expect(posts()).toEqual([]);
+
+    const failedAt = new Date(now.getTime() - 21 * 60_000);
+    const [failed] = await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.assignedAgentId,
+      status: "failed", startedAt: failedAt, finishedAt: failedAt }).returning();
+    await db.update(agents).set({ status: "error", updatedAt: failedAt }).where(eq(agents.id, fixture.assignedAgentId));
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
+    await service.processPendingPublications();
+    const agentKey = founderFallbackKey({ endpointId: endpoint.id, kind: "agent", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
+    const [published] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, agentKey));
+    expect(published).toMatchObject({ state: "published", conversationId: conversation!.id, issueId: conversation!.issueId });
+    expect(posts()).toHaveLength(1);
+    expect(JSON.stringify(posts()[0])).toContain("Paperclip fallback notice (automatic, not from ");
+
+    // Recovery is queued, then the agent fails again before the transport
+    // claim: the claim re-proof cancels the row and nothing reaches Slack.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
+    now = new Date(now.getTime() + 60_000);
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
+    await db.update(agents).set({ status: "paused", pausedAt: now }).where(eq(agents.id, fixture.assignedAgentId));
+    await service.processPendingPublications();
+    const recoveredKey = founderFallbackKey({ endpointId: endpoint.id, kind: "recovered", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
+    const [stale] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, recoveredKey));
+    expect(stale?.state).toBe("cancelled");
+    expect(posts()).toHaveLength(1);
+
+    // That cancellation was definitely before I/O, so once the agent is
+    // available again the recovery notice is re-armed and delivered once.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
+    now = new Date(now.getTime() + 60_000);
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
+    await service.processPendingPublications();
+    const [rearmed] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, `${recoveredKey}:a1`));
+    expect(rearmed).toMatchObject({ state: "published", conversationId: conversation!.id });
+    expect(posts()).toHaveLength(2);
+    expect(JSON.stringify(posts()[1])).toContain("is available again");
+    expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 0 });
+    await service.shutdown();
   });
 
   it.each([false, true])("applies Slack mention settings to channel replies while exempting DMs (DM=%s)", async (isDM) => {

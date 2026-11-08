@@ -69,6 +69,7 @@ import {
 import {
   parseCodexJsonl, createCodexJsonlParser,
   classifyCodexAuthRefreshFailure,
+  extractCodexDiagnosticText,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
   isCodexProviderQuotaError,
@@ -330,6 +331,27 @@ function managedMcpGatewaysFromContext(context: Record<string, unknown>): Manage
 
 type ResolvedExecutionTarget = ReturnType<typeof readAdapterExecutionTarget>;
 type MaybeResolvedExecutionTarget = ResolvedExecutionTarget | undefined;
+
+export async function resolveRunScopedCodexCredentialMount(
+  effectiveCodexHome: string,
+  runtimeCredentialHome: string | null,
+): Promise<{ path: string; access: "rw" } | null> {
+  if (!runtimeCredentialHome || path.resolve(effectiveCodexHome) === path.resolve(runtimeCredentialHome)) {
+    return null;
+  }
+  const managedAuthPath = path.join(effectiveCodexHome, "auth.json");
+  const sourceAuthPath = path.join(runtimeCredentialHome, "auth.json");
+  const managedAuth = await fs.lstat(managedAuthPath).catch(() => null);
+  if (!managedAuth?.isSymbolicLink()) return null;
+  const [managedTarget, expectedSource, sourceFile] = await Promise.all([
+    fs.realpath(managedAuthPath).catch(() => null),
+    fs.realpath(sourceAuthPath).catch(() => null),
+    fs.stat(sourceAuthPath).catch(() => null),
+  ]);
+  return managedTarget && expectedSource && managedTarget === expectedSource && sourceFile?.isFile()
+    ? { path: sourceAuthPath, access: "rw" }
+    : null;
+}
 
 type SandboxCodexAuthProbeResult = "present" | "absent" | "unknown";
 
@@ -1043,12 +1065,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const biller = managedBilling?.biller ?? resolveCodexBiller(effectiveEnv, billingType);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+    const runScopedCredentialMount = filesystemScope && runtimeSkillDigest
+      ? await resolveRunScopedCodexCredentialMount(effectiveCodexHome, runtimeCredentialHome)
+      : null;
     const localProcessSandbox: LocalProcessSandboxOptions | null =
       (filesystemScope || networkScope) && !executionTargetIsRemote
         ? {
             workspaceDir: effectiveExecutionCwd,
             filesystemScope,
-            managedPaths: [{ path: effectiveCodexHome, access: "rw" }],
+            managedPaths: [
+              { path: effectiveCodexHome, access: "rw" },
+              ...(runScopedCredentialMount ? [runScopedCredentialMount] : []),
+            ],
             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
             pathAliases: targetWorkspaceRealization?.mode === "copy"
               ? targetWorkspaceRealization.pathAliases
@@ -1292,7 +1320,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (observabilityProfile) replaceCodexProfileArgs(args, observabilityProfile.name);
       else if (observabilityPreparationFailed) disableCodexObservabilityArgs(args);
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity));
+      const shellKeys = [...new Set([
+        ...codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity)),
+        ...(localProcessSandbox?.networkScope === "allowlist"
+          ? ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+          : []),
+      ])].sort();
       args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
         "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =
@@ -1535,7 +1568,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
         : null;
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-      const stderrLine = firstMeaningfulStderrLine(attempt.proc.stderr);
+      // Report the fallback from diagnostic stderr text, never from a quoted
+      // structured record. Classification reads the same diagnostics directly
+      // from stdout/stderr, so the display message is never trusted input.
+      const stderrLine = firstMeaningfulStderrLine(extractCodexDiagnosticText(attempt.proc.stderr));
       const fallbackErrorMessage =
         parsedError ||
         stderrLine ||
@@ -1545,7 +1581,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? extractCodexRetryNotBefore({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
-              errorMessage: fallbackErrorMessage,
             })
           : null;
       const authRefreshFailure =
@@ -1553,7 +1588,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? classifyCodexAuthRefreshFailure({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
-              errorMessage: fallbackErrorMessage,
             })
           : null;
       const providerQuota =
@@ -1562,7 +1596,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         isCodexProviderQuotaError({
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
@@ -1571,7 +1604,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         isCodexTransientUpstreamError({
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
         });
       const harnessCrash =
         !authRefreshFailure &&

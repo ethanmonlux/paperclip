@@ -988,4 +988,47 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+
+  // A stalled review must be nudgeable without pulling work out of review.
+  it("resumes an in-review task by waking the assignee and the current reviewer, keeping it in review", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_review",
+      executionState: {
+        status: "pending",
+        currentStageId: "55555555-5555-4555-8555-555555555555",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: MENTIONED_AGENT_ID, userId: null },
+        returnAssignee: { type: "agent", agentId: ASSIGNEE_AGENT_ID, userId: null },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-review-nudge",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Review is stalled; please continue.",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "Review is stalled; please continue.", resume: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(2));
+    for (const agentId of [ASSIGNEE_AGENT_ID, MENTIONED_AGENT_ID]) {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
+        reason: "issue_commented",
+        contextSnapshot: expect.objectContaining({ issueId: existing.id, resumeIntent: true }),
+      }));
+    }
+    expect(mockIssueService.update.mock.calls.some(([, patch]) =>
+      (patch as Record<string, unknown> | undefined)?.status === "todo")).toBe(false);
+  });
+
 });

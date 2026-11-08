@@ -5,6 +5,8 @@ import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
 import {
   classifyCodexAuthRefreshFailure,
+  codexAppServerRpcErrorDiagnostic,
+  codexWhamHttpFailureDiagnostic,
   type CodexAuthRefreshFailureClass,
 } from "./parse.js";
 
@@ -194,7 +196,7 @@ interface WhamUsageResponse {
   credits?: WhamCredits | null;
 }
 
-class CodexQuotaAuthError extends Error {
+export class CodexQuotaAuthError extends Error {
   constructor(
     message: string,
     readonly errorFamily: CodexAuthRefreshFailureClass,
@@ -202,6 +204,10 @@ class CodexQuotaAuthError extends Error {
     super(message);
     this.name = "CodexQuotaAuthError";
   }
+}
+
+function quotaError(message: string, errorFamily: CodexAuthRefreshFailureClass | null): Error {
+  return errorFamily ? new CodexQuotaAuthError(message, errorFamily) : new Error(message);
 }
 
 /**
@@ -294,7 +300,7 @@ export async function fetchCodexQuota(
     const message = `chatgpt wham api returned ${resp.status}`;
     const responseText = await readResponseTextPrefix(resp);
     const authFailure = classifyCodexAuthRefreshFailure({
-      errorMessage: [message, responseText].filter(Boolean).join("\n"),
+      diagnostic: codexWhamHttpFailureDiagnostic(resp.status, responseText),
     });
     if (authFailure) throw new CodexQuotaAuthError(message, authFailure);
     throw new Error(message);
@@ -495,7 +501,12 @@ class CodexRpcClient {
       this.stderr = (this.stderr + chunk).slice(-MAX_QUOTA_ERROR_BODY_BYTES);
     });
     this.proc.on("exit", () => {
-      this.fail(new Error(this.stderr.trim() || "codex app-server closed unexpectedly"));
+      // Plain stderr lines are the app-server's own diagnostics; structured
+      // records it echoes are not, and are ignored by the classifier.
+      this.fail(quotaError(
+        this.stderr.trim() || "codex app-server closed unexpectedly",
+        classifyCodexAuthRefreshFailure({ stderr: this.stderr }),
+      ));
     });
     this.proc.on("close", () => {
       this.closed = true;
@@ -545,9 +556,12 @@ class CodexRpcClient {
       clearTimeout(pending.timer);
       if (parsed.error != null) {
         const error = parsed.error as { message?: unknown };
-        pending.reject(new Error(typeof error.message === "string"
-          ? error.message.slice(0, MAX_QUOTA_ERROR_BODY_BYTES)
-          : "codex app-server rejected the quota request"));
+        pending.reject(quotaError(
+          typeof error.message === "string"
+            ? error.message.slice(0, MAX_QUOTA_ERROR_BODY_BYTES)
+            : "codex app-server rejected the quota request",
+          classifyCodexAuthRefreshFailure({ diagnostic: codexAppServerRpcErrorDiagnostic(parsed) }),
+        ));
       } else if (!parsed.result || typeof parsed.result !== "object" || Array.isArray(parsed.result)) {
         pending.reject(new Error("codex app-server returned an invalid quota response"));
       } else {
@@ -652,10 +666,9 @@ function formatProviderError(source: string, error: unknown): string {
   return `${source}: ${message}`;
 }
 
+/** Spawn, stdin, timeout and framing failures are local and never authentication. */
 export function readCodexQuotaErrorFamily(error: unknown): CodexAuthRefreshFailureClass | null {
-  if (error instanceof CodexQuotaAuthError) return error.errorFamily;
-  const message = error instanceof Error ? error.message : String(error);
-  return classifyCodexAuthRefreshFailure({ errorMessage: message });
+  return error instanceof CodexQuotaAuthError ? error.errorFamily : null;
 }
 
 export async function getQuotaWindows(): Promise<ProviderQuotaResult> {

@@ -25,6 +25,7 @@ import {
   createBundledInstallManifest,
   configureBundledProviderOverrides,
   materializePublishManifest,
+  materializeWorkspacePublishManifest,
   selectBundledDependencyPatches,
   stageBundledEsbuildOptionalDependencies,
   stageBundledProviderOptionalDependencies,
@@ -463,6 +464,40 @@ test("bundled package staging materializes workspace dependency versions", () =>
   });
 });
 
+test("frozen workspace staging resolves the actual SDK manifest and fails closed on missing or mismatched packages", t => {
+  const root = mkdtempSync(join(tmpdir(), "paperclip-workspace-manifest-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceDir = join(root, "server");
+  const sdk = join(root, "sdk");
+  mkdirSync(join(sourceDir, "node_modules", "@paperclipai"), { recursive: true });
+  mkdirSync(sdk);
+  const sdkManifest = join(sdk, "package.json");
+  writeFileSync(sdkManifest, JSON.stringify({ name: "@paperclipai/plugin-sdk", version: "1.0.0" }));
+  symlinkSync(sdk, join(sourceDir, "node_modules", "@paperclipai", "plugin-sdk"), "junction");
+  const source = { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/plugin-sdk": "workspace:*" } };
+  assert.equal(materializeWorkspacePublishManifest(source, sourceDir).dependencies["@paperclipai/plugin-sdk"], "1.0.0");
+  writeFileSync(sdkManifest, JSON.stringify({ name: "wrong-package", version: "1.0.0" }));
+  assert.throws(() => materializeWorkspacePublishManifest(source, sourceDir), /Invalid workspace dependency/);
+  rmSync(sdkManifest);
+  assert.throws(() => materializeWorkspacePublishManifest(source, sourceDir), /ENOENT/);
+});
+
+test("bundled staging preserves independent workspace dependency versions", () => {
+  const source = {
+    name: "@paperclipai/server",
+    version: "0.3.1",
+    dependencies: { "@paperclipai/plugin-sdk": "workspace:*", caret: "workspace:^" },
+    optionalDependencies: { tilde: "workspace:~" },
+    peerDependencies: { peer: "workspace:*" },
+  };
+  const versions = { "@paperclipai/plugin-sdk": "1.0.0", caret: "2.0.0", tilde: "3.0.0", peer: "4.0.0" };
+  const staged = materializePublishManifest(source, name => versions[name]);
+  assert.deepEqual(staged.dependencies, { "@paperclipai/plugin-sdk": "1.0.0", caret: "^2.0.0" });
+  assert.deepEqual(staged.optionalDependencies, { tilde: "~3.0.0" });
+  assert.deepEqual(staged.peerDependencies, { peer: "4.0.0" });
+  assert.equal(source.dependencies["@paperclipai/plugin-sdk"], "workspace:*");
+});
+
 test("bundled package staging installs only dependencies included in the tarball", () => {
   const publishManifest = {
     name: "@paperclipai/db",
@@ -589,6 +624,16 @@ test("server package staging applies every bundled runtime patch and preserves t
     join(sourceDir, "package.json"),
     JSON.stringify({ ...serverPackage, files: ["dist"] }),
   );
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const [name, specifier] of Object.entries(serverPackage[section] ?? {})) {
+      if (!specifier.startsWith("workspace:")) continue;
+      const dependency = join(sourceDir, "node_modules", name);
+      mkdirSync(dependency, { recursive: true });
+      writeFileSync(join(dependency, "package.json"), JSON.stringify({
+        name, version: name === "@paperclipai/plugin-sdk" ? "1.0.0" : serverPackage.version,
+      }));
+    }
+  }
   writeFileSync(callLog, "");
   mkdirSync(fixtureArtifacts);
   const nativePackage = join(fixtureArtifacts, "@openai/codex-linux-x64");
@@ -661,7 +706,7 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
     process.execPath,
     [
       "--input-type=module", "-e",
-      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+      `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3], preserveWorkspaceVersions: true });`,
       sourceDir,
       destinationDir,
       fixtureSourceRoot,
@@ -683,6 +728,7 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
   assert.equal(lstatSync(stagedAcpxDir).isSymbolicLink(), false);
   assert.equal(existsSync(join(destinationDir, "node_modules/.pnpm")), false);
   const stagedManifest = JSON.parse(readFileSync(join(destinationDir, "package.json"), "utf8"));
+  assert.equal(stagedManifest.dependencies["@paperclipai/plugin-sdk"], "1.0.0");
   for (const [name, version] of Object.entries({ ...codexOptional, ...claudeOptional })) {
     assert.equal(stagedManifest.optionalDependencies[name], version);
     assert.equal(existsSync(join(destinationDir, "node_modules", name)), false);
@@ -722,6 +768,21 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
       `${specifier} receives its own full configured patch`,
     );
   }
+
+  rmSync(join(sourceDir, "node_modules"), { recursive: true });
+  const releaseDestination = join(fixtureDir, "release-destination");
+  execFileSync(process.execPath, [
+    "--input-type=module", "-e",
+    `import { prepareBundledPackage } from ${JSON.stringify(new URL("./prepare-bundled-package.mjs", import.meta.url).href)}; prepareBundledPackage(process.argv[1], process.argv[2], { sourceRoot: process.argv[3] });`,
+    sourceDir, releaseDestination, fixtureSourceRoot,
+  ], {
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, FAKE_CALL_LOG: callLog,
+      FAKE_SOURCE_PACKAGE: join(sourceDir, "package.json"), FAKE_NATIVE_ARTIFACTS: fixtureArtifacts },
+    stdio: "pipe",
+  });
+  const releaseManifest = JSON.parse(readFileSync(join(releaseDestination, "package.json"), "utf8"));
+  assert.equal(releaseManifest.dependencies["@paperclipai/plugin-sdk"], serverPackage.version);
+
 });
 
 test("bundled package dry runs preview without querying published versions", () => {

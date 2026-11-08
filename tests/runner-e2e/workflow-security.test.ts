@@ -67,6 +67,14 @@ describe("public repository paid workflow security", () => {
       path.join(repositoryRoot, ".github/workflows/pr.yml"),
       "utf8",
     );
+    // A fork runs its own reviewed copy of the trusted workflow, so its CI
+    // matches its own scripts rather than upstream master's. Upstream itself
+    // must still call the pinned first-party workflow.
+    const repository = process.env.GITHUB_REPOSITORY;
+    if (repository && repository !== "paperclipai/paperclip") {
+      expect(ordinaryPrWorkflow).toMatch(/^\s+uses:\s+\.\/\.github\/workflows\/pr-trusted\.yml$/mu);
+      return;
+    }
     const trustedWorkflowCalls = [
       ...ordinaryPrWorkflow.matchAll(
         /^\s+uses:\s+(paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml)@([^\s#]+)$/gmu,
