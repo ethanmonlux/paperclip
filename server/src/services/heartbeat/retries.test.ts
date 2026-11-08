@@ -390,6 +390,7 @@ describePostgres("heartbeat retry module database wiring", () => {
     expect(isResolvedInteractionContinuationWakeContext(successor!.contextSnapshot)).toBe(true);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor!.wakeupRequestId!));
     expect(wake!.payload).toMatchObject({ mutation: "interaction", interactionId: "interaction-1", retryReason: "runner_revision_wait" });
+  });
 
   // A Coordinator woken to confirm on its Engineer's child task fails before
   // work. Nothing else re-wakes it, and its own task is blocked by the child.
