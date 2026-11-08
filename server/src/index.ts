@@ -31,6 +31,7 @@ import { registerCustomImageCleanupWork } from "./services/custom-image-cleanup-
 import { registerWorkspaceRecoveryWork } from "./services/workspace-recovery-work.js";
 import { registerEnvironmentCleanupWork } from "./services/environment-cleanup-work.js";
 import { loginCleanupSchedule } from "./services/login-cleanup-state.js";
+import { createFounderFallbackNotices, founderFallbackSettingsFromEnv, registerFounderFallbackNoticeWork } from "./services/founder-fallback-notices.js";
 import { registerLoginCleanupWork } from "./services/login-cleanup-work.js";
 import { timeStartupRecovery } from "./startup-recovery-timing.js";
 import { runtimeAssetRetention } from "./services/native-runtime/runtime-asset-retention.js";
@@ -1795,6 +1796,17 @@ async function startServerWithDatabaseTeardown(
         () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
       await step("attention_retention", () => registerAttentionRetentionWork(deliveryWork, attentionRetentionService(db as any),
         () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
+      const founderFallbackSettings = founderFallbackSettingsFromEnv();
+      if (founderFallbackSettings.enabled) {
+        await step("founder_fallback_notices", () => {
+          const worker = registerFounderFallbackNoticeWork(deliveryWork,
+            createFounderFallbackNotices(db as any, founderFallbackSettings),
+            () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped,
+            Math.max(60_000, config.heartbeatSchedulerIntervalMs), db);
+          server.on("close", worker.stop);
+          return worker.ready;
+        });
+      }
     };
 
     const startHeartbeatScheduler = () => {
