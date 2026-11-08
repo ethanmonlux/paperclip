@@ -164,7 +164,9 @@ export function nativeRestartFixture(options: { dedicatedDatabaseUrl?: string } 
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      identifier: `NRR-${label}`,
+      // Identifiers are globally unique. A vitest retry or a shared recovery
+      // database reseeds the same label, so suffix it with this row's id.
+      identifier: `NRR-${label}-${issueId.slice(0, 8)}`,
       title: `Recover ${label}`,
       status: "in_progress",
       priority: "medium",
