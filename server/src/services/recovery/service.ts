@@ -627,13 +627,14 @@ export function classifyAdapterFailureForRecovery(
     return null;
   }
   const resultJson = parseObject(latestRun.resultJson);
-  // A refused exact resume keeps its interrupted attempt for operators in
-  // `error` and `nativeExactResumeRefusal`. Recovery follows the refusal only.
-  const { nativeExactResumeRefusal: _interruptedAttempt, ...currentResult } = resultJson;
+  // Classify from the run's own failure text only. currentRunFailureText
+  // follows a refused exact resume's refusal, not the interrupted attempt in
+  // `error`. Saved result bodies (tool output, quoted protocol, stored
+  // evidence) can contain configuration or quota words that are not the
+  // failure, so they stay out of this text. Typed fields are read below.
   const error = [
     latestRun.errorCode ?? "",
     currentRunFailureText(latestRun) ?? "",
-    JSON.stringify(currentResult),
   ].join("\n");
   if (
     latestRun.errorCode === "configuration_incomplete" ||
