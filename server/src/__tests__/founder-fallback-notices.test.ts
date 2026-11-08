@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, like } from "drizzle-orm";
+import { and, asc, eq, inArray, like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals, chatIdentityLinks,
-  chatPublications, companies, companyMemberships, createDb, heartbeatRuns, issueThreadInteractions, issues,
+  chatPublications, companies, companyMemberships, createDb, heartbeatRuns, issueAccessGrants, issueThreadInteractions, issues,
   toolApplications, toolConnections,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -876,6 +876,62 @@ const support = await getEmbeddedPostgresTestSupport();
         }
       });
     });
+  });
+
+  it("counts and notifies only tasks the founder may read, and re-proves the summary at the claim", async () => {
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    try {
+      const f = await fixture();
+      const visibleIssueId = randomUUID(), hiddenIssueId = randomUUID();
+      await db.insert(issues).values([
+        { id: visibleIssueId, companyId: f.companyId, title: "Granted private task", identifier: "F-3", visibility: "private" },
+        { id: hiddenIssueId, companyId: f.companyId, title: "Hidden private task", identifier: "F-4", visibility: "private" },
+      ]);
+      const [grant] = await db.insert(issueAccessGrants).values({ issueId: visibleIssueId, subjectType: "user",
+        subjectId: f.founderUserId, source: "explicit", grantedByUserId: f.founderUserId }).returning();
+      const visible = await interaction(f, { issueId: visibleIssueId, addresseeUserId: f.founderUserId, title: "Visible decision" });
+      const hidden = await interaction(f, { issueId: hiddenIssueId, addresseeUserId: f.founderUserId, title: "Hidden decision" });
+      const hiddenEscalation = await interaction(f, { issueId: hiddenIssueId, addresseeAgentId: f.agentId, title: "Hidden escalation" });
+      // A pending item addressed to the same founder in another company is never counted here.
+      const otherCompanyId = randomUUID(), otherCompanyIssueId = randomUUID();
+      await db.insert(companies).values({ id: otherCompanyId, name: "Other", issuePrefix: `O${otherCompanyId.slice(0, 4).toUpperCase()}` });
+      await db.insert(issues).values({ id: otherCompanyIssueId, companyId: otherCompanyId, title: "Other company task", identifier: "O-1" });
+      await db.insert(issueThreadInteractions).values({ companyId: otherCompanyId, issueId: otherCompanyIssueId,
+        kind: "request_confirmation", payload: { version: 1, prompt: "Approve?" } as never, addresseeUserId: f.founderUserId, createdAt: start });
+      await failAgent(f, start);
+      at(21);
+      expect((await f.service.sweep()).inserted).toBe(2);
+      const published = await rows(f);
+      expect(published.map(row => row.idempotencyKey).filter(key => key.includes(":item:")))
+        .toEqual([founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: visible.id })]);
+      for (const row of published) {
+        expect(text(row)).not.toContain("Hidden");
+        expect(text(row)).not.toContain("F-4");
+      }
+      const summary = published.find(row => row.idempotencyKey.includes(":agent:"))!;
+      expect(text(summary)).toContain("Waiting on Master Builder: 0 escalation(s). Waiting on you: 1 decision(s).");
+      expect(await f.service.authorizeFounderFallbackPublication(db, summary)).toBe(true);
+      for (const id of [hidden.id, hiddenEscalation.id]) {
+        const key = founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: id });
+        expect(await f.service.authorizeFounderFallbackPublication(db, { ...summary, idempotencyKey: key })).toBe(false);
+      }
+
+      // The grant is revoked before the transport claim: neither the queued
+      // summary nor the queued item may disclose the now-hidden task.
+      await db.update(issueAccessGrants).set({ revokedAt: now }).where(eq(issueAccessGrants.id, grant!.id));
+      const item = published.find(row => row.idempotencyKey.endsWith(visible.id))!;
+      expect(await f.service.authorizeFounderFallbackPublication(db, summary)).toBe(false);
+      expect(await f.service.authorizeFounderFallbackPublication(db, item)).toBe(false);
+      await db.update(chatPublications).set({ state: "cancelled", redactedError: "Notice no longer applies" })
+        .where(inArray(chatPublications.id, [summary.id, item.id]));
+      at(22);
+      expect((await f.service.sweep()).inserted).toBe(1);
+      const rearmed = (await rows(f)).find(row => row.idempotencyKey === `${summary.idempotencyKey}:a1`)!;
+      expect(text(rearmed)).toContain("Waiting on Master Builder: 0 escalation(s). Waiting on you: 0 decision(s).");
+      expect(await f.service.authorizeFounderFallbackPublication(db, rearmed)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("bounds item notices per sweep and finishes the rest on the next sweep", async () => {

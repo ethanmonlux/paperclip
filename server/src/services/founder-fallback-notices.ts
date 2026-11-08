@@ -249,6 +249,16 @@ function stateSentence(agent: Agent, state: Unavailability) {
   return `${name} has been in error since ${utc(state.since)}${state.runId ? ` (run ${state.runId.slice(0, 8)} failed)` : ""}.`;
 }
 
+/** The founder's own task-read decision, never widened by instance admin. */
+async function founderCanReadIssue(tx: Tx, target: Target, issueId: string) {
+  const decision = await authorizationService(tx).decide({
+    actor: { type: "board", userId: target.founderUserId, source: "session", ignoreInstanceAdmin: true },
+    action: "issue:read",
+    resource: { type: "issue", companyId: target.endpoint.companyId, issueId },
+  });
+  return decision.allowed;
+}
+
 type ItemReason = { kind: "unavailable"; state: Unavailability } | { kind: "missed" };
 
 async function itemReason(
@@ -260,33 +270,44 @@ async function itemReason(
   const toAgent = interaction.addresseeAgentId === target.agent.id;
   const toFounder = interaction.addresseeUserId === target.founderUserId;
   if (!toAgent && !toFounder) return null;
-  const readable = await authorizationService(tx).decide({
-    actor: { type: "board", userId: target.founderUserId, source: "session", ignoreInstanceAdmin: true },
-    action: "issue:read",
-    resource: { type: "issue", companyId: interaction.companyId, issueId: interaction.issueId },
-  });
-  if (!readable.allowed) return null;
+  if (!(await founderCanReadIssue(tx, target, interaction.issueId))) return null;
   if (eligible(state, now, boundMs)) return { kind: "unavailable", state };
   if (toAgent && !state && await escalationMissed(tx, target.agent, interaction, now, boundMs)) return { kind: "missed" };
   return null;
 }
 
+/**
+ * Counts only items on tasks the founder may read, with the same decision an
+ * item notice requires, so the summary reveals no aggregate of hidden tasks.
+ */
 async function agentNoticeText(tx: Tx, target: Target, state: Unavailability) {
-  const [counts] = await tx.select({
+  const perIssue = await tx.select({
+    issueId: issueThreadInteractions.issueId,
     escalations: sql<number>`count(*) filter (where ${issueThreadInteractions.addresseeAgentId} = ${target.agent.id})::int`,
     decisions: sql<number>`count(*) filter (where ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})::int`,
   }).from(issueThreadInteractions).where(and(
     eq(issueThreadInteractions.companyId, target.endpoint.companyId),
     eq(issueThreadInteractions.status, "pending"),
     sql`${issueThreadInteractions.issueId} <> ${target.issueId}`,
-  ));
+    sql`(${issueThreadInteractions.addresseeAgentId} = ${target.agent.id} or ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})`,
+  )).groupBy(issueThreadInteractions.issueId).orderBy(asc(issueThreadInteractions.issueId));
+  let escalations = 0, decisions = 0;
+  for (const row of perIssue) {
+    if (!(await founderCanReadIssue(tx, target, row.issueId))) continue;
+    escalations += row.escalations;
+    decisions += row.decisions;
+  }
   const name = clip(target.agent.name, 60);
   return [
     header(target.agent),
     stateSentence(target.agent, state),
-    `Waiting on ${name}: ${counts?.escalations ?? 0} escalation(s). Waiting on you: ${counts?.decisions ?? 0} decision(s).`,
+    `Waiting on ${name}: ${escalations} escalation(s). Waiting on you: ${decisions} decision(s).`,
     `Until ${name} recovers, Paperclip sends a separate fallback notice here for each one.`,
   ].join("\n");
+}
+
+function noticePayload(text: string) {
+  return projectSafeChatPublication({ classification: "external", source: "safe_milestone", text });
 }
 
 async function itemNoticeText(tx: Tx, target: Target, interaction: Interaction, reason: ItemReason, now: Date) {
@@ -326,7 +347,10 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
    */
   async function authorizeFounderFallbackPublication(
     tx: Tx,
-    publication: { idempotencyKey: string; endpointId: string; conversationId: string; issueId: string; companyId: string },
+    publication: {
+      idempotencyKey: string; endpointId: string; conversationId: string; issueId: string; companyId: string;
+      payload?: unknown;
+    },
   ): Promise<boolean> {
     if (!settings.enabled) return false;
     const key = parseFounderFallbackKey(publication.idempotencyKey);
@@ -339,14 +363,20 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     const state = await unavailability(tx, target.agent);
     if (key.kind !== "item") {
       if (key.agentId !== target.agent.id) return false;
-      return key.kind === "agent" ? eligible(state, now, settings.boundMs) && state.anchor === key.anchor : !state;
+      if (key.kind === "recovered") return !state;
+      if (!eligible(state, now, settings.boundMs) || state.anchor !== key.anchor) return false;
+      // A queued summary is sent only while its counts still match what the
+      // founder can read; otherwise it is cancelled before I/O and re-armed.
+      if (publication.payload === undefined) return true;
+      const sent = (publication.payload as { text?: unknown } | null)?.text;
+      return sent === noticePayload(await agentNoticeText(tx, target, state)).text;
     }
     const [interaction] = await tx.select().from(issueThreadInteractions)
       .where(and(eq(issueThreadInteractions.id, key.interactionId), eq(issueThreadInteractions.companyId, publication.companyId)));
     return !!interaction && !!(await itemReason(tx, target, interaction, state, now, settings.boundMs));
   }
 
-  async function insert(target: Target, key: string, text: () => Promise<string> | string) {
+  async function insert(target: Target, key: string, text: (tx: Tx) => Promise<string> | string) {
     return db.transaction(async raw => {
       const tx = raw as unknown as Tx;
       const row = {
@@ -357,7 +387,7 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       await notifyChatPublicationWork(tx);
       return (await tx.insert(chatPublications).values({
         ...row,
-        payload: projectSafeChatPublication({ classification: "external", source: "safe_milestone", text: await text() }),
+        payload: noticePayload(await text(tx)),
         state: "pending",
       }).onConflictDoNothing().returning({ id: chatPublications.id })).length;
     });
@@ -437,7 +467,7 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       const key = founderFallbackKey({ endpointId, kind: "agent", agentId: target.agent.id, anchor: state.anchor });
       const attempt = (await nextAttempts(companyId, [key])).get(key);
       if (attempt != null && !(await openAgentEpisode(target, state))) {
-        inserted += await insert(target, withAttempt(key, attempt), () => agentNoticeText(db, target, state));
+        inserted += await insert(target, withAttempt(key, attempt), tx => agentNoticeText(tx, target, state));
       }
     }
     if (!state) {
@@ -475,7 +505,7 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       if (items >= MAX_ITEMS_PER_SWEEP) { due(now.getTime()); continue; }
       const reason = await itemReason(db, target, interaction, state, now, settings.boundMs);
       if (!reason) continue;
-      const count = await insert(target, withAttempt(key, attempt), () => itemNoticeText(db, target, interaction, reason, now));
+      const count = await insert(target, withAttempt(key, attempt), tx => itemNoticeText(tx, target, interaction, reason, now));
       items += count;
       inserted += count;
     }
