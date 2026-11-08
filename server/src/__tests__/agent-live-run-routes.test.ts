@@ -27,6 +27,7 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
 }));
 const mockNativeReviewAssignment = vi.hoisted(() => vi.fn());
+const mockPendingAddressee = vi.hoisted(() => vi.fn());
 
 const mockExecutionProjection = vi.hoisted(() => ({
   executionProjectionForRun: vi.fn(async () => null),
@@ -83,6 +84,10 @@ const mockChatRunRetries = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/pending-agent-interaction.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/pending-agent-interaction.js")>("../services/pending-agent-interaction.js")),
+    pendingAgentInteractionAddressee: mockPendingAddressee,
+  }));
   vi.doMock("../services/native-runtime/native-review-participant.js", async () => ({
     ...(await vi.importActual<typeof import("../services/native-runtime/native-review-participant.js")>("../services/native-runtime/native-review-participant.js")),
     getNativeReviewAssignment: mockNativeReviewAssignment,
@@ -301,6 +306,7 @@ describe("agent live run routes", () => {
     mockChatRunRetries.prepareFailedChatRunRetry.mockReset();
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
     mockNativeReviewAssignment.mockReset().mockResolvedValue(null);
+    mockPendingAddressee.mockReset().mockResolvedValue(false);
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
       allowed: true,
@@ -1108,6 +1114,63 @@ describe("agent live run routes", () => {
         }
       },
     );
+  });
+
+  // A Coordinator is woken because a confirmation on a child task is addressed
+  // to it. Dispatch admits that non-assignee wake while the confirmation is
+  // pending. If the run then fails before work, the board exact retry must
+  // admit it too; otherwise it returns 409 "no longer assigned" forever and the
+  // Coordinator's own task stays blocked by the same child.
+  describe("exact pending-addressee wake retry", () => {
+    const interactionId = "77777777-7777-4777-8777-777777777777";
+    const sourceRunId = "88888888-8888-4888-8888-888888888888";
+    const addresseeContext = {
+      issueId: failedChatIssueId, taskId: failedChatIssueId,
+      source: "issue.interaction.created", wakeReason: "interaction_pending",
+      interactionId, interactionKind: "request_confirmation", sourceRunId,
+    };
+    const selectedRun = {
+      id: failedChatRunId, companyId: "company-1", agentId: routeAgentId,
+      status: "failed", runtimeMode: "native", errorCode: "configuration_incomplete",
+      contextSnapshot: addresseeContext,
+    };
+    const childIssue = { id: failedChatIssueId, companyId: "company-1", status: "blocked", assigneeAgentId: "engineer", assigneeUserId: null };
+    const retryBody = { failedRunId: failedChatRunId, reason: "retry_failed_run" };
+    beforeEach(() => {
+      mockAgentService.getById.mockResolvedValue({ id: routeAgentId, companyId: "company-1" });
+      mockHeartbeatService.getRun.mockResolvedValue(selectedRun);
+      mockIssueService.getById.mockResolvedValue(childIssue);
+    });
+
+    it("retries the same addressee wake while its confirmation is still pending", async () => {
+      mockPendingAddressee.mockResolvedValue(true);
+      const fixture = createFailedChatRetryDb(false);
+      const res = await requestApp(await createApp(fixture.db), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send({
+        ...retryBody, payload: { issueId: "forged", interactionId: "forged" },
+      }));
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(mockPendingAddressee).toHaveBeenCalledExactlyOnceWith(fixture.db, {
+        companyId: "company-1", issueId: failedChatIssueId, agentId: routeAgentId, contextSnapshot: addresseeContext,
+      });
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledExactlyOnceWith(routeAgentId, expect.objectContaining({
+        failedRunId: failedChatRunId, reason: "retry_failed_run",
+        payload: { issueId: failedChatIssueId, taskId: failedChatIssueId },
+        contextSnapshot: expect.objectContaining({
+          source: "issue.interaction.created", wakeReason: "interaction_pending",
+          interactionId, interactionKind: "request_confirmation", sourceRunId,
+        }),
+      }));
+      expect(JSON.stringify(mockHeartbeatService.wakeup.mock.calls)).not.toContain("forged");
+    });
+
+    it("keeps the 409 ownership guard once the confirmation is resolved or re-addressed", async () => {
+      mockPendingAddressee.mockResolvedValue(false);
+      const fixture = createFailedChatRetryDb(false);
+      const res = await requestApp(await createApp(fixture.db), url => request(url).post(`/api/agents/${routeAgentId}/wakeup`).send(retryBody));
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("The task is no longer assigned to this agent.");
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
   });
 
   describe("exact failed chat run retry", () => {

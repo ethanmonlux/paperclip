@@ -968,16 +968,35 @@ export async function runAdapterExecutionTargetProcess(
       ? sanitizeRemoteExecutionEnv(options.env)
       : options.env;
 
+  const localProcessSandbox =
+    target?.kind === "local" || !target ? options.localProcessSandbox : null;
+  const launcherDirectory = localProcessSandbox && env.PAPERCLIP_GITHUB_LAUNCHER_DIR
+    ? githubOperationLauncherDirectory({ runId, target: null })
+    : null;
+  const mountsLauncher =
+    localProcessSandbox && launcherDirectory && env.PAPERCLIP_GITHUB_LAUNCHER_DIR === launcherDirectory;
+  const scopedLocalProcessSandbox = mountsLauncher
+    ? { ...localProcessSandbox, managedPaths: [
+        ...(localProcessSandbox.managedPaths ?? []),
+        { path: launcherDirectory, access: "ro" as const },
+      ] }
+    : localProcessSandbox;
+  // The read-only launcher bind also covers its gh-config root. A workspace
+  // sandbox mounts a private /tmp, so per-operation scratch is created there.
+  const sandboxEnv = mountsLauncher && localProcessSandbox.filesystemScope === "workspace"
+    ? { ...env, GH_CONFIG_DIR: GITHUB_SANDBOX_OPERATION_CONFIG_ROOT }
+    : env;
+
   const result = await runChildProcess(runId, command, args, {
     cwd: options.cwd,
-    env,
+    env: sandboxEnv,
     stdin: options.stdin,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
     terminalResultCleanup: options.terminalResultCleanup,
-    localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
+    localProcessSandbox: scopedLocalProcessSandbox,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),
   });
   // Closing an SSH client on timeout/disconnect does not prove the remote
@@ -1627,6 +1646,9 @@ export function runtimeAssetDir(
 ): string {
   return prepared.assetDirs[key] ?? path.posix.join(fallbackRemoteCwd, ".paperclip-runtime", key);
 }
+
+/** Lives on the sandbox's private /tmp, never on a host path. */
+const GITHUB_SANDBOX_OPERATION_CONFIG_ROOT = "/tmp/paperclip-github-operation-config";
 
 type GitHubLauncherLocation = {
   runId: string; target: AdapterExecutionTarget | null | undefined;

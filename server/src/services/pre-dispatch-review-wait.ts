@@ -1,4 +1,5 @@
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { canonicalExecutionUuid } from "./execution-identity.js";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
@@ -34,6 +35,8 @@ export function neverStartedDispatchCancellationPredicate() {
     eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "cancelled"),
     inArray(heartbeatRuns.errorCode, staleDispatchErrorCodes),
     isNotNull(heartbeatRuns.finishedAt),
+    or(isNull(heartbeatRuns.issueId), eq(heartbeatRuns.issueId,
+      canonicalExecutionUuid(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`))),
     noRetainedExecutionPredicate(),
   );
 }

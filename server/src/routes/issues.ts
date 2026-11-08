@@ -2296,7 +2296,10 @@ function isExplicitResumeCapableStatus(status: string | null | undefined) {
     status === "cancelled" ||
     status === "blocked" ||
     status === "todo" ||
-    status === "in_progress"
+    status === "in_progress" ||
+    // A stalled review must be nudgeable. Resume on in_review wakes the
+    // assignee and current review participant without leaving review.
+    status === "in_review"
   );
 }
 
@@ -14646,8 +14649,10 @@ export function issueRoutes(
         normalizedAssigneeAgentId === undefined
           ? existing.assigneeAgentId
           : normalizedAssigneeAgentId;
+      // Resume on in_review nudges review; it never pulls work out of review.
       const explicitMoveToTodoRequested =
-        reopenRequested || resumeRequested === true;
+        existing.status !== "in_review" &&
+        (reopenRequested || resumeRequested === true);
       const recoveryRelevantSourceMutationRequested =
         req.body.status !== undefined ||
         normalizedAssigneeAgentId !== undefined ||
@@ -19380,8 +19385,10 @@ export function issueRoutes(
       ) {
         if (!(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
       }
+      // Resume on in_review nudges review; it never pulls work out of review.
       const explicitMoveToTodoRequested =
-        effectiveReopenRequested || effectiveResumeRequested === true;
+        issue.status !== "in_review" &&
+        (effectiveReopenRequested || effectiveResumeRequested === true);
       const scheduledRetryForHumanComment =
         shouldHumanCommentResumeInProgressScheduledRetry({
           hasComment: true,
@@ -20177,6 +20184,54 @@ export function issueRoutes(
                       reviewPathInstruction: REVIEW_PATH_RECOVERY_INSTRUCTION,
                     }
                   : {}),
+              },
+            });
+          }
+        }
+
+        // A resume request on a stalled review nudges whoever must act next.
+        // When the current review participant is an agent other than the
+        // assignee, wake it on this task too; dispatch admits it as the
+        // current participant. The task stays in review.
+        if (
+          resumeRequested === true &&
+          !goalCommentSteered &&
+          wakeIssueSnapshot.status === "in_review"
+        ) {
+          const reviewParticipant = parseIssueExecutionState(
+            wakeIssueSnapshot.executionState,
+          )?.currentParticipant;
+          const reviewerAgentId =
+            reviewParticipant?.type === "agent"
+              ? (reviewParticipant.agentId ?? null)
+              : null;
+          if (
+            reviewerAgentId &&
+            reviewerAgentId !== assigneeId &&
+            !(actorIsAgent && actor.actorId === reviewerAgentId)
+          ) {
+            addWakeup(reviewerAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: currentIssue.id,
+                commentId: comment.id,
+                mutation: "comment",
+                resumeIntent: true,
+                followUpRequested: true,
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: currentIssue.id,
+                taskId: currentIssue.id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                source: "issue.comment",
+                wakeReason: "issue_commented",
+                resumeIntent: true,
+                followUpRequested: true,
               },
             });
           }
