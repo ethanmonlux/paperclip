@@ -1,10 +1,24 @@
 import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { executionStartedEventPredicate } from "./pre-dispatch-execution-evidence.js";
+
+/** Its executor settled this cancelled legacy run before adapter dispatch: no
+ * process, session or execution-start event was ever recorded, the same proof
+ * settleCancelledLegacyPreparation uses for providerWorkStarted: false. Nothing
+ * is left to stop, whatever adapter it claimed. Leases are checked by the caller. */
+async function settledBeforeDispatch(db: Db, run: typeof heartbeatRuns.$inferSelect) {
+  if (run.executionStage !== "settled" || run.processStartedAt || run.sessionIdAfter || run.nativeIssueId ||
+      run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput != null) return false;
+  const [started] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    executionStartedEventPredicate())).limit(1);
+  return !started;
+}
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -56,7 +70,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
-        !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
+        !(run.executionStage === "settled" && (!await runUsedConversationAdapter(db, run) || await settledBeforeDispatch(db, run))) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }
   // Release an expired owner only after its cancelled execution has stop proof.
