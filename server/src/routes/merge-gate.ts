@@ -5,7 +5,7 @@ import { issues, type Db } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import type { MergeGateActor } from "../services/merge-gate/service.js";
 import { mergeGateService } from "../services/merge-gate/wiring.js";
-import { assertCompanyAccess } from "./authz.js";
+import { assertCompanyAccess, hasCompanyAccess } from "./authz.js";
 
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
 const mergeBody = z.object({
@@ -37,7 +37,7 @@ export function mergeGateRoutes(db: Db) {
   router.post("/issues/:issueId/merge-gate", async (req, res) => {
     const issueId = req.params.issueId as string;
     const [issue] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, issueId));
-    if (!issue) throw notFound("Issue not found");
+    if (!issue || !hasCompanyAccess(req, issue.companyId)) throw notFound("Issue not found");
     assertCompanyAccess(req, issue.companyId);
     const body = mergeBody.parse(req.body ?? {});
     res.set("cache-control", "no-store");

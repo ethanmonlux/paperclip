@@ -52,7 +52,7 @@ describe("urgent lane decisions", () => {
   });
 });
 
-const external = resolveExternalTestDatabaseUrl();
+const external = resolveExternalTestDatabaseUrl("PAPERCLIP_URGENT_LANE_TEST_DATABASE_URL");
 const support = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
 if (!support.supported) console.warn(`Skipping urgent lane database tests: ${support.reason}`);
 
