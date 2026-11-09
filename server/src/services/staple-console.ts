@@ -68,6 +68,7 @@ interface PullRequestSnapshot {
   headSha: string | null;
   ci: StapleConsoleCiState;
   ciStartedAt: string | null;
+  headCommittedAt: string | null;
 }
 
 export interface StapleConsoleServiceOptions {
@@ -159,11 +160,19 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       : "unknown";
     let ci: StapleConsoleCiState = "unknown";
     let ciStartedAt: string | null = null;
+    let headCommittedAt: string | null = null;
     if (headSha && (state === "open" || state === "draft")) {
       ({ ci, ciStartedAt } = summarizeCheckRuns(
         await githubJson(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, token)));
+      if (ci === "none") {
+        // Zero check runs: time the head so the board can say CI never started (FAC-840).
+        // Commit time is the closest GitHub record to the push; unreadable leaves it unknown.
+        const commit = asRecord(await githubJson(`/repos/${repo}/commits/${headSha}`, token).catch(() => null));
+        const date = asRecord(asRecord(commit?.commit)?.committer)?.date;
+        headCommittedAt = typeof date === "string" ? date : null;
+      }
     }
-    const value = { state, mergedAt, headSha, ci, ciStartedAt };
+    const value = { state, mergedAt, headSha, ci, ciStartedAt, headCommittedAt };
     prCache.set(key, { value, expiresAt: nowMs + (state === "open" || state === "draft" ? OPEN_PR_TTL_MS : FINAL_PR_TTL_MS) });
     if (prCache.size > 500) prCache.delete(prCache.keys().next().value!);
     return value;
@@ -386,7 +395,10 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       for (const pr of pullRequests) {
         const snapshot = resolved.get(`${pr.repo.toLowerCase()}#${pr.number}`);
         if (!snapshot) continue;
-        Object.assign(pr, { state: snapshot.state, mergedAt: snapshot.mergedAt, ci: snapshot.ci, ciStartedAt: snapshot.ciStartedAt, source: "github" });
+        Object.assign(pr, {
+          state: snapshot.state, mergedAt: snapshot.mergedAt, ci: snapshot.ci, ciStartedAt: snapshot.ciStartedAt,
+          headSha: snapshot.headSha, headCommittedAt: snapshot.headCommittedAt, source: "github",
+        });
       }
       const gaps = [
         failures > 0 ? `GitHub read failed for ${failures} of ${targets.length} PRs` : null,

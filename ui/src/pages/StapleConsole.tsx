@@ -160,9 +160,9 @@ function ConsoleCard({
         </div>
       ))}
 
-      {card.stuck.map((flag) => (
+      {card.stuck.map((flag, index) => (
         <p
-          key={`${flag.rule}-${flag.issueIdentifier}`}
+          key={`${flag.rule}-${flag.issueIdentifier}-${index}`}
           className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive"
           data-rule={flag.rule}
         >

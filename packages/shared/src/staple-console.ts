@@ -116,6 +116,8 @@ export const STAPLE_CONSOLE_THRESHOLDS = {
   longRunMs: 90 * 60_000,
   reviewIdleMs: 2 * 60 * 60_000,
   repeatedFailureCount: 3,
+  /** A pushed PR head with zero check runs after this long means CI never started (FAC-840). */
+  ciNotStartedMs: 10 * 60_000,
 } as const;
 
 export const STAPLE_CONSOLE_TIME_ZONE = "America/Denver";
@@ -204,6 +206,9 @@ export interface StapleConsolePullRequestInput {
   mergedAt: string | null;
   ci: StapleConsoleCiState;
   ciStartedAt: string | null;
+  /** Head commit, and its commit time when GitHub reports no check runs for it. */
+  headSha?: string | null;
+  headCommittedAt?: string | null;
   /** Where PR state came from: live GitHub read, a Paperclip work product, or only a title reference. */
   source: "github" | "work_product" | "reference";
 }
@@ -243,7 +248,8 @@ export type StapleConsoleStuckRule =
   | "long_run"
   | "blocked_without_blocker"
   | "review_idle"
-  | "repeated_failure";
+  | "repeated_failure"
+  | "ci_not_started";
 
 export interface StapleConsoleStuckFlag {
   rule: StapleConsoleStuckRule;
@@ -448,6 +454,17 @@ function lastActivityOf(ctx: IssueRunContext): string | null {
   return latest(ctx.runs.map(lastRunActivity));
 }
 
+function hasPendingRecovery(ctx: IssueRunContext) {
+  return ctx.runs.some((run) => PENDING_RUN_STATUSES.has(run.status))
+    || ctx.wakes.some((wake) => PENDING_WAKE_STATUSES.has(wake.status));
+}
+
+// A queued retry or wake is not recovery yet: the flag stays until a run
+// actually starts (FAC-840). Say so, so the board does not read as handled.
+function pendingRecoveryNote(ctx: IssueRunContext) {
+  return hasPendingRecovery(ctx) ? "; recovery queued, not started" : "";
+}
+
 function hasScheduledWake(ctx: IssueRunContext) {
   if (ctx.issue.monitorNextCheckAt) return true;
   if (ctx.runs.some((run) => PENDING_RUN_STATUSES.has(run.status))) return true;
@@ -481,10 +498,12 @@ export function stuckLongRun(ctx: IssueRunContext, nowMs: number): StapleConsole
 export function stuckBlockedWithoutBlocker(ctx: IssueRunContext): StapleConsoleStuckFlag | null {
   if (ctx.issue.status !== "blocked") return null;
   if (ctx.openBlockerCount > 0 || ctx.pendingQuestionCount > 0) return null;
+  // A live issue monitor is a stated external wait; a running run means the recovery wake resumed it.
+  if (ctx.issue.monitorServiceName || activeRunOf(ctx.runs)) return null;
   return {
     rule: "blocked_without_blocker",
     issueIdentifier: ctx.issue.identifier,
-    reason: "Blocked, but no open blocker and no pending question",
+    reason: `Blocked, but no open blocker, pending question or external wait${pendingRecoveryNote(ctx)}`,
   };
 }
 
@@ -513,6 +532,8 @@ function failureSignature(run: StapleConsoleRunInput) {
 
 export function stuckRepeatedFailure(ctx: IssueRunContext): StapleConsoleStuckFlag | null {
   if (isStapleConsoleTerminal(ctx.issue.status)) return null;
+  // A retry that is actually running is recovery in progress; a queued one is not.
+  if (activeRunOf(ctx.runs)) return null;
   const finished = ctx.runs.filter((run) => !ACTIVE_RUN_STATUSES.has(run.status) && !PENDING_RUN_STATUSES.has(run.status));
   const count = STAPLE_CONSOLE_THRESHOLDS.repeatedFailureCount;
   const recent = finished.slice(0, count);
@@ -522,7 +543,25 @@ export function stuckRepeatedFailure(ctx: IssueRunContext): StapleConsoleStuckFl
   return {
     rule: "repeated_failure",
     issueIdentifier: ctx.issue.identifier,
-    reason: `Same failure ${count} times in a row: ${signature}`,
+    reason: `Same failure ${count} times in a row: ${signature}${pendingRecoveryNote(ctx)}`,
+  };
+}
+
+/** An open PR whose head has had no check run for 10 min: CI never started. Clears once a check run exists. */
+export function stuckCiNotStarted(
+  pr: StapleConsolePullRequestInput,
+  issueIdentifier: string,
+  nowMs: number,
+): StapleConsoleStuckFlag | null {
+  if (pr.source !== "github" || pr.ci !== "none") return null;
+  if (pr.state !== "open" && pr.state !== "draft") return null;
+  const sinceMs = ms(pr.headCommittedAt ?? null);
+  if (sinceMs === null || nowMs - sinceMs <= STAPLE_CONSOLE_THRESHOLDS.ciNotStartedMs) return null;
+  const head = pr.headSha ? ` head ${pr.headSha.slice(0, 9)}` : " head";
+  return {
+    rule: "ci_not_started",
+    issueIdentifier,
+    reason: `PR #${pr.number}${head} has no CI check run ${formatStapleConsoleDuration(nowMs - sinceMs)} after its commit`,
   };
 }
 
@@ -830,6 +869,14 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
         pendingQuestionCount: questions.length + approvals.length + (member.assigneeUserId ? 1 : 0),
         isReview: reviewIds.has(member.id),
       }, nowMs));
+    }
+
+    for (const pr of prs) {
+      const owner = byId.get(pr.issueId);
+      const flag = owner && !isStapleConsoleTerminal(owner.status)
+        ? stuckCiNotStarted(pr, owner.identifier, nowMs)
+        : null;
+      if (flag) stuck.push(flag);
     }
 
     const mergedAt = step === "merged" ? stepSince : null;

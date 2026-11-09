@@ -7,6 +7,7 @@ import {
   stapleConsoleDefaultRepo,
   stapleConsoleFreshness,
   stuckBlockedWithoutBlocker,
+  stuckCiNotStarted,
   stuckInProgressIdle,
   stuckLongRun,
   stuckRepeatedFailure,
@@ -14,6 +15,7 @@ import {
   type StapleConsoleInput,
   type StapleConsoleIssueInput,
   type StapleConsoleIssueRunContext,
+  type StapleConsolePullRequestInput,
   type StapleConsoleRunInput,
 } from "./staple-console.js";
 
@@ -119,13 +121,21 @@ describe("stuck rule 3: blocked, with no open blocker and no pending interaction
   const base = issue({ id: "a", status: "blocked" });
 
   it("flags a blocked task with nothing to wait on", () => {
-    expect(stuckBlockedWithoutBlocker(ctx({ issue: base }))?.reason).toBe("Blocked, but no open blocker and no pending question");
+    expect(stuckBlockedWithoutBlocker(ctx({ issue: base }))?.reason).toBe("Blocked, but no open blocker, pending question or external wait");
   });
 
   it("does not flag when a blocker or a pending question exists", () => {
     expect(stuckBlockedWithoutBlocker(ctx({ issue: base, openBlockerCount: 1 }))).toBeNull();
     expect(stuckBlockedWithoutBlocker(ctx({ issue: base, pendingQuestionCount: 1 }))).toBeNull();
     expect(stuckBlockedWithoutBlocker(ctx({ issue: { ...base, status: "in_progress" } }))).toBeNull();
+    // A live monitor is a stated external wait.
+    expect(stuckBlockedWithoutBlocker(ctx({ issue: { ...base, monitorServiceName: "GitHub Actions" } }))).toBeNull();
+  });
+
+  it("keeps the flag while the 30-min recovery wake is only queued, and clears it once the run starts", () => {
+    const queued = stuckBlockedWithoutBlocker(ctx({ issue: base, wakes: [{ issueId: "a", status: "queued", requestedAt: minutesAgo(1) }] }));
+    expect(queued?.reason).toBe("Blocked, but no open blocker, pending question or external wait; recovery queued, not started");
+    expect(stuckBlockedWithoutBlocker(ctx({ issue: base, runs: [run({ id: "r", issueId: "a", status: "running", finishedAt: null })] }))).toBeNull();
   });
 });
 
@@ -168,6 +178,44 @@ describe("stuck rule 5: the same failure repeated 3 times", () => {
     expect(stuckRepeatedFailure(ctx({ issue: base, runs: [failed("1", "a"), failed("2", "b"), failed("3", "a")] }))).toBeNull();
     expect(stuckRepeatedFailure(ctx({ issue: base, runs: [failed("1", "a"), run({ id: "2", issueId: "a" }), failed("3", "a")] }))).toBeNull();
     expect(stuckRepeatedFailure(ctx({ issue: base, runs: [failed("1", "a"), failed("2", "a")] }))).toBeNull();
+  });
+
+  it("keeps the flag while a retry is only scheduled, and clears it once the retry runs", () => {
+    const three = [failed("1", "adapter_failed"), failed("2", "adapter_failed"), failed("3", "adapter_failed")];
+    const scheduled = run({ id: "4", issueId: "a", status: "scheduled_retry", startedAt: null, finishedAt: null });
+    expect(stuckRepeatedFailure(ctx({ issue: base, runs: [scheduled, ...three] }))?.reason)
+      .toBe("Same failure 3 times in a row: adapter_failed; recovery queued, not started");
+    const running = run({ id: "4", issueId: "a", status: "running", finishedAt: null });
+    expect(stuckRepeatedFailure(ctx({ issue: base, runs: [running, ...three] }))).toBeNull();
+  });
+});
+
+describe("CI never started: an open PR head with no check run after 10 min", () => {
+  const pr = (overrides: Partial<StapleConsolePullRequestInput>): StapleConsolePullRequestInput => ({
+    issueId: "a", repo: "acme/widgets", number: 24, url: "https://github.com/acme/widgets/pull/24",
+    state: "open", mergedAt: null, ci: "none", ciStartedAt: null, source: "github",
+    headSha: "aaba163c30dee516", headCommittedAt: minutesAgo(15), ...overrides,
+  });
+
+  it("flags a head with zero check runs after 10 min", () => {
+    expect(stuckCiNotStarted(pr({}), "A", nowMs)?.reason).toBe("PR #24 head aaba163c3 has no CI check run 15 min after its commit");
+  });
+
+  it("clears once a check run starts, and does not guess without a live read or head time", () => {
+    expect(stuckCiNotStarted(pr({ ci: "pending", ciStartedAt: minutesAgo(1) }), "A", nowMs)).toBeNull();
+    expect(stuckCiNotStarted(pr({ headCommittedAt: minutesAgo(5) }), "A", nowMs)).toBeNull();
+    expect(stuckCiNotStarted(pr({ headCommittedAt: null }), "A", nowMs)).toBeNull();
+    expect(stuckCiNotStarted(pr({ source: "work_product", ci: "unknown" }), "A", nowMs)).toBeNull();
+    expect(stuckCiNotStarted(pr({ state: "merged" }), "A", nowMs)).toBeNull();
+  });
+
+  it("shows on the board card for the PR's task", () => {
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [issue({ id: "a", status: "in_progress", startedAt: minutesAgo(15), updatedAt: minutesAgo(1) })],
+      runs: [run({ id: "r", issueId: "a", finishedAt: minutesAgo(5) })],
+      pullRequests: [pr({})],
+    }));
+    expect(board.lanes.flatMap((lane) => lane.cards)[0]!.stuck.map((flag) => flag.rule)).toEqual(["ci_not_started"]);
   });
 });
 

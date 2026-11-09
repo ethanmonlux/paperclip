@@ -89,6 +89,9 @@ suite("staple console service", () => {
       if (target.endsWith("/pulls/900")) return new Response("{}", { status: 404 });
       if (target.endsWith("/pulls/26")) return new Response("{}", { status: 503 });
       if (target.includes("/check-runs")) return Response.json({ check_runs: [] });
+      if (target.endsWith("/commits/abc")) {
+        return Response.json({ commit: { committer: { date: new Date(Date.now() - 20 * 60_000).toISOString() } } });
+      }
       return Response.json({ state: "open", draft: false, merged_at: null, head: { sha: "abc" } });
     };
     const svc = stapleConsoleService(db, {
@@ -115,6 +118,10 @@ suite("staple console service", () => {
     }
     expect(prsOf(taskNumbered(3).id)).toEqual([
       { label: "widgets#3", url: url(3), state: "open", ci: "none", source: "github" },
+    ]);
+    // Zero check runs 20 min after the head commit: CI never started (FAC-840).
+    expect(cards(board).find((card) => card.id === taskNumbered(3).id)!.stuck).toEqual([
+      expect.objectContaining({ rule: "ci_not_started", reason: expect.stringContaining("PR #3 head abc has no CI check run") }),
     ]);
     expect(board.sources.github.detail).toContain("GitHub read failed for 1 of 25 PRs");
     expect(board.sources.github.detail).toContain("2 older PRs are beyond the 25-PR refresh limit");
