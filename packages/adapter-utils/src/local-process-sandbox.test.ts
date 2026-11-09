@@ -165,7 +165,8 @@ describe("local process sandbox", () => {
 
     expect(target.args).toContain("--unshare-net");
     expect(target.args).toContain("--bind");
-    expect(target.args).not.toContain("--tmpfs");
+    // No fresh root: only service lifecycle guards may add a tmpfs.
+    expect(target.args.some((arg, index) => arg === "--tmpfs" && target.args[index + 1] === "/")).toBe(false);
     expect(target.env?.HTTP_PROXY).toBeUndefined();
   });
 

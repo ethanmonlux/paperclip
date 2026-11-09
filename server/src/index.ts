@@ -68,6 +68,7 @@ import { assertEphemeralServerConfig, assertEphemeralServerData } from "./servic
 import { deploymentNotifications } from "./services/deployment-notifications.js";
 import { registerTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./services/terminal-workspace-work.js";
 import { isIdleTaskDrainActive, readTaskDrain, beginIdleTrackedWork, trackIdleWork, registerTaskDrainExpiryWork } from "./services/task-admission.js";
+import { maintenanceHoldService } from "./services/maintenance-hold.js";
 import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/idle-local-work.js";
 import { idleBackupWakeMarker } from "./services/idle-database-backup.js";
 import { createDatabaseBackupOwner } from "./services/database-backup-owner.js";
@@ -937,6 +938,14 @@ async function startServerWithDatabaseTeardown(
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
   const accountingHeartbeat = heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  // Restore an active maintenance hold before anything can start a queued run,
+  // so the managed install restart keeps holding until the script releases it.
+  const maintenanceHold = maintenanceHoldService(db as any);
+  await maintenanceHold.load().then(row => {
+    if (row) logger.warn({ holdId: row.id, expiresAt: row.expiresAt }, "maintenance hold active at startup; queued work stays held");
+  }).catch((err: unknown) => {
+    logger.error({ err }, "could not read the maintenance hold at startup; starting without a hold");
+  });
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
   };
@@ -1341,6 +1350,9 @@ async function startServerWithDatabaseTeardown(
     }));
   });
   server.on("close", () => { void taskDrainExpiryWork.stop(); });
+  const detachMaintenanceHold = maintenanceHold.attach(accountingHeartbeat,
+    { canRun: () => !heartbeatSchedulerStopped && !isWarmStandby() });
+  server.on("close", detachMaintenanceHold);
   const runEvidenceMigrationWork = registerRunEvidenceMigrationWork(db, deliveryWork,
     () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby(), { storageProvider: config.storageProvider });
   if (runEvidenceMigrationWork) trackHeartbeatSchedulerWork(runEvidenceMigrationWork.ready);

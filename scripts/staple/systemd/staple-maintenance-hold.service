@@ -1,0 +1,6 @@
+[Unit]
+Description=Staple nightly maintenance hold (admission held before the 03:30 upgrade)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/staple-nightly-upgrade hold

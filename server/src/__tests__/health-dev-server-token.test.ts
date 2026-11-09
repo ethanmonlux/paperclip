@@ -235,6 +235,44 @@ describe("POST /health/dev-server/restart", () => {
     }
   });
 
+  it.each(["local_trusted", "authenticated"] as const)("rejects agent-key manual restarts in %s mode", async (deploymentMode) => {
+    const previousFile = process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE;
+    process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE = createDevServerStatusFile({
+      dirty: true,
+      changedPathCount: 1,
+      changedPathsSample: ["server/src/routes/health.ts"],
+      pendingMigrations: [],
+    });
+
+    try {
+      const app = express();
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_jwt" };
+        next();
+      });
+      app.use(
+        "/health",
+        healthRoutes(undefined, {
+          deploymentMode,
+          deploymentExposure: "private",
+          authReady: true,
+          companyDeletionEnabled: true,
+        }),
+      );
+
+      const res = await request(app).post("/health/dev-server/restart");
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "board_access_required" });
+    } finally {
+      if (previousFile === undefined) {
+        delete process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE;
+      } else {
+        process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE = previousFile;
+      }
+    }
+  });
+
   it("rejects unauthenticated manual restarts in authenticated mode", async () => {
     const previousFile = process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE;
     process.env.PAPERCLIP_DEV_SERVER_STATUS_FILE = createDevServerStatusFile({

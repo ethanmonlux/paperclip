@@ -234,6 +234,29 @@ function ConsoleCard({
   );
 }
 
+function MaintenanceHoldBanner({ hold }: { hold: NonNullable<StapleConsoleBoard["maintenanceHold"]> }) {
+  return (
+    <div
+      role="status"
+      className="rounded-md border border-amber-500 bg-amber-500/10 p-2 text-xs text-foreground"
+      data-testid="staple-console-maintenance-hold"
+    >
+      <p className="font-semibold">
+        Maintenance hold since {clock(hold.since)}, {hold.queuedWakes} {hold.queuedWakes === 1 ? "wake" : "wakes"} queued
+      </p>
+      <p className="text-muted-foreground">
+        New runs are held, not dropped.{" "}
+        {hold.parkedRuns > 0
+          ? `${hold.parkedRuns} parked at the drain deadline. `
+          : hold.runningRuns > 0
+            ? `${hold.runningRuns} still finishing until ${clock(hold.drainDeadlineAt)}. `
+            : ""}
+        Lifts after the upgrade, or by {clock(hold.expiresAt)} at the latest.
+      </p>
+    </div>
+  );
+}
+
 function HeaderCounts({ header }: { header: StapleConsoleBoard["header"] }) {
   const items = [
     { label: "Merged today", value: header.mergedToday, tone: "" },
@@ -324,6 +347,7 @@ export function StapleConsole() {
         <p className="text-sm text-muted-foreground">{query.isLoading ? "Loading the board…" : "No board loaded."}</p>
       ) : (
         <div className={cn("space-y-4 transition", stale && "opacity-60 grayscale")} data-stale={stale ? "true" : "false"}>
+          {board.maintenanceHold ? <MaintenanceHoldBanner hold={board.maintenanceHold} /> : null}
           <HeaderCounts header={board.header} />
 
           <section aria-label="Scheduled" className="rounded-md border border-border p-2">

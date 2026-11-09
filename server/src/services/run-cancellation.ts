@@ -109,6 +109,10 @@ export function cancellationResultJson(run: Run, status: string, patch?: Run["re
     } else if (code === "server_shutdown_interrupted") {
       cancellation = { source: "shutdown", expected: true, initiator: { type: "system" },
         reason: "Server shutdown interrupted execution", recordedAt: new Date().toISOString() };
+    } else if (code === "maintenance_hold_parked") {
+      // The maintenance hold's drain deadline stops a run on purpose; it is not a failure.
+      cancellation = { source: "shutdown", expected: true, initiator: { type: "system" },
+        reason: "Parked for the maintenance window", recordedAt: new Date().toISOString() };
     } else if (result.cancelledByActorType || result.cancelledByUserId || result.interruptedByActorType || result.queuedCommentInterruptQueueId) {
       cancellation = requestedRunCancellation(result, error ?? run.error ?? "Execution stopped");
     } else {

@@ -1,0 +1,9 @@
+[Unit]
+Description=Place the Staple maintenance hold at 02:30
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

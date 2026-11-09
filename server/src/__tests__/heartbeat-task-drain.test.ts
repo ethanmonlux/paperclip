@@ -5,6 +5,15 @@ import {
   startTaskDrain,
   stopTaskDrain,
 } from "../services/heartbeat.ts";
+import {
+  applyMaintenanceHold,
+  readMaintenanceHold,
+  runMaintenanceDrainDeadline,
+  setMaintenanceDrainDeadlineHandler,
+  subscribeMaintenanceHoldExpiry,
+  subscribeTaskDrainExpiry,
+  type MaintenanceHoldState,
+} from "../services/task-admission.js";
 
 describe("heartbeat task drain", () => {
   afterEach(() => {
@@ -62,4 +71,69 @@ describe("heartbeat task drain", () => {
     expect(status.quiescent).toBe(true);
   });
 
+});
+
+describe("maintenance hold admission slot (FAC-840 C1)", () => {
+  const hold = (overrides: Partial<MaintenanceHoldState> = {}): MaintenanceHoldState => ({
+    id: "hold-1",
+    startedAt: new Date(Date.now() - 60_000),
+    drainDeadlineAt: new Date(Date.now() - 1_000),
+    expiresAt: new Date(Date.now() + 60 * 60_000),
+    parkedAt: null,
+    ...overrides,
+  });
+  const detach: Array<() => void> = [];
+  afterEach(() => {
+    for (const fn of detach.splice(0)) fn();
+    applyMaintenanceHold(null);
+    stopTaskDrain();
+  });
+
+  it("holds admission, and the generic drain stop cannot lift it", () => {
+    applyMaintenanceHold(hold());
+    expect(resolveHeartbeatSchedulingSuppression({})).toEqual({ suppressed: true, reason: "task_drain" });
+    expect(stopTaskDrain()).toEqual({ wasActive: false });
+    expect(resolveHeartbeatSchedulingSuppression({})).toEqual({ suppressed: true, reason: "task_drain" });
+  });
+
+  it("parks once at the drain deadline and backs off after a failed attempt", async () => {
+    applyMaintenanceHold(hold());
+    const handler = vi.fn().mockRejectedValueOnce(new Error("database unavailable")).mockResolvedValue(undefined);
+    detach.push(setMaintenanceDrainDeadlineHandler(handler));
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    try {
+      expect(await runMaintenanceDrainDeadline(new Date())).toBe(false);
+      expect(handler).toHaveBeenCalledTimes(1);
+      // The retry waits a minute instead of spinning.
+      expect(await runMaintenanceDrainDeadline(new Date())).toBe(false);
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(await runMaintenanceDrainDeadline(new Date(Date.now() + 61_000))).toBe(true);
+      expect(handler).toHaveBeenCalledTimes(2);
+      expect(readMaintenanceHold(new Date())?.parkedAt).toBeInstanceOf(Date);
+      expect(await runMaintenanceDrainDeadline(new Date(Date.now() + 120_000))).toBe(false);
+      expect(handler).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not park before the drain deadline", async () => {
+    applyMaintenanceHold(hold({ drainDeadlineAt: new Date(Date.now() + 60_000) }));
+    const handler = vi.fn().mockResolvedValue(undefined);
+    detach.push(setMaintenanceDrainDeadlineHandler(handler));
+    expect(await runMaintenanceDrainDeadline(new Date())).toBe(false);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("auto-releases at expiry through the hold's own listener only", () => {
+    const expired = vi.fn();
+    const generic = vi.fn();
+    detach.push(subscribeMaintenanceHoldExpiry(expired));
+    detach.push(subscribeTaskDrainExpiry(generic));
+    applyMaintenanceHold(hold({ expiresAt: new Date(Date.now() - 1) }));
+    expect(resolveHeartbeatSchedulingSuppression({})).toEqual({ suppressed: false, reason: null });
+    expect(expired).toHaveBeenCalledWith(expect.objectContaining({ id: "hold-1" }));
+    expect(generic).not.toHaveBeenCalled();
+    expect(readMaintenanceHold(new Date())).toBeNull();
+  });
 });
