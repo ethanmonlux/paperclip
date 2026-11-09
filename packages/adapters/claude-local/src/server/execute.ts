@@ -901,7 +901,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let attemptNumber = 0;
   const runAttempt = async (resumeSessionId: string | null) => {
     const currentAttempt = ++attemptNumber;
-    const rawDiagnostic = createClaudeRawOutputDiagnostic();
+    const rawDiagnostic = executionTargetIsRemote ? null : createClaudeRawOutputDiagnostic();
     await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
     const renderedBootstrapPrompt =
       !resumeSessionId && bootstrapPromptTemplate.trim().length > 0
@@ -970,7 +970,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const consumeAccounting = createClaudeStreamParser();
     const accountingLog = createUsageCheckpointLog(async (stream, chunk) => {
-      rawDiagnostic.add(stream, chunk);
+      rawDiagnostic?.add(stream, chunk);
       await onLog(stream, chunk);
     }, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
@@ -1001,13 +1001,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    if (!parsed && !proc.timedOut) {
+    if (!parsed && !proc.timedOut && rawDiagnostic) {
       try {
         const directory = await rawDiagnostic.preserve({
           // Run scratch is removed at settlement. Keep the bounded evidence in
           // the task workspace's ignored .paperclip directory instead.
-          directory: executionTargetIsRemote ? undefined :
-            path.join(effectiveEnv.PAPERCLIP_WORKSPACE_CWD || cwd, ".paperclip"),
+          directory: path.join(effectiveEnv.PAPERCLIP_WORKSPACE_CWD || cwd, ".paperclip"),
           runId, attempt: currentAttempt, exitCode: proc.exitCode,
           signal: proc.signal, timedOut: proc.timedOut,
         });
