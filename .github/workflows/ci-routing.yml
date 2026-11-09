@@ -383,26 +383,49 @@ jobs:
         run: |
           set -euo pipefail
           fallback() { echo 'plan=' >> "$GITHUB_OUTPUT"; exit 0; }
-          # A fork must not plan with upstream master's task matrix: it names
-          # scripts and lane options this fork may not have. Use the matrix
-          # defined in this branch's own workflow instead.
-          [[ -z "${GITHUB_REPOSITORY:-}" || "$GITHUB_REPOSITORY" == 'paperclipai/paperclip' ]] || fallback
+          repository='paperclipai/paperclip'
+          if [[ -n "${GITHUB_REPOSITORY:-}" && "$GITHUB_REPOSITORY" != 'paperclipai/paperclip' ]]; then
+            # A fork must not plan with upstream master's task matrix: it names
+            # scripts and lane options this fork may not have. pr.yml already runs
+            # this branch's own pr-trusted.yml, so plan from the definitions in the
+            # same tested merge commit. That trusts nothing the PR cannot already
+            # change, and any lookup failure still runs the full matrix.
+            [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fallback
+            repository="$GITHUB_REPOSITORY"
+          fi
           [[ "$FULL_CI" == 'true' ]] || fallback
           [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$EVENT_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || fallback
-          trusted="$(gh api /repos/paperclipai/paperclip/git/ref/heads/master --jq .object.sha)" || fallback
+          if [[ "$repository" == 'paperclipai/paperclip' ]]; then
+            trusted="$(gh api /repos/paperclipai/paperclip/git/ref/heads/master --jq .object.sha)" || fallback
+          else
+            trusted="$EVENT_MERGE_SHA"
+          fi
           [[ "$trusted" =~ ^[0-9a-f]{40}$ ]] || fallback
           directory="$(mktemp -d)"
           trap 'rm -rf "$directory"' EXIT
           for file in .github/scripts/ci-plan.mjs .github/scripts/ci-inputs.mjs .github/scripts/ci-diff.mjs .github/ci-task-matrix.json turbo.json; do
             gh api -H 'Accept: application/vnd.github.raw+json' \
-              "/repos/paperclipai/paperclip/contents/$file?ref=$trusted" \
+              "/repos/$repository/contents/$file?ref=$trusted" \
               > "$directory/${file##*/}" || fallback
           done
+          if [[ "$repository" != 'paperclipai/paperclip' ]]; then
+            # The fork runs every job for cross-workspace packages and nested
+            # lockfiles or manifests. Only this plan sees the extra inputs:
+            # turbo.json stays upstream's because local verify and Turbo task
+            # hashing read it too.
+            node -e '
+              const fs = require("node:fs"), file = process.argv[1];
+              const config = JSON.parse(fs.readFileSync(file, "utf8"));
+              config.globalDependencies.push("**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock",
+                "**/Cargo.lock", "**/Cargo.toml", "packages/shared/**", "packages/db/**", "packages/adapter-utils/**");
+              fs.writeFileSync(file, JSON.stringify(config));
+            ' "$directory/turbo.json" || fallback
+          fi
           # Read the exact tested merge and both parents. The event's base SHA can
           # lag behind its actual first parent. A bare tree diff has no API file cap.
           git init --bare "$directory/repository.git" >/dev/null || fallback
           git -C "$directory/repository.git" fetch --quiet --no-tags --filter=blob:none --depth=2 \
-            https://github.com/paperclipai/paperclip.git "$EVENT_MERGE_SHA" || fallback
+            "https://github.com/$repository.git" "$EVENT_MERGE_SHA" || fallback
           if [[ "$PROFILE_CI" == 'true' || "$FORCE_FULL_CI" == 'true' ]]; then
             export CI_FORCE_REASON='Full suite requested by label'
           elif [[ "$STACK_JSON" != 'null' && -n "$STACK_JSON" ]]; then

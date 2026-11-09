@@ -30,11 +30,14 @@ jobs:
   test_selection:
     name: Select Vitest files
     needs: [gate]
+    # Forks get path-scoped job groups from the task plan, but file-level Vitest
+    # selection stays upstream-only until a fork sets CI_VITEST_SELECTION=enabled.
     if: >-
       needs.gate.outputs.full_ci == 'true' && needs.gate.outputs.plan != '' &&
       fromJSON(needs.gate.outputs.plan).mode == 'enabled' &&
       fromJSON(needs.gate.outputs.plan).forceReason == null &&
-      (vars.CI_VITEST_SELECTION == '' || vars.CI_VITEST_SELECTION == 'enabled')
+      (vars.CI_VITEST_SELECTION == '' || vars.CI_VITEST_SELECTION == 'enabled') &&
+      (github.repository == 'paperclipai/paperclip' || vars.CI_VITEST_SELECTION == 'enabled')
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 10
     # An unavailable optimization must not suppress the original test matrix.
