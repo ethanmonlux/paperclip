@@ -3,6 +3,11 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import {
+  buildServiceLifecycleGuardArgs,
+  type ServiceLifecycleGuardMount,
+  type ServiceLifecycleGuardPath,
+} from "./service-lifecycle-guard.js";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -29,6 +34,8 @@ export interface LocalProcessSandboxOptions {
   networkAllowlist?: string[];
   networkTrustedUrls?: string[];
   command?: string;
+  /** Overrides the host's service lifecycle paths (tests only). */
+  serviceLifecycleGuards?: ServiceLifecycleGuardPath[];
 }
 
 export interface LocalProcessSandboxSpawnTarget {
@@ -424,6 +431,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   let cleanup: (() => Promise<void>) | undefined;
   let executable = input.executable;
   let executableArgs = input.args;
+  const guardMounts: ServiceLifecycleGuardMount[] = [];
 
   if (filesystemScope === "workspace") {
     args.push("--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
@@ -440,6 +448,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       if (mounted.has(normalized) || !(await pathExists(normalized))) return;
       addParentDirectories(args, created, normalized);
       args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
+      guardMounts.push({ path: normalized, access });
       mounted.add(normalized);
       created.add(normalized);
     };
@@ -465,6 +474,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       }
       addParentDirectories(args, created, aliasPath);
       args.push("--bind", aliasTarget, aliasPath);
+      guardMounts.push({ path: aliasPath, access: "rw", source: aliasTarget });
       created.add(aliasPath);
     }
 
@@ -491,6 +501,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     }
   } else {
     args.push("--bind", "/", "/");
+    guardMounts.push({ path: "/", access: "rw" });
     if (networkScope === "allowlist") {
       const tempDir = await createNetworkProxyTempDir();
       const socketPath = path.join(tempDir, "proxy.sock");
@@ -527,6 +538,11 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     env.https_proxy = proxyUrl;
   }
 
+  // Last, so no earlier mount can reopen service lifecycle control.
+  args.push(...await buildServiceLifecycleGuardArgs({
+    mounts: guardMounts,
+    guards: input.options.serviceLifecycleGuards,
+  }));
   args.push("--chdir", cwd, "--", executable, ...executableArgs);
   return { command: bwrapCommand, args, cwd: "/", env, cleanup };
 }

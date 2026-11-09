@@ -1,3 +1,4 @@
+import { listAgentSandboxWidening } from "../services/agent-sandbox-authority.js";
 import { pendingAgentInteractionAddressee } from "../services/pending-agent-interaction.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -2668,6 +2669,19 @@ export function agentRoutes(
     );
   }
 
+  function assertNoAgentSandboxWidening(
+    req: Request,
+    existingAdapterConfig: Record<string, unknown> | null | undefined,
+    nextAdapterConfig: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return;
+    const widened = listAgentSandboxWidening(existingAdapterConfig, nextAdapterConfig);
+    if (widened.length === 0) return;
+    throw forbidden(
+      `Agent keys cannot widen the run sandbox (${widened.join(", ")}). A board operator must make this change.`,
+    );
+  }
+
   function assertNoAgentProcessAdapterMutation(req: Request, adapterType: string, mutatesConfiguration: boolean) {
     if (req.actor.type !== "agent" || adapterType !== "process" || !mutatesConfiguration) return;
     throw forbidden("Agent keys cannot configure host-executed process adapters.");
@@ -4336,6 +4350,7 @@ export function agentRoutes(
     assertNoAgentAdapterConfigMutation(req, rollbackAdapterConfig);
     if (req.actor.type === "agent" && rollbackAdapterConfig.homeMode !== asRecord(existing.adapterConfig)?.homeMode)
       throw forbidden("Only an operator can configure Runner homeMode.");
+    assertNoAgentSandboxWidening(req, asRecord(existing.adapterConfig), rollbackAdapterConfig);
     assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
     assertNoAgentProcessAdapterMutation(
       req,
@@ -5680,6 +5695,7 @@ export function agentRoutes(
       }
       if (req.actor.type === "agent" && rawEffectiveAdapterConfig.homeMode !== existingAdapterConfig.homeMode)
         throw forbidden("Only an operator can configure Runner homeMode.");
+      assertNoAgentSandboxWidening(req, existingAdapterConfig, rawEffectiveAdapterConfig);
       if (changingAdapterType || requestedAdapterConfig) {
         assertNoAgentLocalAdapterHostCommandMutation(
           req,

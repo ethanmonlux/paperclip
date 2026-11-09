@@ -1975,13 +1975,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   // Release admission promptly without first scanning unrelated recovery work.
   // Every run still passes the ordinary per-agent claim and dispatch gates.
-  async function resumeQueuedRunsAfterDrain(scope?: { companyId: string }) {
+  // Agents start in the order of their most urgent queued task (critical
+  // first, then the oldest), so held work does not release in arbitrary order.
+  // A maintenance release staggers agent starts so the queue does not stampede.
+  async function resumeQueuedRunsAfterDrain(scope?: { companyId: string }, options: { staggerMs?: number } = {}) {
     if (isRunAdmissionClosed() || (await getSchedulingSuppression()).suppressed) return;
     const cutoff = await getWorktreeExecutionCutoff();
     const queuedRuns = await db
-      .select({ agentId: heartbeatRuns.agentId })
+      .select({ agentId: heartbeatRuns.agentId, createdAt: heartbeatRuns.createdAt, priority: issues.priority })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .leftJoin(issues, and(
+        eq(issues.companyId, heartbeatRuns.companyId),
+        sql`${issues.id}::text = coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')`,
+      ))
       .where(
         and(
           eq(heartbeatRuns.status, "queued"),
@@ -1991,8 +1998,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         ),
       );
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
-    for (const agentId of agentIds) {
+    const urgency = new Map<string, { rank: number; createdAt: number }>();
+    for (const run of queuedRuns) {
+      const candidate = { rank: issueRunPriorityRank(run.priority), createdAt: run.createdAt.getTime() };
+      const current = urgency.get(run.agentId);
+      if (!current || candidate.rank < current.rank ||
+          (candidate.rank === current.rank && candidate.createdAt < current.createdAt)) {
+        urgency.set(run.agentId, candidate);
+      }
+    }
+    const agentIds = [...urgency.entries()]
+      .sort(([, left], [, right]) => left.rank - right.rank || left.createdAt - right.createdAt)
+      .map(([agentId]) => agentId);
+    const staggerMs = Math.max(0, options.staggerMs ?? 0);
+    for (const [index, agentId] of agentIds.entries()) {
+      if (index > 0 && staggerMs > 0) await new Promise(resolve => setTimeout(resolve, staggerMs));
       await startNextQueuedRunForAgent(agentId);
     }
   }

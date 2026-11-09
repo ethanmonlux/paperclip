@@ -13,11 +13,12 @@ import { resolveConfigPath } from "../config/store.js";
 import { detectServiceManager } from "../services/service-manager.js";
 import { restartManagedService } from "./service.js";
 import { packageVersion } from "../version.js";
+import { assertServiceLifecycleOutsideAgentRun, assertServiceLifecycleQuiet, countActiveServiceRuns, describeActiveRuns, type ActiveServiceRunsProbe } from "../service-lifecycle-authority.js";
 
 const execFileAsync = promisify(execFile);
 export type InstallMode = "managed" | "global-npm" | "npx" | "source" | "unknown";
 export type UpdateOptions = { canary?: boolean; latest?: boolean; version?: string; rollback?: boolean; check?: boolean; dryRun?: boolean; json?: boolean; yes?: boolean; backup?: boolean };
-type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string) => Promise<boolean>; hasInstanceData: () => boolean };
+type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string) => Promise<boolean>; hasInstanceData: () => boolean; activeServiceRuns: ActiveServiceRunsProbe; env: NodeJS.ProcessEnv };
 
 const DATABASE_UNREACHABLE_CODES = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT"]);
 
@@ -170,11 +171,31 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
   const runCommand = overrides.runCommand ?? execFileAsync;
   const mode = detectInstallMode(executablePath, paths);
   const manifest = readInstallManifest(paths);
+  const activeServiceRuns = overrides.activeServiceRuns ?? (() => countActiveServiceRuns());
+  // Payload changes refuse inside agent runs and start only on a quiet instance.
+  const authorizePayloadChange = async (action: string) => {
+    assertServiceLifecycleOutsideAgentRun(action, overrides.env);
+    await assertServiceLifecycleQuiet(action, activeServiceRuns);
+  };
+  // A restart never replaces the server under running agent runs. The payload
+  // stays switched and the service keeps its current code until it restarts
+  // at a quiet moment.
+  const restartActiveServiceWhenQuiet = async (expectedVersion: string): Promise<boolean> => {
+    const running = await activeServiceRuns();
+    if (running > 0) {
+      console.warn(pc.yellow(`Restart deferred: ${describeActiveRuns(running)}. The active service keeps its current code until it restarts at a quiet moment.`));
+      return false;
+    }
+    return (overrides.restartActiveService ?? restartActiveManagedService)(expectedVersion);
+  };
   if (options.rollback) {
     if (mode !== "managed") throw new Error("--rollback is only available for managed installs.");
     if (options.dryRun) { emit(options, { mode, action: "rollback", dryRun: true, target: manifest?.previous[0]?.version ?? null }, `Would roll back to ${manifest?.previous[0]?.version ?? "the previous payload"}.`); return; }
+    // A rollback restores the payload even while runs are active (that is how a
+    // build that finished during busy work is withdrawn); only its restart waits.
+    assertServiceLifecycleOutsideAgentRun("roll back Paperclip", overrides.env);
     const next = await withInstallStoreLock(async () => rollbackManagedInstall(paths), paths);
-    const restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(next.version);
+    const restarted = await restartActiveServiceWhenQuiet(next.version);
     emit(options, { mode, action: "rollback", version: next.version, restarted }, pc.green(`Rolled back to paperclipai ${next.version}${restarted ? " and restarted the active service" : ""}. Database migrations are not reversed; restore the pre-update backup if needed.`));
     return;
   }
@@ -192,6 +213,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
       const confirmed = await (overrides.confirm ?? defaultConfirm)(`Update from ${manifest.repo}@${manifest.ref} and execute build scripts from commit ${targetSha.slice(0, 12)}?`);
       if (!confirmed) throw new Error("Git update cancelled. Re-run with --yes to confirm executing build scripts from the updated commit.");
     }
+    await authorizePayloadChange("update Paperclip");
     if (options.backup !== false) await runPreUpdateBackup(options, overrides.backup ?? (() => dbBackupCommand({})), overrides.hasInstanceData);
     const installed = await withInstallStoreLock(async () => {
       assertManagedShimWritable(paths);
@@ -204,7 +226,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     }, paths);
     let restarted: boolean;
     try {
-      restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(installed.version);
+      restarted = await restartActiveServiceWhenQuiet(installed.version);
     } catch (error) {
       return rollbackAfterServiceValidationFailure(
         paths,
@@ -224,6 +246,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     if (comparison < 0 && options.yes !== true) { const confirmed = await (overrides.confirm ?? defaultConfirm)(`Downgrade paperclipai from ${currentVersion} to ${targetVersion}?`); if (!confirmed) throw new Error("Downgrade cancelled. Re-run with --yes to confirm explicitly."); }
     const args = ["install", "-g", `paperclipai@${targetVersion}`, `--registry=${PUBLIC_NPM_REGISTRY}`, `--@paperclipai:registry=${PUBLIC_NPM_REGISTRY}`]; console.log(`Running: npm ${args.join(" ")}`);
     if (!options.dryRun) {
+      await authorizePayloadChange("update Paperclip");
       const npmConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-npm-"));
       const npmUserConfigPath = path.join(npmConfigDir, "npmrc");
       try {
@@ -248,6 +271,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
   if (comparison === 0) { emit(options, { mode, currentVersion, targetVersion, changed: false }, `paperclipai ${targetVersion} is already active.`); return; }
   if (comparison < 0 && options.yes !== true) { const confirmed = await (overrides.confirm ?? defaultConfirm)(`Downgrade paperclipai from ${currentVersion} to ${targetVersion}?`); if (!confirmed) throw new Error("Downgrade cancelled. Re-run with --yes to confirm explicitly."); }
   if (options.dryRun) { emit(options, { mode, currentVersion, targetVersion, action: comparison < 0 ? "downgrade" : "update", backup: options.backup !== false, dryRun: true }, `Would ${comparison < 0 ? "downgrade" : "update"} paperclipai ${currentVersion} → ${targetVersion}${options.backup === false ? " without a backup" : " after a database backup"}.`); return; }
+  await authorizePayloadChange("update Paperclip");
   if (options.backup !== false) await runPreUpdateBackup(options, overrides.backup ?? (() => dbBackupCommand({})), overrides.hasInstanceData);
   const installed = await withInstallStoreLock(async () => {
     assertManagedShimWritable(paths);
@@ -260,7 +284,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
   }, paths);
   let restarted: boolean;
   try {
-    restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(targetVersion);
+    restarted = await restartActiveServiceWhenQuiet(targetVersion);
   } catch (error) {
     return rollbackAfterServiceValidationFailure(
       paths,

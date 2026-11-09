@@ -7,6 +7,7 @@ import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../con
 import { detectServiceManager, type ServiceManager, type ServiceStatus } from "../services/service-manager.js";
 import { ensureServiceShim } from "../onboard-service.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
+import { assertServiceLifecycleOutsideAgentRun, assertServiceLifecycleQuiet, countActiveServiceRuns } from "../service-lifecycle-authority.js";
 
 type CommonOptions = { instance?: string; json?: boolean };
 type HealthResult = { ok: boolean; serverVersion: string | null; error?: string };
@@ -166,12 +167,19 @@ export async function restartManagedService(input: { instanceId?: string; expect
 export function registerServiceCommands(program: Command): void {
   const service = program.command("service").description("Manage Paperclip as a background service");
   const common = (command: Command) => command.option("-i, --instance <id>", "Local instance id (default: default)").option("--json", "Print machine-readable JSON", false);
+  // Lifecycle verbs refuse inside agent runs; those that stop a live server
+  // also refuse while it has running agent runs.
+  const authorize = async (action: string, opts: CommonOptions, stopsLiveServer: boolean) => {
+    assertServiceLifecycleOutsideAgentRun(action);
+    if (stopsLiveServer) await assertServiceLifecycleQuiet(action, () => countActiveServiceRuns({ instanceId: opts.instance }));
+  };
 
   common(service.command("install").description("Install and register the background service"))
     .option("--no-start-now", "Install without starting now")
     .option("--no-start-on-login", "Install without enabling start on login")
     .option("--enable-linger", "Allow systemd startup without an active login session", false)
     .action(async (opts) => {
+      await authorize("install the Paperclip service", opts, false);
       const manager = await resolveManager(opts); if (!manager) return;
       const shim = await ensureServiceShim({ installIfMissing: !opts.json });
       if (!shim.ok) {
@@ -196,6 +204,7 @@ export function registerServiceCommands(program: Command): void {
     });
 
   common(service.command("uninstall").description("Stop, disable, and remove the background service")).action(async (opts) => {
+    await authorize("uninstall the Paperclip service", opts, true);
     const manager = await resolveManager(opts); if (!manager) return;
     await manager.uninstall();
     const status = await manager.status();
@@ -205,6 +214,7 @@ export function registerServiceCommands(program: Command): void {
 
   for (const verb of ["start", "stop"] as const) {
     common(service.command(verb).description(`${verb === "start" ? "Start" : "Stop"} the background service`)).action(async (opts) => {
+      await authorize(`${verb} the Paperclip service`, opts, verb === "stop");
       const manager = await resolveManager(opts); if (!manager) return;
       await manager[verb]();
       output(await manager.status(), opts.json);
@@ -214,7 +224,11 @@ export function registerServiceCommands(program: Command): void {
   common(service.command("restart").description("Hot-restart the service while preserving active agent runs"))
     .option("--wait", "Wait for active runs to drain instead of adopting them", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
-    .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
+    .action(async (opts) => {
+      // Draining lets active runs finish first, so only an adopting restart needs a quiet instance.
+      await authorize("restart the Paperclip service", opts, !opts.wait);
+      output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json);
+    });
 
   common(service.command("status").description("Show supervisor and health status")).action(async (opts) => {
     const manager = await resolveManager(opts); if (!manager) return;
