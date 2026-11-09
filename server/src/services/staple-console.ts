@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -56,8 +57,6 @@ const MAX_GITHUB_PRS_PER_REFRESH = 25;
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
 const GITHUB_TIMEOUT_MS = 8_000;
-/** Reuse a resolved managed credential briefly so a polling board does not resolve the secret on every refresh. */
-const MANAGED_CREDENTIAL_TTL_MS = 5 * 60_000;
 
 /**
  * Founder-stated nightly events (FAC-620). Paperclip has no record of these jobs,
@@ -160,30 +159,24 @@ function summarizeCheckRuns(body: unknown): { ci: StapleConsoleCiState; ciStarte
 
 export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions = {}) {
   const fetchImpl = opts.fetch ?? ghFetch;
-  const managedCredentials = new Map<string, { value: StapleConsoleGitHubCredential; expiresAt: number }>();
-
   /**
    * A company secret or server token first. Otherwise the managed GitHub connection agents already
    * use, but only the viewer's own personal grant: never another person's or an agent's (STA-205).
+   * Resolved on every refresh so a revoked grant or disabled connection stops live reads at once.
    */
   async function defaultCredential(companyId: string, actor: AuthorizationActor): Promise<StapleConsoleGitHubCredential | null> {
     const shared = await resolveGitHubApiCredential(db, companyId);
     if (shared) return shared;
     const userId = actor.type === "board" ? actor.userId : null;
     if (!userId) return null;
-    const key = `${companyId}:${userId}`;
-    const cached = managedCredentials.get(key);
-    if (cached && cached.expiresAt > Date.now()) return cached.value;
     const managed = await resolveManagedGitHubCredential(db, secretService(db), companyId, {
       responsibleUserId: userId, agentId: null, allowStandingDelegation: false,
     });
     if (!managed.credential?.token) return null;
-    const value = {
-      token: managed.credential.token, source: "managed_connection" as const, secretName: null,
+    return {
+      token: managed.credential.token, source: "managed_connection", secretName: null,
       login: managed.credential.githubIdentity?.login ?? null,
     };
-    managedCredentials.set(key, { value, expiresAt: Date.now() + MANAGED_CREDENTIAL_TTL_MS });
-    return value;
   }
 
   const credentialProvider = opts.credentialProvider ?? defaultCredential;
@@ -203,7 +196,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
   }
 
   async function resolvePullRequest(repo: string, number: number, token: string, scope: string, nowMs: number) {
-    // Scoped to the credential identity so one person's private-repo read is never served to another viewer.
+    // Scoped to company, viewer and the exact token, so a read is only reused for the credential GitHub checked.
     const key = `${scope}|${repo.toLowerCase()}#${number}`;
     const cached = prCache.get(key);
     if (cached && cached.expiresAt > nowMs) return cached.value;
@@ -439,7 +432,9 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       const unique = new Map<string, { repo: string; number: number }>();
       for (const pr of pullRequests) unique.set(`${pr.repo.toLowerCase()}#${pr.number}`, pr);
       const targets = [...unique.entries()].sort((a, b) => b[1].number - a[1].number).slice(0, MAX_GITHUB_PRS_PER_REFRESH);
-      const scope = `${credential.source}:${credential.secretName ?? ("login" in credential ? credential.login ?? "" : "")}`;
+      const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
+      const tokenHash = createHash("sha256").update(credential.token).digest("hex");
+      const scope = `${companyId}|${viewer}|${tokenHash}`;
       const resolved = new Map<string, PullRequestSnapshot>();
       let failures = 0;
       await Promise.all(targets.map(async ([key, pr]) => {

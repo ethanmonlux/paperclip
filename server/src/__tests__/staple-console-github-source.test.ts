@@ -66,9 +66,9 @@ suite("staple console GitHub source", () => {
       available: true, detail: expect.stringContaining("your connected GitHub account (founder-gh)"),
     });
 
-    // A second refresh reuses the resolved grant and the cached PR read.
+    // A second refresh revalidates the grant but reuses the PR read checked with this same token.
     await svc.board(companyId, asUser(founder));
-    expect(credentials.resolveManagedGitHubCredential).toHaveBeenCalledTimes(1);
+    expect(credentials.resolveManagedGitHubCredential).toHaveBeenCalledTimes(2);
     expect(requests).toHaveLength(1);
 
     // Another viewer with no grant of their own never gets the founder's grant or cached read.
@@ -78,6 +78,33 @@ suite("staple console GitHub source", () => {
       { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product" },
     ]);
     expect(recorded.sources.github).toEqual({ available: false, detail: expect.stringContaining("recorded status (not live)") });
+
+    // A different grant for the same GitHub login (reconnect, rotation or narrower access) is checked by GitHub again.
+    const grant = (token: string) => ({
+      configured: true, credential: { token, source: "managed_connection", secretName: null, githubIdentity: { userId: "1", login: "founder-gh" } },
+    });
+    credentials.resolveManagedGitHubCredential.mockResolvedValue(grant("founder-rotated"));
+    await svc.board(companyId, asUser(founder));
+    expect(requests.at(-1)).toEqual({ url: "https://api.github.com/repos/acme/paperclip/pulls/26", token: "Bearer founder-rotated" });
+    expect(requests).toHaveLength(2);
+
+    // The same token in another company does not reuse this company's read.
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other", issuePrefix: `H${otherCompanyId.slice(0, 6).toUpperCase()}` });
+    const [otherTask] = await db.insert(issues).values({ companyId: otherCompanyId, title: "Other PR task", status: "in_review" }).returning();
+    await db.insert(issueWorkProducts).values({
+      companyId: otherCompanyId, issueId: otherTask!.id, type: "pull_request", provider: "github", title: "PR 26", url, status: "active",
+    });
+    await svc.board(otherCompanyId, asUser(founder));
+    expect(requests).toHaveLength(3);
+
+    // Revoking the grant stops live reads on the next refresh, even though the PR read is still cached.
+    credentials.resolveManagedGitHubCredential.mockResolvedValue({ configured: true, error: "Grant revoked" });
+    const revoked = await svc.board(companyId, asUser(founder));
+    expect(requests).toHaveLength(3);
+    expect(cards(revoked)[0]!.pullRequests).toEqual([
+      { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product" },
+    ]);
 
     // An agent caller has no personal grant, so the managed path is not consulted at all.
     credentials.resolveManagedGitHubCredential.mockClear();
