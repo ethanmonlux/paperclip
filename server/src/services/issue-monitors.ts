@@ -4,6 +4,7 @@ import { z } from "zod";
 import { forbidden, unprocessable } from "../errors.js";
 import type { accessService } from "./access.js";
 import { authorizationDeniedDetails, type AuthorizationActor } from "./authorization.js";
+import { prepareWaitRecordMonitor } from "./wait-records.js";
 import { applyIssueMonitorPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, redactIssueMonitorExternalRef, setIssueExecutionPolicyMonitorScheduledBy } from "./issue-execution-policy.js";
 
 type NormalizedExecutionPolicy = ReturnType<typeof normalizeIssueExecutionPolicy>;
@@ -18,14 +19,18 @@ export function monitorPoliciesEqual(
   );
 }
 
+/** Every monitor write path passes here, so wait-record targets are validated once. */
 export function applyActorMonitorScheduledBy(
   policy: NormalizedExecutionPolicy | null,
   actorType: "agent" | "user",
+  now = new Date(),
 ) {
-  return setIssueExecutionPolicyMonitorScheduledBy(
+  const scheduled = setIssueExecutionPolicyMonitorScheduledBy(
     policy,
     actorType === "user" ? "board" : "assignee",
   );
+  if (!scheduled?.monitor) return scheduled;
+  return { ...scheduled, monitor: prepareWaitRecordMonitor(scheduled.monitor, now) };
 }
 
 export async function assertCanManageIssueMonitor(
@@ -103,6 +108,8 @@ export function summarizeIssueMonitor(
       policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,
     recoveryPolicy:
       policy?.monitor?.recoveryPolicy ?? state?.monitor?.recoveryPolicy ?? null,
+    target: policy?.monitor?.target ?? state?.monitor?.target ?? null,
+    observation: state?.monitor?.observation ?? null,
     status: state?.monitor?.status ?? (policy?.monitor ? "scheduled" : null),
     clearReason: state?.monitor?.clearReason ?? null,
   };
@@ -135,7 +142,7 @@ export function prepareIssueMonitorUpdate(
   const previousPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy);
   const policy = applyActorMonitorScheduledBy(normalizeIssueExecutionPolicy({
     ...previousPolicy, monitor,
-  }), actor.type === "board" ? "user" : "agent");
+  }), actor.type === "board" ? "user" : "agent", now);
   const transition = applyIssueMonitorPolicyTransition({
     issue, policy, previousPolicy, requestedAssigneePatch: {},
     actor: { agentId: actor.agentId ?? null, userId: actor.userId ?? null },

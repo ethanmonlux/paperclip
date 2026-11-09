@@ -3,13 +3,20 @@ import { buildIssueGraphLivenessIncidentKey } from "./origins.js";
 
 export type IssueLivenessSeverity = "warning" | "critical";
 
+/** The free-text external-owner convention the blocked inbox already reads. */
+export function hasRecordedExternalOwner(description: string | null | undefined) {
+  if (!description) return false;
+  return /^\s*external owner\s*:\s*\S/im.test(description) && /^\s*external action\s*:\s*\S/im.test(description);
+}
+
 export type IssueLivenessState =
   | "blocked_by_unassigned_issue"
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
   | "invalid_review_participant"
-  | "in_review_without_action_path";
+  | "in_review_without_action_path"
+  | "blocked_without_wait_path";
 
 export interface IssueLivenessIssueInput {
   conversationAgentId?: string | null;
@@ -31,6 +38,9 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  /** Wait-contract inputs; omitted callers never report `blocked_without_wait_path`. */
+  description?: string | null;
+  unblockDescriptor?: { owner: unknown; action?: string } | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -744,6 +754,34 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       const review = reviewFinding(issue, issue, [issue]);
       if (review) findings.push(review);
     }
+
+    if (issue.status === "blocked" && !chainFinding && !hasUnresolvedBlockerEdge && !unresolvedBlockers.has(issue.id)) {
+      const orphan = orphanedWaitFinding(issue);
+      if (orphan) findings.push(orphan);
+    }
+  }
+
+  /** FAC-840 wait contract: blocked with no wait record and no live path. */
+  function orphanedWaitFinding(issue: IssueLivenessIssueInput): IssueLivenessFinding | null {
+    if (issue.description === undefined || !issue.assigneeAgentId || issue.conversationAgentId) return null;
+    if (hasExplicitWaitingPath(issue) || hasRecordedExternalOwner(issue.description)) return null;
+    const owner = issue.unblockDescriptor?.owner;
+    const ownerAgentId = owner && typeof owner === "object" && "agentId" in owner ? (owner as { agentId: unknown }).agentId : null;
+    if (owner && ownerAgentId !== issue.assigneeAgentId) return null;
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(issue, input.agents, agentsById, { includeStalledAssignee: true });
+    return finding({
+      issue,
+      state: "blocked_without_wait_path",
+      severity: "warning",
+      reason: `${issueLabel(issue)} is blocked with no blocker, interaction, approval, unblock owner, monitor, active run, or recovery issue recording what it waits for.`,
+      dependencyPath: [issue],
+      recoveryIssue: issue,
+      recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+      recommendedOwnerCandidates: ownerCandidates,
+      recommendedAction:
+        `Record what ${issueLabel(issue)} waits for (a blocker, an interaction, an unblock owner, or an in-progress monitor), or resume it.`,
+      blockerIssueId: issue.id,
+    });
   }
 
   return findings;

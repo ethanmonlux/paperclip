@@ -442,6 +442,8 @@ export {
   issueExecutionPolicySchema,
   requiredQualityReviewSchema,
   issueExecutionMonitorPolicySchema,
+  issueWaitTargetSchema,
+  issueWaitObservationSchema,
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,

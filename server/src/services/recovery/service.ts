@@ -1,4 +1,5 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { wakeOwnersOfOrphanedWaits, type OrphanWaitWakeup } from "./orphan-wait-wakeups.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
 import { promoteDeferredWorkIntents } from "../work-intent-outbox.js";
@@ -5816,6 +5817,7 @@ export function recoveryService(
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
+      orphanWaitsWoken: 0,
       issueIds: [] as string[],
     };
 
@@ -6093,6 +6095,22 @@ export function recoveryService(
       // Counted with the dependency wakes, so the worker retries a failed one.
       result.enqueueFailed += stalls.failed;
       if (stalls.retryAt !== null) opts?.onDeferredDeadline?.(stalls.retryAt);
+
+      // FAC-840 wait contract: a blocked task with no wait record and no live
+      // path wakes its owner, bounded per cycle and per day (orphan-wait-wakeups.ts).
+      const orphans = await wakeOwnersOfOrphanedWaits(db, deps.enqueueWakeup as OrphanWaitWakeup, {
+        companyId: opts?.companyId ?? null,
+        issueId: opts?.issueId ?? null,
+        hasLivePath: async (companyId, issueId, agentId) =>
+          (await hasActiveExecutionPath(companyId, issueId, agentId)) ||
+          (await hasQueuedIssueWake(companyId, issueId, agentId)) ||
+          (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, issueId, treeControlSvc)),
+      });
+      result.orphanWaitsWoken = orphans.woken;
+      if (orphans.woken > 0) {
+        logger.warn({ woken: orphans.woken, issueIds: orphans.issueIds, capped: orphans.capped },
+          "wait contract woke owners of blocked tasks with no wait record");
+      }
     }
     return result;
   }

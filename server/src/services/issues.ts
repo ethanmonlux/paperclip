@@ -6007,6 +6007,8 @@ async function listIssueBlockedInboxAttentionMap(
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
       monitorAttemptCount: issue.monitorAttemptCount,
+      description: issue.description ?? null,
+      unblockDescriptor: issue.unblockDescriptor ?? null,
     })),
     relations: graphRelations,
     agents: companyAgents,
@@ -6293,6 +6295,8 @@ async function listIssueBlockedInboxAttentionMap(
                   return "Repair review participant";
                 case "in_review_without_action_path":
                   return "Choose review path";
+                case "blocked_without_wait_path":
+                  return "Record a wait";
               }
             })(),
             detail: finding.recommendedAction,

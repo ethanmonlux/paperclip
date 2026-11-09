@@ -143,6 +143,10 @@ export interface StapleConsoleIssueInput {
   /** executionState.monitor.serviceName while that monitor is not cleared. */
   monitorServiceName?: string | null;
   monitorTriggeredAt?: string | null;
+  /** Live wait-record kind (FAC-840): external_service, ci or pr_mergeable. */
+  waitKind?: string | null;
+  /** The server's latest reading of a ci / pr_mergeable wait, or its target. */
+  waitDetail?: string | null;
 }
 
 export interface StapleConsoleAgentInput {
@@ -499,7 +503,7 @@ export function stuckBlockedWithoutBlocker(ctx: IssueRunContext): StapleConsoleS
   if (ctx.issue.status !== "blocked") return null;
   if (ctx.openBlockerCount > 0 || ctx.pendingQuestionCount > 0) return null;
   // A live issue monitor is a stated external wait; a running run means the recovery wake resumed it.
-  if (ctx.issue.monitorServiceName || activeRunOf(ctx.runs)) return null;
+  if (ctx.issue.monitorServiceName || ctx.issue.waitKind || activeRunOf(ctx.runs)) return null;
   return {
     rule: "blocked_without_blocker",
     issueIdentifier: ctx.issue.identifier,
@@ -767,7 +771,8 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     const anyPrMerged = prs.some((pr) => pr.state === "merged");
     const openPr = prs.find((pr) => pr.state === "open" || pr.state === "draft") ?? null;
     const ciMonitor = members.find((issue) =>
-      !isStapleConsoleTerminal(issue.status) && /github|actions|\bci\b/i.test(issue.monitorServiceName ?? ""));
+      !isStapleConsoleTerminal(issue.status)
+      && (issue.waitKind === "ci" || /github|actions|\bci\b/i.test(issue.monitorServiceName ?? "")));
     const buildRunActive = [root, ...buildMembers].some((issue) => activeRunOf(runsByIssue.get(issue.id) ?? []));
 
     let step: StapleConsoleStep;
