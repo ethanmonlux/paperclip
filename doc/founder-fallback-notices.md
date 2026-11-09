@@ -2,8 +2,11 @@
 
 The agent assigned to a chat endpoint writes every ordinary message in its
 founder DM. When that agent is unavailable, nothing would reach the founder.
-Founder fallback notices cover that gap. Each one is a short, fixed-format
-message in the same DM, labelled as automatic and not from the agent.
+A decision addressed to the founder on another task also has no native route
+into that DM, because native interaction cards publish only to a conversation
+bound to their own task. Founder fallback notices cover both gaps. Each one is
+a short, fixed-format message in the same DM, labelled as automatic and not
+from the agent.
 
 The feature is off by default.
 
@@ -16,14 +19,17 @@ The feature is off by default.
 
 The sweep checks each active endpoint that allows DMs and has an assigned
 agent. A target is a DM conversation on that endpoint whose task is
-assigned to the endpoint's agent. Every sender in that DM must link to the same
+assigned to the endpoint's agent. The DM stays a target after its task closes,
+because the outbox still delivers there. A published `/close` or `/new` task
+control ends it as a target, matching the outbox's own guard, and an open DM is
+preferred over a completed one. Every sender in that DM must link to the same
 Paperclip user, and that user must be an active company owner. If no DM
 qualifies, the sweep skips the endpoint.
 
 | Notice | Condition |
 | --- | --- |
 | Agent | The agent has been `error`, `paused` or `terminated` for longer than the bound. |
-| Item | A pending interaction on another task is addressed to the founder or to the agent, the founder can read that task, and either the agent is unavailable, or the agent has not started a run on that interaction's task since it was created, for longer than the bound. Runs on other tasks, or bound to no task, do not count as pickup. |
+| Item | A pending interaction on another task is addressed to the founder or to the agent, and the founder can read that task. It qualifies when the agent has been unavailable for longer than the bound. One addressed to the founder also qualifies once it has waited longer than the bound, whatever the agent's state. One addressed to the agent also qualifies when the agent has not started a run on that interaction's task since it was created, for longer than the bound. Runs on other tasks, or bound to no task, do not count as pickup. |
 | Recovered | The agent is available again after an agent notice was published or may have been published (`delivery_unknown`). |
 
 A decision notice tells the founder to answer on the original task in Paperclip.
