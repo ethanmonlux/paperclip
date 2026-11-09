@@ -147,7 +147,17 @@ ${options.brokerFile ? String.raw`
       }
       }
     } else if (askBroker) { diagnostic('capability_missing'); }
-    } catch { diagnostic('broker_transport_unavailable'); }
+    } catch (error) {
+      // Transport errors used to collapse to one string, making an unreachable
+      // socket, DNS failure, and the 10-second request deadline indistinguishable.
+      // Only emit a known code; never print an exception message or URL because
+      // those can contain connection details.
+      const cause = error && typeof error === 'object' ? error.cause : null;
+      const rawCode = cause && typeof cause === 'object' ? cause.code : null;
+      const code = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(rawCode)
+        ? rawCode : error && typeof error === 'object' && error.name === 'TimeoutError' ? 'request_timeout' : 'unknown';
+      diagnostic('broker_transport_unavailable (' + code + ')');
+    }
   }
   const connectorTool = connected ? connectorRepositoryTool(process.argv.slice(2)) : null;
   if (connectorTool) {
