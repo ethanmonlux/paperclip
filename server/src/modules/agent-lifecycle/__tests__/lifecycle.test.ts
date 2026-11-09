@@ -655,6 +655,17 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("deferred_issue_execution");
   });
 
+  // Hermes can launch without adapter.invoke, and an unclaimed run names no
+  // adapter, so neither absence proves the run never started.
+  it.each([{ adapterDispatch: { adapterType: "hermes_local" } }, { adapterDispatch: {} }])("keeps the hold for a settled run without a pre-spawn receipt (%j)", async runnerProfileJson => {
+    const agent = await hire();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      invocationSource: "assignment", runtimeMode: "legacy", executionStage: "settled",
+      startedAt: new Date(), finishedAt: new Date(), runnerProfileJson,
+      resultJson: { stopReason: "cancelled", conversationContinuation: "continue_conversation_v1" } });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+  });
+
   it("surfaces a pausing stop that stays pending as a lifecycle error and keeps checking", async () => {
     const lifecycle = createAgentLifecycle(db);
     const agent = await hire();
