@@ -196,7 +196,7 @@ process.exit(result.status ?? 98);
     expect(result.stderr).toContain("broker_transport_unavailable (proxy_transport_unclassified)");
     expect(result.stderr).not.toContain(proxyUrl);
     expect(result.stderr).not.toContain("private-capability");
-  });
+  }, 15_000); // transport retries add at least 1.5s before Node startup and CI scheduling
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
