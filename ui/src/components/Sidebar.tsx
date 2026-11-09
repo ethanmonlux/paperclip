@@ -24,6 +24,7 @@ import {
   GanttChartSquare,
   LayoutGrid,
   Users,
+  Gauge,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -190,6 +191,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               alert={inboxBadge.failedRuns > 0}
             />
           ) : null}
+          <SidebarNavItem to="/console" label="Console" icon={Gauge} />
           {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} badge={unreadChatCount} badgeLabel="unread chats" /> : null}
           {showDecisions ? (
             <SidebarNavItem
