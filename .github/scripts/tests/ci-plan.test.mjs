@@ -348,6 +348,11 @@ test("a fork routing step plans from its own tested merge, never upstream master
     for (const [name, files] of Object.entries({
       ui: ["ui/src/components/Sidebar.tsx"], server: ["server/src/index.ts"], lockfile: ["pnpm-lock.yaml"],
       rust: ["packages/paperclip-runner/runner/crates/runner-core/src/lib.rs"], plans: ["doc/plans/2026-11-08-example.md"],
+      shared: ["packages/shared/src/types/issue.ts"], db: ["packages/db/src/schema/issues.ts"],
+      adapterUtils: ["packages/adapter-utils/src/index.ts"], cargoLock: ["packages/paperclip-runner/runner/Cargo.lock"],
+      cargoManifest: ["packages/paperclip-runner/runner/crates/runner-core/Cargo.toml"],
+      nestedPnpmLock: ["packages/plugins/sandbox-providers/daytona/pnpm-lock.yaml"],
+      npmLock: ["packages/paperclip-runner/scripts/pi-distribution/package-lock.json"],
     })) {
       git("checkout", "-q", "-b", name, "master");
       for (const file of files) write(file, name);
@@ -421,6 +426,17 @@ process.stdout.write(fs.readFileSync(path.join(process.env.TEST_TRUSTED_ROOT, fi
     const lockfile = run("lockfile");
     assert.match(lockfile.forceReason, /Global CI input changed: pnpm-lock.yaml/);
     assert.ok(Object.values(lockfile.jobs).every((lane) => lane.selected === lane.total));
+
+    // Shared packages and nested lockfiles or manifests feed every consumer, so they run the full matrix.
+    for (const [name, file] of [["shared", "packages/shared/src/types/issue.ts"], ["db", "packages/db/src/schema/issues.ts"],
+      ["adapterUtils", "packages/adapter-utils/src/index.ts"], ["cargoLock", "packages/paperclip-runner/runner/Cargo.lock"],
+      ["cargoManifest", "packages/paperclip-runner/runner/crates/runner-core/Cargo.toml"],
+      ["nestedPnpmLock", "packages/plugins/sandbox-providers/daytona/pnpm-lock.yaml"],
+      ["npmLock", "packages/paperclip-runner/scripts/pi-distribution/package-lock.json"]]) {
+      const resultPlan = run(name);
+      assert.equal(resultPlan.forceReason, `Global CI input changed: ${file}`, name);
+      assert.ok(Object.values(resultPlan.jobs).every((lane) => lane.selected === lane.total), name);
+    }
 
     for (const overrides of [{ PROFILE_CI: "true" }, { STACK_JSON: "{}" }]) {
       assert.ok(Object.values(run("ui", overrides).jobs).every((lane) => lane.selected === lane.total));
