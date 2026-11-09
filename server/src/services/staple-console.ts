@@ -30,7 +30,9 @@ import {
   type StapleConsolePullRequestInput,
   type StapleConsoleScheduledEvent,
   type StapleConsoleSourceStatus,
+  type StapleConsoleMaintenanceHold,
 } from "@paperclipai/shared/staple-console";
+import { maintenanceHoldService } from "./maintenance-hold.js";
 import { notFound } from "../errors.js";
 import { resolveGitHubApiCredential, type GitHubApiCredential } from "./git-credentials.js";
 import { ghFetch } from "./github-fetch.js";
@@ -56,6 +58,7 @@ const GITHUB_TIMEOUT_MS = 8_000;
  * so the board prints them as a schedule, not as observed runs.
  */
 const NIGHTLY_EVENTS = [
+  { label: "2:30 maintenance hold", time: "02:30" },
   { label: "3:20 wake", time: "03:20" },
   { label: "3:30 managed upgrade", time: "03:30" },
 ] as const;
@@ -149,6 +152,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
   const fetchImpl = opts.fetch ?? ghFetch;
   const credentialProvider = opts.credentialProvider ?? ((companyId: string) => resolveGitHubApiCredential(db, companyId));
   const prCache = new Map<string, { value: PullRequestSnapshot; expiresAt: number }>();
+  const holdService = maintenanceHoldService(db);
 
   async function githubJson(path: string, token: string) {
     const response = await fetchImpl(`https://api.github.com${path}`, {
@@ -514,7 +518,8 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     }
 
     const liveIdSet = new Set(liveIds);
-    return buildStapleConsoleBoard({
+    const maintenanceHold = await readMaintenanceHoldBanner();
+    const built = buildStapleConsoleBoard({
       now: nowIso,
       issuePrefix: company.issuePrefix,
       issues: issueInputs,
@@ -561,6 +566,24 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       scheduled,
       sources: { github },
     });
+    return { ...built, maintenanceHold };
+  }
+
+  async function readMaintenanceHoldBanner(): Promise<StapleConsoleMaintenanceHold | null> {
+    try {
+      const status = await holdService.status();
+      if (!status.hold) return null;
+      return {
+        since: status.hold.startedAt,
+        drainDeadlineAt: status.hold.drainDeadlineAt,
+        expiresAt: status.hold.expiresAt,
+        queuedWakes: status.queuedRuns,
+        runningRuns: status.runningRuns,
+        parkedRuns: status.hold.parkedRunCount,
+      };
+    } catch {
+      return null;
+    }
   }
 
   return { board };

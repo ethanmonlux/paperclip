@@ -1140,12 +1140,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    options: { cause?: "shutdown" | "maintenance_hold" } = {},
   ) {
+    // A maintenance hold parks the runs still running at its drain deadline
+    // through this same graceful stop. Parking is not a failure: it spends no
+    // process-loss retry budget, and the hold queues each task's continuation.
+    const parking = options.cause === "maintenance_hold";
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
+    const interruptedRuns: Array<{ runId: string; agentId: string; companyId: string; issueId: string | null }> = [];
     if (selectedRunIds?.length === 0) {
       return {
         interrupted: 0,
         interruptedRunIds: [],
+        interruptedRuns,
         retryRunIds: [],
         restartSuspendedRunIds: [],
       };
@@ -1182,6 +1189,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
       ) {
+        // A runner-owned native turn survives a controller restart by reattach;
+        // the hold leaves it to finish rather than detaching a live controller.
+        if (parking) return;
         const [owner] = await db.select({ bootId: nativeRunFinalizations.controllerBootId })
           .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
         if (owner?.bootId && owner.bootId !== nativeController.bootId) return;
@@ -1260,7 +1270,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         restartSuspendedRunIds.push(run.id);
         return;
       }
-      const message = `Interrupted by graceful server shutdown (${signal})`;
+      const message = parking
+        ? "Parked for the maintenance window: the run was still running at the hold's drain deadline and continues when the hold lifts"
+        : `Interrupted by graceful server shutdown (${signal})`;
+      const errorCode = parking ? "maintenance_hold_parked" : "server_shutdown_interrupted";
       const running = runningProcesses.get(run.id);
       const control = run.runtimeMode === "legacy" ? adapterExecutionControls.get(run.id) : undefined;
       if (control) await beginLegacyShutdownWorkspaceSettlement(db, run, settlementDeadline);
@@ -1297,12 +1310,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         {
           finishedAt: now,
           error: message,
-          errorCode: "server_shutdown_interrupted",
+          errorCode,
           signal,
           resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
             conversationContinuationEligible: await runUsedConversationAdapter(db, run),
             resultJson: persistedCancellationResult,
-            errorCode: "server_shutdown_interrupted",
+            errorCode,
             errorMessage: message,
           }),
         },
@@ -1343,12 +1356,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           failureReason: interrupted.error ?? undefined,
         });
 
-        const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+        const retry = parking ? null : await enqueueProcessLossRetry(interrupted, agent, now);
         if (!retry) {
           await releaseIssueExecutionAndPromote(interrupted);
         } else {
           retryRunIds.push(retry.id);
         }
+        interruptedRuns.push({ runId: interrupted.id, agentId: interrupted.agentId, companyId: interrupted.companyId,
+          issueId: interrupted.issueId ?? readNonEmptyString(parseObject(interrupted.contextSnapshot).issueId) });
 
         await appendRunEvent(interrupted, {
           eventType: "lifecycle",
@@ -1357,6 +1372,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           message,
           payload: {
             signal,
+            ...(parking ? { cause: "maintenance_hold" } : {}),
             ...(run.processPid ? { processPid: run.processPid } : {}),
             ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
             ...(retry ? { retryRunId: retry.id } : {}),
@@ -1400,13 +1416,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           interruptedRunIds,
           retryRunIds,
         },
-        "interrupted running heartbeat runs for graceful shutdown",
+        parking ? "parked running heartbeat runs for the maintenance hold" : "interrupted running heartbeat runs for graceful shutdown",
       );
     }
 
     return {
       interrupted: interruptedRunIds.length,
       interruptedRunIds,
+      interruptedRuns,
       retryRunIds,
       restartSuspendedRunIds,
     };

@@ -245,6 +245,7 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceSettingsSchema,
   startTaskDrainRequestSchema,
+  placeMaintenanceHoldRequestSchema,
   // Resource memberships
   updateDocumentResourceMembershipSchema,
   updateResourceMembershipSchema,
@@ -7176,6 +7177,33 @@ registry.registerPath({
   summary: "End a task drain and restore run admission",
   request: { query: z.object({ ownerId: z.string().uuid().optional() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/maintenance-hold",
+  tags: ["instance"],
+  summary: "Read the managed maintenance hold, with queued and running run counts",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/instance/maintenance-hold",
+  tags: ["instance"],
+  summary: "Place or renew the managed maintenance hold: new runs stay queued, runs still running at the drain deadline are parked",
+  description: "Requires a board instance admin; agent keys are refused. The hold survives a server restart and lifts by itself at its expiry. Renewal only moves the expiry later, never more than four hours after the hold started.",
+  request: { body: jsonBody(placeMaintenanceHoldRequestSchema) },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/maintenance-hold",
+  tags: ["instance"],
+  summary: "Release the managed maintenance hold; held work starts in priority order",
+  request: { query: z.object({ reason: z.string().max(200).optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({

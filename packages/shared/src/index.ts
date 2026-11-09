@@ -1813,6 +1813,9 @@ export {
   MAX_TASK_DRAIN_TTL_MS,
   startTaskDrainRequestSchema,
   type StartTaskDrainRequest,
+  MAX_MAINTENANCE_HOLD_MINUTES,
+  placeMaintenanceHoldRequestSchema,
+  type PlaceMaintenanceHoldRequest,
 } from "./validators/instance.js";
 
 export {

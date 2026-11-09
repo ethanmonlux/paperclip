@@ -29,9 +29,13 @@ export function registerTaskDrainExpiryWork(
   const worker = coordinator.register(DELIVERY_QUEUES.taskDrainExpiry, {
     retryMs: 1000,
     runDuringDrain: true,
-    run: async () => { readTaskDrain(new Date()); },
+    run: async () => {
+      const now = new Date();
+      readTaskDrain(now);
+      await runMaintenanceDrainDeadline(now);
+    },
     hasPending: async () => false,
-    nextRunAt: () => taskDrainState?.expiresAt?.getTime() ?? null,
+    nextRunAt: () => earliestExpiry(),
   });
   expiryListeners.add(onExpired);
   changeListeners.add(worker.wake);
@@ -55,14 +59,113 @@ export function setControllerLeaseQuiesce(quiesced: boolean): void {
   notifyDrainChanged();
 }
 
-export function readTaskDrain(now: Date): TaskDrainState | null {
-  if (taskDrainState?.expiresAt && taskDrainState.expiresAt.getTime() <= now.getTime()) {
-    taskDrainState = null;
-    for (const listener of expiryListeners) {
-      try { listener(); } catch (error) { process.emitWarning(`Task drain expiry notification failed: ${String(error)}`); }
+/**
+ * The managed nightly maintenance window (FAC-840 C1). It holds admission like
+ * an operator drain, but it is loaded from the database at startup, so the
+ * install restart keeps it until the managed script releases it. Its expiry is
+ * the auto-release that lifts the hold even if that script dies.
+ */
+export type MaintenanceHoldState = {
+  id: string;
+  startedAt: Date;
+  drainDeadlineAt: Date;
+  expiresAt: Date;
+  parkedAt: Date | null;
+};
+let maintenanceHold: MaintenanceHoldState | null = null;
+const maintenanceExpiryListeners = new Set<(hold: MaintenanceHoldState) => void>();
+
+export function subscribeMaintenanceHoldExpiry(listener: (hold: MaintenanceHoldState) => void) {
+  maintenanceExpiryListeners.add(listener);
+  return () => { maintenanceExpiryListeners.delete(listener); };
+}
+
+export function applyMaintenanceHold(hold: MaintenanceHoldState | null): void {
+  maintenanceHold = hold;
+  notifyDrainChanged();
+}
+
+// An expired hold resumes held work through its own (staggered) release; the
+// generic listeners resume an expired operator drain.
+function notifyExpired(drainExpired: boolean, maintenance: MaintenanceHoldState | null) {
+  if (maintenance) {
+    for (const listener of maintenanceExpiryListeners) {
+      try { listener(maintenance); } catch (error) { process.emitWarning(`Maintenance hold expiry notification failed: ${String(error)}`); }
     }
   }
-  return taskDrainState ?? controllerLeaseQuiesce;
+  if (!drainExpired) return;
+  for (const listener of expiryListeners) {
+    try { listener(); } catch (error) { process.emitWarning(`Task drain expiry notification failed: ${String(error)}`); }
+  }
+}
+
+export function readMaintenanceHold(now: Date): MaintenanceHoldState | null {
+  readTaskDrain(now);
+  return maintenanceHold;
+}
+
+// Parks the runs still running at the drain deadline. Registered by the
+// maintenance hold service; it runs once per hold, and a failed attempt retries
+// after a minute rather than spinning the expiry worker.
+let drainDeadlineHandler: ((hold: MaintenanceHoldState) => Promise<void>) | null = null;
+let drainDeadlineRetryAt: number | null = null;
+const DRAIN_DEADLINE_RETRY_MS = 60_000;
+
+export function setMaintenanceDrainDeadlineHandler(handler: ((hold: MaintenanceHoldState) => Promise<void>) | null) {
+  drainDeadlineHandler = handler;
+  drainDeadlineRetryAt = null;
+  notifyDrainChanged();
+  return () => {
+    if (drainDeadlineHandler === handler) drainDeadlineHandler = null;
+  };
+}
+
+function pendingDrainDeadline(): number | null {
+  if (!maintenanceHold || maintenanceHold.parkedAt || !drainDeadlineHandler) return null;
+  return Math.max(maintenanceHold.drainDeadlineAt.getTime(), drainDeadlineRetryAt ?? 0);
+}
+
+export async function runMaintenanceDrainDeadline(now: Date): Promise<boolean> {
+  const hold = maintenanceHold;
+  const due = pendingDrainDeadline();
+  if (!hold || !drainDeadlineHandler || due === null || due > now.getTime()) return false;
+  try {
+    await drainDeadlineHandler(hold);
+    drainDeadlineRetryAt = null;
+    if (maintenanceHold?.id === hold.id && !maintenanceHold.parkedAt) {
+      maintenanceHold = { ...maintenanceHold, parkedAt: new Date() };
+    }
+    notifyDrainChanged();
+    return true;
+  } catch (error) {
+    drainDeadlineRetryAt = Date.now() + DRAIN_DEADLINE_RETRY_MS;
+    process.emitWarning(`Maintenance hold could not park running runs; retrying: ${String(error)}`);
+    notifyDrainChanged();
+    return false;
+  }
+}
+
+function earliestExpiry(): number | null {
+  const times = [taskDrainState?.expiresAt?.getTime(), maintenanceHold?.expiresAt.getTime(), pendingDrainDeadline()]
+    .filter((time): time is number => typeof time === "number");
+  return times.length > 0 ? Math.min(...times) : null;
+}
+
+export function readTaskDrain(now: Date): TaskDrainState | null {
+  let drainExpired = false;
+  if (taskDrainState?.expiresAt && taskDrainState.expiresAt.getTime() <= now.getTime()) {
+    taskDrainState = null;
+    drainExpired = true;
+  }
+  let expiredHold: MaintenanceHoldState | null = null;
+  if (maintenanceHold && maintenanceHold.expiresAt.getTime() <= now.getTime()) {
+    expiredHold = maintenanceHold;
+    maintenanceHold = null;
+  }
+  if (drainExpired || expiredHold) notifyExpired(drainExpired, expiredHold);
+  return taskDrainState
+    ?? (maintenanceHold ? { startedAt: maintenanceHold.startedAt, expiresAt: maintenanceHold.expiresAt } : null)
+    ?? controllerLeaseQuiesce;
 }
 
 export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" } = {}): TaskDrainState {
@@ -80,6 +183,8 @@ export function startTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" }
   applyTaskDrain(drain);
   return drain;
 }
+// Stops only an operator drain. A maintenance hold is released through its own
+// managed route, so it cannot be lifted by the generic drain endpoint.
 export function stopTaskDrain(): { wasActive: boolean } {
   const wasActive = readTaskDrain(new Date()) !== null && taskDrainState !== null;
   taskDrainState = null;
