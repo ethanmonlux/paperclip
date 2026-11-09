@@ -107,7 +107,7 @@ describe("update under lifecycle authority", () => {
   it("refuses a payload update while runs are active, before backup or install", async () => {
     const { paths, executablePath } = managedInstall();
     const before = readInstallManifest(paths);
-    const runCommand = vi.fn(async () => ({ stdout: "\"3.0.0\"\n", stderr: "" }));
+    const runCommand = vi.fn<CommandRunner>(async () => ({ stdout: "\"3.0.0\"\n", stderr: "" }));
     const backup = vi.fn(async () => undefined);
     const restartActiveService = vi.fn(async () => true);
     await expect(updateCommand({ yes: true }, {
