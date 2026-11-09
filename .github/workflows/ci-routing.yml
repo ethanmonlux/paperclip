@@ -408,6 +408,19 @@ jobs:
               "/repos/$repository/contents/$file?ref=$trusted" \
               > "$directory/${file##*/}" || fallback
           done
+          if [[ "$repository" != 'paperclipai/paperclip' ]]; then
+            # The fork runs every job for cross-workspace packages and nested
+            # lockfiles or manifests. Only this plan sees the extra inputs:
+            # turbo.json stays upstream's because local verify and Turbo task
+            # hashing read it too.
+            node -e '
+              const fs = require("node:fs"), file = process.argv[1];
+              const config = JSON.parse(fs.readFileSync(file, "utf8"));
+              config.globalDependencies.push("**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock",
+                "**/Cargo.lock", "**/Cargo.toml", "packages/shared/**", "packages/db/**", "packages/adapter-utils/**");
+              fs.writeFileSync(file, JSON.stringify(config));
+            ' "$directory/turbo.json" || fallback
+          fi
           # Read the exact tested merge and both parents. The event's base SHA can
           # lag behind its actual first parent. A bare tree diff has no API file cap.
           git init --bare "$directory/repository.git" >/dev/null || fallback
