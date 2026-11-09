@@ -228,7 +228,7 @@ function wakeCoversIssueBlockersResolvedReadyState(
  * Returns the first matching wake or `null`.
  */
 export async function findExistingIssueBlockersResolvedWakeForReadyState(
-  db: Db,
+  db: Pick<Db, "select">,
   input: {
     companyId: string;
     dependentIssueId: string;

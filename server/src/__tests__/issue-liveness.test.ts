@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness } from "../services/issue-liveness.ts";
+import { eligibleIssueMonitorWait } from "../services/issue-monitors.ts";
 
 const companyId = "company-1";
 const managerId = "manager-1";
@@ -684,5 +685,81 @@ describe("wait contract orphan blocked tasks (FAC-840)", () => {
 
   it("leaves callers that do not pass wait-contract inputs unchanged", () => {
     expect(classify({ description: undefined })).toEqual([]);
+  });
+
+  // FAC-851: the assignee re-blocked after its blockers were done, so the
+  // dependency backstop withholds its wake; the relations wait for nothing.
+  describe("self-blocked after its blockers were done", () => {
+    const resolved = (extra: Record<string, unknown> = {}, blockerStatus = "done") => classifyIssueGraphLiveness({
+      issues: [orphan(), issue({ id: blockerId, identifier: "STA-143", status: blockerStatus, description: null })],
+      relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }],
+      agents: [agent(), manager],
+      dependencyWakeDisownedIssueIds: [blockedId],
+      now: "2026-11-09T12:00:00.000Z",
+      ...extra,
+    }).filter((finding) => finding.state === "blocked_without_wait_path");
+
+    it("is visible to its owner", () => {
+      expect(resolved()).toEqual([expect.objectContaining({ issueId: blockedId, recommendedOwnerAgentId: coderId })]);
+    });
+
+    it("stays quiet while a pending interaction, approval, run or wake records the wait", () => {
+      const waits: Array<[string, Record<string, unknown>]> = [
+        ["pending interaction", { pendingInteractions: [{ companyId, issueId: blockedId, status: "pending" }] }],
+        ["pending approval", { pendingApprovals: [{ companyId, issueId: blockedId, status: "pending" }] }],
+        ["active run", { activeRuns: [{ companyId, issueId: blockedId, agentId: coderId, status: "running" }] }],
+        ["queued wake", { queuedWakeRequests: [{ companyId, issueId: blockedId, agentId: coderId, status: "queued" }] }],
+      ];
+      for (const [name, extra] of waits) expect(resolved(extra), name).toEqual([]);
+    });
+
+    it("never overrides a blocker that is still unresolved", () => {
+      expect(resolved({}, "in_progress")).toEqual([]);
+    });
+  });
+});
+
+// FAC-847: a `ci` wait's timeoutAt is its no-start deadline. The scheduler keeps
+// re-arming a wait whose CI started without moving timeoutAt, so liveness and
+// completion eligibility must both read the server's started observation.
+describe("started CI waits past their no-start deadline (FAC-847)", () => {
+  const now = new Date("2026-11-09T12:00:00.000Z");
+  const nextCheckAt = "2026-11-09T12:02:00.000Z";
+  const target = { repo: "ethanmonlux/paperclip", sha: "e938be88946f6e3b929c3a8c6e04d39f31159e84", pullNumber: 25,
+    pushedAt: "2026-11-09T10:00:00.000Z" };
+  const reviewIssue = (opts: { kind?: string; observation?: string | null; stateTarget?: Record<string, unknown> } = {}) => {
+    const kind = opts.kind ?? "ci";
+    const monitor = { nextCheckAt, notes: null, scheduledBy: "assignee", kind, timeoutAt: "2026-11-09T10:10:00.000Z",
+      ...(kind === "ci" ? { target } : { serviceName: "vendor" }) };
+    return issue({
+      status: "in_review",
+      executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor },
+      executionState: { status: "idle", monitor: { status: "scheduled", nextCheckAt, attemptCount: 0, kind,
+        target: kind === "ci" ? opts.stateTarget ?? target : null,
+        observation: opts.observation ? { state: opts.observation, checkedAt: "2026-11-09T11:58:00.000Z", detail: "x" } : null } },
+      monitorNextCheckAt: new Date(nextCheckAt),
+      monitorAttemptCount: 0,
+    });
+  };
+  const liveness = (reviewed: ReturnType<typeof issue>) => classifyIssueGraphLiveness({
+    issues: [reviewed], relations: [], agents: [agent(), manager], now,
+  }).map((finding) => finding.state);
+  const completion = (reviewed: ReturnType<typeof issue>) => eligibleIssueMonitorWait(reviewed as never, coderId, now);
+
+  it.each(["started", "queued_long"])("keeps a server-observed %s CI wait valid in liveness and completion", (state) => {
+    const reviewed = reviewIssue({ observation: state });
+    expect(liveness(reviewed)).toEqual([]);
+    expect(completion(reviewed)).toBe(nextCheckAt);
+  });
+
+  it.each([
+    ["no reading yet", { observation: null }],
+    ["CI never started", { observation: "not_started" }],
+    ["a reading for another head", { observation: "started", stateTarget: { ...target, sha: "0".repeat(40) } }],
+    ["an ordinary expired monitor", { kind: "external_service", observation: "started" }],
+  ] as const)("still surfaces %s once its deadline passed", (_name, opts) => {
+    const reviewed = reviewIssue(opts);
+    expect(liveness(reviewed)).toEqual(["in_review_without_action_path"]);
+    expect(completion(reviewed)).toBeNull();
   });
 });

@@ -2,7 +2,8 @@
  * Wake the owner of a blocked task that has no wait record (`issue_wait_orphaned`).
  *
  * FAC-840 wait contract: a task that is not running must say what it waits
- * for. Blocked tasks do that through a blocker relation, a pending
+ * for. Blocked tasks do that through a blocker relation that can still wake
+ * them (dependency-wake-ownership.ts), a pending
  * interaction or approval, an unblock action owned by someone else, a recorded
  * external owner, a scheduled monitor, an open recovery action, or an open
  * recovery issue. A blocked
@@ -71,6 +72,9 @@ async function readOrphanCandidates(db: Db, opts: { companyId?: string | null; i
     description: issues.description,
     assigneeAgentId: issues.assigneeAgentId,
     blockedTransitionAt: issues.blockedTransitionAt,
+    hasBlockerRelation: sql<boolean>`exists (select 1 from issue_relations relation
+      where relation.company_id = ${issues.companyId} and relation.type = 'blocks'
+        and relation.related_issue_id = ${issues.id})`,
   }).from(issues)
     .innerJoin(companies, eq(companies.id, issues.companyId))
     .where(and(
@@ -86,11 +90,12 @@ async function readOrphanCandidates(db: Db, opts: { companyId?: string | null; i
       // An unblock action owned by someone other than the assignee is a wait record.
       or(isNull(issues.unblockDescriptor),
         sql`${issues.unblockDescriptor}->'owner'->>'agentId' = ${issues.assigneeAgentId}::text`),
-      // Any blocker relation, resolved or not: the resolved-dependency backstop
-      // owns waking a dependent (issue_blockers_resolved, workspace finalize).
+      // An unresolved blocker owns the wait; a dependent whose blockers are all
+      // done is checked against the dependency wake by the caller.
       sql`not exists (select 1 from issue_relations relation
+        join issues blocker on blocker.id = relation.issue_id and blocker.company_id = relation.company_id
         where relation.company_id = ${issues.companyId} and relation.type = 'blocks'
-          and relation.related_issue_id = ${issues.id})`,
+          and relation.related_issue_id = ${issues.id} and blocker.status <> 'done')`,
       // An open recovery action (e.g. a board-owned native terminal failure or
       // execution hold) records who must act next.
       sql`not exists (select 1 from issue_recovery_actions action
@@ -118,15 +123,29 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
   now?: Date;
   /** True when the task has an active run, queued wake, or pause hold. */
   hasLivePath: (companyId: string, issueId: string, agentId: string) => Promise<boolean>;
+  /**
+   * For a task whose blockers are all done: true when no dependency wake can
+   * still reach it (spent, or withheld for a self-block). Without it, any
+   * blocker relation is left to the dependency path.
+   */
+  dependencyWakeDisowned?: (companyId: string, candidate: {
+    id: string; assigneeAgentId: string; blockedTransitionAt: Date | null;
+  }) => Promise<boolean>;
 }) {
   const now = opts.now ?? new Date();
-  const result = { orphans: 0, woken: 0, alreadyWoken: 0, capped: 0, livePathSkipped: 0, inGrace: 0, deferred: 0, failed: 0,
+  const result = { orphans: 0, woken: 0, alreadyWoken: 0, capped: 0, livePathSkipped: 0, dependencySkipped: 0,
+    inGrace: 0, deferred: 0, failed: 0,
     retryAt: null as number | null, issueIds: [] as string[] };
   const retryAt = (at: number) => { result.retryAt = result.retryAt === null ? at : Math.min(result.retryAt, at); };
   const candidates = await readOrphanCandidates(db, { companyId: opts.companyId, issueId: opts.issueId, now });
   for (const candidate of candidates) {
     const agentId = candidate.assigneeAgentId!;
     if (hasRecordedExternalOwner(candidate.description)) continue;
+    if (candidate.hasBlockerRelation && !(await opts.dependencyWakeDisowned?.(candidate.companyId,
+      { id: candidate.id, assigneeAgentId: agentId, blockedTransitionAt: candidate.blockedTransitionAt }))) {
+      result.dependencySkipped += 1;
+      continue;
+    }
     const graceEndsAt = candidate.blockedTransitionAt
       ? candidate.blockedTransitionAt.getTime() + ORPHAN_WAIT_GRACE_MS : null;
     if (graceEndsAt !== null && graceEndsAt > now.getTime()) {
