@@ -27,6 +27,7 @@ import { projectCompanyHolds } from "../adapters/company-policy.js";
 import { createLifecycleStore as createStore } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
 import type { LifecycleAgent, LifecycleDriver } from "../application/ports.js";
+import { STALLED_STOP_ATTEMPTS } from "../application/worker.js";
 import { budgetService } from "../../../services/budgets.js";
 import { agentConfigurationRevision } from "../../../lib/agent-configuration-revision.js";
 
@@ -652,6 +653,27 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle", lifecycleHolds: [] });
     // The pause kept the deferred wake for delivery after it lifted.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status).toBe("deferred_issue_execution");
+  });
+
+  it("surfaces a pausing stop that stays pending as a lifecycle error and keeps checking", async () => {
+    const lifecycle = createAgentLifecycle(db);
+    const agent = await hire();
+    await worker().process(agent.id);
+    let stopped = false;
+    const work = worker(async () => stopped ? "complete" : "pending");
+    await lifecycle.pauseAgent(agent.id);
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "pausing", lifecycleError: null });
+    await db.update(agents).set({ lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation}, '{attempts}', ${STALLED_STOP_ATTEMPTS - 1}::text::jsonb) - 'retryAt'` })
+      .where(eq(agents.id, agent.id));
+    await work.process(agent.id);
+    const stalled = await current(agent.id);
+    expect(stalled).toMatchObject({ lifecycleState: "pausing", lifecycleError: expect.stringContaining("has not recorded that it stopped") });
+    expect(Date.parse(stalled.lifecycleOperation!.retryAt!)).toBeGreaterThan(Date.now() + 30_000);
+    stopped = true;
+    await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "paused", lifecycleError: null });
   });
 
   it("does not prepare a proposed hire until approval", async () => {

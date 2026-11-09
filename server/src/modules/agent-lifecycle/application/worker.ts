@@ -3,6 +3,9 @@ import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.
 import { isLifecycleWorkPending } from "../domain/policy.js";
 import { lifecycleFailureCode, lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
 
+/** Claims of one operation after which a pending stop step records a lifecycle error. */
+export const STALLED_STOP_ATTEMPTS = 60;
+
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
   let stopped = false;
@@ -52,7 +55,12 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
             return;
           }
           if (host === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue;
+            // A stop that never completes must surface, not retry silently. It keeps checking.
+            const stalled = ["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)
+              && (agent.lifecycleOperation?.attempts ?? 0) >= STALLED_STOP_ATTEMPTS
+              ? lifecycleFailureMessage(failureContext, Object.assign(new Error("Execution stop stalled"), { code: "execution_stop_stalled" }))
+              : null;
+            if (!await runStep("defer", () => store.defer(agent, owner, stalled, new Date()))) continue;
             return;
           }
           if (!await runStep("complete_host", () => store.completeHost(agent, owner))) continue;

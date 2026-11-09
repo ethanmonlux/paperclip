@@ -14,6 +14,7 @@ const reasons = {
   test_environment_unavailable: "The test environment is unavailable. Check the agent's environment in Configuration. Paperclip will retry automatically.",
   required_plugin_unavailable: "A required plugin is unavailable. Check the plugin's status in Settings. Paperclip will retry automatically.",
   invalid_lifecycle_result: "A required plugin returned an invalid result. Check the plugin's status in Settings. Paperclip will retry automatically.",
+  execution_stop_stalled: "A run of this agent has not recorded that it stopped. Paperclip keeps checking. If this continues, check the agent's latest runs or contact your instance administrator.",
 } as const;
 
 const transientCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "40001", "40P01", "53300", "57P01"]);
