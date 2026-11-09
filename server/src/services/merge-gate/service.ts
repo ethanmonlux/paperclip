@@ -98,11 +98,14 @@ export interface MergeGateDependencies {
   resolveToken: (companyId: string, actor: MergeGateActor) => Promise<string | null>;
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
   /**
-   * Model families recorded by the task's implementation runs, excluding the
-   * given agents (reviewers, the merging coordinator). Null when a run that
-   * may have authored the change recorded no model.
+   * Who may have authored the task: every agent with a run on it and the
+   * model families those runs recorded. Only the merging coordinator's runs
+   * are left out (`excludeAgentId`). Reviewers are not: a reviewer with a run
+   * on the task is a potential author. Null when the runs cannot be read, or
+   * a potential author recorded no model.
    */
-  loadAuthorModelFamilies: (companyId: string, input: { issueId: string; excludeAgentIds: string[] }) => Promise<string[] | null>;
+  loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null }) =>
+    Promise<{ agentIds: string[]; modelFamilies: string[] } | null>;
   /**
    * Run `action` holding the merge lock for one repository branch, across
    * server instances. Returns `MERGE_LOCK_BUSY` when another merge holds it.
@@ -265,19 +268,21 @@ async function evaluateLocked(
   const reviews = await deps.loadReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber });
   // A review written by the merging coordinator is not independent of the merge.
   const independentOfMerger = reviews.filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId);
-  // Who authored the change is read from what the runs recorded, not from the
-  // assignee's current adapter configuration.
-  const runFamilies = await deps.loadAuthorModelFamilies(request.companyId, {
+  // Who may have authored the change is read from what the runs recorded,
+  // not from the assignee's current adapter configuration. No run says
+  // whether it wrote code, so every agent that ran on the task counts,
+  // including one that reviews it now. The merging coordinator is the one
+  // exclusion: it is the accountable party the route already authorized, and
+  // the gate refuses it as the reviewer.
+  const authorship = await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentIds: [...new Set([
-      ...independentOfMerger.map(review => review.reviewerAgentId).filter((id): id is string => Boolean(id)),
-      ...(request.actor.agentId ? [request.actor.agentId] : []),
-    ])],
+    excludeAgentId: request.actor.agentId ?? null,
   });
   const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
   const author: MergeGateAuthor = {
-    agentId: issue.assigneeAgentId,
-    modelFamilies: runFamilies === null ? null : [...new Set([...runFamilies, ...trailerFamilies])].sort(),
+    agentIds: authorship === null ? null
+      : [...new Set([...authorship.agentIds, ...(issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
+    modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
   };
   const deltas = new Map<string, HeadDelta>();
   for (const review of independentOfMerger) {

@@ -40,7 +40,7 @@ function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAtt
   };
 }
 
-const author = { agentId: "claude-engineer", modelFamilies: ["anthropic"] };
+const author = { agentIds: ["claude-engineer"], modelFamilies: ["anthropic"] };
 
 describe("conservative path filters", () => {
   it("replays STA-163: a .github/scripts change needs windows-fast, and a skipped windows-fast refuses the merge", () => {
@@ -119,7 +119,8 @@ describe("required CI coverage", () => {
     expect(evaluateHeadCi({ headSha: HEAD, policy: unknownRepo, checksComplete: true, requiredChecks: [], changedFiles: ["src/a.ts"],
       checks: [check("lint", "success"), check("tests", "skipped")] }))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("tests was skipped") }]);
-    const paperclipGreen = [check("ci / policy", "success"), check("ci / Typecheck + Release Registry", "success"), check("ci / Build", "success"),
+    const paperclipGreen = [check("ci / policy", "success"), check("ci / verify", "success"), check("ci / e2e", "success"),
+      check("ci / Typecheck + Release Registry", "success"), check("ci / Build", "success"),
       check("ci / General tests (server (1/12))", "success"), check("ci / Verify serialized server suites (1/9)", "success"),
       check("ci / Select Vitest files", "skipped"), workflow("PR", "success"), workflow("Storybook Visual", "skipped")];
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"], checks: paperclipGreen }))
@@ -130,6 +131,66 @@ describe("required CI coverage", () => {
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
       checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+  });
+});
+
+/** Every check run GitHub reported on an ordinary green paperclip PR (#30, 2026-11-09). */
+const PAPERCLIP_ORDINARY_PR: MergeGateCheck[] = [
+  ...["ci / gate / Select trusted runner", "ci / policy", "ci / verify", "ci / e2e", "ci / Typecheck + Release Registry", "ci / Build",
+    "ci / Docker context integrity", "ci / Sandbox provider tests", "ci / Runner support suite", "ci / Canary Dry Run",
+    ...Array.from({ length: 12 }, (_, i) => `ci / General tests (server (${i + 1}/12))`),
+    ...Array.from({ length: 3 }, (_, i) => `ci / General tests (chat (${i + 1}/3))`),
+    "ci / General tests (workspaces-a (1/2))", "ci / General tests (workspaces-a (2/2))",
+    "ci / General tests (workspaces-b)", "ci / General tests (workspaces-c)",
+    ...Array.from({ length: 9 }, (_, i) => `ci / Verify serialized server suites (${i + 1}/9)`),
+    ...Array.from({ length: 8 }, (_, i) => `ci / e2e shard (${i + 1}/8)`),
+    ...["static checks", "rust", "vitest package (1/3)", "vitest package (2/3)", "vitest package (3/3)", "vitest native server"]
+      .map(lane => `ci / Verify Paperclip Runner (${lane})`),
+  ].map(name => check(name, "success")),
+  check("ci / Select Vitest files", "skipped"),
+  check("Storybook visual regression", "skipped"),
+  check("Deploy selected branch Storybook", "skipped"),
+];
+
+describe("paperclip CI policy (STA-218)", () => {
+  const evaluate = (checks: MergeGateCheck[], changedFiles = ["server/src/app.ts"]) => evaluateHeadCi({
+    headSha: HEAD, policy: paperclip, checksComplete: true, checks, changedFiles,
+    requiredChecks: requiredPathScopedChecks({ policy: paperclip, changedFiles }),
+  });
+
+  it("accepts the complete observed job set of an ordinary green PR, including its Storybook skips", () => {
+    expect(PAPERCLIP_ORDINARY_PR).toHaveLength(55);
+    expect(evaluate(PAPERCLIP_ORDINARY_PR)).toEqual([]);
+  });
+
+  it("accepts a suite the CI plan skipped only when ci / verify or ci / e2e passed", () => {
+    const planSkipped = PAPERCLIP_ORDINARY_PR.map(entry =>
+      /Docker context|e2e shard/.test(entry.name) ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(planSkipped)).toEqual([]);
+    const reasons = evaluate(planSkipped.filter(entry => entry.name !== "ci / verify" && entry.name !== "ci / e2e"));
+    expect(reasons.map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("ci / verify runs on every change"),
+      expect.stringContaining("ci / e2e runs on every change"),
+      expect.stringContaining("ci / Docker context integrity was skipped"),
+      expect.stringContaining("ci / e2e shard (1/8) was skipped"),
+    ]));
+  });
+
+  it("still refuses a skipped required suite, even with ci / verify green", () => {
+    const skippedBuild = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / Build" ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(skippedBuild)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+  });
+
+  it("needs the Windows runner check for its trigger paths and for Windows scripts, and not otherwise", () => {
+    expect(requiredPathScopedChecks({ policy: paperclip, changedFiles: ["server/src/app.ts", "docs/a.md"] })).toEqual([]);
+    for (const file of ["packages/paperclip-runner/runner/src/lib.rs", "scripts/setup.ps1", ".github/scripts/check.mjs"]) {
+      expect(requiredPathScopedChecks({ policy: paperclip, changedFiles: ["server/src/app.ts", file] })).toEqual(["Runner Rust (Windows x64)"]);
+    }
+    expect(requiredPathScopedChecks({ policy: paperclip, changedFiles: null })).toEqual(["Runner Rust (Windows x64)"]);
+    const files = ["packages/paperclip-runner/runner/src/lib.rs"];
+    expect(evaluate(PAPERCLIP_ORDINARY_PR, files))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("Runner Rust (Windows x64) did not run") }]);
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, check("Runner Rust (Windows x64)", "success")], files)).toEqual([]);
   });
 });
 
@@ -228,7 +289,7 @@ describe("review coverage and merge bar", () => {
     expect(evaluate([review({ reviewerModelFamilies: modelFamiliesFromRunUsage({ model: "anthropic/claude-sonnet-5-5", provider: "openrouter" }) })]))
       .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("anthropic") }]);
     expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
-      author: { agentId: "runner-claude", modelFamilies: modelFamiliesFromRunUsage({ model: "claude-opus-5-5", provider: "anthropic" }) },
+      author: { agentIds: ["runner-claude"], modelFamilies: modelFamiliesFromRunUsage({ model: "claude-opus-5-5", provider: "anthropic" }) },
       reviews: [review({ reviewerAgentId: "runner-codex", reviewerModelFamilies: modelFamiliesFromRunUsage({ model: "gpt-6.1-sol", provider: "openai" }) })] }))
       .toEqual([]);
   });
@@ -236,8 +297,18 @@ describe("review coverage and merge bar", () => {
   it("fails closed when review or implementation provenance is missing", () => {
     expect(evaluate([review({ reviewerModelFamilies: [] })])).toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("recorded no model") }]);
     expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
-      author: { agentId: "claude-engineer", modelFamilies: null }, reviews: [review()] }))
+      author: { agentIds: ["claude-engineer"], modelFamilies: null }, reviews: [review()] }))
       .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }]);
+    expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
+      author: { agentIds: null, modelFamilies: ["anthropic"] }, reviews: [review()] }))
+      .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("no recorded model provenance") }]);
+  });
+
+  it("refuses a reviewer that worked on the task, whatever its model now", () => {
+    // STA-218: a previous implementer reviewing after a handoff is not independent.
+    expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
+      author: { agentIds: ["claude-engineer", "codex-reviewer"], modelFamilies: ["anthropic", "openai"] }, reviews: [review()] }))
+      .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("worked on this task") }]);
   });
 
   it("reads every model a run recorded", () => {

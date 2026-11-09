@@ -67,7 +67,7 @@ function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAtt
 
 function harness(input: {
   github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
-  authorFamilies?: string[] | null; locks?: Set<string>; onLoadReviews?: () => void;
+  authorFamilies?: string[] | null; authorAgents?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
@@ -76,14 +76,15 @@ function harness(input: {
   const parked: Array<{ issueId: string; blockerIssueId: string }> = [];
   const logs: Array<{ action: string; details: Record<string, unknown> }> = [];
   const locks = input.locks ?? new Set<string>();
-  const authorQueries: Array<{ issueId: string; excludeAgentIds: string[] }> = [];
+  const authorQueries: Array<{ issueId: string; excludeAgentId: string | null }> = [];
   const deps: MergeGateDependencies = {
     github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
     loadIssue: async (_company, id) => issues.get(id) ?? null,
-    loadAuthorModelFamilies: async (_company, query) => {
+    loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
-      return input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
+      const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
+      return families === null ? null : { agentIds: input.authorAgents ?? ["claude-engineer"], modelFamilies: families };
     },
     // The database lock is a try-lock shared across server instances.
     withMergeLock: async (key, action) => {
@@ -236,7 +237,8 @@ describe("merge gate service", () => {
     const sameFamily = harness({ github, authorFamilies: ["anthropic"], reviews: [review({ reviewerModelFamilies: ["anthropic"] })] });
     await expect(evaluateAndMerge(sameFamily.deps, request()))
       .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
-    expect(sameFamily.authorQueries).toEqual([{ issueId: "task", excludeAgentIds: ["codex-reviewer", "coordinator"] }]);
+    // Only the merging coordinator's runs are left out; reviewers' runs count.
+    expect(sameFamily.authorQueries).toEqual([{ issueId: "task", excludeAgentId: "coordinator" }]);
     // A run with no recorded model leaves only the trailers, which still name Claude.
     const trailersOnly = harness({ github, authorFamilies: [], reviews: [review({ reviewerModelFamilies: ["anthropic"] })] });
     await expect(evaluateAndMerge(trailersOnly.deps, request()))
@@ -245,6 +247,20 @@ describe("merge gate service", () => {
     await expect(evaluateAndMerge(missing.deps, request()))
       .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }] });
     expect(coAuthorModelFamilies(["fix\n\nCo-authored-by: Codex <codex@openai.com>", null])).toEqual(["openai"]);
+  });
+
+  it("refuses a previous implementer as reviewer after the task is handed to another model (STA-218)", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    // codex-reviewer authored part of the PR with Codex, then the task moved to
+    // claude-engineer. No co-author trailers name Codex.
+    const handedOff = harness({ github, authorAgents: ["claude-engineer", "codex-reviewer"], authorFamilies: ["anthropic", "openai"] });
+    await expect(evaluateAndMerge(handedOff.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("worked on this task") }] });
+    // Another Codex agent reviewing the mixed-authorship change shares a family.
+    const mixed = harness({ github, authorAgents: ["claude-engineer", "codex-implementer"], authorFamilies: ["anthropic", "openai"] });
+    await expect(evaluateAndMerge(mixed.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("openai") }] });
+    expect(merge).not.toHaveBeenCalled();
   });
 
   it("does not count a review written by the merging coordinator", async () => {

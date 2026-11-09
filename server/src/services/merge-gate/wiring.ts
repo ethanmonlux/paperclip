@@ -1,5 +1,5 @@
 /** Database and GitHub wiring for the protected-main merge gate (FAC-840 B). */
-import { and, desc, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, ne, notInArray, sql } from "drizzle-orm";
 import {
   agents,
   documentRevisions,
@@ -104,15 +104,16 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
       return (await resolveGitHubApiCredential(db, companyId))?.token ?? null;
     },
     loadIssue,
-    async loadAuthorModelFamilies(companyId, input) {
-      // Every run that started on the task may have authored part of it.
+    async loadTaskAuthorship(companyId, input) {
+      // Every run that started on the task may have authored part of it,
+      // whatever role its agent holds now.
       const runs = await db.select({ agentId: heartbeatRuns.agentId, usage: heartbeatRuns.usageJson })
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.issueId, input.issueId),
           isNotNull(heartbeatRuns.startedAt),
-          input.excludeAgentIds.length > 0 ? notInArray(heartbeatRuns.agentId, input.excludeAgentIds) : undefined,
+          input.excludeAgentId ? ne(heartbeatRuns.agentId, input.excludeAgentId) : undefined,
         ))
         .orderBy(desc(heartbeatRuns.createdAt))
         .limit(MAX_AUTHOR_RUNS + 1);
@@ -132,7 +133,7 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         if (entry.families.size === 0 && entry.unrecorded > 0) return null;
         for (const family of entry.families) families.add(family);
       }
-      return [...families].sort();
+      return { agentIds: [...byAgent.keys()].sort(), modelFamilies: [...families].sort() };
     },
     withMergeLock: (key, action) => withAdvisoryTryLock(db, key, action),
     async loadReviews(companyId, input) {

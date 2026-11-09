@@ -93,12 +93,21 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     const deps = createMergeGateDependencies(db);
     await expect(deps.loadReviews(f.company.id, { reviewIssueIds: [reviewIssue.id], repo: "ethanmonlux/facette", pullNumber: 704 }))
       .resolves.toMatchObject([{ reviewerAgentId: reviewer.id, reviewerModelFamilies: ["openai"], writtenByReviewer: true, reviewedSha: HEAD }]);
-    await expect(deps.loadAuthorModelFamilies(f.company.id, { issueId: task.id, excludeAgentIds: [reviewer.id] })).resolves.toEqual(["anthropic"]);
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null }))
+      .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
+
+    // STA-218: a reviewer that ran on the task stays a potential author; only
+    // the merging coordinator's runs are left out.
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    await f.run(coordinator.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
+    await f.run(reviewer.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: coordinator.id }))
+      .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
 
     // An agent whose only runs on the task recorded no model leaves authorship unknown.
     const silent = await f.agent("Silent", "process");
     await f.run(silent.id, task.id, null);
-    await expect(deps.loadAuthorModelFamilies(f.company.id, { issueId: task.id, excludeAgentIds: [reviewer.id] })).resolves.toBeNull();
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: coordinator.id })).resolves.toBeNull();
 
     // A later revision written by someone else is not the reviewer's record.
     await db.insert(documentRevisions).values({ companyId: f.company.id, documentId: document!.id, revisionNumber: 2, body,

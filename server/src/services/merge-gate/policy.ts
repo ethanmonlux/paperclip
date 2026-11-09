@@ -26,12 +26,26 @@ export interface RepositoryMergePolicy {
   /** Suites that run on every pull request: each must have a passing check run. */
   alwaysRequiredChecks: Array<{ label: string; pattern: RegExp }>;
   /**
-   * Checks a CI path filter may skip. Each may be skipped (or absent) only
-   * when every changed file matches one of its `irrelevantPaths`.
+   * Checks a CI path filter may skip or not start. With `irrelevantPaths`,
+   * a check may be skipped (or absent) only when every changed file matches
+   * one of them, so an unknown path needs the check. With `relevantPaths`
+   * (a workflow-level `paths:` trigger), the check is needed when any changed
+   * file matches one. Either way, a file a Windows suite executes always
+   * needs a Windows check.
    */
-  pathScopedChecks: Array<{ platform: string; checks: string[]; irrelevantPaths: RegExp[] }>;
-  /** Check runs that may skip on any change (selectors, not suites). Any other skip refuses. */
+  pathScopedChecks: Array<{ platform: string; checks: string[]; irrelevantPaths?: RegExp[]; relevantPaths?: RegExp[] }>;
+  /**
+   * Check runs that may skip on any change: selectors, and jobs that run
+   * only on a label or manual dispatch. Any other skip refuses.
+   */
   optionalSkips: RegExp[];
+  /**
+   * Jobs the repository's own CI plan may skip, each accepted as skipped only
+   * when its `validator` check passed. The validator is an always-run job
+   * that fails unless every planned suite has the result the plan chose
+   * (success when selected, skipped when not).
+   */
+  planValidatedSkips: Array<{ validator: string; checks: RegExp[] }>;
   mergeMethod: "merge" | "squash" | "rebase";
 }
 
@@ -67,27 +81,64 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       { platform: "windows", checks: ["windows-fast", "windows-native"], irrelevantPaths: FACETTE_WINDOWS_IRRELEVANT },
     ],
     optionalSkips: [],
+    planValidatedSkips: [],
     mergeMethod: "merge",
   },
-  // .github/workflows/pr.yml (`ci / …` jobs). Sharded suites match by prefix;
-  // a skipped shard still refuses through the skip rule.
+  // .github/workflows/pr.yml calls pr-trusted.yml (`ci / …` jobs). Its CI
+  // plan may skip suites; `ci / verify` and `ci / e2e` always run and fail
+  // unless each planned suite has the result the plan chose. The suites below
+  // must pass on every change regardless of the plan. Sharded suites match by
+  // prefix; a skipped shard of one still refuses.
   "ethanmonlux/paperclip": {
     alwaysRequiredChecks: [
       exactly("ci / policy"),
+      exactly("ci / verify"),
+      exactly("ci / e2e"),
       { label: "ci / Typecheck + Release Registry", pattern: /^ci \/ Typecheck\b/ },
       exactly("ci / Build"),
       { label: "ci / General tests (server …)", pattern: /^ci \/ General tests \(server\b/ },
       { label: "ci / Verify serialized server suites", pattern: /^ci \/ Verify serialized server suites\b/ },
     ],
-    pathScopedChecks: [],
-    optionalSkips: [/^ci \/ Select Vitest files$/],
+    // runner-windows.yml starts only for these paths (its `paths:` trigger).
+    pathScopedChecks: [{
+      platform: "windows",
+      checks: ["Runner Rust (Windows x64)"],
+      relevantPaths: [
+        /^\.github\/workflows\/runner-windows\.yml$/,
+        /^packages\/paperclip-runner\/(rust-toolchain\.toml|acpx-profiles\.json|antigravity-distributions\.json)$/,
+        /^packages\/paperclip-runner\/(runner|protocol|test-fixtures|test\/fixtures)\//,
+        /^tests\/runner-e2e\/fixtures\//,
+      ],
+    }],
+    optionalSkips: [
+      // The plan's test selector; skipped when no selection applies.
+      /^ci \/ Select Vitest files$/,
+      // storybook-visual.yml: visual tests need the `storybook-visual` label
+      // or a manual dispatch, the preview deploy a manual `deploy_preview`.
+      /^Storybook visual regression$/,
+      /^Deploy selected branch Storybook$/,
+    ],
+    planValidatedSkips: [
+      {
+        validator: "ci / verify",
+        checks: [
+          /^ci \/ General tests \((chat|workspaces-[a-z])\b/,
+          /^ci \/ Verify Paperclip Runner \(/,
+          /^ci \/ Docker context integrity$/,
+          /^ci \/ Sandbox provider tests$/,
+          /^ci \/ Canary Dry Run$/,
+          /^ci \/ Runner support suite$/,
+        ],
+      },
+      { validator: "ci / e2e", checks: [/^ci \/ e2e shard \(/] },
+    ],
     mergeMethod: "merge",
   },
 };
 
 /** Unknown repositories: nothing may skip, and at least one check must pass. */
 export const DEFAULT_REPOSITORY_MERGE_POLICY: RepositoryMergePolicy = {
-  alwaysRequiredChecks: [], pathScopedChecks: [], optionalSkips: [], mergeMethod: "merge",
+  alwaysRequiredChecks: [], pathScopedChecks: [], optionalSkips: [], planValidatedSkips: [], mergeMethod: "merge",
 };
 
 export function repositoryMergePolicy(repo: string): RepositoryMergePolicy {
@@ -137,8 +188,10 @@ function matchesAny(path: string, patterns: readonly RegExp[]) {
 
 /**
  * Checks a change needs, by name. A path-scoped check is needed unless every
- * changed file is known to be irrelevant to it. An empty or unreadable file
- * list is unknown, so every path-scoped check is needed.
+ * changed file is known to be irrelevant to it (or, for a `relevantPaths`
+ * scope, no changed file is relevant to it). A file a Windows suite executes
+ * always needs the Windows checks. An empty or unreadable file list is
+ * unknown, so every path-scoped check is needed.
  */
 export function requiredPathScopedChecks(input: {
   policy: RepositoryMergePolicy;
@@ -147,8 +200,12 @@ export function requiredPathScopedChecks(input: {
   const files = input.changedFiles;
   const required: string[] = [];
   for (const scope of input.policy.pathScopedChecks) {
-    const allIrrelevant = files !== null && files.length > 0 && files.every(file =>
-      matchesAny(file, scope.irrelevantPaths) && !(scope.platform === "windows" && matchesAny(file, WINDOWS_EXECUTED_PATHS)));
+    const irrelevant = (file: string) => {
+      if (scope.platform === "windows" && matchesAny(file, WINDOWS_EXECUTED_PATHS)) return false;
+      if (scope.relevantPaths) return !matchesAny(file, scope.relevantPaths);
+      return matchesAny(file, scope.irrelevantPaths ?? []);
+    };
+    const allIrrelevant = files !== null && files.length > 0 && files.every(irrelevant);
     if (!allIrrelevant) required.push(...scope.checks);
   }
   return required;
@@ -212,6 +269,9 @@ export function evaluateHeadCi(input: {
   for (const check of checkRuns) {
     if (check.conclusion !== "skipped" || reported.has(check.name)) continue;
     if (skippablePathScoped.has(check.name) || matchesAny(check.name, input.policy.optionalSkips)) continue;
+    // A plan skip counts only when the plan's validator ran and passed.
+    if (input.policy.planValidatedSkips.some(scope =>
+      matchesAny(check.name, scope.checks) && passed.some(run => run.name === scope.validator))) continue;
     reported.add(check.name);
     reasons.push({ code: "required_check_skipped", detail: touchesWindowsScripts && WINDOWS_CHECK_NAME.test(check.name)
       ? `${check.name} was skipped, but this change touches files a Windows suite executes. It must run and pass on ${sha}.`
@@ -342,10 +402,15 @@ export function modelFamiliesFromRunUsage(usage: unknown): string[] {
 }
 
 export interface MergeGateAuthor {
-  agentId: string | null;
   /**
-   * Model families that authored the change: every recorded implementation
-   * run plus commit co-author trailers. Null when provenance is missing.
+   * Agents that may have authored the change: the assignee and every agent
+   * with a run on the task, whatever role it holds now. Null when the runs
+   * could not be read.
+   */
+  agentIds: string[] | null;
+  /**
+   * Model families that may have authored the change: every run on the task
+   * plus commit co-author trailers. Null when provenance is missing.
    */
   modelFamilies: string[] | null;
 }
@@ -354,7 +419,12 @@ export interface MergeGateAuthor {
 function independenceProblem(review: MergeReviewAttestation, author: MergeGateAuthor) {
   if (review.reviewIssueStatus !== "done") return `${reviewLabel(review)} is ${review.reviewIssueStatus}, not done.`;
   if (!review.writtenByReviewer || !review.reviewerAgentId) return `${reviewLabel(review)}'s merge-review document was not written by its assigned reviewer.`;
-  if (author.agentId && review.reviewerAgentId === author.agentId) return `${reviewLabel(review)} was reviewed by the implementer.`;
+  if (!author.agentIds) {
+    return `The gate found no recorded model provenance for the agents that worked on this task, so it cannot show ${reviewLabel(review)} is independent.`;
+  }
+  if (author.agentIds.includes(review.reviewerAgentId)) {
+    return `${reviewLabel(review)} was reviewed by an agent that worked on this task and may have authored part of the change.`;
+  }
   if (review.reviewerModelFamilies.length === 0) {
     return `The run that wrote ${reviewLabel(review)}'s merge-review document recorded no model, so the gate cannot show the review is cross-model.`;
   }
