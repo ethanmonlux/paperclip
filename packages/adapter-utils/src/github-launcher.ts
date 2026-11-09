@@ -147,7 +147,24 @@ ${options.brokerFile ? String.raw`
       }
       }
     } else if (askBroker) { diagnostic('capability_missing'); }
-    } catch { diagnostic('broker_transport_unavailable'); }
+    } catch (error) {
+      // Transport errors used to collapse to one string, making an unreachable
+      // socket, DNS failure, and the 10-second request deadline indistinguishable.
+      // Only emit a known code; never print an exception message or URL because
+      // those can contain connection details.
+      const cause = error && typeof error === 'object' ? error.cause : null;
+      const rawCode = cause && typeof cause === 'object' ? cause.code : null;
+      // Node's environment proxy can turn distinct upstream failures into a
+      // code-0 cancellation. Preserve that routing fact without guessing which
+      // upstream mechanism failed or exposing proxy URLs in the run log.
+      const viaEnvironmentProxy = env.NODE_USE_ENV_PROXY === '1'
+        && Boolean(env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy)
+        && !env.NO_PROXY && !env.no_proxy;
+      const code = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(rawCode)
+        ? rawCode : error && typeof error === 'object' && error.name === 'TimeoutError' ? 'request_timeout'
+          : rawCode === 0 && viaEnvironmentProxy ? 'proxy_transport_unclassified' : 'unknown';
+      diagnostic('broker_transport_unavailable (' + code + ')');
+    }
   }
   const connectorTool = connected ? connectorRepositoryTool(process.argv.slice(2)) : null;
   if (connectorTool) {
