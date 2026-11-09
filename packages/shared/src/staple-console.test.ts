@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   buildStapleConsoleBoard,
+  clipStapleConsoleText,
   extractFacIds,
   extractStapleConsolePrRefs,
   nextStapleConsoleLocalTime,
   stapleConsoleDefaultRepo,
   stapleConsoleFreshness,
+  stapleConsolePrStatusText,
   stuckBlockedWithoutBlocker,
   stuckCiNotStarted,
   stuckInProgressIdle,
@@ -218,6 +220,28 @@ describe("CI never started: an open PR head with no check run after 10 min", () 
       pullRequests: [pr({})],
     }));
     expect(board.lanes.flatMap((lane) => lane.cards)[0]!.stuck.map((flag) => flag.rule)).toEqual(["ci_not_started"]);
+  });
+});
+
+describe("PR status text and long questions (STA-205)", () => {
+  it("labels a Paperclip-recorded PR state as recorded with CI unknown, and only a GitHub read as live", () => {
+    expect(stapleConsolePrStatusText({ state: "open", ci: "unknown", source: "work_product" })).toBe("recorded open · CI unknown");
+    expect(stapleConsolePrStatusText({ state: "merged", ci: "unknown", source: "work_product" })).toBe("recorded merged");
+    expect(stapleConsolePrStatusText({ state: "unknown", ci: "unknown", source: "reference" })).toBe("state unknown");
+    expect(stapleConsolePrStatusText({ state: "merged", ci: "unknown", source: "github" })).toBe("merged");
+    expect(stapleConsolePrStatusText({ state: "open", ci: "pending", source: "github" })).toBe("open · CI pending");
+    expect(stapleConsolePrStatusText({ state: "open", ci: "none", source: "github" })).toBe("open · CI not reported");
+  });
+
+  it("shortens a long question at a word boundary with an ellipsis instead of mid-word", () => {
+    const question = `${"Confirm the merged source ".repeat(15)}and live validation remain separate.`;
+    expect(question.length).toBeGreaterThan(400);
+    const clipped = clipStapleConsoleText(question);
+    expect(clipped.length).toBeLessThanOrEqual(400);
+    expect(clipped.endsWith("…")).toBe(true);
+    expect(question.startsWith(clipped.slice(0, -1))).toBe(true);
+    expect(question[clipped.length - 1]).toBe(" ");
+    expect(clipStapleConsoleText("Short question?")).toBe("Short question?");
   });
 });
 

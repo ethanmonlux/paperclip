@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -18,6 +19,7 @@ import {
 } from "@paperclipai/db";
 import {
   buildStapleConsoleBoard,
+  clipStapleConsoleText,
   extractStapleConsolePrRefs,
   isStapleConsoleTerminal,
   nextStapleConsoleLocalTime,
@@ -34,8 +36,13 @@ import {
 } from "@paperclipai/shared/staple-console";
 import { maintenanceHoldService } from "./maintenance-hold.js";
 import { notFound } from "../errors.js";
-import { resolveGitHubApiCredential, type GitHubApiCredential } from "./git-credentials.js";
+import {
+  resolveGitHubApiCredential,
+  resolveManagedGitHubCredential,
+  type GitHubApiCredential,
+} from "./git-credentials.js";
 import { ghFetch } from "./github-fetch.js";
+import { secretService } from "./secrets.js";
 import { executionIssueCondition } from "./issue-visibility.js";
 import {
   approvalReadSqlCondition,
@@ -74,9 +81,14 @@ interface PullRequestSnapshot {
   headCommittedAt: string | null;
 }
 
+/** A shared company/server credential, or the viewing person's own managed GitHub connection grant. */
+export type StapleConsoleGitHubCredential =
+  | GitHubApiCredential
+  | { token: string; source: "managed_connection"; secretName: null; login: string | null };
+
 export interface StapleConsoleServiceOptions {
   fetch?: FetchLike;
-  credentialProvider?: (companyId: string) => Promise<GitHubApiCredential | null>;
+  credentialProvider?: (companyId: string, actor: AuthorizationActor) => Promise<StapleConsoleGitHubCredential | null>;
   now?: () => Date;
 }
 
@@ -95,7 +107,7 @@ function interactionQuestion(row: { kind: string; title: string | null; summary:
   const firstPrompt = asRecord(questions[0])?.prompt;
   const candidates = [payload?.title, firstPrompt, payload?.prompt, row.title, row.summary];
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 400);
+    if (typeof candidate === "string" && candidate.trim()) return clipStapleConsoleText(candidate.trim());
   }
   return row.kind.replace(/_/g, " ");
 }
@@ -150,7 +162,27 @@ function summarizeCheckRuns(body: unknown): { ci: StapleConsoleCiState; ciStarte
 
 export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions = {}) {
   const fetchImpl = opts.fetch ?? ghFetch;
-  const credentialProvider = opts.credentialProvider ?? ((companyId: string) => resolveGitHubApiCredential(db, companyId));
+  /**
+   * A company secret or server token first. Otherwise the managed GitHub connection agents already
+   * use, but only the viewer's own personal grant: never another person's or an agent's (STA-205).
+   * Resolved on every refresh so a revoked grant or disabled connection stops live reads at once.
+   */
+  async function defaultCredential(companyId: string, actor: AuthorizationActor): Promise<StapleConsoleGitHubCredential | null> {
+    const shared = await resolveGitHubApiCredential(db, companyId);
+    if (shared) return shared;
+    const userId = actor.type === "board" ? actor.userId : null;
+    if (!userId) return null;
+    const managed = await resolveManagedGitHubCredential(db, secretService(db), companyId, {
+      responsibleUserId: userId, agentId: null, allowStandingDelegation: false,
+    });
+    if (!managed.credential?.token) return null;
+    return {
+      token: managed.credential.token, source: "managed_connection", secretName: null,
+      login: managed.credential.githubIdentity?.login ?? null,
+    };
+  }
+
+  const credentialProvider = opts.credentialProvider ?? defaultCredential;
   const prCache = new Map<string, { value: PullRequestSnapshot; expiresAt: number }>();
   const holdService = maintenanceHoldService(db);
 
@@ -167,8 +199,9 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     return response.json() as Promise<unknown>;
   }
 
-  async function resolvePullRequest(repo: string, number: number, token: string, nowMs: number) {
-    const key = `${repo.toLowerCase()}#${number}`;
+  async function resolvePullRequest(repo: string, number: number, token: string, scope: string, nowMs: number) {
+    // Scoped to company, viewer and the exact token, so a read is only reused for the credential GitHub checked.
+    const key = `${scope}|${repo.toLowerCase()}#${number}`;
     const cached = prCache.get(key);
     if (cached && cached.expiresAt > nowMs) return cached.value;
     const pr = asRecord(await githubJson(`/repos/${repo}/pulls/${number}`, token));
@@ -393,21 +426,24 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
 
     let github: StapleConsoleSourceStatus["github"];
     const missingOnGitHub = new Set<string>();
-    const credential = await credentialProvider(companyId).catch(() => null);
+    const credential = await credentialProvider(companyId, actor).catch(() => null);
     if (!credential) {
       github = {
         available: false,
-        detail: "No server GitHub credential is configured, so PR state comes from Paperclip records and CI is unknown.",
+        detail: "No company GitHub secret, server token or connected GitHub account of yours is available, so PR state is Paperclip's recorded status (not live) and CI is unknown.",
       };
     } else {
       const unique = new Map<string, { repo: string; number: number }>();
       for (const pr of pullRequests) unique.set(`${pr.repo.toLowerCase()}#${pr.number}`, pr);
       const targets = [...unique.entries()].sort((a, b) => b[1].number - a[1].number).slice(0, MAX_GITHUB_PRS_PER_REFRESH);
+      const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
+      const tokenHash = createHash("sha256").update(credential.token).digest("hex");
+      const scope = `${companyId}|${viewer}|${tokenHash}`;
       const resolved = new Map<string, PullRequestSnapshot>();
       let failures = 0;
       await Promise.all(targets.map(async ([key, pr]) => {
         try {
-          resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, nowMs));
+          resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, scope, nowMs));
         } catch (error) {
           if ((error as { status?: unknown }).status === 404) missingOnGitHub.add(key);
           else failures += 1;
@@ -429,8 +465,10 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       github = {
         available: failures < targets.length || targets.length === 0,
         detail: gaps.length === 0
-          ? `Live GitHub read with the server's existing ${credential.source === "server_env" ? "environment" : "company"} credential (cached up to 2 min).`
-          : `${gaps.join("; ")}; those show Paperclip records with state and CI unknown.`,
+          ? `Live GitHub read with ${credential.source === "managed_connection"
+            ? `your connected GitHub account${credential.login ? ` (${credential.login})` : ""}`
+            : `the server's existing ${credential.source === "server_env" ? "environment" : "company"} credential`} (cached up to 2 min).`
+          : `${gaps.join("; ")}; those show Paperclip's recorded status (not live) with CI unknown.`,
       };
     }
     // Only a reference GitHub definitively answered 404 for (a wrong repo guess) is dropped. Timeouts,
@@ -558,7 +596,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           issueId: row.issueId,
           type: row.type,
           status: row.status,
-          title: (title ?? `Approval requested: ${row.type.replace(/_/g, " ")}`).slice(0, 400),
+          title: clipStapleConsoleText(title ?? `Approval requested: ${row.type.replace(/_/g, " ")}`),
           createdAt: iso(row.createdAt)!,
         };
       }),
