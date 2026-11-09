@@ -12,6 +12,7 @@ import {
   issues,
   issueThreadInteractions,
   issueWorkProducts,
+  projects,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
@@ -34,6 +35,12 @@ import { notFound } from "../errors.js";
 import { resolveGitHubApiCredential, type GitHubApiCredential } from "./git-credentials.js";
 import { ghFetch } from "./github-fetch.js";
 import { executionIssueCondition } from "./issue-visibility.js";
+import {
+  approvalReadSqlCondition,
+  issueReadSqlCondition,
+  projectReadSqlCondition,
+  type AuthorizationActor,
+} from "./authorization.js";
 import { getServerInfoSnapshot } from "../server-info.js";
 
 /** Runs older than this are not needed for any FAC-620 rule or card timing. */
@@ -134,7 +141,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       },
       signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
-    if (!response.ok) throw new Error(`GitHub ${response.status}`);
+    if (!response.ok) throw Object.assign(new Error(`GitHub ${response.status}`), { status: response.status });
     return response.json() as Promise<unknown>;
   }
 
@@ -162,7 +169,8 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     return value;
   }
 
-  async function board(companyId: string): Promise<StapleConsoleBoard> {
+  /** Every task-derived row is limited to tasks `actor` may read (private projects and private ancestry). */
+  async function board(companyId: string, actor: AuthorizationActor): Promise<StapleConsoleBoard> {
     const now = opts.now?.() ?? new Date();
     const nowIso = now.toISOString();
     const nowMs = now.getTime();
@@ -173,6 +181,11 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       .from(companies)
       .where(eq(companies.id, companyId));
     if (!company) throw notFound("Company not found");
+    const [readableIssue, readableApproval, readableProject] = await Promise.all([
+      issueReadSqlCondition(db, actor),
+      approvalReadSqlCondition(db, actor),
+      projectReadSqlCondition(db, actor),
+    ]);
 
     const issueRows = await db
       .select({
@@ -192,7 +205,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         executionState: issues.executionState,
       })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.visibility, "open"), executionIssueCondition()));
+      .where(and(eq(issues.companyId, companyId), eq(issues.visibility, "open"), executionIssueCondition(), readableIssue));
 
     const issueInputs: StapleConsoleIssueInput[] = issueRows.map((row) => {
       const monitor = asRecord(asRecord(row.executionState)?.monitor);
@@ -293,6 +306,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           eq(issueApprovals.companyId, companyId),
           eq(approvals.status, "pending"),
           inArray(issueApprovals.issueId, liveIds),
+          readableApproval,
         )),
       liveIds.length === 0 ? [] : db
         .select({
@@ -311,6 +325,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
 
     // ---- Pull requests: Paperclip records first, then a cached live GitHub read.
     const byId = new Map(issueRows.map((row) => [row.id, row]));
+    const readableRelations = relationRows.filter((row) => byId.has(row.blockerIssueId) && byId.has(row.blockedIssueId));
     const titleChain = (id: string) => {
       const titles: string[] = [];
       const seen = new Set<string>();
@@ -346,6 +361,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     }
 
     let github: StapleConsoleSourceStatus["github"];
+    const missingOnGitHub = new Set<string>();
     const credential = await credentialProvider(companyId).catch(() => null);
     if (!credential) {
       github = {
@@ -361,27 +377,32 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       await Promise.all(targets.map(async ([key, pr]) => {
         try {
           resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, nowMs));
-        } catch {
-          failures += 1;
+        } catch (error) {
+          if ((error as { status?: unknown }).status === 404) missingOnGitHub.add(key);
+          else failures += 1;
         }
       }));
+      const skipped = unique.size - targets.length;
       for (const pr of pullRequests) {
         const snapshot = resolved.get(`${pr.repo.toLowerCase()}#${pr.number}`);
         if (!snapshot) continue;
         Object.assign(pr, { state: snapshot.state, mergedAt: snapshot.mergedAt, ci: snapshot.ci, ciStartedAt: snapshot.ciStartedAt, source: "github" });
       }
+      const gaps = [
+        failures > 0 ? `GitHub read failed for ${failures} of ${targets.length} PRs` : null,
+        skipped > 0 ? `${skipped} older PRs are beyond the ${MAX_GITHUB_PRS_PER_REFRESH}-PR refresh limit` : null,
+      ].filter(Boolean);
       github = {
         available: failures < targets.length || targets.length === 0,
-        detail: failures === 0
+        detail: gaps.length === 0
           ? `Live GitHub read with the server's existing ${credential.source === "server_env" ? "environment" : "company"} credential (cached up to 2 min).`
-          : `GitHub read failed for ${failures} of ${targets.length} PRs; those show Paperclip records only.`,
+          : `${gaps.join("; ")}; those show Paperclip records with state and CI unknown.`,
       };
     }
-    // With GitHub reachable, a bare title reference it could not confirm (wrong repo guess) is dropped;
-    // without GitHub, references stay as links with unknown state.
-    const confirmedPullRequests = credential
-      ? pullRequests.filter((pr) => pr.source !== "reference")
-      : pullRequests;
+    // Only a reference GitHub definitively answered 404 for (a wrong repo guess) is dropped. Timeouts,
+    // rate limits and capped PRs keep their link with unknown state.
+    const confirmedPullRequests = pullRequests.filter((pr) =>
+      pr.source !== "reference" || !missingOnGitHub.has(`${pr.repo.toLowerCase()}#${pr.number}`));
 
     // ---- Scheduled events with their actual source
     const scheduled: StapleConsoleScheduledEvent[] = [];
@@ -390,7 +411,9 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         .select({ title: routines.title, nextRunAt: routineTriggers.nextRunAt, label: routineTriggers.label })
         .from(routineTriggers)
         .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
+        .leftJoin(projects, and(eq(projects.id, routines.projectId), eq(projects.companyId, routines.companyId)))
         .where(and(
+          or(isNull(routines.projectId), readableProject),
           eq(routineTriggers.companyId, companyId),
           eq(routineTriggers.enabled, true),
           eq(routineTriggers.archived, false),
@@ -466,7 +489,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       issuePrefix: company.issuePrefix,
       issues: issueInputs,
       agents: agentRows.map((agent) => ({ id: agent.id, name: agent.name, role: agent.role ?? null })),
-      relations: relationRows,
+      relations: readableRelations,
       runs: runRows.filter((run) => run.issueId).map((run) => ({
         id: run.id,
         issueId: run.issueId!,

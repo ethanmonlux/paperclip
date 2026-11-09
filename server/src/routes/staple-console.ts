@@ -12,7 +12,7 @@ export function stapleConsoleRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     res.set("cache-control", "no-store");
-    res.json(await svc.board(companyId));
+    res.json(await svc.board(companyId, req.actor));
   });
 
   return router;
