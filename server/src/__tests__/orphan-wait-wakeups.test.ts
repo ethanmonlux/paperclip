@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, executionWorkspaces, issueRecoveryActions, issueRelations,
+  issues, issueThreadInteractions, issueTreeHolds, projects, workspaceOperations, type Db } from "@paperclipai/db";
 import { ISSUE_WAIT_ORPHANED_WAKE_REASON } from "@paperclipai/shared";
 import { recoveryService } from "../services/recovery/service.js";
-import { ORPHAN_REFUSED_WAKE_RETRY_MS, ORPHAN_WAIT_GRACE_MS, orphanWaitWakeKey } from "../services/recovery/orphan-wait-wakeups.js";
+import { issueService } from "../services/issues.js";
+import { buildIssueBlockersResolvedWakeStateKey, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../services/issue-dependency-wakeups.js";
+import { MAX_ORPHAN_WAKES_PER_DAY, ORPHAN_REFUSED_WAKE_RETRY_MS, ORPHAN_WAIT_GRACE_MS, orphanWaitWakeKey } from "../services/recovery/orphan-wait-wakeups.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -126,6 +129,128 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(enqueueWakeup.mock.calls.filter(([, input]) => input.reason === ISSUE_WAIT_ORPHANED_WAKE_REASON)).toHaveLength(0);
     expect(deadlines.filter(at => at === f.issue.blockedTransitionAt!.getTime() + ORPHAN_WAIT_GRACE_MS)).toEqual([]);
     expect(await orphanWakes(f.companyId)).toHaveLength(0);
+  });
+
+  // FAC-851: the assignee re-blocks its own task after its only blocker is
+  // done. The dependency backstop withholds its wake (a self-block must not
+  // loop), so the done relation waits for nothing: the task is an orphan.
+  describe("self-blocked after its blocker was done", () => {
+    async function selfBlocked(blockedAt: Date, opts: { blockerFinalizing?: boolean } = {}) {
+      const f = await fixture(blockedAt);
+      let executionWorkspaceId: string | null = null;
+      if (opts.blockerFinalizing) {
+        const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Dependency" }).returning();
+        const [workspace] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, projectId: project.id,
+          mode: "isolated_workspace", strategyType: "git_worktree", name: "Blocker workspace" }).returning();
+        executionWorkspaceId = workspace.id;
+      }
+      const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Done blocker", status: "done",
+        completedAt: new Date(blockedAt.getTime() - 10 * 60_000), executionWorkspaceId }).returning();
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blocker.id, relatedIssueId: f.issue.id, type: "blocks" });
+      if (executionWorkspaceId) {
+        // The blocker ran on its workspace but has not synced it back yet.
+        await db.insert(workspaceOperations).values({ companyId: f.companyId, executionWorkspaceId, issueId: blocker.id,
+          phase: "adapter_execute", status: "succeeded", startedAt: new Date(blockedAt.getTime() - 60_000) });
+      }
+      await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.agentId, agentId: f.agentId,
+        action: "issue.updated", entityType: "issue", entityId: f.issue.id, details: { status: "blocked" }, createdAt: blockedAt });
+      return { ...f, blocker };
+    }
+    const check = async (service: ReturnType<typeof recoveryService>, f: { companyId: string; issue: { id: string } }) => {
+      const deadlines: number[] = [];
+      const result = await service.reconcileResolvedDependencyWakeBackstop({ companyId: f.companyId, issueId: f.issue.id,
+        onDeferredDeadline: at => deadlines.push(at) });
+      return { result, deadlines };
+    };
+    const inboxReason = async (f: { companyId: string; issue: { id: string } }) => {
+      const rows = await issueService(db).list(f.companyId, { attention: "blocked" }) as Array<{ id: string; blockedInboxAttention?: { reason?: string } | null }>;
+      return rows.find(row => row.id === f.issue.id)?.blockedInboxAttention?.reason ?? null;
+    };
+    const dependencyWakes = (companyId: string) => db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId))
+      .then(rows => rows.filter(row => row.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON));
+
+    it("is visible and gets one bounded wake at its grace deadline with no later write", async () => {
+      const blockedAt = new Date(Date.now() - 60_000);
+      const f = await selfBlocked(blockedAt);
+      const service = recoveryService(db, { enqueueWakeup: wakeQueue(f.companyId) as never });
+      expect(await inboxReason(f)).toBe("blocked_without_wait_path");
+
+      const early = await check(service, f);
+      expect(early.result).toMatchObject({ healed: 0, selfBlockedSkipped: 1, orphanWaitsWoken: 0, enqueueFailed: 0 });
+      expect(early.deadlines).toEqual([blockedAt.getTime() + ORPHAN_WAIT_GRACE_MS]);
+
+      // The worker returns at that deadline; nothing else wrote the task.
+      vi.useFakeTimers({ toFake: ["Date"], now: blockedAt.getTime() + ORPHAN_WAIT_GRACE_MS + 1_000 });
+      const due = await check(service, f);
+      expect(due.result).toMatchObject({ healed: 0, selfBlockedSkipped: 1, orphanWaitsWoken: 1, enqueueFailed: 0 });
+      expect(due.deadlines).toEqual([]);
+      expect(await orphanWakes(f.companyId)).toEqual([
+        expect.objectContaining({ agentId: f.agentId, idempotencyKey: orphanWaitWakeKey(f.issue.id, blockedAt) })]);
+      expect(await dependencyWakes(f.companyId)).toHaveLength(0);
+
+      // Once per blocked cycle, and nothing keeps the worker busy afterwards.
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.companyId, f.companyId));
+      const settled = await check(service, f);
+      expect(settled.result.orphanWaitsWoken).toBe(0);
+      expect(settled.deadlines).toEqual([]);
+      expect(await orphanWakes(f.companyId)).toHaveLength(1);
+      expect(await inboxReason(f)).toBe("blocked_without_wait_path");
+    });
+
+    it("stops at the daily cap and stays visible", async () => {
+      const f = await selfBlocked(new Date(Date.now() - 2 * ORPHAN_WAIT_GRACE_MS));
+      await db.insert(agentWakeupRequests).values(Array.from({ length: MAX_ORPHAN_WAKES_PER_DAY }, (_, index) => ({
+        companyId: f.companyId, agentId: f.agentId, source: "automation", triggerDetail: "system",
+        reason: ISSUE_WAIT_ORPHANED_WAKE_REASON, payload: { issueId: f.issue.id }, status: "completed",
+        idempotencyKey: `earlier-cycle-${index}` })));
+      const { result, deadlines } = await check(recoveryService(db, { enqueueWakeup: wakeQueue(f.companyId) as never }), f);
+      expect(result.orphanWaitsWoken).toBe(0);
+      expect(deadlines).toEqual([]);
+      expect(await orphanWakes(f.companyId)).toHaveLength(MAX_ORPHAN_WAKES_PER_DAY);
+      expect(await inboxReason(f)).toBe("blocked_without_wait_path");
+    });
+
+    it("wakes a board-blocked dependent once its dependency wake for this cycle was spent", async () => {
+      const blockedAt = new Date(Date.now() - 2 * ORPHAN_WAIT_GRACE_MS);
+      const f = await fixture(blockedAt);
+      const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Done blocker", status: "done" }).returning();
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blocker.id, relatedIssueId: f.issue.id, type: "blocks" });
+      const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({ dependentIssueId: f.issue.id,
+        blockerIssueIds: [blocker.id], blockedTransitionAt: blockedAt });
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+        triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, payload: { issueId: f.issue.id },
+        status: "completed", idempotencyKey });
+      expect(await inboxReason(f)).toBe("blocked_without_wait_path");
+      const { result } = await check(recoveryService(db, { enqueueWakeup: wakeQueue(f.companyId) as never }), f);
+      expect(result).toMatchObject({ healed: 0, existingWakeSkipped: 1, orphanWaitsWoken: 1 });
+    });
+
+    it.each(["pending interaction", "pause hold", "finalizing blocker", "dependency wake in flight"] as const)(
+      "stays quiet with a %s", async (path) => {
+        const blockedAt = new Date(Date.now() - 2 * ORPHAN_WAIT_GRACE_MS);
+        const f = await selfBlocked(blockedAt, { blockerFinalizing: path === "finalizing blocker" });
+        if (path === "pending interaction") {
+          await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issue.id,
+            kind: "ask_user_questions", status: "pending", title: "Which vendor?", payload: { version: 1, questions: [{ id: "q",
+              prompt: "Which vendor?", options: [{ id: "a", label: "A" }], selectionMode: "single", required: true }] } });
+        } else if (path === "pause hold") {
+          await db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.issue.id, mode: "pause", status: "active",
+            createdByActorType: "user", createdByUserId: "board-1", releasePolicy: { strategy: "manual", note: "hold" } });
+        } else if (path === "dependency wake in flight") {
+          await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+            triggerDetail: "system", reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, payload: { issueId: f.issue.id },
+            status: "deferred_issue_execution", idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
+              dependentIssueId: f.issue.id, blockerIssueIds: [f.blocker.id], blockedTransitionAt: blockedAt }) });
+        }
+        const enqueueWakeup = wakeQueue(f.companyId);
+        const { result, deadlines } = await check(recoveryService(db, { enqueueWakeup: enqueueWakeup as never }), f);
+        expect(result.orphanWaitsWoken).toBe(0);
+        expect(deadlines).toEqual([]);
+        expect(enqueueWakeup.mock.calls.filter(([, input]) => input.reason === ISSUE_WAIT_ORPHANED_WAKE_REASON)).toHaveLength(0);
+        expect(await orphanWakes(f.companyId)).toHaveLength(0);
+        if (path !== "pause hold") expect(await inboxReason(f)).not.toBe("blocked_without_wait_path");
+      });
   });
 
   it("keeps a refused wake as a deadline instead of consuming it as delivered", async () => {

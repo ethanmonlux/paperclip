@@ -259,6 +259,7 @@ import {
   type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
+import { dependencyWakeDisowned } from "./recovery/dependency-wake-ownership.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
@@ -5985,7 +5986,33 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // FAC-851: a listed blocked task whose blockers are all done keeps its
+  // relations as a wait only while the dependency wake can still reach it.
+  const rowIssueIdSet = new Set(rowIssueIds);
+  const relationsByBlockedIssueId = new Map<string, string[]>();
+  for (const relation of graphRelations) {
+    const list = relationsByBlockedIssueId.get(relation.blockedIssueId) ?? [];
+    list.push(relation.blockerIssueId);
+    relationsByBlockedIssueId.set(relation.blockedIssueId, list);
+  }
+  const resolvedDependents = graphIssues.filter((issue) =>
+    rowIssueIdSet.has(issue.id) && issue.status === "blocked" && issue.assigneeAgentId &&
+    !issue.assigneeUserId && !issue.conversationAgentId &&
+    (relationsByBlockedIssueId.get(issue.id) ?? []).length > 0 &&
+    // Graph issues exclude done ones, so a listed blocker is unresolved.
+    !(relationsByBlockedIssueId.get(issue.id) ?? []).some((blockerId) => issuesById.has(blockerId)));
+  const dependencyReadiness = resolvedDependents.length === 0
+    ? new Map<string, IssueDependencyReadiness>()
+    : await listIssueDependencyReadinessMap(dbOrTx, companyId, resolvedDependents.map((issue) => issue.id));
+  const dependencyWakeDisownedIssueIds: string[] = [];
+  for (const issue of resolvedDependents) {
+    if (await dependencyWakeDisowned(dbOrTx, companyId, issue, dependencyReadiness.get(issue.id))) {
+      dependencyWakeDisownedIssueIds.push(issue.id);
+    }
+  }
+
   const findings = classifyIssueGraphLiveness({
+    dependencyWakeDisownedIssueIds,
     externalResponseWaits: await listExternalReviewWaits(dbOrTx, companyId, graphIssues.filter(issue => issue.status === "in_review").map(issue => issue.id)),
     issues: graphIssues.map((issue) => ({
       id: issue.id,
