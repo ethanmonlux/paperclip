@@ -755,7 +755,9 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       if (review) findings.push(review);
     }
 
-    if (issue.status === "blocked" && !chainFinding && !hasUnresolvedBlockerEdge && !unresolvedBlockers.has(issue.id)) {
+    // Any blocker edge, resolved or not, belongs to the dependency backstop.
+    const hasBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => relation.companyId === issue.companyId);
+    if (issue.status === "blocked" && !chainFinding && !hasBlockerEdge && !unresolvedBlockers.has(issue.id)) {
       const orphan = orphanedWaitFinding(issue);
       if (orphan) findings.push(orphan);
     }

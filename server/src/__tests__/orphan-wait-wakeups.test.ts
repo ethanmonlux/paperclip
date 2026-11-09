@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, issues, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
 import { ISSUE_WAIT_ORPHANED_WAKE_REASON } from "@paperclipai/shared";
 import { recoveryService } from "../services/recovery/service.js";
 import { ORPHAN_REFUSED_WAKE_RETRY_MS, ORPHAN_WAIT_GRACE_MS, orphanWaitWakeKey } from "../services/recovery/orphan-wait-wakeups.js";
@@ -103,6 +103,29 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       onDeferredDeadline: () => {} });
     expect(retried).toMatchObject({ orphanWaitsWoken: 1, enqueueFailed: 0 });
     expect(await orphanWakes(f.companyId)).toHaveLength(1);
+  });
+
+  // A native terminal failure blocks the task with a board-owned recovery
+  // action, and a dependent with a done blocker belongs to the dependency
+  // backstop: neither is an orphan, so neither wakes or keeps a deadline.
+  it.each(["recovery action", "resolved blocker"] as const)("leaves a blocked task with a %s alone", async (path) => {
+    const f = await fixture(new Date(Date.now() - 60_000));
+    if (path === "recovery action") {
+      await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issue.id,
+        kind: "active_run_watchdog", ownerType: "board", returnOwnerAgentId: f.agentId, cause: "native_terminal_failure",
+        status: "active", evidence: {}, fingerprint: randomUUID(), nextAction: "Inspect the failure." });
+    } else {
+      const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Done blocker", status: "done" }).returning();
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blocker.id, relatedIssueId: f.issue.id, type: "blocks" });
+    }
+    const enqueueWakeup = wakeQueue(f.companyId);
+    const deadlines: number[] = [];
+    const result = await recoveryService(db, { enqueueWakeup: enqueueWakeup as never }).reconcileResolvedDependencyWakeBackstop({
+      companyId: f.companyId, issueId: f.issue.id, onDeferredDeadline: at => deadlines.push(at) });
+    expect(result.orphanWaitsWoken).toBe(0);
+    expect(enqueueWakeup.mock.calls.filter(([, input]) => input.reason === ISSUE_WAIT_ORPHANED_WAKE_REASON)).toHaveLength(0);
+    expect(deadlines.filter(at => at === f.issue.blockedTransitionAt!.getTime() + ORPHAN_WAIT_GRACE_MS)).toEqual([]);
+    expect(await orphanWakes(f.companyId)).toHaveLength(0);
   });
 
   it("keeps a refused wake as a deadline instead of consuming it as delivered", async () => {

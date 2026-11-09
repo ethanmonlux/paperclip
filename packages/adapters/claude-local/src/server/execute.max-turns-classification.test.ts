@@ -31,8 +31,8 @@ const POISONED_TOOL_OUTPUT =
 
 function buildProcResult(resultEvent: Record<string, unknown>, extraStdout = "") {
   return {
-    exitCode: 1,
-    signal: null,
+    exitCode: 1 as number | null,
+    signal: null as string | null,
     timedOut: false,
     stdout: [
       JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),

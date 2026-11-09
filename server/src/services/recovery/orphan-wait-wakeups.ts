@@ -2,9 +2,10 @@
  * Wake the owner of a blocked task that has no wait record (`issue_wait_orphaned`).
  *
  * FAC-840 wait contract: a task that is not running must say what it waits
- * for. Blocked tasks do that through an unresolved blocker, a pending
+ * for. Blocked tasks do that through a blocker relation, a pending
  * interaction or approval, an unblock action owned by someone else, a recorded
- * external owner, a scheduled monitor, or an open recovery issue. A blocked
+ * external owner, a scheduled monitor, an open recovery action, or an open
+ * recovery issue. A blocked
  * task with none of these and no live run or queued wake can wait forever:
  * STA-144 set its own task blocked with nothing to wake it.
  *
@@ -35,6 +36,8 @@ export const ORPHAN_REFUSED_WAKE_RETRY_MS = 10 * 60_000;
 const MAX_ORPHANS_PER_PASS = 100;
 const DAY_MS = 24 * 60 * 60_000;
 const SKIPPED_WAKE_STATUSES = ["skipped", "failed", "cancelled"];
+/** Mirrors issue-recovery-actions.ts: statuses that still name an owner. */
+const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"];
 
 export const ORPHAN_WAIT_INSTRUCTION =
   "This task is blocked, but nothing records what it waits for, so nothing will wake it. " +
@@ -83,10 +86,16 @@ async function readOrphanCandidates(db: Db, opts: { companyId?: string | null; i
       // An unblock action owned by someone other than the assignee is a wait record.
       or(isNull(issues.unblockDescriptor),
         sql`${issues.unblockDescriptor}->'owner'->>'agentId' = ${issues.assigneeAgentId}::text`),
+      // Any blocker relation, resolved or not: the resolved-dependency backstop
+      // owns waking a dependent (issue_blockers_resolved, workspace finalize).
       sql`not exists (select 1 from issue_relations relation
-        join issues blocker on blocker.id = relation.issue_id and blocker.company_id = relation.company_id
         where relation.company_id = ${issues.companyId} and relation.type = 'blocks'
-          and relation.related_issue_id = ${issues.id} and blocker.status <> 'done')`,
+          and relation.related_issue_id = ${issues.id})`,
+      // An open recovery action (e.g. a board-owned native terminal failure or
+      // execution hold) records who must act next.
+      sql`not exists (select 1 from issue_recovery_actions action
+        where action.company_id = ${issues.companyId} and action.source_issue_id = ${issues.id}
+          and action.status in (${sql.join(ACTIVE_RECOVERY_ACTION_STATUSES.map(status => sql`${status}`), sql`, `)}))`,
       sql`not exists (select 1 from issue_thread_interactions interaction
         where interaction.company_id = ${issues.companyId} and interaction.issue_id = ${issues.id}
           and interaction.status = 'pending')`,

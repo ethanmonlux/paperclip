@@ -672,6 +672,16 @@ describe("wait contract orphan blocked tasks (FAC-840)", () => {
     }
   });
 
+  it("leaves a dependent with a resolved blocker to the dependency backstop", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [orphan(), issue({ id: blockerId, identifier: "STA-143", status: "done", description: null })],
+      relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }],
+      agents: [agent(), manager],
+      now: "2026-11-09T12:00:00.000Z",
+    });
+    expect(findings.map((finding) => finding.state)).not.toContain("blocked_without_wait_path");
+  });
+
   it("leaves callers that do not pass wait-contract inputs unchanged", () => {
     expect(classify({ description: undefined })).toEqual([]);
   });
