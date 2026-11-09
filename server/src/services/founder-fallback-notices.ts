@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, like, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, like, notExists, or, sql } from "drizzle-orm";
 import type { LiveEvent } from "@paperclipai/shared";
 import {
   agents,
@@ -30,9 +30,11 @@ import { subscribeTaskDrainChanges } from "./task-admission.js";
  * The agent assigned to a chat endpoint normally owns every ordinary message in
  * its founder DM. When that agent is unavailable, this sweep enqueues short,
  * model-free, clearly labelled notices into the same DM through the native
- * outbox, so retry, UNKNOWN, restart and idempotency stay native. A notice is
- * re-proved at the transport claim and cancelled before any I/O when its
- * condition no longer holds. Disabled unless explicitly configured.
+ * outbox, so retry, UNKNOWN, restart and idempotency stay native. A decision
+ * addressed to the founder on another task has no native route into that DM,
+ * so it gets its own notice after the bound even while the agent is available.
+ * A notice is re-proved at the transport claim and cancelled before any I/O
+ * when its condition no longer holds. Disabled unless explicitly configured.
  *
  * The sweep is not a poll. It runs at startup, on wake hints from agent, run,
  * interaction and chat-configuration changes, and at the real deadline when a
@@ -141,7 +143,12 @@ function header(agent: Agent) {
   return `Paperclip fallback notice (automatic, not from ${clip(agent.name, 60)}).`;
 }
 
-/** The founder DM of the endpoint's own agent, or null when none qualifies. */
+/**
+ * The founder DM of the endpoint's own agent, or null when none qualifies.
+ * A DM stays a target after its task closes, because the outbox still delivers
+ * there; only a published `/close` or `/new` task control ends it, matching the
+ * outbox's own completed-conversation guard. Open conversations come first.
+ */
 async function resolveTarget(tx: Tx, endpoint: Endpoint): Promise<Target | null> {
   if (endpoint.status !== "active" || !endpoint.allowDirectMessages || !endpoint.assignedAgentId) return null;
   const [agent] = await tx.select().from(agents)
@@ -153,10 +160,21 @@ async function resolveTarget(tx: Tx, endpoint: Endpoint): Promise<Target | null>
       eq(chatConversations.companyId, endpoint.companyId),
       eq(chatConversations.endpointId, endpoint.id),
       eq(chatConversations.isDirectMessage, true),
-      inArray(chatConversations.state, ["active", "waiting"]),
+      or(
+        inArray(chatConversations.state, ["active", "waiting"]),
+        and(
+          eq(chatConversations.state, "completed"),
+          notExists(tx.select({ id: chatPublications.id }).from(chatPublications).where(and(
+            eq(chatPublications.conversationId, chatConversations.id),
+            eq(chatPublications.state, "published"),
+            or(like(chatPublications.idempotencyKey, "control:new:%"), like(chatPublications.idempotencyKey, "control:close:%")),
+          ))),
+        ),
+      ),
       eq(issues.assigneeAgentId, agent.id),
     ))
-    .orderBy(sql`${chatConversations.lastActivityAt} desc nulls last`,
+    .orderBy(sql`case when ${chatConversations.state} = 'completed' then 1 else 0 end`,
+      sql`${chatConversations.lastActivityAt} desc nulls last`,
       desc(chatConversations.sessionGeneration), asc(chatConversations.id));
   for (const { conversation } of candidates) {
     const founderUserId = await soleFounderRecipient(tx, endpoint, conversation.id);
@@ -259,7 +277,7 @@ async function founderCanReadIssue(tx: Tx, target: Target, issueId: string) {
   return decision.allowed;
 }
 
-type ItemReason = { kind: "unavailable"; state: Unavailability } | { kind: "missed" };
+type ItemReason = { kind: "unavailable"; state: Unavailability } | { kind: "missed" } | { kind: "awaiting_founder" };
 
 async function itemReason(
   tx: Tx, target: Target, interaction: Interaction, state: Unavailability | null, now: Date, boundMs: number,
@@ -273,6 +291,9 @@ async function itemReason(
   if (!(await founderCanReadIssue(tx, target, interaction.issueId))) return null;
   if (eligible(state, now, boundMs)) return { kind: "unavailable", state };
   if (toAgent && !state && await escalationMissed(tx, target.agent, interaction, now, boundMs)) return { kind: "missed" };
+  // Nothing routes a founder decision on another task into this DM natively,
+  // so the agent's availability does not decide whether the founder hears of it.
+  if (toFounder && now.getTime() - interaction.createdAt.getTime() >= boundMs) return { kind: "awaiting_founder" };
   return null;
 }
 
@@ -318,9 +339,12 @@ async function itemNoticeText(tx: Tx, target: Target, interaction: Interaction, 
     : [];
   const name = clip(target.agent.name, 60);
   const toFounder = interaction.addresseeUserId === target.founderUserId;
+  const minutes = Math.floor((now.getTime() - interaction.createdAt.getTime()) / 60_000);
   const why = reason.kind === "unavailable"
     ? stateSentence(target.agent, reason.state)
-    : `${name} has not started a run on that task since this escalation reached it ${Math.floor((now.getTime() - interaction.createdAt.getTime()) / 60_000)} min ago.`;
+    : reason.kind === "awaiting_founder"
+      ? `This decision has waited ${minutes} min for your answer.`
+      : `${name} has not started a run on that task since this escalation reached it ${minutes} min ago.`;
   const url = publicChatTaskUrl(interaction.issueId);
   return [
     header(target.agent),
@@ -500,7 +524,8 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       const attempt = plan.get(key);
       if (attempt == null) continue;
       const missedAt = interaction.createdAt.getTime() + settings.boundMs;
-      if (!state && interaction.addresseeAgentId === target.agent.id && missedAt > now.getTime()) due(missedAt);
+      const toFounder = interaction.addresseeUserId === target.founderUserId && interaction.issueId !== target.issueId;
+      if ((toFounder || (!state && interaction.addresseeAgentId === target.agent.id)) && missedAt > now.getTime()) due(missedAt);
       if (interaction.createdAt > now) continue;
       if (items >= MAX_ITEMS_PER_SWEEP) { due(now.getTime()); continue; }
       const reason = await itemReason(db, target, interaction, state, now, settings.boundMs);

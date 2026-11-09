@@ -391,14 +391,100 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await restarted.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
   });
 
+  it("alerts once for a founder decision on another task while the DM agent is available (STA-176)", async () => {
+    const f = await fixture();
+    // Another agent asks the founder directly; the DM agent never touches that task.
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId, title: "Approve public branch/PR authority" });
+    at(19);
+    expect(await f.service.sweep()).toMatchObject({ targets: 1, inserted: 0, nextDueAt: start.getTime() + BOUND });
+    at(20);
+    expect((await f.service.sweep()).inserted).toBe(1);
+    const [notice, ...rest] = await rows(f);
+    expect(rest).toEqual([]);
+    expect(notice).toMatchObject({
+      idempotencyKey: founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id }),
+      conversationId: f.conversationId, issueId: f.dmIssueId, endpointId: f.endpointId, state: "pending",
+    });
+    expect(text(notice!)).toContain("Paperclip fallback notice (automatic, not from Master Builder).");
+    expect(text(notice!)).toContain("Why: This decision has waited 20 min for your answer.");
+    expect(text(notice!)).toContain("F-2 · Protected decision task");
+    expect(text(notice!)).toContain('Decision waiting for you from Workflow Coordinator, raised 2026-11-03 12:00 UTC: "Approve public branch/PR authority"');
+    expect(text(notice!)).toContain("Answer it on that task in Paperclip; a reply in this chat does not resolve it.");
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
+
+    // The DM agent running on the task does not silence a decision only the founder can make.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.otherIssueId, status: "running",
+      createdAt: now, startedAt: now });
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
+    at(60);
+    expect((await f.service.sweep()).inserted).toBe(0);
+    const restarted = createFounderFallbackNotices(db, { enabled: true, boundMs: BOUND }, () => now);
+    expect((await restarted.sweep()).inserted).toBe(0);
+    expect(await rows(f)).toHaveLength(1);
+
+    // An answer on the original task makes a queued notice fail closed before any I/O.
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, decision.id));
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+  });
+
+  it("does not alert a founder decision addressed to someone else or on a task the founder cannot read", async () => {
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    try {
+      const f = await fixture();
+      const hiddenIssueId = randomUUID();
+      await db.insert(issues).values({ id: hiddenIssueId, companyId: f.companyId, title: "Hidden private task", identifier: "F-5", visibility: "private" });
+      await interaction(f, { addresseeUserId: `someone-${randomUUID()}`, title: "Not the founder" });
+      await interaction(f, { issueId: hiddenIssueId, addresseeUserId: f.founderUserId, title: "Hidden decision" });
+      at(30);
+      expect((await f.service.sweep()).inserted).toBe(0);
+      expect(await rows(f)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("keeps a founder DM whose task closed as the target, unless a task control ended it", async () => {
+    const f = await fixture();
+    // The DM's own task was cancelled; its conversation is completed but still deliverable.
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.dmIssueId));
+    await db.update(chatConversations).set({ state: "completed" }).where(eq(chatConversations.id, f.conversationId));
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+    at(20);
+    expect(await f.service.sweep()).toMatchObject({ targets: 1, inserted: 1 });
+    const [notice] = await rows(f);
+    expect(notice).toMatchObject({ conversationId: f.conversationId,
+      idempotencyKey: founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id }) });
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
+
+    // An open DM of the same founder is preferred over the completed one.
+    const openIssueId = randomUUID(), openConversationId = randomUUID();
+    await db.insert(issues).values({ id: openIssueId, companyId: f.companyId, title: "New founder DM", assigneeAgentId: f.agentId, identifier: "F-6" });
+    await db.insert(chatConversations).values({ id: openConversationId, companyId: f.companyId, endpointId: f.endpointId, issueId: openIssueId,
+      externalConversationId: "dm-1", externalLabel: "Founder DM", isDirectMessage: true, state: "active", sessionGeneration: 2, lastActivityAt: start });
+    await addSender({ companyId: f.companyId, endpointId: f.endpointId, conversationId: openConversationId, principalId: randomUUID(), userId: f.founderUserId });
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+    await db.delete(chatConversations).where(eq(chatConversations.id, openConversationId));
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(true);
+
+    // A published /close ends the DM for the outbox, so it ends it as a target too.
+    await db.insert(chatPublications).values({ companyId: f.companyId, endpointId: f.endpointId, conversationId: f.conversationId,
+      issueId: f.dmIssueId, idempotencyKey: `control:close:${randomUUID()}`, payload: { text: "Closed" }, state: "published", publishedAt: now });
+    expect(await f.service.authorizeFounderFallbackPublication(db, notice!)).toBe(false);
+    expect(await f.service.sweep()).toMatchObject({ targets: 0, inserted: 0 });
+  });
+
   it("re-arms an item cancelled before delivery when the same pending item qualifies again", async () => {
     const f = await fixture();
-    const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+    // A founder decision keeps qualifying after recovery; an escalation the
+    // recovered agent picks up on its task does not.
+    const decision = await interaction(f, { addresseeAgentId: f.agentId });
     await failAgent(f, start);
     at(21);
     await f.service.sweep();
     const notice = (await rows(f)).find(row => row.idempotencyKey.endsWith(decision.id))!;
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.otherIssueId, status: "succeeded",
+      createdAt: now, startedAt: now, finishedAt: now });
     expect(await f.service.authorizeFounderFallbackPublication(db, notice)).toBe(false);
     // The native transport claim cancels each row that fails its re-proof before provider I/O.
     await db.update(chatPublications).set({ state: "cancelled", redactedError: "Task control requester or destination is no longer authorized" })
@@ -492,14 +578,21 @@ const support = await getEmbeddedPostgresTestSupport();
   it("reports the real next deadline and no deadline when idle", async () => {
     const f = await fixture();
     expect(await f.service.sweep()).toEqual({ targets: 1, inserted: 0, nextDueAt: null, awaitingOutbox: false });
-    await interaction(f, { addresseeUserId: f.founderUserId, createdAt: new Date(start.getTime() + 2 * MINUTE) });
-    expect((await f.service.sweep()).nextDueAt).toBeNull();
+    // A founder decision on another task has its own deadline, whatever the agent's state.
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId, createdAt: new Date(start.getTime() + 2 * MINUTE) });
+    expect((await f.service.sweep()).nextDueAt).toBe(decision.createdAt.getTime() + BOUND);
+    // A founder card on the DM task itself publishes natively and has no deadline here.
+    await interaction(f, { addresseeUserId: f.founderUserId, issueId: f.dmIssueId, createdAt: new Date(start.getTime() + MINUTE) });
+    expect((await f.service.sweep()).nextDueAt).toBe(decision.createdAt.getTime() + BOUND);
     const escalation = await interaction(f, { addresseeAgentId: f.agentId, createdAt: new Date(start.getTime() + 3 * MINUTE) });
     at(10);
+    expect((await f.service.sweep()).nextDueAt).toBe(decision.createdAt.getTime() + BOUND);
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, decision.id));
     expect((await f.service.sweep()).nextDueAt).toBe(escalation.createdAt.getTime() + BOUND);
     await failAgent(f, new Date(start.getTime() + 5 * MINUTE));
     // While the agent is down its bound replaces the escalation deadline.
     expect((await f.service.sweep()).nextDueAt).toBe(start.getTime() + 25 * MINUTE);
+    await db.update(issueThreadInteractions).set({ status: "pending" }).where(eq(issueThreadInteractions.id, decision.id));
     at(26);
     const due = await f.service.sweep();
     expect(due).toMatchObject({ inserted: 3, nextDueAt: null });
