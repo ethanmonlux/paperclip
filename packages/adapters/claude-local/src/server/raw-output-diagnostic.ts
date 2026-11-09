@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 // Capture the provider stream before the shared process runner's 4 MiB tail
-// limit. These files are private to the task scratch area and are kept only
+// limit. These files are private to the server's temp area and are kept only
 // when a Claude invocation has no parseable terminal result.
 const STREAM_LIMIT_BYTES = 8 * 1024 * 1024;
 
@@ -24,7 +25,7 @@ class StreamCapture {
   }
 
   async save(file: string) {
-    await fs.writeFile(file, Buffer.concat(this.chunks), { mode: 0o600 });
+    await fs.writeFile(file, Buffer.concat(this.chunks), { mode: 0o600, flag: "wx" });
     return {
       file: path.basename(file),
       totalBytes: this.totalBytes,
@@ -62,17 +63,16 @@ export function createClaudeRawOutputDiagnostic() {
       (stream === "stdout" ? stdout : stderr).add(chunk);
     },
     async preserve(input: {
-      directory: string | undefined;
       runId: string;
       attempt: number;
       exitCode: number | null;
       signal: string | null;
       timedOut: boolean;
     }) {
-      if (!input.directory || !/^[0-9a-f-]{36}$/i.test(input.runId)) return null;
-      const directory = path.join(input.directory, "claude-parse-diagnostics", input.runId, String(input.attempt));
-      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-      await fs.chmod(directory, 0o700);
+      if (!/^[0-9a-f-]{36}$/i.test(input.runId) || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return null;
+      // A unique directory created by the server prevents an agent-writable
+      // workspace entry from redirecting writes to another host file.
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-claude-parse-${input.runId}-${input.attempt}-`));
       const [out, err] = await Promise.all([
         stdout.save(path.join(directory, "stdout.raw")),
         stderr.save(path.join(directory, "stderr.raw")),
@@ -81,7 +81,7 @@ export function createClaudeRawOutputDiagnostic() {
         version: 1, runId: input.runId, attempt: input.attempt,
         exitCode: input.exitCode, signal: input.signal, timedOut: input.timedOut,
         stdout: out, stderr: err, stdoutProtocol: stdout.protocolSummary(),
-      }, null, 2) + "\n", { mode: 0o600 });
+      }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
       return directory;
     },
   };

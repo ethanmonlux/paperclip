@@ -1004,9 +1004,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!parsed && !proc.timedOut && rawDiagnostic) {
       try {
         const directory = await rawDiagnostic.preserve({
-          // Run scratch is removed at settlement. Keep the bounded evidence in
-          // the task workspace's ignored .paperclip directory instead.
-          directory: path.join(effectiveEnv.PAPERCLIP_WORKSPACE_CWD || cwd, ".paperclip"),
           runId, attempt: currentAttempt, exitCode: proc.exitCode,
           signal: proc.signal, timedOut: proc.timedOut,
         });

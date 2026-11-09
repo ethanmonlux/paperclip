@@ -154,8 +154,15 @@ ${options.brokerFile ? String.raw`
       // those can contain connection details.
       const cause = error && typeof error === 'object' ? error.cause : null;
       const rawCode = cause && typeof cause === 'object' ? cause.code : null;
+      // Node's environment proxy can turn distinct upstream failures into a
+      // code-0 cancellation. Preserve that routing fact without guessing which
+      // upstream mechanism failed or exposing proxy URLs in the run log.
+      const viaEnvironmentProxy = env.NODE_USE_ENV_PROXY === '1'
+        && Boolean(env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy)
+        && !env.NO_PROXY && !env.no_proxy;
       const code = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(rawCode)
-        ? rawCode : error && typeof error === 'object' && error.name === 'TimeoutError' ? 'request_timeout' : 'unknown';
+        ? rawCode : error && typeof error === 'object' && error.name === 'TimeoutError' ? 'request_timeout'
+          : rawCode === 0 && viaEnvironmentProxy ? 'proxy_transport_unclassified' : 'unknown';
       diagnostic('broker_transport_unavailable (' + code + ')');
     }
   }
