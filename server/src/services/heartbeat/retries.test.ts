@@ -13,6 +13,7 @@ import { createHeartbeatRunState } from "./run-state.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import * as extracted from "./retries.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../conversation-continuation.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -446,6 +447,33 @@ describePostgres("heartbeat retry module database wiring", () => {
     expect(result, JSON.stringify(result)).toMatchObject({ outcome: "scheduled" });
     const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id));
     expect(successor!.contextSnapshot).toMatchObject({ wakeReason: "interaction_pending", interactionId, interactionKind: "ask_user_questions" });
+  });
+
+  // FAC-840 replay of STA-153 run d175a109: a claude_local addressee woken to
+  // answer an ask_user_questions card on its reviewer's task exited 0 with
+  // unparseable output. The run carried the conversation-continuation policy,
+  // so the retry gate read its own pending card as "waiting for a response"
+  // and nothing re-woke it.
+  it("retries a claude-local addressee whose exit-0 output was unparseable (STA-153)", async () => {
+    const { coordinator, child, failed, interactionId } = await addresseeFixture("pending", "ask_user_questions");
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, coordinator.id));
+    const [crashed] = await db.update(heartbeatRuns).set({
+      errorCode: "adapter_failed", error: "Failed to parse claude JSON output", responsibleUserId: "founder",
+      resultJson: { stdout: '{"type":"system","subtype":"init"}', stderr: "", conversationContinuation: CONVERSATION_CONTINUATION_POLICY },
+    }).where(eq(heartbeatRuns.id, failed.id)).returning();
+    const result = await boundRetries().retries.scheduleInteractionContinuationInfrastructureRetryIfEligible(
+      crashed!, { ...coordinator, adapterType: "claude_local" });
+    expect(result, JSON.stringify(result)).toMatchObject({ outcome: "scheduled" });
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id));
+    expect(successor).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: extracted.PENDING_ADDRESSEE_RETRY_REASON });
+    expect(successor!.contextSnapshot).toMatchObject({ wakeReason: "interaction_pending", interactionId });
+
+    // Another pending question on the same task still holds the retry.
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, successor!.id));
+    await db.insert(issueThreadInteractions).values({ companyId: child.companyId, issueId: child.id,
+      kind: "ask_user_questions", status: "pending", addresseeUserId: "someone-else", payload: { version: 1, questions: [] } as never });
+    expect(await boundRetries().retries.scheduleInteractionContinuationInfrastructureRetryIfEligible(
+      crashed!, { ...coordinator, adapterType: "claude_local" })).toMatchObject({ outcome: "not_scheduled", errorCode: "issue_waiting_for_response" });
   });
 
   it("does not retry the addressee once its confirmation is resolved", async () => {

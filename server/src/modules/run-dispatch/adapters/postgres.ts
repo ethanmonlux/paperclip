@@ -159,6 +159,12 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+// A verified addressee run answers its own pending card; that card must not
+// park the run's retry as "waiting for a response" (FAC-840, STA-153).
+function answeringInteractionId(isPendingInteractionAddressee: boolean | undefined, context: Record<string, unknown>) {
+  return isPendingInteractionAddressee === true ? readNonEmptyString(context.interactionId) : null;
+}
+
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
   if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) return "max_turn_continuation";
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
@@ -426,7 +432,8 @@ export function createPostgresRunDispatchAdapter(
     });
     if (input.conversationContinuation || retryReason === "interrupted_preparation") {
       facts.pendingResponse = await connectionContinuationPendingResponse(dbOrTx as unknown as Db,
-        issue, input.responsibleUserId, input.runId);
+        issue, input.responsibleUserId, input.runId,
+        answeringInteractionId(facts.isPendingInteractionAddressee, input.contextSnapshot));
     }
     facts.reviewParticipant = await readNativeReviewParticipantFacts(dbOrTx, {
       companyId: input.companyId, issueId, agentId: input.agentId,
@@ -657,6 +664,10 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    const isPendingInteractionAddressee = issue ? await pendingAgentInteractionAddressee(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId,
+      contextSnapshot: context,
+    }) : false;
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -677,17 +688,15 @@ export function createPostgresRunDispatchAdapter(
         unresolvedBlockerCount: readiness.unresolvedBlockerCount,
       } : null,
       pendingResponse: issue && (input.conversationContinuation || retryReason === "interrupted_preparation" || context.connectionIntentResolution === "existing_connection")
-        ? await connectionContinuationPendingResponse(dbOrTx as unknown as Db, issue, input.responsibleUserId, input.runId)
+        ? await connectionContinuationPendingResponse(dbOrTx as unknown as Db, issue, input.responsibleUserId, input.runId,
+          answeringInteractionId(isPendingInteractionAddressee, context))
         : null,
       issueFound: issue !== null,
       issueStatus: issue?.status ?? null,
       issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
       issueExecutionRunId: issue?.executionRunId ?? null,
       issueCheckoutRunId: issue?.checkoutRunId ?? null,
-      isPendingInteractionAddressee: issue ? await pendingAgentInteractionAddressee(dbOrTx, {
-        companyId: input.companyId, issueId, agentId: input.agentId,
-        contextSnapshot: context,
-      }) : false,
+      isPendingInteractionAddressee,
       isResolvedInteractionContinuation,
       isUnstartedTaskQuestionAnswer: Boolean(isResolvedInteractionContinuation && issue?.status === "todo" &&
         await isUnstartedTaskQuestionAnswer(dbOrTx, { companyId: input.companyId, issueId, interactionId: context.interactionId })),
