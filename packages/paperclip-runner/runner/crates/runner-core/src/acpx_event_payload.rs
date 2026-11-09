@@ -88,12 +88,9 @@ pub enum AcpxEventPayload {
     },
 }
 
-/// Validates event authority before it decodes the bounded sidecar payload.
-pub fn decode_acpx_event(
-    scope: &AcpxEventScope,
-    event: &AcpxSidecarEvent,
-) -> Result<AcpxEventPayload, LocalRunnerError> {
-    scope.validate_event(event)?;
+/// Applies the payload admission limit. Every sidecar event passes it, the
+/// history of a settled turn included.
+pub fn admit_acpx_event_payload_size(event: &AcpxSidecarEvent) -> Result<(), LocalRunnerError> {
     let payload_bytes = serde_json::to_vec(&event.payload).map_err(|error| {
         LocalRunnerError::invalid(format!("ACPX event payload is invalid: {error}"))
     })?;
@@ -102,6 +99,16 @@ pub fn decode_acpx_event(
             "ACPX event payload exceeds the 256 KiB admission limit",
         ));
     }
+    Ok(())
+}
+
+/// Validates event authority before it decodes the bounded sidecar payload.
+pub fn decode_acpx_event(
+    scope: &AcpxEventScope,
+    event: &AcpxSidecarEvent,
+) -> Result<AcpxEventPayload, LocalRunnerError> {
+    scope.validate_event(event)?;
+    admit_acpx_event_payload_size(event)?;
 
     match event.event_type {
         GeneratedAcpxSidecarEventType::RuntimeRichEvent => decode_rich_event(&event.payload),
@@ -222,6 +229,7 @@ pub fn decode_acpx_event(
 fn rich_event_schema(event_type: &str) -> Option<&'static str> {
     Some(match event_type {
         "plan.updated" => "plan",
+        "plan.proposed" => "planProposal",
         "tool.execution.started" | "tool.execution.progressed" | "tool.execution.completed" => {
             "toolExecution"
         }
@@ -277,7 +285,7 @@ fn rich_event_validators(
         if !internal_refs(&schema) { return Err("provider-event schema may use only internal references".to_owned()); }
         let definitions = schema.get("$defs").and_then(Value::as_object).ok_or_else(|| "provider-event schema has no definitions".to_owned())?;
         let mut validators = BTreeMap::new();
-        for name in ["plan", "toolExecution", "research", "delegation", "modelRoute", "modelVerification", "contextCompacted", "artifactViewed", "artifactGenerated", "reviewMode", "hook", "memoryCitation", "safetyReview", "terminalInput", "wait", "providerNotice"] {
+        for name in ["plan", "planProposal", "toolExecution", "research", "delegation", "modelRoute", "modelVerification", "contextCompacted", "artifactViewed", "artifactGenerated", "reviewMode", "hook", "memoryCitation", "safetyReview", "terminalInput", "wait", "providerNotice"] {
             if !definitions.contains_key(name) { return Err("provider-event schema is missing an admitted definition".to_owned()); }
             let selected = serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema", "$ref":format!("#/$defs/{name}"), "$defs":definitions});
             let validator = jsonschema::validator_for(&selected).map_err(|_| "embedded provider-event schema cannot compile".to_owned())?;

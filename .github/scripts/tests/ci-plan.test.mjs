@@ -33,7 +33,9 @@ test("a UI component retains browser and build coverage without unrelated server
   assert.equal(selected(result, "build"), true);
   assert.equal(selected(result, "e2e_shards"), true);
   assert.equal(selected(result, "verify_serialized_server"), false);
-  assert.deepEqual([...selectedTasks(result)].filter((task) => /server|chat|runner/.test(task)), []);
+  // The Runner support suite imports UI modules and checks that catalog-listed
+  // UI files stay tracked, so UI source changes are its inputs too.
+  assert.deepEqual([...selectedTasks(result)].filter((task) => /server|chat|runner/.test(task)), ["ci:runner-e2e-support"]);
   assert.equal(result.jobs.general_tests.selected, 2);
 });
 
@@ -74,6 +76,31 @@ test("shared contracts, runtime prompts, protocol inputs and fixtures reach cons
   for (const file of ["tests/runner-e2e/fixtures/prompt.md", "scripts/run-vitest-stable.mjs", "pnpm-lock.yaml"]) {
     assert.ok(Object.values(plan([file]).jobs).every((job) => job.selected === job.total), file);
   }
+});
+
+test("sandbox provider tests run only for the providers, the plugin SDK, and what the SDK imports", () => {
+  for (const file of ["packages/plugins/sandbox-providers/daytona/src/plugin.ts",
+    "packages/plugins/sandbox-providers/cloudflare/bridge-template/src/index.ts",
+    "packages/plugins/sdk/src/index.ts", "packages/shared/src/types/issue.ts"]) {
+    assert.equal(selected(plan([file]), "sandbox_provider_tests"), true, file);
+  }
+  for (const file of ["server/src/index.ts", "ui/src/components/Sidebar.tsx", "cli/src/index.ts",
+    "packages/paperclip-runner/src/index.ts", "packages/plugins/plugin-workspace-diff/src/worker.ts"]) {
+    assert.equal(selected(plan([file]), "sandbox_provider_tests"), false, file);
+  }
+  // The provider lockfiles, the shared install workspace and the runner script are global inputs.
+  for (const file of ["scripts/typecheck-sandbox-providers/pnpm-lock.yaml", "scripts/test-sandbox-providers.mjs",
+    "packages/plugins/sandbox-providers/daytona/package.json"]) {
+    assert.equal(selected(plan([file]), "sandbox_provider_tests"), true, file);
+  }
+  // The SDK depends on shared and nothing else in the workspace. A new dependency must join the inputs.
+  const sdk = JSON.parse(readFileSync(new URL("packages/plugins/sdk/package.json", root), "utf8"));
+  const workspace = Object.entries({ ...sdk.dependencies, ...sdk.peerDependencies })
+    .filter(([, version]) => String(version).startsWith("workspace:")).map(([name]) => name);
+  assert.deepEqual(workspace, ["@paperclipai/shared"]);
+  const shared = JSON.parse(readFileSync(new URL("packages/shared/package.json", root), "utf8"));
+  assert.deepEqual(Object.values({ ...shared.dependencies, ...shared.peerDependencies })
+    .filter((version) => String(version).startsWith("workspace:")), []);
 });
 
 test("renames out of source and deletions cannot masquerade as release notes", () => {
@@ -232,7 +259,7 @@ else process.exit(3);
       const output = path.join(directory, "output");
       writeFileSync(output, "");
       const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
-        ...process.env, PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
+        ...process.env, GITHUB_REPOSITORY: "paperclipai/paperclip", PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
         RUNNER_TEMP: directory, FULL_CI: "true", PROFILE_CI: "false", FORCE_FULL_CI: "false",
         CI_INCREMENTAL_MODE: "enabled", STACK_JSON: "null", EVENT_BASE_SHA: "b".repeat(40), EVENT_HEAD_SHA: prHead, EVENT_MERGE_SHA: merge,
         TEST_GIT_REPOSITORY: repository,
@@ -301,4 +328,124 @@ test("complete merge trees handle more than 300 files, base advancement, renames
   assert.throws(() => mergeDiff(head, base, directory), /expected PR head/);
   assert.throws(() => mergeDiff(prHead, prHead, directory), /merge commit/);
   assert.throws(() => mergeDiff("f".repeat(40), prHead, directory));
+});
+
+test("a fork routing step plans from its own tested merge, never upstream master", () => {
+  const workflow = readFileSync(new URL(".github/workflows/ci-routing.yml", root), "utf8");
+  const block = workflow.split("      - name: Plan affected CI tasks from trusted definitions\n")[1];
+  const shell = block.split("        run: |\n")[1].split("\n").map((line) => line.slice(10)).join("\n");
+  const directory = mkdtempSync(path.join(tmpdir(), "ci-routing-fork-"));
+  const fork = "someone/paperclip-fork";
+  try {
+    const repository = path.join(directory, "source");
+    mkdirSync(repository);
+    const gitBin = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const git = (...args) => execFileSync(gitBin, args, { cwd: repository, encoding: "utf8" }).trim();
+    const write = (file, value) => { mkdirSync(path.dirname(path.join(repository, file)), { recursive: true }); writeFileSync(path.join(repository, file), value); };
+    git("init", "-q", "-b", "master"); git("config", "user.name", "CI"); git("config", "user.email", "ci@example.invalid");
+    write("base", "base"); git("add", "."); git("commit", "-qm", "base");
+    const merges = {};
+    for (const [name, files] of Object.entries({
+      ui: ["ui/src/components/Sidebar.tsx"], server: ["server/src/index.ts"], lockfile: ["pnpm-lock.yaml"],
+      rust: ["packages/paperclip-runner/runner/crates/runner-core/src/lib.rs"], plans: ["doc/plans/2026-11-08-example.md"],
+      shared: ["packages/shared/src/types/issue.ts"], db: ["packages/db/src/schema/issues.ts"],
+      adapterUtils: ["packages/adapter-utils/src/index.ts"], cargoLock: ["packages/paperclip-runner/runner/Cargo.lock"],
+      cargoManifest: ["packages/paperclip-runner/runner/crates/runner-core/Cargo.toml"],
+      nestedPnpmLock: ["packages/plugins/sandbox-providers/daytona/pnpm-lock.yaml"],
+      npmLock: ["packages/paperclip-runner/scripts/pi-distribution/package-lock.json"],
+    })) {
+      git("checkout", "-q", "-b", name, "master");
+      for (const file of files) write(file, name);
+      git("add", "."); git("commit", "-qm", name);
+      const prHead = git("rev-parse", "HEAD");
+      git("checkout", "-q", "--detach", "master");
+      git("merge", "-q", "--no-ff", name, "-m", `tested merge ${name}`);
+      merges[name] = { prHead, merge: git("rev-parse", "HEAD"), base: git("rev-parse", "HEAD^1") };
+    }
+    git("checkout", "-q", "master");
+    writeFileSync(path.join(directory, "git"), `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+if(process.env.TEST_GIT_FAILURE==='true')process.exit(1);
+if(process.argv.includes('https://github.com/paperclipai/paperclip.git'))process.exit(4);
+const args=process.argv.slice(2).map(a=>a==='https://github.com/${fork}.git'?process.env.TEST_GIT_REPOSITORY:a);
+const r=spawnSync(${JSON.stringify(gitBin)},args,{stdio:'inherit'});process.exit(r.status??1);
+`);
+    chmodSync(path.join(directory, "git"), 0o755);
+    writeFileSync(path.join(directory, "gh"), `#!/usr/bin/env node
+const fs = require('node:fs'), path = require('node:path');
+const endpoint = process.argv.find(arg => arg.startsWith('/repos/'));
+fs.appendFileSync(process.env.TEST_GH_LOG, endpoint + '\\n');
+if (!endpoint?.startsWith('/repos/${fork}/contents/')) process.exit(3);
+if (process.env.TEST_FETCH_FAILURE === 'true') process.exit(1);
+const [file, query] = endpoint.split('/contents/')[1].split('?');
+if (query !== 'ref=' + process.env.EVENT_MERGE_SHA) process.exit(2);
+process.stdout.write(fs.readFileSync(path.join(process.env.TEST_TRUSTED_ROOT, file)));
+`);
+    chmodSync(path.join(directory, "gh"), 0o755);
+    const run = (name, overrides = {}) => {
+      const output = path.join(directory, "output"), log = path.join(directory, "gh.log");
+      writeFileSync(output, ""); writeFileSync(log, "");
+      const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
+        ...process.env, GITHUB_REPOSITORY: fork, PATH: `${directory}:${process.env.PATH}`, TEST_TRUSTED_ROOT: root.pathname,
+        RUNNER_TEMP: directory, FULL_CI: "true", PROFILE_CI: "false", FORCE_FULL_CI: "false",
+        CI_INCREMENTAL_MODE: "enabled", STACK_JSON: "null", EVENT_HEAD_SHA: merges[name].prHead, EVENT_MERGE_SHA: merges[name].merge,
+        TEST_GIT_REPOSITORY: repository, TEST_GH_LOG: log, GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: "", ...overrides,
+      } });
+      assert.equal(result.status, 0, result.stderr);
+      const endpoints = readFileSync(log, "utf8").split("\n").filter(Boolean);
+      assert.ok(endpoints.every((endpoint) => endpoint.startsWith(`/repos/${fork}/contents/`)), endpoints.join(", "));
+      const value = readFileSync(output, "utf8").trim();
+      return value === "plan=" ? null : JSON.parse(value.slice("plan=".length));
+    };
+    const jobsRun = (resultPlan) => Object.fromEntries(Object.entries(resultPlan.jobs).map(([job, lane]) => [job, lane.selected]));
+
+    const ui = run("ui");
+    assert.equal(ui.forceReason, null);
+    assert.equal(ui.diff.base, merges.ui.base);
+    assert.deepEqual(ui.changed, ["ui/src/components/Sidebar.tsx"]);
+    assert.deepEqual(jobsRun(ui), { typecheck_release_registry: 1, general_tests: 2, docker_context_integrity: 1,
+      sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 1, verify_serialized_server: 0, canary_dry_run: 1,
+      e2e_shards: 8, verify_runner_e2e_support: 1 });
+
+    const server = run("server");
+    assert.equal(server.forceReason, null);
+    assert.deepEqual(jobsRun(server), { typecheck_release_registry: 1, general_tests: 18, docker_context_integrity: 1,
+      sandbox_provider_tests: 0, verify_paperclip_runner: 5, build: 1, verify_serialized_server: 9, canary_dry_run: 1,
+      e2e_shards: 8, verify_runner_e2e_support: 1 });
+    assert.ok(!server.jobs.verify_paperclip_runner.matrix.include.some((entry) => entry.task === "ci:runner-rust"));
+
+    const rust = run("rust");
+    // Runner Rust lives under packages/**, which every Node consumer also reads.
+    assert.ok(rust.jobs.verify_paperclip_runner.matrix.include.some((entry) => entry.task === "ci:runner-rust"));
+    assert.ok(rust.jobs.e2e_shards.run);
+
+    const plans = run("plans");
+    assert.equal(plans.forceReason, null);
+    assert.ok(Object.values(plans.jobs).every((lane) => !lane.run));
+
+    const lockfile = run("lockfile");
+    assert.match(lockfile.forceReason, /Global CI input changed: pnpm-lock.yaml/);
+    assert.ok(Object.values(lockfile.jobs).every((lane) => lane.selected === lane.total));
+
+    // Shared packages and nested lockfiles or manifests feed every consumer, so they run the full matrix.
+    for (const [name, file] of [["shared", "packages/shared/src/types/issue.ts"], ["db", "packages/db/src/schema/issues.ts"],
+      ["adapterUtils", "packages/adapter-utils/src/index.ts"], ["cargoLock", "packages/paperclip-runner/runner/Cargo.lock"],
+      ["cargoManifest", "packages/paperclip-runner/runner/crates/runner-core/Cargo.toml"],
+      ["nestedPnpmLock", "packages/plugins/sandbox-providers/daytona/pnpm-lock.yaml"],
+      ["npmLock", "packages/paperclip-runner/scripts/pi-distribution/package-lock.json"]]) {
+      const resultPlan = run(name);
+      assert.equal(resultPlan.forceReason, `Global CI input changed: ${file}`, name);
+      assert.ok(Object.values(resultPlan.jobs).every((lane) => lane.selected === lane.total), name);
+    }
+
+    for (const overrides of [{ PROFILE_CI: "true" }, { STACK_JSON: "{}" }]) {
+      assert.ok(Object.values(run("ui", overrides).jobs).every((lane) => lane.selected === lane.total));
+    }
+    for (const overrides of [{ TEST_FETCH_FAILURE: "true" }, { TEST_GIT_FAILURE: "true" }, { FULL_CI: "false" },
+      { GITHUB_REPOSITORY: "someone/fork;rm" }, { EVENT_MERGE_SHA: "not-a-sha" }]) {
+      assert.equal(run("ui", overrides), null, JSON.stringify(overrides));
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

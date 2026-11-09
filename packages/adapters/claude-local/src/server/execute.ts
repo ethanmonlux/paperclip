@@ -1076,7 +1076,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? proc.errorCode
         : loginMeta.requiresLogin
         ? "claude_auth_required"
-        : isClaudeModelNotFoundError({
+        // An exit-0 or signal-killed run with no result event is a crash, not a
+        // provider answer: its stdout is the agent's own tool output, which can
+        // quote "model_not_found" and would seal a retryable crash as missing
+        // configuration. Same exit guard as providerQuota/transientUpstream.
+        : (proc.exitCode ?? 0) !== 0 && isClaudeModelNotFoundError({
           parsed: null,
           stdout: proc.stdout,
           stderr: proc.stderr,

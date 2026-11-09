@@ -61,7 +61,7 @@ async function sourceFixture(registration?: CapabilityRunnerdCodexTransportOptio
       runId: identity.runId, executionWorkspaceId: "workspace" },
     task: { identifier: "TASK-1", title: "Complete fake work", description: null, prompt: "Complete fake work", workMode: "standard" },
     workspace: { cwd: root, repoUrl: null, repoRef: null, branchName: null },
-    session: { normalizedSessionId: identity.normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1 },
+    session: { normalizedSessionId: identity.normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
     provider: { kind: "codex", model: null, approvalPolicy: "never" },
     completionContract: { id: "contract", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.completion-contract.v1",
       contract: { revision: "1", objective: "Complete fake work", criteria: [{ id: "objective", requirement: "Complete fake work" }] } }, interactionResponses: [], credentialBindings: [] };
@@ -90,7 +90,7 @@ async function sourceFixture(registration?: CapabilityRunnerdCodexTransportOptio
     await vi.waitFor(() => { expect(absent(evidence.runnerPid!)).toBe(true); expect(absent(evidence.codexPid!)).toBe(true); });
     expect((await read(runnerFile)).lifecycle).toBe("ready");
     const recover = (overrides: Partial<CapabilityRunnerdCodexTransportOptions> = {}) => {
-      const bundle = createCapabilityRunnerdCodexTransport({ ...options, sourceRecoveryVersion: 1, resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId }, onRecoveryAccountingEvent: async () => {}, ...overrides, get authorityRunId() { return Object.hasOwn(overrides, "authorityRunId") ? overrides.authorityRunId : "run-target"; } });
+      const bundle = createCapabilityRunnerdCodexTransport({ ...options, codexSourceRecoveryVersion: 1, resumeProviderSession: { driverSessionId: thread.id, providerSessionId: thread.sessionId }, onRecoveryAccountingEvent: async () => {}, ...overrides, get authorityRunId() { return Object.hasOwn(overrides, "authorityRunId") ? overrides.authorityRunId : "run-target"; } });
       bundles.push(bundle); return bundle;
     };
     return { root, options, identity, thread, runnerFile, providerFile, coreFile, calls, complete, settled, recover, dispose, nativeIdentity, execution, nativeSnapshot };
@@ -101,6 +101,8 @@ it.each(["isolated", "preconfigured"] as const)("recovers the real native backen
   const f = await sourceFixture(undefined, true, homeMode);
   try {
     expect(f.nativeSnapshot!.sessionId).toBe(f.thread.id);
+    await expect(f.recover({ codexSourceRecoveryVersion: undefined, acpxSourceRecoveryVersion: 1 })
+      .transport.request("thread/read", {})).rejects.toThrow("recovery_integrity_unsupported");
     let owner = "run-target";
     const source = f.recover({ ...(homeMode === "isolated" ? { environment: { ...process.env, PAPERCLIP_RUNNER_HOME_MODE: "preconfigured" } } : {}), get authorityRunId() { return owner; } });
     await expect(source.transport.request("thread/read", { threadId: "foreign-thread" })).rejects.toThrow("history_identity_mismatch");
@@ -198,7 +200,7 @@ it.each([["launch", "default"], ["adopt", "default"], ["adopt-denied", "default"
     expect((await prepare(requirements)).provider).toEqual(provider); prepare.mockClear();
     const binary = fixture.options.runnerBinary;
     let owner: string | undefined = "prepared-target";
-    const sourceOptions: Partial<CapabilityRunnerdCodexTransportOptions> = { sourceRecoveryVersion: 1, get authorityRunId() { return owner; },
+    const sourceOptions: Partial<CapabilityRunnerdCodexTransportOptions> = { codexSourceRecoveryVersion: 1, get authorityRunId() { return owner; },
       recoveryLaunch: { requirements }, prepareLaunch: prepare,
       disableCodexWebSearch: policy === "conflict" ? false : undefined,
       runnerArtifact: { version: "0.3.0", digest: `sha256:${createHash("sha256").update(await readFile(binary)).digest("hex")}` },
@@ -229,7 +231,7 @@ it.each([["launch", "default"], ["adopt", "default"], ["adopt-denied", "default"
     expect((await read(fixture.coreFile)).preparedLaunchConfigurations).toEqual(before.preparedLaunchConfigurations);
     await expect(readFile(join(fixture.root, "launch-preparation.json"))).rejects.toHaveProperty("code", "ENOENT");
     if (mode !== "launch") {
-      const evidence = resumed.evidence(), startedAt = resumed.transport.processInfo().startedAt;
+      const evidence = resumed.evidence(), startedAt = resumed.transport.processInfo!().startedAt;
       await resumed.detachControllerForRestart();
       prepare.mockClear();
       if (mode === "adopt-denied") prepare.mockRejectedValueOnce(new Error("source preparation authorization revoked"));

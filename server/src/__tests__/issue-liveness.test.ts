@@ -628,3 +628,61 @@ describe("issue graph liveness classifier", () => {
     });
   });
 });
+
+describe("wait contract orphan blocked tasks (FAC-840)", () => {
+  const orphan = (overrides: Record<string, unknown> = {}) => issue({
+    identifier: "STA-144",
+    title: "Independent review",
+    description: "Review PR #704.",
+    unblockDescriptor: null,
+    ...overrides,
+  });
+  const classify = (overrides: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
+    classifyIssueGraphLiveness({
+      issues: [orphan(overrides)],
+      relations: [],
+      agents: [agent(), manager],
+      now: "2026-11-09T12:00:00.000Z",
+      ...extra,
+    });
+
+  it("STA-144 replay: a task set blocked with nothing recording its wait is visible to its owner", () => {
+    const findings = classify();
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      state: "blocked_without_wait_path",
+      recoveryIssueId: blockedId,
+      recommendedOwnerAgentId: coderId,
+    });
+  });
+
+  it("does not flag a blocked task that records what it waits for", () => {
+    const waits: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["pending interaction", {}, { pendingInteractions: [{ companyId, issueId: blockedId, status: "pending" }] }],
+      ["pending approval", {}, { pendingApprovals: [{ companyId, issueId: blockedId, status: "pending" }] }],
+      ["open recovery issue", {}, { openRecoveryIssues: [{ companyId, issueId: blockedId, status: "todo" }] }],
+      ["active run", {}, { activeRuns: [{ companyId, issueId: blockedId, agentId: coderId, status: "running" }] }],
+      ["unblock action owned by someone else", { unblockDescriptor: { owner: { type: "user", userId: "board-1" } } }, {}],
+      ["recorded external owner", { description: "External owner: GitHub support\nExternal action: restore runner" }, {}],
+      ["human assignee", { assigneeUserId: "board-1" }, {}],
+    ];
+    for (const [name, overrides, extra] of waits) {
+      expect(classify(overrides, extra).map((finding) => finding.state), name).not.toContain("blocked_without_wait_path");
+    }
+  });
+
+  it("leaves a dependent with a resolved blocker to the dependency backstop", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [orphan(), issue({ id: blockerId, identifier: "STA-143", status: "done", description: null })],
+      relations: [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }],
+      agents: [agent(), manager],
+      now: "2026-11-09T12:00:00.000Z",
+    });
+    expect(findings.map((finding) => finding.state)).not.toContain("blocked_without_wait_path");
+  });
+
+  it("leaves callers that do not pass wait-contract inputs unchanged", () => {
+    expect(classify({ description: undefined })).toEqual([]);
+  });
+});

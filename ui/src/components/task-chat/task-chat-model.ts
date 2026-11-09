@@ -35,6 +35,7 @@ export type { PaperclipQuestionResponse, PaperclipQuestionSet };
 
 export type TaskChatProviderActivityFamily =
   | "plan"
+  | "plan_proposal"
   | "tool_execution"
   | "research"
   | "delegation"
@@ -231,6 +232,11 @@ export interface TaskChatToolItem {
    * next to the tool name — the v7 toolrow "target".
    */
   target?: string;
+  /**
+   * Task the call is about, when its input named one by UUID. Rows show the
+   * task's identifier for it; the UUID itself is never rendered.
+   */
+  taskRefId?: string;
   detail?: string;
   diff?: TaskChatDiff;
   /** Resolved permission decision badge, when one applied. */
@@ -293,7 +299,7 @@ export interface TaskChatStatusItem {
 export interface TaskChatMarkerItem {
   id: string;
   kind: "marker";
-  variant: "session_start" | "interrupted" | "turn_boundary";
+  variant: "session_start" | "interrupted" | "turn_boundary" | "context_compacted";
   label: string;
   detail?: string;
   /** False when the recorded run cannot be retried, even after the chat continues. */
@@ -577,6 +583,7 @@ export interface TaskChatMaterializedResourceItem {
   document?: IssueDocumentSummary;
   workProduct?: IssueWorkProduct;
   attachment?: IssueAttachment;
+  imageItems?: TaskChatMaterializedResourceItem[];
 }
 
 export type TaskChatProtocolItem =

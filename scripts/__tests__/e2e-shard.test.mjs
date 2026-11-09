@@ -30,8 +30,10 @@ function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
   assert.match(
     caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
+    // Upstream calls CODEOWNERS-protected master. A single-owner fork runs its
+    // own branch definition so CI matches the fork's scripts.
+    /^\s+uses: (?:paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master|\.\/\.github\/workflows\/pr-trusted\.yml)\s*$/m,
+    "pr.yml must call the trusted workflow from protected master or, on the fork, this branch",
   );
   // Validate proposed workflow changes locally; CI executes the merged master version.
   return readFileSync(trustedPrWorkflow, "utf8");
@@ -230,7 +232,7 @@ test("runner authorization uses reserved capacity and executes metadata checks o
 test("the trusted PR workflow limits full CI to merge-relevant stack layers", () => {
   const workflow = readFileSync(trustedPrWorkflow, "utf8");
   const jobs = readWorkflowJobs(workflow);
-  assert.match(jobs.get("gate"), /uses: paperclipai\/paperclip\/\.github\/workflows\/ci-routing\.yml@master/);
+  assert.match(jobs.get("gate"), /uses: (?:paperclipai\/paperclip\/\.github\/workflows\/ci-routing\.yml@master|\.\/\.github\/workflows\/ci-routing\.yml)/);
   const gate = readWorkflowJobs(readFileSync(routingWorkflow, "utf8")).get("gate");
 
   assert.match(gate, /^ {6}full_ci: \$\{\{ steps\.scope\.outputs\.full_ci \}\}$/m);
@@ -246,6 +248,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
     "verify_serialized_server",
     "canary_dry_run",
     "e2e_shards",
+    "verify_runner_e2e_support",
   ]) {
     assert.match(
       jobs.get(jobId),
@@ -263,7 +266,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, verify_serialized_server, canary_dry_run\]$/m,
+    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support\]$/m,
   );
   assert.equal(runAggregate(verify, true).status, 0);
   assert.equal(runAggregate(verify, false).status, 0);
@@ -272,7 +275,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
       "an optional selector cannot block the successful original matrix");
   }
   for (const job of ["gate", "policy", "typecheck_release_registry", "general_tests", "verify_paperclip_runner",
-    "build", "docker_context_integrity", "verify_serialized_server", "canary_dry_run"]) {
+    "build", "docker_context_integrity", "sandbox_provider_tests", "verify_serialized_server", "canary_dry_run", "verify_runner_e2e_support"]) {
     for (const result of ["failure", "cancelled", "skipped"]) {
       assert.notEqual(runAggregate(verify, true, { [job]: result }).status, 0, `${job}: ${result}`);
     }

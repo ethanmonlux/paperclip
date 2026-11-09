@@ -1,3 +1,4 @@
+import { groupImageResources } from "./image-resources";
 import { useRef, type ReactNode } from "react";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { useSecondTick } from "@/hooks/useSecondTick";
@@ -16,6 +17,7 @@ import { TaskChatSubagentTree } from "./TaskChatSubagentCard";
 import { TaskChatRunHealthBanner, partitionRunHealthItems } from "./TaskChatRunHealthBanner";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
+import { TaskChatMarker } from "./TaskChatMarker";
 import { TaskChatShimmerScope, useTaskChatShimmer } from "./TaskChatShimmer";
 import {
   buildTurnTimelineRows,
@@ -158,7 +160,8 @@ export function TaskChatRunnerTurn({
   finishedAtMs,
   activityUnavailable = false,
   allowSummaryFallback = true,
-  suppressFinal = false,
+  awaitingContinuation = false,
+  waitSummary = null,
   continuedAfterSteering = false,
   showHeader = true,
   onRuntimeRequestDecision,
@@ -177,8 +180,14 @@ export function TaskChatRunnerTurn({
   finishedAtMs?: number | null;
   activityUnavailable?: boolean;
   allowSummaryFallback?: boolean;
-  /** Accepted wait/interaction authority overrides an early provider final. */
-  suppressFinal?: boolean;
+  /**
+   * Accepted wait/interaction authority: the turn is waiting, so an early
+   * provider final that only restates the wait is not presented as a reply.
+   * Prose the agent wrote for the user stays visible.
+   */
+  awaitingContinuation?: boolean;
+  /** The accepted yielded result's wait summary, when known. */
+  waitSummary?: string | null;
   /** The visible tail resumes the same native run after an accepted steer. */
   continuedAfterSteering?: boolean;
   /** The task thread keeps a shared header across native and legacy discovery. */
@@ -197,11 +206,9 @@ export function TaskChatRunnerTurn({
       item.surface === "run_result" &&
       item.disposition === "yielded",
   );
-  const observedFinal = suppressFinal
-    ? undefined
-    : paperclipRunnerFinalResponse(turnItems, {
-        allowFallback: terminal && allowSummaryFallback,
-      });
+  const observedFinal = paperclipRunnerFinalResponse(turnItems, awaitingContinuation
+    ? { allowFallback: false, yielded: true, waitSummary }
+    : { allowFallback: terminal && allowSummaryFallback });
   const observedProviderText = Boolean(
     observedFinal &&
     turnItems.some(
@@ -223,8 +230,8 @@ export function TaskChatRunnerTurn({
   if (finalRef.current.runId !== runId) finalRef.current = { runId };
   // A provider final can arrive before the accepted yielded result. Clear any
   // replay latch once the control plane establishes that this turn is waiting
-  // for continuation rather than presenting a durable assistant reply.
-  if (yielded || suppressFinal) finalRef.current = { runId };
+  // for continuation; only an authored (non-wait) final is re-latched below.
+  if (yielded || awaitingContinuation) finalRef.current = { runId };
   if (
     observedFinal &&
     (!finalRef.current.item ||
@@ -238,10 +245,10 @@ export function TaskChatRunnerTurn({
   const final = finalRef.current.item;
   const timelineItems = paperclipRunnerTimelineItems(turnItems);
   const currentActivityItems = currentActivityStatusItems(timelineItems);
-  const timelineRows = buildTurnTimelineRows(
+  const timelineRows = groupImageResources(buildTurnTimelineRows(
     omitProgressRepeatedByResponse(timelineItems, final?.text),
     !terminal,
-  );
+  ));
 
   return (
     <TaskChatShimmerScope items={items}><div
@@ -286,6 +293,8 @@ export function TaskChatRunnerTurn({
                       : "task-chat-plan-preview"
                   }
                 />
+              ) : row.kind === "marker" ? (
+                <TaskChatMarker item={row} />
               ) : row.kind === "subagent_group" ? (
                 <TaskChatSubagentTree subagents={row.subagents} />
               ) : row.kind === "protocol" ? (

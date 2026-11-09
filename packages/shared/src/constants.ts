@@ -223,6 +223,13 @@ export type IssueWorkMode = (typeof ISSUE_WORK_MODES)[number];
 export const ISSUE_HARNESS_KINDS = ["skill_test"] as const;
 export type IssueHarnessKind = (typeof ISSUE_HARNESS_KINDS)[number];
 export const MAX_ISSUE_REQUEST_DEPTH = 1024;
+/**
+ * Deepest task tree an agent (or automation acting for one) may create: a root
+ * task plus one level of children. A deeper request is not rejected; the new
+ * task is parented at this depth instead, as a sibling of the requester. Board
+ * users are not limited, and existing deeper trees stay valid.
+ */
+export const MAX_AGENT_TASK_HIERARCHY_DEPTH = 2;
 
 export const SUMMARY_SLOT_SCOPE_KINDS = [
   "project",
@@ -410,6 +417,16 @@ export const ISSUE_RECOVERY_ACTION_OWNER_TYPES = [
 ] as const;
 export type IssueRecoveryActionOwnerType = (typeof ISSUE_RECOVERY_ACTION_OWNER_TYPES)[number];
 
+/**
+ * Wake reason for an agent whose child or blocker stalled on a recovery action
+ * that needs the board. Woken once per stall (one recovery action).
+ */
+export const ISSUE_BLOCKER_STALLED_WAKE_REASON = "issue_blocker_stalled" as const;
+/** A blocked task with no wait record and no live run (FAC-840 wait contract). */
+export const ISSUE_WAIT_ORPHANED_WAKE_REASON = "issue_wait_orphaned" as const;
+export const ISSUE_BLOCKER_STALL_RELATIONS = ["child", "blocker"] as const;
+export type IssueBlockerStallRelation = (typeof ISSUE_BLOCKER_STALL_RELATIONS)[number];
+
 export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "restored",
   "handed_back",
@@ -530,7 +547,12 @@ export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[numbe
 export const ISSUE_MONITOR_SCHEDULED_BY = ["assignee", "board"] as const;
 export type IssueMonitorScheduledBy = (typeof ISSUE_MONITOR_SCHEDULED_BY)[number];
 
-export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service"] as const;
+/**
+ * Wait-record kinds. `external_service` is woken at nextCheckAt for the owner
+ * to check. `ci` and `pr_mergeable` name a GitHub target the server evaluates
+ * itself, waking the owner only on resolution, startup failure or conflict.
+ */
+export const ISSUE_EXECUTION_MONITOR_KINDS = ["external_service", "ci", "pr_mergeable"] as const;
 export type IssueExecutionMonitorKind = (typeof ISSUE_EXECUTION_MONITOR_KINDS)[number];
 
 export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";

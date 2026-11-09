@@ -26,7 +26,7 @@ import { createAgentLifecycle, configureAgentLifecycle, startAgentLifecycle } fr
 import { projectCompanyHolds } from "../adapters/company-policy.js";
 import { createLifecycleStore as createStore } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
-import type { LifecycleAgent } from "../application/ports.js";
+import type { LifecycleAgent, LifecycleDriver } from "../application/ports.js";
 import { budgetService } from "../../../services/budgets.js";
 import { agentConfigurationRevision } from "../../../lib/agent-configuration-revision.js";
 
@@ -53,7 +53,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Lifecycle test", issuePrefix: `L${companyId.slice(0, 7)}` });
   });
-  function worker(runHost: (agent: LifecycleAgent) => Promise<"complete" | "pending"> = async () => "complete") {
+  function worker(runHost: LifecycleDriver["runHost"] = async () => "complete") {
     const value = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost });
     workers.push(value); return value;
   }
@@ -369,6 +369,19 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       .rejects.toThrow("Hire initialization failed");
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
     expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId))).toHaveLength(0);
+  });
+
+  // H1 bug B: a pause's stop is told apart from termination by the cause the
+  // pause records on each run it stops.
+  it("records what a pause stopped each active run for", async () => {
+    const agent = await hire();
+    await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ lifecycleState: "pausing", lifecycleHolds: ["company_paused"] }).where(eq(agents.id, agent.id));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "queued" }).returning();
+    await createLifecycleDriver(db, {} as never).runHost(await current(agent.id) as never);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(stopped.status).toBe("cancelled");
+    expect(stopped.resultJson).toMatchObject({ pauseStop: { holds: ["company_paused"], companyPauseReason: "budget" } });
   });
 
   it("runs the saved harness test and keeps a failed configuration out of ready", async () => {

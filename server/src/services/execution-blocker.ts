@@ -75,7 +75,11 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
     sql`${environmentLeases.metadata}->'workspaceRecoveryCleanup' is not null`,
   ))).filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
-  const [state] = await db.execute<{ pending: boolean }>(sql`SELECT
+  // A missing predecessor row owns nothing: deleting a run nulls its leases'
+  // run reference and removes its finalization coordinator. Failing closed on
+  // absence stranded the successor with no next action (invariants 3 and 7).
+  const [state] = await db.execute<{ pending: boolean }>(sql`SELECT EXISTS (SELECT 1 FROM ${heartbeatRuns}
+    WHERE ${heartbeatRuns.companyId} = ${companyId} AND ${heartbeatRuns.id} = ${runId} AND (
     ${heartbeatRuns.runnerProfileJson}->>'nativeWorkspaceFinalizationOwner' IS NOT NULL
     OR EXISTS (SELECT 1 FROM ${environmentLeases}
       WHERE ${environmentLeases.companyId} = ${companyId} AND ${environmentLeases.heartbeatRunId} = ${runId}
@@ -93,13 +97,12 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
                   OR (${environmentLeases.provider} = 'ssh' AND ${environmentLeases.metadata}->>'driver' = 'ssh'
                     AND ${environmentLeases.providerLeaseId} LIKE 'ssh://%')))))
             OR (${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-              AND ${environmentLeases.cleanupStatus} = 'success'), false))))
+              AND ${environmentLeases.cleanupStatus} = 'success'), false))))))
     OR EXISTS (SELECT 1 FROM ${nativeRunFinalizations}
       WHERE ${nativeRunFinalizations.companyId} = ${companyId} AND ${nativeRunFinalizations.runId} = ${runId}
         AND (${nativeRunFinalizations.leaseOwner} IS NOT NULL
-          OR ${nativeRunFinalizations.phase} NOT IN ('committed', 'applied', 'terminal_failure'))) AS pending
-    FROM ${heartbeatRuns} WHERE ${heartbeatRuns.companyId} = ${companyId} AND ${heartbeatRuns.id} = ${runId} LIMIT 1`);
-  return state?.pending !== false;
+          OR ${nativeRunFinalizations.phase} NOT IN ('committed', 'applied', 'terminal_failure'))) AS pending`);
+  return state?.pending === true;
 }
 
 /** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
@@ -311,7 +314,13 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const cancellation = run ? readRunCancellation(run.resultJson) : null;
   const eligibleContinuation = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && canContinueCancelledRun(run));
-  const canRetry = Boolean(!restoreHold && run && conversation?.assigneeAgentId === run.agentId &&
+  // A failed run whose saved work is verifiably recovered no longer needs the
+  // hold to protect its files. Offer the same Retry that admission accepts, so
+  // an infrastructure failure (such as a restart) is not left to a new message.
+  // An intentional Stop keeps "send a new message" as its only continuation.
+  const recoveredFailure = Boolean(restoreHold && run?.status === "failed" && !workspaceRepairRequired &&
+    workspaceRecovery?.status === "recovered");
+  const canRetry = Boolean((!restoreHold || recoveredFailure) && run && conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
@@ -359,7 +368,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: workspaceRecovery?.message ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
+    nextAction: (workspaceRecovery?.status === "recovered" && canRetry && !chatBinding
+      ? "Saved work recovered. Retry or send a message to continue." : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
     runError: runError?.slice(0, 1024) ?? null,

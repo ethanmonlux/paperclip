@@ -9,10 +9,18 @@ import type { DurableRecoveryIdentity } from "../contracts/durable-recovery.js";
  * specifications stay private to the driver; plugins receive versioned requirements.
  */
 export interface RunnerExecutionDriver {
-  /** Attests stopped ownership and dormant prelaunch admission for the selected provider. */
-  sourceRecoveryVersion?: 1;
-  /** Same trusted prelaunch attestation for a qualified ACPX provider. */
+  /** The driver verifies a stopped, idle Codex App Server source before launch. */
+  codexSourceRecoveryVersion?: 1;
+  /** The driver verifies a stopped, idle source for the selected ACPX provider before launch. */
   acpxSourceRecoveryVersion?: 1;
+  /** An explicitly supported host release/resume pair; absence keeps ordinary warm ownership.
+   * Release and released-source adoption require the registration checkpoint cleanup hook. */
+  releaseResume?: {
+    release(identity: DurableRecoveryIdentity): Promise<void>;
+    resume(identity: DurableRecoveryIdentity, bootstrapTicket: string): Promise<"resumed" | "unavailable">;
+    /** Confirmed Core-owned completed-session proof, used only for cache adoption. */
+    releasedSource?: DurableRecoveryIdentity;
+  };
   /** Current authenticated lease/checkpoint-writer owner; may change during warm reuse. */
   authorityRunId?: string;
   /** Own provider configuration and file preparation in the execution environment. */

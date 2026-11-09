@@ -18,6 +18,7 @@ import {
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorRecoveryPolicy,
+  type IssueWaitObservation,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   EXECUTION_RECONCILIATION_CAUSES,
   isUuidLike,
@@ -47,7 +48,10 @@ import {
   buildIssueMonitorClearedPatch,
   parseIssueExecutionState,
   buildIssueMonitorTriggeredPatch,
+  buildIssueWaitObservedState,
 } from "../issue-execution-policy.js";
+import { evaluateServerWait, isServerEvaluatedWaitKind, type WaitEvaluation } from "../wait-records.js";
+import { resolveGitHubApiCredential } from "../git-credentials.js";
 import { conflict, HttpError, notFound } from "../../errors.js";
 import { EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON } from "./run-state.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -76,6 +80,13 @@ export interface HeartbeatSchedulingDependencies
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: (fresh?: boolean) => Promise<{ suppressed: boolean }>;
+  /** Reads GitHub for `ci` / `pr_mergeable` wait records; injectable for replays. */
+  evaluateServerWait?: (input: {
+    companyId: string;
+    monitor: IssueExecutionMonitorPolicy;
+    previous: IssueWaitObservation | null;
+    now: Date;
+  }) => Promise<WaitEvaluation>;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -143,6 +154,12 @@ export function createHeartbeatScheduling(
     nextTimerHeartbeatAt,
     claimDueTimerHeartbeat,
   } = dependencies;
+  const evaluateWait = dependencies.evaluateServerWait ?? (input => evaluateServerWait({
+    monitor: input.monitor,
+    now: input.now,
+    previous: input.previous,
+    resolveToken: async () => (await resolveGitHubApiCredential(db, input.companyId))?.token ?? null,
+  }));
 
   const issueMonitorDispatchColumns = {
     id: issues.id,
@@ -286,6 +303,7 @@ export function createHeartbeatScheduling(
 
   async function performIssueMonitorRecovery(input: {
     claimed: IssueMonitorDispatchRow;
+    waitContext?: Record<string, unknown>;
     scheduledAtIso: string;
     nextAttemptCount: number;
     clearReason: IssueExecutionMonitorClearReason;
@@ -337,6 +355,8 @@ export function createHeartbeatScheduling(
           status: "todo",
           priority: "high",
           parentId: input.claimed.id,
+          // Recovery work is structural system machinery tied to the stranded task.
+          parentDepthPolicy: "allow_nested",
           projectId: input.claimed.projectId,
           goalId: input.claimed.goalId,
           assigneeAgentId: input.claimed.assigneeAgentId,
@@ -430,6 +450,7 @@ export function createHeartbeatScheduling(
           timeoutAt: input.monitor?.timeoutAt ?? null,
           maxAttempts: input.monitor?.maxAttempts ?? null,
           ...(reviewPathContext ?? {}),
+          ...(input.waitContext ?? {}),
         },
         "status_only",
       ),
@@ -447,6 +468,7 @@ export function createHeartbeatScheduling(
           timeoutAt: input.monitor?.timeoutAt ?? null,
           maxAttempts: input.monitor?.maxAttempts ?? null,
           ...(reviewPathContext ?? {}),
+          ...(input.waitContext ?? {}),
         },
         "status_only",
       ),
@@ -470,6 +492,7 @@ export function createHeartbeatScheduling(
 
   async function clearIssueMonitorAndRecover(input: {
     claimed: IssueMonitorDispatchRow;
+    waitContext?: Record<string, unknown>;
     policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
     scheduledAtIso: string;
     nextAttemptCount: number;
@@ -638,6 +661,49 @@ export function createHeartbeatScheduling(
     }
   }
 
+  /** Re-arm a started or not-yet-due server wait without waking or consuming an attempt. */
+  async function rescheduleServerWait(
+    claimed: IssueMonitorDispatchRow,
+    policy: NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>,
+    evaluation: Extract<WaitEvaluation, { action: "keep_waiting" }>,
+    input: Pick<Parameters<typeof dispatchClaimedIssueMonitor>[1], "now" | "actorType" | "actorId" | "agentId" | "runId">,
+  ) {
+    const observed = buildIssueWaitObservedState({
+      issue: claimed, policy, nextCheckAt: evaluation.nextCheckAt, observation: evaluation.observation,
+    });
+    const nextCheckAtIso = evaluation.nextCheckAt.toISOString();
+    const publications: ActivityPublication[] = [];
+    const rescheduled = await db.transaction(async tx => {
+      await notifyStatusCardIssueChange(tx, claimed.companyId);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+      const rows = await tx.update(issues).set({
+        monitorNextCheckAt: evaluation.nextCheckAt,
+        monitorWakeRequestedAt: null,
+        executionPolicy: sql`jsonb_set(${issues.executionPolicy}, '{monitor,nextCheckAt}', ${JSON.stringify(nextCheckAtIso)}::jsonb)`,
+        executionState: sql`jsonb_set(coalesce(${issues.executionState}, ${JSON.stringify(observed.executionState)}::jsonb),
+          '{monitor}', ${JSON.stringify(observed.monitorState)}::jsonb)`,
+        updatedAt: input.now,
+      }).where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
+      if (rows.length > 0 && evaluation.notice) {
+        // One report per condition (for example CI queued for a long time); the wait continues.
+        await insertIssueComment(tx, {
+          companyId: claimed.companyId,
+          issueId: claimed.id,
+          body: `Paperclip is still waiting on this task's wait record: ${evaluation.observation.detail}`,
+        });
+        await logActivity(tx as unknown as Db, {
+          companyId: claimed.companyId, actorType: input.actorType, actorId: input.actorId,
+          agentId: input.agentId, runId: input.runId, action: "issue.wait_notice",
+          entityType: "issue", entityId: claimed.id,
+          details: { identifier: claimed.identifier, nextCheckAt: nextCheckAtIso, observation: evaluation.observation },
+        }, publications);
+      }
+      return rows;
+    });
+    for (const publication of publications) publishActivity(publication);
+    return { outcome: "skipped" as const, reason: rescheduled.length > 0 ? "wait_pending" : "monitor_replaced" };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -663,7 +729,7 @@ export function createHeartbeatScheduling(
       claimed.executionPolicy ?? null,
     );
     const monitor = policy?.monitor ?? null;
-    const clearReason = issueMonitorLimitClearReason({
+    let clearReason = issueMonitorLimitClearReason({
       monitor,
       nextAttemptCount,
       now: input.now,
@@ -707,9 +773,37 @@ export function createHeartbeatScheduling(
         }
       : {};
 
+    // FAC-840 wait contract: Paperclip reads a ci / pr_mergeable target itself.
+    // Started or not-yet-due waits re-arm quietly and never consume attempts or
+    // expire; a resolution wakes the owner even past the deadline.
+    let waitContext: Record<string, unknown> = {};
+    let observedIssue: IssueMonitorDispatchRow = claimed;
+    if (policy && monitor && isServerEvaluatedWaitKind(monitor.kind) && !isProviderQuotaReviewMonitor) {
+      const previous = parseIssueExecutionState(claimed.executionState)?.monitor?.observation ?? null;
+      const evaluation = await evaluateWait({ companyId: claimed.companyId, monitor, previous, now: input.now })
+        .catch((err): WaitEvaluation => {
+          logger.warn({ err, issueId: claimed.id }, "server wait evaluation failed");
+          return { action: "fallback", observation: { state: "unobservable", checkedAt: input.now.toISOString(),
+            detail: "Paperclip could not evaluate this wait record; check the target yourself." } };
+        });
+      if (evaluation.action === "keep_waiting" && input.activitySource === "scheduled") {
+        return rescheduleServerWait(claimed, policy, evaluation, input);
+      }
+      observedIssue = {
+        ...claimed,
+        executionState: buildIssueWaitObservedState({
+          issue: claimed, policy, nextCheckAt: claimed.monitorNextCheckAt, observation: evaluation.observation,
+        }).executionState,
+      };
+      if (evaluation.action === "wake") clearReason = null;
+      if (evaluation.action === "expire") clearReason = "timeout_exceeded";
+      waitContext = { kind: monitor.kind, target: monitor.target ?? null, waitObservation: evaluation.observation };
+    }
+
     if (clearReason) {
       return clearIssueMonitorAndRecover({
-        claimed,
+        waitContext,
+        claimed: observedIssue,
         policy,
         scheduledAtIso,
         nextAttemptCount,
@@ -799,6 +893,7 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...waitContext,
             source: input.activitySource,
           },
           requestedByActorType: input.actorType,
@@ -814,6 +909,7 @@ export function createHeartbeatScheduling(
             monitorNotes: claimed.monitorNotes ?? null,
             ...monitorMetadata,
             ...reviewRecoveryContext,
+            ...waitContext,
             manualTrigger: input.activitySource === "manual",
           },
         });
@@ -835,7 +931,7 @@ export function createHeartbeatScheduling(
         return tx.update(issues)
         .set({
           ...monitorOnlyDispatchPatch(buildIssueMonitorTriggeredPatch({
-            issue: claimed,
+            issue: observedIssue,
             policy,
             triggeredAt: input.now,
           })),
@@ -862,6 +958,7 @@ export function createHeartbeatScheduling(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          ...waitContext,
           source: input.activitySource,
         },
       });

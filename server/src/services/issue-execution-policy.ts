@@ -9,6 +9,7 @@ import type {
   IssueExecutionStagePrincipal,
   IssueExecutionState,
   IssueMonitorScheduledBy,
+  IssueWaitObservation,
 } from "@paperclipai/shared";
 import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
@@ -100,6 +101,7 @@ function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
     timeoutAt: monitor.timeoutAt ?? null,
     maxAttempts: monitor.maxAttempts ?? null,
     recoveryPolicy: monitor.recoveryPolicy ?? null,
+    target: monitor.target ?? null,
   };
 }
 
@@ -111,6 +113,8 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
     timeoutAt: state?.timeoutAt ?? null,
     maxAttempts: state?.maxAttempts ?? null,
     recoveryPolicy: state?.recoveryPolicy ?? null,
+    target: state?.target ?? null,
+    observation: state?.observation ?? null,
   };
 }
 
@@ -166,7 +170,15 @@ function derivePersistedMonitorState(input: {
   const scheduledByRaw = input.issue.monitorScheduledBy ?? scheduledMonitor?.scheduledBy ?? fromState?.scheduledBy ?? null;
   const scheduledBy =
     scheduledByRaw === "assignee" || scheduledByRaw === "board" ? scheduledByRaw : null;
-  const metadata = scheduledMonitor ? monitorMetadataFromPolicy(scheduledMonitor) : monitorMetadataFromState(fromState);
+  const metadata = scheduledMonitor
+    ? {
+      ...monitorMetadataFromPolicy(scheduledMonitor),
+      // A server-evaluated wait keeps its latest reading while it still names the same target.
+      observation: JSON.stringify(fromState?.target ?? null) === JSON.stringify(scheduledMonitor.target ?? null)
+        ? fromState?.observation ?? null
+        : null,
+    }
+    : monitorMetadataFromState(fromState);
 
   if (nextCheckAt) {
     return {
@@ -391,6 +403,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
+      target: parsed.data.monitor.target ?? null,
     }
     : null;
 
@@ -1173,6 +1186,33 @@ export function buildInitialIssueMonitorFields(input: {
     monitorNotes: input.policy.monitor.notes ?? null,
     monitorScheduledBy: input.policy.monitor.scheduledBy,
     executionState: executionStateWithMonitor(null, monitorState) as Record<string, unknown> | null,
+  };
+}
+
+/**
+ * The monitor state of a server-evaluated wait re-armed at `nextCheckAt`, with
+ * the server's latest reading. Callers write only the monitor keys, so review
+ * policy and state changed concurrently are preserved.
+ */
+export function buildIssueWaitObservedState(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy;
+  nextCheckAt: Date;
+  observation: IssueWaitObservation;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const policy = input.policy.monitor
+    ? { ...input.policy, monitor: { ...input.policy.monitor, nextCheckAt: input.nextCheckAt.toISOString() } }
+    : input.policy;
+  const derived = derivePersistedMonitorState({
+    issue: { ...input.issue, monitorNextCheckAt: input.nextCheckAt },
+    state: existingState,
+    policy,
+  });
+  const monitorState: IssueExecutionMonitorState | null = derived ? { ...derived, observation: input.observation } : null;
+  return {
+    monitorState,
+    executionState: executionStateWithMonitor(existingState, monitorState) as Record<string, unknown> | null,
   };
 }
 

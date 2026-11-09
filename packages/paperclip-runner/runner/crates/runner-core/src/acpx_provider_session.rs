@@ -1,6 +1,6 @@
 use crate::generated_acpx_profiles::acpx_release_profile;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -350,7 +350,9 @@ pub struct AcpxProviderSession {
     closed: bool,
     failure: Option<LocalRunnerError>,
     transport_terminated: bool,
+    rejected_start_resumable: bool,
     runtime_retired: bool,
+    completed_turn_observed: bool,
 }
 
 pub(crate) fn goal_is_dormant(projection: &Value) -> bool {
@@ -406,7 +408,9 @@ impl AcpxProviderSession {
             closed: false,
             failure: None,
             transport_terminated: false,
+            rejected_start_resumable: false,
             runtime_retired: false,
+            completed_turn_observed: false,
         })
     }
 
@@ -420,6 +424,10 @@ impl AcpxProviderSession {
 
     pub fn identity(&self) -> &AcpxProviderSessionIdentity {
         &self.identity
+    }
+
+    pub(crate) fn rejected_start_checkpoint(&self) -> Option<&AcpxProviderSessionIdentity> {
+        self.rejected_start_resumable.then_some(&self.identity)
     }
 
     pub fn turn_control_capabilities(&self) -> AcpxTurnControlCapabilities {
@@ -446,6 +454,25 @@ impl AcpxProviderSession {
         let snapshot = self
             .transport
             .request(GeneratedAcpxSidecarCommand::SessionSnapshot, json!({}))?;
+        self.validate_dormant_snapshot(&snapshot)?;
+        // The status barrier can queue a newer goal while the snapshot is in flight.
+        // Inspect without consuming facts that ordinary polling still owns.
+        let mut checked_state = self.state.clone();
+        for event in self.transport.buffered_events().skip(prior_events) {
+            if event.event_type != GeneratedAcpxSidecarEventType::RuntimeGoal {
+                continue;
+            }
+            checked_state.accept_event(event)?;
+            if !goal_is_dormant(&event.payload) {
+                return Err(LocalRunnerError::invalid(
+                    "saved dormant ACPX received an active or unknown goal during its snapshot",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dormant_snapshot(&self, snapshot: &Value) -> Result<(), LocalRunnerError> {
         let identity: AcpxProviderSessionIdentity =
             serde_json::from_value(snapshot["identity"].clone()).map_err(|_| {
                 LocalRunnerError::invalid("saved dormant ACPX snapshot identity is invalid")
@@ -463,21 +490,47 @@ impl AcpxProviderSession {
                 "saved dormant ACPX snapshot has unexpected work or identity",
             ));
         }
-        // The status barrier can queue a newer goal while the snapshot is in flight.
-        // Inspect without consuming facts that ordinary polling still owns.
-        let mut checked_state = self.state.clone();
-        for event in self.transport.buffered_events().skip(prior_events) {
-            if event.event_type != GeneratedAcpxSidecarEventType::RuntimeGoal {
-                continue;
-            }
-            checked_state.accept_event(event)?;
-            if !goal_is_dormant(&event.payload) {
-                return Err(LocalRunnerError::invalid(
-                    "saved dormant ACPX received an active or unknown goal during its snapshot",
-                ));
-            }
-        }
         Ok(())
+    }
+
+    pub(crate) fn observed_event_sequence(&self) -> u64 {
+        self.transport.observed_event_sequence()
+    }
+
+    pub(crate) fn settle_park_observation(&mut self) -> Result<(), LocalRunnerError> {
+        self.transport.settle_observation()
+    }
+
+    pub(crate) fn host_park_ready(&mut self, deadline: Instant) -> Result<bool, LocalRunnerError> {
+        if self.closed
+            || self.failure.is_some()
+            || self.transport_terminated
+            || self.runtime_retired
+            || !self.completed_turn_observed
+            || self.state.active_turn_id().is_some()
+            || self.state.has_pending_requests()
+            || self.transport.buffered_events().len() != 0
+        {
+            return Ok(false);
+        }
+        let Some(goal) = self
+            .transport
+            .observe(GeneratedAcpxSidecarCommand::SessionGoalGet, deadline)?
+        else {
+            return Ok(false);
+        };
+        if !goal_is_dormant(&goal) {
+            return Ok(false);
+        }
+        let Some(snapshot) = self
+            .transport
+            .observe(GeneratedAcpxSidecarCommand::SessionSnapshot, deadline)?
+        else {
+            return Ok(false);
+        };
+        // Polling still owns every frame observed during these reads.
+        Ok(self.validate_dormant_snapshot(&snapshot).is_ok()
+            && self.transport.buffered_events().len() == 0)
     }
 
     /// Read the same live sidecar before exposing its in-memory pending ledger.
@@ -531,6 +584,10 @@ impl AcpxProviderSession {
         self.transport.request(command, payload)
     }
 
+    pub(crate) fn buffered_event_count(&self) -> usize {
+        self.transport.buffered_events().len()
+    }
+
     pub fn start_turn(
         &mut self,
         turn_id: &str,
@@ -547,6 +604,7 @@ impl AcpxProviderSession {
         working_directory: &Path,
         performance: bool,
     ) -> Result<Value, LocalRunnerError> {
+        self.rejected_start_resumable = false;
         self.ensure_open()?;
         if self.runtime_retired {
             return Err(LocalRunnerError::invalid(
@@ -635,12 +693,19 @@ impl AcpxProviderSession {
                 "ACPX reserved tool receipt rotation failed: {error}"
             ))));
         }
-        let response = match self.transport.request(
-            GeneratedAcpxSidecarCommand::TurnStart,
+        let response = match self.transport.request_turn_start(
             json!({"turnId":turn_id,"message":message,"performance":performance}),
         ) {
             Ok(response) => response,
-            Err(error) => return Err(self.fail_closed(error)),
+            Err(failure) => {
+                let resumable = failure.resume_required
+                    && self.state.active_turn_id().is_none()
+                    && !self.state.has_pending_requests()
+                    && self.transport.buffered_events().len() == 0;
+                let error = self.fail_closed(failure.error);
+                self.rejected_start_resumable = resumable && self.transport_terminated;
+                return Err(error);
+            }
         };
         if response.get("turnId").and_then(Value::as_str) != Some(turn_id) {
             return Err(self.fail_closed(LocalRunnerError::invalid(
@@ -657,6 +722,7 @@ impl AcpxProviderSession {
         }
         self.tool_bridge = next_tool_bridge;
         self.reserved_tool_bridge = next_reserved_tool_bridge;
+        self.completed_turn_observed = false;
         Ok(response)
     }
 
@@ -742,6 +808,17 @@ impl AcpxProviderSession {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Vec<AcpxProviderStateEvent>>, LocalRunnerError> {
+        Ok(self
+            .poll_output(timeout, false, None)?
+            .map(|(events, _)| events))
+    }
+
+    pub(crate) fn poll_output(
+        &mut self,
+        timeout: Duration,
+        disconnected: bool,
+        last_goal_revision: Option<u64>,
+    ) -> Result<Option<(Vec<AcpxProviderStateEvent>, Option<Value>)>, LocalRunnerError> {
         self.ensure_open()?;
         let event = match self.transport.poll_event(timeout) {
             Ok(event) => event,
@@ -750,6 +827,34 @@ impl AcpxProviderSession {
         let Some(mut event) = event else {
             return Ok(None);
         };
+        let mut terminal_goal = None;
+        if disconnected
+            && event.event_type == GeneratedAcpxSidecarEventType::RuntimeTurnTerminal
+            && event.payload.pointer("/error/code").and_then(Value::as_str)
+                != Some("ACPX_PROVIDER_PROCESS_LOST")
+        {
+            let snapshot = event.payload.get("goalAtTerminal").filter(|snapshot| {
+                snapshot["schema"] == "paperclip.session_goal.snapshot.v1"
+                    && snapshot["workingNow"] == false
+                    && snapshot["providerRevision"]
+                        .as_u64()
+                        .is_some_and(|revision| revision > last_goal_revision.unwrap_or(0))
+                    && snapshot["sessionGoals"]["availability"]
+                        .as_str()
+                        .is_some_and(|availability| {
+                            matches!(availability, "available" | "unsupported")
+                        })
+                    && (goal_is_dormant(snapshot)
+                        || snapshot.pointer("/goal/status").and_then(Value::as_str)
+                            == Some("active"))
+            });
+            let Some(snapshot) = snapshot else {
+                // Older sidecars need a connected goal read before settling this turn.
+                self.transport.defer_polled_event(event);
+                return Ok(None);
+            };
+            terminal_goal = Some(snapshot.clone());
+        }
         if event.event_type == GeneratedAcpxSidecarEventType::RuntimePermissionRequested {
             // Authority comes from this admitted connection's profile. A sidecar
             // claim cannot relabel another provider; old frames may omit origin.
@@ -913,10 +1018,20 @@ impl AcpxProviderSession {
                 reconciled_events.push(event);
             }
         }
+        for event in &reconciled_events {
+            if let AcpxProviderStateEvent::TurnTerminal {
+                turn_id, status, ..
+            } = event
+            {
+                self.completed_turn_observed = *status
+                    == crate::acpx_event_payload::AcpxTurnStatus::Completed
+                    && self.state.active_turn_id() == Some(turn_id.as_str());
+            }
+        }
         self.state = next_state;
         self.tool_bridge = next_bridge;
         self.reserved_tool_bridge = next_reserved_bridge;
-        Ok(Some(reconciled_events))
+        Ok(Some((reconciled_events, terminal_goal)))
     }
 
     pub fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
@@ -2126,7 +2241,9 @@ mod mode_tests {
             closed: false,
             failure: None,
             transport_terminated: false,
+            rejected_start_resumable: false,
             runtime_retired: false,
+            completed_turn_observed: false,
         }
     }
 

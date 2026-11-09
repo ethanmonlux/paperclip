@@ -19,6 +19,7 @@ export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const WORKSPACE_BUSY_RETRY_REASON = "workspace_busy";
 export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
+export const RUNNER_REVISION_WAIT_RETRY_REASON = "runner_revision_wait";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
@@ -167,6 +168,23 @@ export function allowsIssueInteractionWake(
   return Boolean(deriveCommentId(contextSnapshot));
 }
 
+/**
+ * Whether a wake may run while its issue still has unresolved blockers: a
+ * verified comment interaction, or a stalled child or blocker
+ * (`issue_blocker_stalled`, once per stall), which the assignee must be able
+ * to re-delegate, escalate or block on while that dependency is stuck. The
+ * caller verifies the stall against server state (`verifyBlockerStallWake`);
+ * the wake reason string alone never qualifies. Pause holds are separate and
+ * do not use this rule.
+ */
+export function allowsDependencyBlockedWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  interactionWakeReasons: ReadonlySet<string>,
+  verifiedBlockerStall: boolean,
+): boolean {
+  return allowsIssueInteractionWake(contextSnapshot, interactionWakeReasons) || verifiedBlockerStall;
+}
+
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);
@@ -182,6 +200,7 @@ export function isResolvedInteractionContinuationWakeContext(contextSnapshot: un
   const retryReason = readNonEmptyString(context.retryReason);
   return (
     (mutation === "interaction" && wakeReason === "issue_commented") ||
+    (mutation === "interaction" && retryReason === RUNNER_REVISION_WAIT_RETRY_REASON) ||
     wakeReason === INTERACTION_CONTINUATION_INFRA_WAKE_REASON ||
     retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
   );
