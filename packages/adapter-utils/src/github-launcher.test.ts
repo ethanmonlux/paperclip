@@ -171,27 +171,32 @@ process.exit(result.status ?? 98);
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
 
-  it("identifies a code-0 failure from Node's environment proxy without logging its URL", async () => {
+  it("classifies a code-0 fetch failure under an environment proxy without logging its URL", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-failure-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
     await mkdir(bin);
     await exec("git", ["init", "-q", root]);
     await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
-    const proxy = createServer((_req, res) => { res.writeHead(502); res.end(); });
-    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
-    cleanups.push(() => new Promise<void>(resolve => proxy.close(() => resolve())));
-    const { port } = proxy.address() as { port: number };
-    const proxyUrl = `http://127.0.0.1:${port}`;
+    // Inject the failure at fetch: CI network routing can bypass a local proxy
+    // or leave its CONNECT request pending, neither of which tests this branch.
+    const preload = path.join(root, "fail-fetch.cjs");
+    await writeFile(preload, `globalThis.fetch = async () => {
+  const error = new TypeError("fetch failed");
+  error.cause = Object.assign(new Error("proxy transport failed"), { code: 0 });
+  throw error;
+};\n`);
+    const proxyUrl = "http://proxy-secret.invalid:3128";
     const result = await exec(path.join(bin, "git"), ["remote"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: "http://broker.invalid:3100", token: "private-capability" }),
-      PATH: `${bin}:${process.env.PATH}`, NODE_USE_ENV_PROXY: "1",
+      PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, NODE_USE_ENV_PROXY: "1",
       HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, NO_PROXY: "", no_proxy: "",
+      NODE_OPTIONS: `--require=${preload}`,
     } });
     expect(result.stderr).toContain("broker_transport_unavailable (proxy_transport_unclassified)");
     expect(result.stderr).not.toContain(proxyUrl);
     expect(result.stderr).not.toContain("private-capability");
-  }, 15_000);
+  });
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
