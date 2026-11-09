@@ -253,6 +253,42 @@ process.exit(result.status ?? 98);
     status = "absent";
     expect(JSON.parse((await gh("repo", "create", "demo")).stdout)).toEqual({ args: ["repo", "create", "demo"], token: null });
   });
+  it("refuses direct pull request merges before capturing a credential (FAC-840 B)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-direct-merge-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed"), realBin = path.join(root, "real");
+    await mkdir(bin); await mkdir(realBin);
+    await writeFile(path.join(bin, "gh"), githubLauncherSource(), { mode: 0o700 });
+    await writeFile(path.join(realBin, "gh"), '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({args:process.argv.slice(2),token:process.env.GH_TOKEN ?? null}));', { mode: 0o700 });
+    let credentialRequests = 0;
+    const server = createServer((_req, res) => {
+      credentialRequests += 1;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "managed-token" } }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "run-capability" }),
+      PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    const gh = (...args: string[]) => exec(path.join(bin, "gh"), args, { env });
+    for (const args of [
+      ["pr", "merge", "12", "--squash"],
+      ["pr", "merge", "--auto", "--merge"],
+      ["api", "-X", "PUT", "repos/ethanmonlux/facette/pulls/704/merge"],
+      ["api", "--method=PUT", "/repos/ethanmonlux/paperclip/pulls/28/merge", "-f", "merge_method=merge"],
+      ["api", "graphql", "-f", "query=mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }"],
+    ]) {
+      const failure = await gh(...args).catch((error: { code?: number; stdout?: string; stderr?: string }) => error);
+      expect(failure).toMatchObject({ code: 1, stdout: "" });
+      expect(failure.stderr).toContain("protected-main gate");
+    }
+    expect(credentialRequests).toBe(0);
+    // Reading merge state and other PR commands still work.
+    expect(JSON.parse((await gh("api", "repos/ethanmonlux/facette/pulls/704/merge")).stdout).token).toBe("managed-token");
+    expect(JSON.parse((await gh("pr", "view", "12")).stdout)).toEqual({ args: ["pr", "view", "12"], token: "managed-token" });
+    expect(JSON.parse((await gh("pr", "merge", "--help")).stdout).args).toEqual(["pr", "merge", "--help"]);
+  });
   it.each(["before-write", "partial-write"])("keeps Git and managed credentials available after a %s failure", async (failure) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-default-write-failure-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

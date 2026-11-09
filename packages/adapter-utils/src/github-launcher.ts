@@ -50,7 +50,34 @@ function connectorRepositoryTool(args) {
   if (program !== 'gh' || args[0] !== 'repo' || args.includes('--help') || args.includes('-h')) return null;
   return connectorRepositoryTools.get(args[1]) || null;
 }
+// Agents merge only through the protected-main gate (FAC-840 B), which checks
+// base currency, exact-head CI, review coverage and red main before merging.
+function directMergeCommand(args) {
+  if (program !== 'gh' || args.includes('--help') || args.includes('-h')) return null;
+  if (args[0] === 'pr' && args[1] === 'merge') return 'gh pr merge';
+  if (args[0] !== 'api') return null;
+  let method = null;
+  const operands = [];
+  for (let index = 1; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '-X' || arg === '--method') { method = String(args[index + 1] || '').toUpperCase(); index += 1; continue; }
+    if (arg.startsWith('--method=')) { method = arg.slice(9).toUpperCase(); continue; }
+    if (arg.startsWith('-X') && arg.length > 2) { method = arg.slice(2).replace(/^=/, '').toUpperCase(); continue; }
+    if (/mergePullRequest|enablePullRequestAutoMerge/.test(arg)) return 'gh api graphql merge';
+    if (!arg.startsWith('-')) operands.push(arg);
+  }
+  const endpoint = (operands[0] || '').split('?')[0].replace(/^https:\/\/api\.github\.com/, '').replace(/^\/+/, '');
+  return method === 'PUT' && /^repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/merge$/.test(endpoint) ? 'gh api PUT pulls/merge' : null;
+}
 async function main() {
+  const directMerge = directMergeCommand(process.argv.slice(2));
+  if (directMerge) {
+    process.stderr.write('Paperclip: direct pull request merges (' + directMerge + ') are disabled for agents. ' +
+      'The coordinator merges through the protected-main gate: POST /api/issues/<task-id>/merge-gate with {"repo":"owner/name","pullNumber":N} ' +
+      '(add "dryRun":true to see what is missing).\n');
+    process.exitCode = 1;
+    return;
+  }
   let env = { ...process.env };
 ${options.brokerFile ? String.raw`
   delete env.PAPERCLIP_API_URL;

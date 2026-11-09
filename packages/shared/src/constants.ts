@@ -379,6 +379,8 @@ export const ISSUE_ORIGIN_KINDS = [
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   "chat_channel",
+  // The merge gate's single owner issue for a red base branch (FAC-840 B).
+  "merge_gate_red_main",
 ] as const;
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 export type PluginIssueOriginKind = `plugin:${string}`;

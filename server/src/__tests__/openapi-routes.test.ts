@@ -54,6 +54,7 @@ const apiPrefixes: Record<string, string> = {
   "costs.ts": "/api",
   "dashboard.ts": "/api",
   "staple-console.ts": "/api",
+  "merge-gate.ts": "/api",
   "dot-runner.ts": "/api",
   "muse.ts": "/api",
   "muse-qualification.ts": "/api",
