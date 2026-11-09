@@ -236,12 +236,13 @@ async function main(): Promise<number> {
   try {
     await supervisor.start(serverEnvironment);
     const api = new ChaosApi(supervisor.baseUrl);
-    const lab = await seedChaosLab({ api, env: plan.options.env, daytonaImage: plan.options.daytonaImage, daytonaCpu: plan.options.daytonaCpu,
+    const lab = await seedChaosLab({ api, env: plan.options.env, waitForReadyAgents: true, cancelled: () => interrupted, daytonaImage: plan.options.daytonaImage, daytonaCpu: plan.options.daytonaCpu,
       daytonaReuseLease: plan.options.daytonaReuseLease,
       adapters: [...new Set([...plan.tasks.map(task => task.adapter),
         ...(plan.tasks.some(task => task.workload === "M1") ? plan.options.adapters : [])])],
       concurrency: plan.options.concurrency, budgetCents: plan.options.budgetCents, masks: plan.options.masks,
-      fixtureRoot: path.join(supervisor.paths.temporaryRoot, "fixtures"), waveId: plan.waveId, timeline,
+      fixtureRoot: path.join(supervisor.paths.temporaryRoot, "fixtures"), workspaceRepo: plan.options.workspaceRepo,
+      workspaceCommit: plan.options.workspaceCommit, waveId: plan.waveId, timeline,
       adapterConfigOverrides: chaosLifecycleOverrides(plan.options.lifecycle),
       onEnvironment: owned => {
         sweeper = new DaytonaWaveSweeper({ apiKey: process.env.DAYTONA_API_KEY!, companyId: owned.companyId, environmentId: owned.environmentId, api });

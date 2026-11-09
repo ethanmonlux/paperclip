@@ -17,7 +17,7 @@ export interface WorkloadDefinition {
   description(nonce: string, agents?: WorkloadAgents): string;
   followUp?(nonce: string): string;
   /** Files and commands the observer must collect for the T-oracle. */
-  collect: { documents: string[]; files(nonce: string): string[]; commands: Array<{ name: string; argv: string[] }>;
+  collect: { documents: string[]; files(nonce: string): string[]; commands: Array<{ name: string; argv: string[] | ((nonce: string) => string[]) }>;
     childDocuments?: string[] };
   grade(nonce: string, artifacts: OracleArtifacts, agents?: WorkloadAgents): OracleResult;
 }
@@ -38,6 +38,14 @@ const followUpMarker = (nonce: string) => `FOLLOWUP-${nonce}`;
 const notesFile = (nonce: string) => `NOTES-${nonce}.md`;
 const benchFile = (nonce: string) => `bench-result-${nonce}.txt`;
 const benchRecord = (nonce: string) => `.bench/run-${nonce}.txt`;
+const r1Module = (nonce: string) => `packages/shared/src/chaos/slug-${nonce}.ts`;
+const r1Test = (nonce: string) => `packages/shared/src/chaos/slug-${nonce}.test.ts`;
+
+export function r1TestChecksSlug(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.includes("node:test") && text.includes("node:assert") && /\bassert(\.\w+)?\s*\(/.test(text)
+    && text.includes("chaosSlug") && text.includes("hello-chaos-world");
+}
 /** bench.sh must have actually run: at least this long between start and finish. */
 export const BENCH_MIN_SECONDS = 200;
 /** B5: distinct progress values the harness must have observed itself while polling. */
@@ -50,6 +58,20 @@ export function parseBenchRecord(text: string | null | undefined) {
   const started = Number(fields.started), finished = Number(fields.finished);
   return Number.isFinite(started) && Number.isFinite(finished) && fields.result
     ? { seconds: finished - started, result: fields.result } : null;
+}
+
+export function stallWakeChecks(artifacts: OracleArtifacts): OracleResult["checks"] {
+  const stalls = artifacts.childStalls ?? [];
+  if (!stalls.length) return [];
+  const wakes = artifacts.stallWakes ?? [];
+  const matching = (stall: { childIssueId: string; recoveryActionId: string | null }) => wakes.filter(wake =>
+    wake.stalledIssueId === stall.childIssueId && (stall.recoveryActionId === null || wake.recoveryActionId === stall.recoveryActionId));
+  const unwoken = stalls.filter(stall => matching(stall).length === 0).map(stall => `${stall.childIssueId}:${stall.recoveryActionId}`);
+  const perPair = new Map<string, number>();
+  for (const wake of wakes) perPair.set(`${wake.stalledIssueId}:${wake.recoveryActionId}`, (perPair.get(`${wake.stalledIssueId}:${wake.recoveryActionId}`) ?? 0) + 1);
+  const repeated = [...perPair.entries()].filter(([, count]) => count > 1).map(([key]) => key);
+  return [{ name: "parent_woken_once_per_stall", ok: !unwoken.length && !repeated.length,
+    detail: `stalls=${stalls.length} wakes=${wakes.length}${unwoken.length ? ` unwoken=${unwoken.join(",")}` : ""}${repeated.length ? ` repeated=${repeated.join(",")}` : ""}` }];
 }
 
 function result(checks: OracleResult["checks"]): OracleResult {
@@ -197,6 +219,7 @@ export const workloadDefinitions: Record<WorkloadId, WorkloadDefinition> = {
         { name: "part2_kept", ok: distinct && Boolean(agents) && part2[0]!.assigneeAgentId === agents!.self.id,
           detail: `assignee=${part2[0]?.assigneeAgentId ?? "none"}` },
         { name: "summary_has_both_parts", ok: summary.includes(partMarker(nonce, 1)) && summary.includes(partMarker(nonce, 2)) },
+        ...stallWakeChecks(artifacts),
       ]);
     },
   },
@@ -261,6 +284,45 @@ export const workloadDefinitions: Record<WorkloadId, WorkloadDefinition> = {
         { name: "unittest_passes", ok: tests?.exitCode === 0, detail: `exit=${tests?.exitCode ?? "not run"}` },
         { name: "slugify_output", ok: slug?.exitCode === 0 && slug.stdout.trim() === "hello-chaos-world", detail: JSON.stringify(slug?.stdout.trim() ?? null) },
         { name: "notes_file", ok: artifacts.files[notesFile(nonce)]?.trim() === `B1-${nonce}` },
+      ]);
+    },
+  },
+  R1: {
+    id: "R1",
+    label: "Code change in a Paperclip clone",
+    usesRepository: true,
+    fireWindowMs: [20_000, 90_000],
+    budgetMs: 15 * 60_000,
+    title: nonce => `Chaos R1 slug module ${nonce}`,
+    description: nonce => [
+      "Work in this task's repository workspace, a clone of the Paperclip repository.",
+      `Add \`${r1Module(nonce)}\` exporting \`chaosSlug(input: string): string\`: lowercase, every run of characters`,
+      "other than a-z and 0-9 becomes a single `-`, and no leading or trailing `-`.",
+      `Add \`${r1Test(nonce)}\` that uses \`node:test\` and \`node:assert/strict\`, imports \`./slug-${nonce}.ts\`,`,
+      "and checks at least three cases, including `chaosSlug(\"Hello Chaos World\") === \"hello-chaos-world\"`.",
+      `Run \`node --test ${r1Test(nonce)}\` from the repository root until it passes.`,
+      "Do not install dependencies and do not change any other file. Then mark this task done.",
+    ].join("\n"),
+    collect: {
+      documents: [],
+      files: nonce => [r1Module(nonce), r1Test(nonce)],
+      commands: [
+        { name: "node_test", argv: nonce => [process.execPath, "--test", r1Test(nonce)] },
+        { name: "slug", argv: nonce => [process.execPath, "--input-type=module", "-e",
+          `import { chaosSlug } from "./${r1Module(nonce)}"; console.log(JSON.stringify(["Hello Chaos World", "  R1 -- Paperclip__Chaos 2026! "].map(chaosSlug)));`] },
+      ],
+    },
+    grade(nonce, artifacts) {
+      const tests = artifacts.commands.node_test;
+      const slug = artifacts.commands.slug;
+      return result([
+        statusCheck(artifacts),
+        { name: "workspace_located", ok: artifacts.workspacePath !== null },
+        { name: "module_present", ok: typeof artifacts.files[r1Module(nonce)] === "string" },
+        { name: "test_checks_chaos_slug", ok: r1TestChecksSlug(artifacts.files[r1Test(nonce)]) },
+        { name: "node_test_passes", ok: tests?.exitCode === 0, detail: `exit=${tests?.exitCode ?? "not run"}` },
+        { name: "required_and_hidden_cases", ok: slug?.exitCode === 0 && slug.stdout.trim() === JSON.stringify(["hello-chaos-world", "r1-paperclip-chaos-2026"]),
+          detail: JSON.stringify(slug?.stdout.trim() ?? null) },
       ]);
     },
   },
