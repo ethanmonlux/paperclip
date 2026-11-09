@@ -104,6 +104,7 @@ import {
   createClaudeAcpExecutor,
   resolveClaudeExecutionEngineForRun,
 } from "./acp.js";
+import { createClaudeRawOutputDiagnostic } from "./raw-output-diagnostic.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeClaudeAcp = createClaudeAcpExecutor();
@@ -897,7 +898,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
+  let attemptNumber = 0;
   const runAttempt = async (resumeSessionId: string | null) => {
+    const currentAttempt = ++attemptNumber;
+    const rawDiagnostic = executionTargetIsRemote ? null : createClaudeRawOutputDiagnostic();
     await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
     const renderedBootstrapPrompt =
       !resumeSessionId && bootstrapPromptTemplate.trim().length > 0
@@ -965,7 +969,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const consumeAccounting = createClaudeStreamParser();
-    const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
+    const accountingLog = createUsageCheckpointLog(async (stream, chunk) => {
+      rawDiagnostic?.add(stream, chunk);
+      await onLog(stream, chunk);
+    }, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
       return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
         provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
@@ -994,6 +1001,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
+    if (!parsed && !proc.timedOut && rawDiagnostic) {
+      try {
+        const directory = await rawDiagnostic.preserve({
+          runId, attempt: currentAttempt, exitCode: proc.exitCode,
+          signal: proc.signal, timedOut: proc.timedOut,
+        });
+        if (directory) await onLog("stderr", `[paperclip] Claude parse diagnostic saved at ${directory}\n`);
+      } catch {
+        await onLog("stderr", "[paperclip] Claude parse diagnostic could not be saved.\n");
+      }
+    }
     return { proc, parsedStream, parsed };
   };
 
