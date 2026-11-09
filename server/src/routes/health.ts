@@ -139,7 +139,8 @@ export function healthRoutes(
 
   router.post("/dev-server/restart", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
-    if (opts.deploymentMode === "authenticated" && actorType !== "board") {
+    // Agent keys never restart the server, whatever the deployment mode.
+    if (actorType === "agent" || (opts.deploymentMode === "authenticated" && actorType !== "board")) {
       res.status(403).json({ error: "board_access_required" });
       return;
     }

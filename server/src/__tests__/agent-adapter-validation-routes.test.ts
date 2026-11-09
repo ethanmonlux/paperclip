@@ -1222,6 +1222,64 @@ describe("agent routes adapter validation", () => {
     const saved = mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig;
     expect(saved.homeMode).toBe(actor === "agent" ? "preconfigured" : undefined);
   });
+  describe("run sandbox authority", () => {
+    const sandboxed = {
+      model: "gpt-5-codex",
+      filesystemScope: "workspace",
+      networkScope: "allowlist",
+      networkAllowlist: ["api.openai.com"],
+      filesystemExtraPaths: [{ path: "/opt/tools", access: "ro" }],
+    };
+    const agentActor = { type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_jwt" };
+    async function useSandboxedAgent() {
+      mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterConfig: sandboxed, permissions: { canCreateAgents: true } });
+    }
+
+    it.each([
+      ["clearing filesystemScope", { adapterConfig: { filesystemScope: null } }, "filesystemScope"],
+      ["clearing networkScope", { adapterConfig: { networkScope: null } }, "networkScope"],
+      ["mounting the user runtime dir", { adapterConfig: { filesystemExtraPaths: [{ path: "/opt/tools", access: "ro" }, "/run/user/1000"] } }, "filesystemExtraPaths"],
+      ["upgrading a mount to read-write", { adapterConfig: { filesystemExtraPaths: [{ path: "/opt/tools", access: "rw" }] } }, "filesystemExtraPaths"],
+      ["adding a network target", { adapterConfig: { networkAllowlist: ["api.openai.com", "127.0.0.1:3100"] } }, "networkAllowlist"],
+      ["replacing the config without its scopes", { replaceAdapterConfig: true, adapterConfig: { model: "gpt-5-codex" } }, "filesystemScope, networkScope"],
+    ])("refuses an agent key %s", async (_label, body, keys) => {
+      await useSandboxedAgent();
+      const app = await createApp(agentActor);
+      const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send(body));
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+      expect(response.body.error).toContain(`Agent keys cannot widen the run sandbox (${keys})`);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses an agent key rolling back to a revision without the sandbox", async () => {
+      await useSandboxedAgent();
+      mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: { adapterType: "codex_local", adapterConfig: { model: "gpt-5-codex" } } });
+      const app = await createApp(agentActor);
+      const response = await requestApp(app, baseUrl => request(baseUrl)
+        .post("/api/agents/11111111-1111-4111-8111-111111111111/config-revisions/33333333-3333-4333-8333-333333333333/rollback").send({}));
+      expect(response.status, JSON.stringify(response.body)).toBe(403);
+      expect(response.body.error).toContain("Agent keys cannot widen the run sandbox (filesystemScope, networkScope)");
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+
+    it("lets an agent key tighten its sandbox and edit unrelated settings", async () => {
+      await useSandboxedAgent();
+      const app = await createApp(agentActor);
+      const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { model: "gpt-5.1-codex", networkScope: "deny", filesystemExtraPaths: [] } }));
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig).toMatchObject({ filesystemScope: "workspace", networkScope: "deny", filesystemExtraPaths: [] });
+    });
+
+    it("lets a board operator widen the sandbox", async () => {
+      await useSandboxedAgent();
+      const app = await createApp();
+      const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { networkAllowlist: ["api.openai.com", "registry.npmjs.org"] } }));
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(mockAgentService.update.mock.calls.at(-1)?.[1].adapterConfig.networkAllowlist).toEqual(["api.openai.com", "registry.npmjs.org"]);
+    });
+  });
   it("allows an operator to configure Runner homeMode", async () => {
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
     mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-6.1-sol" } });

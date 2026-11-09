@@ -11,6 +11,7 @@ import {
 } from "../install-store.js";
 import { resolvePaperclipInstanceId } from "../config/home.js";
 import { detectServiceManager, launchdServiceName, systemdServiceName } from "../services/service-manager.js";
+import { assertServiceLifecycleOutsideAgentRun } from "../service-lifecycle-authority.js";
 
 type UninstallDependencies = {
   detectServiceManager: typeof detectServiceManager;
@@ -39,6 +40,7 @@ function otherServiceDefinitions(platform: NodeJS.Platform, userHomeDir: string,
 export async function uninstallCommand(
   dependencies: Partial<UninstallDependencies> = {},
 ): Promise<void> {
+  assertServiceLifecycleOutsideAgentRun("uninstall Paperclip");
   const instanceId = resolvePaperclipInstanceId();
   const detect = dependencies.detectServiceManager ?? detectServiceManager;
   const platform = dependencies.platform ?? process.platform;
