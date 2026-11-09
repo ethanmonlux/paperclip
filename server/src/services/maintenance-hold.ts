@@ -15,8 +15,8 @@
  * The hold is a database record loaded at startup, so the install restart
  * keeps it. It always lifts at `expiresAt`, even if the script dies.
  */
-import { and, eq, isNull, lte, sql } from "drizzle-orm";
-import { heartbeatRuns, maintenanceHolds, type Db } from "@paperclipai/db";
+import { and, eq, isNull, lte, sql, type SQL } from "drizzle-orm";
+import { agentWakeupRequests, heartbeatRuns, maintenanceHolds, type Db } from "@paperclipai/db";
 import {
   applyMaintenanceHold,
   setMaintenanceDrainDeadlineHandler,
@@ -25,6 +25,7 @@ import {
 } from "./task-admission.js";
 import { logger } from "../middleware/logger.js";
 import type { WakeupOptions } from "./heartbeat/run-preparation.js";
+import type { ParkedRun } from "./heartbeat/recovery.js";
 
 export const MAINTENANCE_HOLD_DEFAULT_DRAIN_MS = 45 * 60_000;
 export const MAINTENANCE_HOLD_DEFAULT_MAX_MS = 90 * 60_000;
@@ -51,21 +52,57 @@ export type MaintenanceHoldStatus = {
   } | null;
   queuedRuns: number;
   runningRuns: number;
+  /** In-process executions and stop settlements still active (this process only). */
+  settlingRuns: number;
+  /** Runs this hold parked whose continuation wake is not yet recorded. */
+  pendingContinuations: number;
+  /** Work an install would cut short: the sum of the three counts above. */
+  blockingWork: number;
+  /** True only when nothing is running, settling or awaiting its continuation. */
+  quiet: boolean;
 };
+
+/** Parking is incomplete; the admission slot retries it after a minute. */
+export class MaintenanceParkingPendingError extends Error {
+  constructor(readonly progress: { runningRuns: number; settlingRuns: number }) {
+    super(`maintenance hold parking is still pending (running=${progress.runningRuns}, settling=${progress.settlingRuns})`);
+    this.name = "MaintenanceParkingPendingError";
+  }
+}
 
 export type MaintenanceHoldHeartbeat = {
   drainRunningRunsForShutdown: (
     signal: "SIGINT" | "SIGTERM",
     now?: Date,
     runIds?: readonly string[] | null,
-    options?: { cause?: "shutdown" | "maintenance_hold" },
-  ) => Promise<{
-    interrupted: number;
-    interruptedRuns: Array<{ runId: string; agentId: string; companyId: string; issueId: string | null }>;
-  }>;
+    options?: { cause?: "shutdown" | "maintenance_hold"; onParked?: (parked: ParkedRun) => Promise<void> },
+  ) => Promise<{ interrupted: number; interruptedRuns: ParkedRun[] }>;
   wakeup: (agentId: string, opts: WakeupOptions) => Promise<unknown>;
   resumeQueuedRunsAfterDrain: (scope?: { companyId: string }, options?: { staggerMs?: number }) => Promise<void>;
+  /** In-process work; `activeRuns` includes stop settlements past the response wait. */
+  getTaskDrainStatus: () => { activeRuns: number };
 };
+
+type InProcessWork = () => { activeRuns: number };
+
+const continuationKey = (holdId: string, runId: string) => `${MAINTENANCE_WINDOW_RESUME_WAKE_REASON}:${holdId}:${runId}`;
+// The wake keeps its key when it queues. For an adapter without a safe resume
+// checkpoint it is saved as an execution wait under that wait's own key, but
+// its payload still names the hold and the parked run.
+function continuationRecorded(holdId: string, runId: SQL | string) {
+  return sql`(${agentWakeupRequests.idempotencyKey} = ${MAINTENANCE_WINDOW_RESUME_WAKE_REASON}::text || ':' || ${holdId}::text || ':' || (${runId})::text
+    or (${agentWakeupRequests.payload}->>'maintenanceHoldId' = ${holdId}::text
+      and ${agentWakeupRequests.payload}->>'parkedRunId' = (${runId})::text))`;
+}
+// A run this hold stamped that stopped with work left to continue. A run a
+// person stopped during the window stays stopped.
+function parkedByHold(holdId: string) {
+  return sql`(${heartbeatRuns.resultJson}->'maintenanceHoldPark'->>'holdId' = ${holdId}::text
+    and (${heartbeatRuns.status} in ('interrupted', 'failed', 'timed_out')
+      or (${heartbeatRuns.status} = 'cancelled'
+        and coalesce(${heartbeatRuns.resultJson}->>'cancelledByActorType', '') = ''
+        and coalesce(${heartbeatRuns.resultJson}->>'cancelledByUserId', '') = '')))`;
+}
 
 function toState(row: MaintenanceHoldRow): MaintenanceHoldState {
   return {
@@ -165,12 +202,35 @@ export function maintenanceHoldService(db: Db) {
       .where(and(eq(maintenanceHolds.id, holdId), isNull(maintenanceHolds.releasedAt)));
   }
 
-  async function status(now = new Date()): Promise<MaintenanceHoldStatus> {
+  /**
+   * Runs this hold stamped for parking that stopped without a recorded
+   * continuation. The stamp is on the run row, so this survives a restart.
+   */
+  async function parkedWithoutContinuation(holdId: string) {
+    return db.select({
+      runId: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      companyId: heartbeatRuns.companyId,
+      issueId: sql<string | null>`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')`,
+    }).from(heartbeatRuns).where(and(
+      parkedByHold(holdId),
+      sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') is not null`,
+      sql`not exists (select 1 from ${agentWakeupRequests}
+        where ${agentWakeupRequests.companyId} = ${heartbeatRuns.companyId}
+          and ${continuationRecorded(holdId, sql`${heartbeatRuns.id}::text`)})`,
+    ));
+  }
+
+  async function status(now = new Date(), inProcess?: InProcessWork): Promise<MaintenanceHoldStatus> {
     const row = await readActive(now);
     const [counts] = await db.select({
       queuedRuns: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'queued')::int`,
       runningRuns: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'running')::int`,
     }).from(heartbeatRuns).where(sql`${heartbeatRuns.status} in ('queued', 'running')`);
+    const runningRuns = Number(counts?.runningRuns ?? 0);
+    const settlingRuns = inProcess?.().activeRuns ?? 0;
+    const pendingContinuations = row ? (await parkedWithoutContinuation(row.id)).length : 0;
+    const blockingWork = runningRuns + settlingRuns + pendingContinuations;
     return {
       active: row !== null,
       hold: row ? {
@@ -183,46 +243,81 @@ export function maintenanceHoldService(db: Db) {
         reason: row.reason,
       } : null,
       queuedRuns: Number(counts?.queuedRuns ?? 0),
-      runningRuns: Number(counts?.runningRuns ?? 0),
+      runningRuns,
+      settlingRuns,
+      pendingContinuations,
+      blockingWork,
+      quiet: blockingWork === 0,
     };
   }
 
+  async function queueContinuation(heartbeat: MaintenanceHoldHeartbeat, hold: Pick<MaintenanceHoldState, "id">, parked: ParkedRun) {
+    if (!parked.issueId) return;
+    const key = continuationKey(hold.id, parked.runId);
+    const [existing] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, parked.companyId), continuationRecorded(hold.id, parked.runId))).limit(1);
+    if (existing) return;
+    await heartbeat.wakeup(parked.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: MAINTENANCE_WINDOW_RESUME_WAKE_REASON,
+      payload: { issueId: parked.issueId, waitFor: "maintenance_window", maintenanceHoldId: hold.id,
+        parkedRunId: parked.runId, instruction: PARKED_RESUME_INSTRUCTION },
+      idempotencyKey: key,
+      requestedByActorType: "system",
+      requestedByActorId: "maintenance_hold",
+      contextSnapshot: {
+        issueId: parked.issueId, taskId: parked.issueId, wakeReason: MAINTENANCE_WINDOW_RESUME_WAKE_REASON,
+        source: "instance.maintenance_hold.parked", waitFor: "maintenance_window",
+        parkedRunId: parked.runId, instruction: PARKED_RESUME_INSTRUCTION,
+      },
+    });
+  }
+
   /**
-   * Park the runs still running at the drain deadline. Each is stopped
-   * gracefully with its session kept, and its task gets a continuation wake
-   * that stays queued behind the hold. Nothing is cancelled.
+   * Park the runs still running at the drain deadline. Each is stamped with
+   * the hold, stopped gracefully with its session kept, and its task gets a
+   * continuation wake that stays queued behind the hold. Nothing is cancelled.
+   *
+   * Parking completes only at real quiet: no running row, no in-process
+   * execution or stop settlement, and a continuation recorded for every
+   * stamped run. Until then it throws MaintenanceParkingPendingError and the
+   * admission slot retries a minute later. A run this pass could not stop (an
+   * accepted native result still finalizing, a session still opening) is
+   * retried; a stop that settles after the response wait queues its own
+   * continuation; and a restart mid-settlement is covered because the stamp
+   * is durable and every pass, including the first after startup, queues any
+   * missing continuation.
    */
   async function parkRunningRuns(heartbeat: MaintenanceHoldHeartbeat, hold: MaintenanceHoldState, now = new Date()) {
-    const running = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "running"));
-    const result = running.length > 0
-      ? await heartbeat.drainRunningRunsForShutdown("SIGTERM", now, running.map(row => row.id), { cause: "maintenance_hold" })
+    const stamped = await db.update(heartbeatRuns)
+      .set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object('maintenanceHoldPark',
+        coalesce(${heartbeatRuns.resultJson}->'maintenanceHoldPark',
+          jsonb_build_object('holdId', ${hold.id}::text, 'requestedAt', ${now.toISOString()}::text)))` })
+      .where(eq(heartbeatRuns.status, "running"))
+      .returning({ id: heartbeatRuns.id });
+    const result = stamped.length > 0
+      ? await heartbeat.drainRunningRunsForShutdown("SIGTERM", now, stamped.map(row => row.id), {
+        cause: "maintenance_hold",
+        onParked: parked => queueContinuation(heartbeat, hold, parked),
+      })
       : { interrupted: 0, interruptedRuns: [] };
-    for (const parked of result.interruptedRuns) {
-      if (!parked.issueId) continue;
-      try {
-        await heartbeat.wakeup(parked.agentId, {
-          source: "automation",
-          triggerDetail: "system",
-          reason: MAINTENANCE_WINDOW_RESUME_WAKE_REASON,
-          payload: { issueId: parked.issueId, waitFor: "maintenance_window", maintenanceHoldId: hold.id,
-            parkedRunId: parked.runId, instruction: PARKED_RESUME_INSTRUCTION },
-          idempotencyKey: `maintenance_window_resume:${hold.id}:${parked.runId}`,
-          requestedByActorType: "system",
-          requestedByActorId: "maintenance_hold",
-          contextSnapshot: {
-            issueId: parked.issueId, taskId: parked.issueId, wakeReason: MAINTENANCE_WINDOW_RESUME_WAKE_REASON,
-            source: "instance.maintenance_hold.parked", waitFor: "maintenance_window",
-            parkedRunId: parked.runId, instruction: PARKED_RESUME_INSTRUCTION,
-          },
-        });
-      } catch (err) {
-        logger.error({ err, runId: parked.runId, issueId: parked.issueId },
-          "maintenance hold parked a run but could not queue its continuation; the stalled-task recovery owns it");
-      }
+    const [counts] = await db.select({ running: sql<number>`count(*)::int` }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    const progress = { runningRuns: Number(counts?.running ?? 0), settlingRuns: heartbeat.getTaskDrainStatus().activeRuns };
+    if (progress.runningRuns > 0 || progress.settlingRuns > 0) {
+      logger.info({ holdId: hold.id, parkedThisPass: result.interrupted, ...progress },
+        "maintenance hold drain deadline: parking still pending, retrying");
+      throw new MaintenanceParkingPendingError(progress);
     }
-    await markParked(hold.id, result.interrupted, now);
-    logger.info({ holdId: hold.id, parked: result.interrupted }, "maintenance hold drain deadline reached");
+    // Settled: record any continuation a slow or interrupted settlement did not.
+    const missing = await parkedWithoutContinuation(hold.id);
+    for (const parked of missing) await queueContinuation(heartbeat, hold, parked);
+    const [parkedCount] = await db.select({ n: sql<number>`count(*)::int` }).from(heartbeatRuns)
+      .where(parkedByHold(hold.id));
+    await markParked(hold.id, Number(parkedCount?.n ?? 0), now);
+    logger.info({ holdId: hold.id, parked: Number(parkedCount?.n ?? 0), lateContinuations: missing.length },
+      "maintenance hold drain deadline reached; parking complete");
     return result;
   }
 

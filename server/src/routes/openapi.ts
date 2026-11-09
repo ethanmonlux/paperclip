@@ -7183,7 +7183,7 @@ registry.registerPath({
   method: "get",
   path: "/api/instance/maintenance-hold",
   tags: ["instance"],
-  summary: "Read the managed maintenance hold, with queued and running run counts",
+  summary: "Read the managed maintenance hold: queued, running and still-settling work, and whether Staple is quiet enough to install",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 

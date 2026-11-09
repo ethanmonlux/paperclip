@@ -4,12 +4,12 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, applyPendingMigrations, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environments, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../environment-runtime.js";
 import { environmentService } from "../environments.js";
-import { createHeartbeatRecovery, type HeartbeatRecoveryDependencies } from "./recovery.js";
+import { createHeartbeatRecovery, type HeartbeatRecoveryDependencies, type ParkedRun } from "./recovery.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import type { HotRestartIntent } from "../hot-restart.js";
 import type { NativeRestartRecoveryClaim, NativeRestartRecoveryDisposition } from "../native-runtime/index.js";
@@ -1370,6 +1370,97 @@ describePostgres("heartbeat recovery module ownership", () => {
         .toMatchObject({ controllerBootId: bootId, leaseOwner: "other-server", leaseExpiresAt: expiresAt, recoveryState: null });
     } finally {
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    }
+  });
+
+  async function seedRunnerTurn(bootId: string) {
+    const run = await seedRun();
+    await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: run.issueId }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(nativeRunFinalizations).values({ runId: run.id, companyId: run.companyId, issueId: run.issueId!,
+      phase: "observed", controllerBootId: bootId, leaseOwner: "runner-turn", leaseExpiresAt: new Date(Date.now() + 60_000) });
+    return run;
+  }
+
+  function persistingDeps() {
+    const deps = callbacks(db);
+    deps.getRun.mockImplementation(async id => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0] ?? null);
+    deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0] ?? null);
+    deps.setRunStatusIfRunning.mockImplementation(async (id, status, patch) => {
+      const [updated] = await db.update(heartbeatRuns).set({ ...patch, status })
+        .where(and(eq(heartbeatRuns.id, id), eq(heartbeatRuns.status, "running"))).returning();
+      return updated ? { updated: true, run: updated } : { updated: false, run: null };
+    });
+    return deps;
+  }
+
+  it("parks a native Runner turn at the maintenance deadline through the audited native stop (STA-196)", async () => {
+    const run = await seedRunnerTurn((await currentNativeControllerIdentity()).bootId);
+    const deps = persistingDeps(), onParked = vi.fn(async (_parked: ParkedRun) => undefined);
+    try {
+      const result = await createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", new Date(), [run.id],
+        { cause: "maintenance_hold", onParked });
+      expect(result).toMatchObject({ interrupted: 1, interruptedRunIds: [run.id], restartSuspendedRunIds: [] });
+      // Stopped, not detached for a reattach that the upgrade's zero-run gate would never reach.
+      expect(native.detach).not.toHaveBeenCalled();
+      expect(deps.cancelHeartbeatNativeRun).toHaveBeenCalledWith(expect.objectContaining({ runId: run.id, runtimeMode: "native" }));
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+        .toMatchObject({ status: "interrupted", errorCode: "maintenance_hold_parked" });
+      expect(onParked).toHaveBeenCalledWith({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId: run.issueId });
+      expect(deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+    } finally {
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    }
+  });
+
+  it("leaves another server's native Runner turn running when the maintenance hold parks", async () => {
+    const run = await seedRunnerTurn(randomUUID());
+    const deps = persistingDeps(), onParked = vi.fn(async (_parked: ParkedRun) => undefined);
+    try {
+      const result = await createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", new Date(), [run.id],
+        { cause: "maintenance_hold", onParked });
+      expect(result.interrupted).toBe(0);
+      expect(deps.cancelHeartbeatNativeRun).not.toHaveBeenCalled();
+      expect(onParked).not.toHaveBeenCalled();
+      // Still running, so the hold's parking stays pending rather than reporting quiet.
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.status).toBe("running");
+    } finally {
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    }
+  });
+
+  it("delivers a parked run's continuation from settlement when the stop outlasts the response wait (STA-196)", async () => {
+    const run = await seedRun();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: run.issueId } }).where(eq(heartbeatRuns.id, run.id));
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, run.agentId));
+    const deps = persistingDeps(), onParked = vi.fn(async (_parked: ParkedRun) => undefined);
+    const control = createAdapterExecutionControl();
+    adapterExecutionControls.set(run.id, control);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const drain = createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", new Date(), [run.id],
+      { cause: "maintenance_hold", onParked });
+    try {
+      await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
+      await vi.advanceTimersByTimeAsync(30_000);
+      // The response wait ended before settlement: the row is parked, the continuation not yet due.
+      expect(await drain).toMatchObject({ interruptedRunIds: [run.id], interruptedRuns: [] });
+      expect(deps.activeRunExecutionPromises.size).toBe(1);
+      expect(onParked).not.toHaveBeenCalled();
+      control.finish();
+      await Promise.all([...deps.activeRunExecutionPromises]);
+      expect(onParked).toHaveBeenCalledOnce();
+      expect(onParked).toHaveBeenCalledWith(expect.objectContaining({ runId: run.id, issueId: run.issueId }));
+      expect(onParked).toHaveBeenCalledAfter(deps.releaseIssueExecutionAndPromote);
+      expect(deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+      await drain;
+      await Promise.all([...deps.activeRunExecutionPromises]);
       await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     }
   });

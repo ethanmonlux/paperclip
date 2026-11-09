@@ -25,7 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression, stopTaskDrain } from "../services/heartbeat.js";
 import { applyMaintenanceHold, readMaintenanceHold, readTaskDrain } from "../services/task-admission.js";
-import { maintenanceHoldService } from "../services/maintenance-hold.js";
+import { MaintenanceParkingPendingError, maintenanceHoldService } from "../services/maintenance-hold.js";
 import { instanceSettingsRoutes } from "../routes/instance-settings.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
@@ -131,6 +131,10 @@ describeEmbeddedPostgres("maintenance hold (FAC-840 C1)", () => {
   async function heldRun(issueId: string) {
     const runs = await runsFor(issueId);
     return runs.find(run => (run.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_assigned");
+  }
+
+  function holdState(row: typeof maintenanceHolds.$inferSelect) {
+    return { id: row.id, startedAt: row.startedAt, drainDeadlineAt: row.drainDeadlineAt, expiresAt: row.expiresAt, parkedAt: null };
   }
 
   async function runsFor(issueId: string) {
@@ -261,17 +265,24 @@ describeEmbeddedPostgres("maintenance hold (FAC-840 C1)", () => {
     }
 
     const placed = await holds.place({ ...ACTOR, drainMs: 0 });
-    const parked = await holds.parkRunningRuns(heartbeat, {
-      id: placed.row.id, startedAt: placed.row.startedAt, drainDeadlineAt: placed.row.drainDeadlineAt,
-      expiresAt: placed.row.expiresAt, parkedAt: null,
-    });
-    await heartbeat.drainActiveRunExecutions();
-    expect(parked.interrupted).toBe(1);
+    // Parking completes only once the stopped process has fully settled; the
+    // admission slot retries a pending pass, as this loop does. The durable
+    // parkedRunCount (asserted below) counts the run whichever pass stopped it.
+    for (let pass = 0; ; pass++) {
+      try {
+        await holds.parkRunningRuns(heartbeat, holdState(placed.row));
+        break;
+      } catch (err) {
+        if (!(err instanceof MaintenanceParkingPendingError) || pass >= 3) throw err;
+        await heartbeat.drainActiveRunExecutions();
+      }
+    }
 
     const runs = await runsFor(issueId);
     expect(runs.find(run => run.id === runId)).toMatchObject({ status: "interrupted", errorCode: "maintenance_hold_parked" });
     expect(runs.some(run => run.status === "cancelled")).toBe(false);
-    expect(await holds.status()).toMatchObject({ runningRuns: 0, hold: { parkedRunCount: 1 } });
+    expect(await holds.status(new Date(), () => heartbeat.getTaskDrainStatus()))
+      .toMatchObject({ runningRuns: 0, settlingRuns: 0, pendingContinuations: 0, quiet: true, hold: { parkedRunCount: 1 } });
     const resume = (await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests))
       .find(wake => (wake.payload as Record<string, unknown> | null)?.waitFor === "maintenance_window");
     expect(resume).toBeDefined();
@@ -295,6 +306,55 @@ describeEmbeddedPostgres("maintenance hold (FAC-840 C1)", () => {
     await holds.releaseHeldWork(heartbeat, 0);
     await heartbeat.drainActiveRunExecutions();
     expect((await runsFor(issueId)).find(run => run.id === continuation!.id)?.status).toBe("succeeded");
+  }, 30_000);
+
+  it("keeps parking pending until real quiet, and queues a continuation lost to a restart mid-settlement (STA-196)", async () => {
+    const companyId = await seedCompany();
+    const { agentId, issueId } = await seedAgentAndIssue(companyId);
+    const heartbeat = heartbeatService(db);
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "assignment",
+      status: "running", startedAt: new Date(), contextSnapshot: { issueId } }).returning();
+    let settling = 0;
+    // A drain that cannot stop this run in its pass (a session still opening, a result still finalizing).
+    const drain = vi.fn(async () => ({ interrupted: 0, interruptedRuns: [] }));
+    const fake = {
+      drainRunningRunsForShutdown: drain,
+      wakeup: heartbeat.wakeup,
+      resumeQueuedRunsAfterDrain: heartbeat.resumeQueuedRunsAfterDrain,
+      getTaskDrainStatus: () => ({ activeRuns: settling }),
+    };
+    const holds = maintenanceHoldService(db);
+    const placed = await holds.place({ ...ACTOR, drainMs: 0 });
+
+    await expect(holds.parkRunningRuns(fake, holdState(placed.row))).rejects.toBeInstanceOf(MaintenanceParkingPendingError);
+    expect(drain).toHaveBeenCalledWith("SIGTERM", expect.any(Date), [run!.id], expect.objectContaining({ cause: "maintenance_hold" }));
+    const [stamped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(stamped?.resultJson).toMatchObject({ maintenanceHoldPark: { holdId: placed.row.id } });
+    expect((await db.select().from(maintenanceHolds))[0]?.parkedAt).toBeNull();
+    expect(await holds.status(new Date(), fake.getTaskDrainStatus)).toMatchObject({ runningRuns: 1, quiet: false });
+
+    // The stop commits, but its settlement is still active in this process.
+    await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "maintenance_hold_parked", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run!.id));
+    settling = 1;
+    await expect(holds.parkRunningRuns(fake, holdState(placed.row))).rejects.toBeInstanceOf(MaintenanceParkingPendingError);
+    expect(await holds.status(new Date(), fake.getTaskDrainStatus)).toMatchObject({
+      runningRuns: 0, settlingRuns: 1, pendingContinuations: 1, blockingWork: 2, quiet: false });
+
+    // The process dies before settlement queues the continuation. The next process parks again and finds the stamp.
+    settling = 0;
+    const restarted = maintenanceHoldService(db);
+    await restarted.parkRunningRuns(fake, holdState(placed.row));
+    const resumes = async () => (await db.select().from(agentWakeupRequests))
+      .filter(wake => wake.idempotencyKey === `maintenance_window_resume:${placed.row.id}:${run!.id}`);
+    expect(await resumes()).toHaveLength(1);
+    expect((await db.select().from(maintenanceHolds))[0]).toMatchObject({ parkedRunCount: 1 });
+    expect((await db.select().from(maintenanceHolds))[0]?.parkedAt).not.toBeNull();
+    expect(await restarted.status(new Date(), fake.getTaskDrainStatus)).toMatchObject({
+      runningRuns: 0, settlingRuns: 0, pendingContinuations: 0, blockingWork: 0, quiet: true });
+    // Idempotent: another pass records no second continuation.
+    await restarted.parkRunningRuns(fake, holdState(placed.row));
+    expect(await resumes()).toHaveLength(1);
   }, 30_000);
 
   it("releases held agents in priority order, critical first", async () => {

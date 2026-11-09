@@ -503,7 +503,7 @@ export function instanceSettingsRoutes(
   router.get("/instance/maintenance-hold", async (req, res) => {
     assertBoardOrgAccess(req);
     res.set("cache-control", "no-store");
-    res.json(await maintenanceHold.status());
+    res.json(await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()));
   });
 
   router.post("/instance/maintenance-hold", validate(placeMaintenanceHoldRequestSchema), async (req, res) => {
@@ -522,7 +522,7 @@ export function instanceSettingsRoutes(
       drainDeadlineAt: result.row.drainDeadlineAt,
       expiresAt: result.row.expiresAt,
     });
-    res.status(result.created ? 201 : 200).json({ created: result.created, ...await maintenanceHold.status() });
+    res.status(result.created ? 201 : 200).json({ created: result.created, ...await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()) });
   });
 
   router.delete("/instance/maintenance-hold", async (req, res) => {
@@ -539,7 +539,7 @@ export function instanceSettingsRoutes(
         logger.error({ err }, "failed to start held work after the maintenance hold was released; it remains queued");
       });
     }
-    res.json({ wasActive: released.wasActive, ...await maintenanceHold.status() });
+    res.json({ wasActive: released.wasActive, ...await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()) });
   });
 
   // Cloud lifecycle read-back: the harness answers a tenant's archive

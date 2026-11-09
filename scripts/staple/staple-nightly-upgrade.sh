@@ -94,9 +94,11 @@ release_hold() {  # $1 = reason
   esac
   HOLD_KIND=none
 }
-running() {
+running() {  # work an install would cut short: 0 only at real quiet
   if [ "$HOLD_KIND" = maintenance ]; then
-    api_status "$API/api/instance/maintenance-hold" >/dev/null; json_get runningRuns; return
+    # blockingWork also counts stops still settling and parked runs whose continuation is not yet queued.
+    api_status "$API/api/instance/maintenance-hold" >/dev/null
+    local b; b=$(json_get blockingWork); [ -n "$b" ] && echo "$b" || json_get runningRuns; return
   fi
   api "$API/api/companies/$CID/heartbeat-runs?status=running&limit=50" | python3 -c '
 import json,sys
@@ -173,7 +175,7 @@ else
   deadline=$(( $(date +%s) + DRAIN_MIN*60 ))
 fi
 while :; do
-  n=$(running); say "running runs: $n (queued work is held)"
+  n=$(running); say "running or settling work: $n (queued work is held)"
   [ "$n" = "0" ] && break
   if [ $(date +%s) -ge $deadline ]; then report "Skipped: $n run(s) still running after the drain deadline" "Hold released; held work resumes. Installed stays ${INSTALLED:0:8}."; exit 0; fi
   sleep 60

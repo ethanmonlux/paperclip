@@ -363,6 +363,9 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 /** Restart recovery shares the service lifecycle callbacks and execution ownership. */
+/** A run stopped at a maintenance hold's drain deadline. */
+export type ParkedRun = { runId: string; agentId: string; companyId: string; issueId: string | null };
+
 export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryDependencies) {
   const {
     enterShutdown,
@@ -1140,14 +1143,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
-    options: { cause?: "shutdown" | "maintenance_hold" } = {},
+    options: {
+      cause?: "shutdown" | "maintenance_hold";
+      /** Called once a parked run has fully settled, however long that takes. */
+      onParked?: (parked: ParkedRun) => Promise<void>;
+    } = {},
   ) {
     // A maintenance hold parks the runs still running at its drain deadline
     // through this same graceful stop. Parking is not a failure: it spends no
-    // process-loss retry budget, and the hold queues each task's continuation.
+    // process-loss retry budget, and the hold queues each task's continuation
+    // from `onParked`, after settlement rather than after the response wait.
     const parking = options.cause === "maintenance_hold";
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
-    const interruptedRuns: Array<{ runId: string; agentId: string; companyId: string; issueId: string | null }> = [];
+    const interruptedRuns: ParkedRun[] = [];
     if (selectedRunIds?.length === 0) {
       return {
         interrupted: 0,
@@ -1185,16 +1193,17 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) return;
       if (isNativeRunnerOwnershipHeld(run)) return;
-      if (
-        run.runtimeMode === "native" &&
-        agent.adapterType === "paperclip_runner"
-      ) {
-        // A runner-owned native turn survives a controller restart by reattach;
-        // the hold leaves it to finish rather than detaching a live controller.
-        if (parking) return;
-        const [owner] = await db.select({ bootId: nativeRunFinalizations.controllerBootId })
-          .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
-        if (owner?.bootId && owner.bootId !== nativeController.bootId) return;
+      const runnerOwned = run.runtimeMode === "native" && agent.adapterType === "paperclip_runner";
+      const [owner] = runnerOwned
+        ? await db.select({ bootId: nativeRunFinalizations.controllerBootId, resultId: nativeRunFinalizations.resultId })
+          .from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id))
+        : [];
+      if (owner?.bootId && owner.bootId !== nativeController.bootId) return;
+      // Parking stops a runner-owned turn through the Runner's audited native
+      // cancellation below, as for any other native run. An accepted result is
+      // already finalizing: the run stays running and the hold waits for it.
+      if (runnerOwned && parking && owner?.resultId) return;
+      if (runnerOwned && !parking) {
         // A graceful shutdown relinquishes controller authority just like a
         // hot restart. Leaving the old event consumer attached lets its
         // finalizer interrupt/suspend Claude while the next server is adopting
@@ -1362,8 +1371,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         } else {
           retryRunIds.push(retry.id);
         }
-        interruptedRuns.push({ runId: interrupted.id, agentId: interrupted.agentId, companyId: interrupted.companyId,
-          issueId: interrupted.issueId ?? readNonEmptyString(parseObject(interrupted.contextSnapshot).issueId) });
+        const parked: ParkedRun = { runId: interrupted.id, agentId: interrupted.agentId, companyId: interrupted.companyId,
+          issueId: interrupted.issueId ?? readNonEmptyString(parseObject(interrupted.contextSnapshot).issueId) };
+        interruptedRuns.push(parked);
+        if (parking && options.onParked) {
+          try {
+            await options.onParked(parked);
+          } catch (err) {
+            logger.error({ err, runId: parked.runId }, "maintenance hold parked a run but its continuation was not queued here; the hold queues it before it completes");
+          }
+        }
 
         await appendRunEvent(interrupted, {
           eventType: "lifecycle",

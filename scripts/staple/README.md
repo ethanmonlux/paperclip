@@ -8,8 +8,8 @@ Nightly maintenance window:
 | Time | Step |
 | --- | --- |
 | 02:30 | `staple-nightly-upgrade hold` places the maintenance hold. The server starts no new run; wakes, assignments and comments still queue. |
-| 02:30–03:15 | Running runs finish. Runs still running at the drain deadline are parked with a queued continuation, never cancelled. |
-| 03:30 | `staple-nightly-upgrade` upgrades with zero running runs: backup, install, restart, health and smoke checks, rollback on failure. |
+| 02:30–03:15 | Running runs finish. Runs still running at the drain deadline are parked with a queued continuation, never cancelled. Parking retries each minute until nothing is running or still settling. |
+| 03:30 | `staple-nightly-upgrade` upgrades only when `GET` reports `quiet` (`blockingWork` 0: nothing running, no stop still settling, every parked run's continuation recorded): backup, install, restart, health and smoke checks, rollback on failure. |
 | After | The script releases the hold after success or rollback. Held work starts in priority order, staggered across agents. |
 
 The hold is stored in the database, so it survives the install restart. It lifts by itself at its

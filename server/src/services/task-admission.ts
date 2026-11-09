@@ -139,7 +139,10 @@ export async function runMaintenanceDrainDeadline(now: Date): Promise<boolean> {
     return true;
   } catch (error) {
     drainDeadlineRetryAt = Date.now() + DRAIN_DEADLINE_RETRY_MS;
-    process.emitWarning(`Maintenance hold could not park running runs; retrying: ${String(error)}`);
+    // Parking that is still waiting for runs to stop is progress, not a fault.
+    if (!(error instanceof Error && error.name === "MaintenanceParkingPendingError")) {
+      process.emitWarning(`Maintenance hold could not park running runs; retrying: ${String(error)}`);
+    }
     notifyDrainChanged();
     return false;
   }
