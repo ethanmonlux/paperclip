@@ -130,6 +130,8 @@ describe("stuck rule 3: blocked, with no open blocker and no pending interaction
     expect(stuckBlockedWithoutBlocker(ctx({ issue: { ...base, status: "in_progress" } }))).toBeNull();
     // A live monitor is a stated external wait.
     expect(stuckBlockedWithoutBlocker(ctx({ issue: { ...base, monitorServiceName: "GitHub Actions" } }))).toBeNull();
+    // A server-evaluated wait record (FAC-840) is a stated wait even without a service name.
+    expect(stuckBlockedWithoutBlocker(ctx({ issue: { ...base, waitKind: "ci", waitDetail: "CI for abc is queued" } }))).toBeNull();
   });
 
   it("keeps the flag while the 30-min recovery wake is only queued, and clears it once the run starts", () => {

@@ -70,6 +70,17 @@ describe("ci wait record (FAC-840 incident replays)", () => {
     expect(second).toMatchObject({ action: "keep_waiting", notice: false, observation: { state: "queued_long" } });
   });
 
+  it("slow CI: a run queued recently on an old push is not reported as a long queue", () => {
+    const result = classifyCiWait({
+      target: { ...target, pushedAt: minutesAgo(90) },
+      snapshot: snapshot({
+        workflowRuns: [{ id: 1, name: "CI", status: "queued", conclusion: null, checkSuiteId: 7, createdAt: minutesAgo(4) }],
+      }),
+      now,
+    });
+    expect(result).toMatchObject({ action: "keep_waiting", notice: false, observation: { state: "started" } });
+  });
+
   it("surfaces startup_failure, action_required and a zero-job workflow run now", () => {
     for (const run of [
       { status: "completed", conclusion: "startup_failure", checkSuiteId: 9 },

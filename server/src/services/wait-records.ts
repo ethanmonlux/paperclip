@@ -186,10 +186,10 @@ export function classifyCiWait(input: {
   if (activeChecks.length > 0 || activeWorkflows.length > 0) {
     const inProgress = activeChecks.some(run => run.status === "in_progress") ||
       activeWorkflows.some(run => run.status === "in_progress");
-    const queuedSinceMs = Math.min(
-      ...activeWorkflows.map(run => readMs(run.createdAt) ?? nowMs),
-      readMs(target.pushedAt) ?? nowMs,
-    );
+    // Queued time runs from when the workflow run was created; the push time
+    // is only a fallback for check runs GitHub reports without a workflow run.
+    const queuedAt = activeWorkflows.map(run => readMs(run.createdAt)).filter((ms): ms is number => ms !== null);
+    const queuedSinceMs = queuedAt.length > 0 ? Math.min(...queuedAt) : readMs(target.pushedAt) ?? nowMs;
     const nextCheckAt = new Date(nowMs + CI_WAIT_POLL_MS);
     const count = `${activeChecks.length + activeWorkflows.length} active`;
     if (!inProgress && nowMs - queuedSinceMs >= CI_QUEUED_REPORT_MS) {
