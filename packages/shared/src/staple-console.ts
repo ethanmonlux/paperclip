@@ -388,6 +388,24 @@ function earliest(values: Array<string | null | undefined>): string | null {
   return best;
 }
 
+/**
+ * PR status text for a card link. Only a GitHub read is live; a Paperclip work-product status
+ * can go stale, so it reads "recorded" with CI unknown (STA-205).
+ */
+export function stapleConsolePrStatusText(pr: Pick<StapleConsoleCardPullRequest, "state" | "ci" | "source">): string {
+  if (pr.state === "unknown") return "state unknown";
+  if (pr.source !== "github") return `recorded ${pr.state}${pr.state === "open" || pr.state === "draft" ? " · CI unknown" : ""}`;
+  return `${pr.state}${pr.state === "open" || pr.state === "draft" ? ` · CI ${pr.ci === "none" ? "not reported" : pr.ci}` : ""}`;
+}
+
+/** Shorten long text at a word boundary with a visible ellipsis, never mid-word (STA-205). */
+export function clipStapleConsoleText(text: string, max = 400): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max - 1);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > max * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
 export function formatStapleConsoleDuration(durationMs: number): string {
   const minutes = Math.max(0, Math.floor(durationMs / 60_000));
   if (minutes < 1) return "under a minute";

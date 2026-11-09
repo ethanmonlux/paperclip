@@ -5,6 +5,7 @@ import {
   STAPLE_CONSOLE_POLL_MS,
   formatStapleConsoleDuration,
   stapleConsoleFreshness,
+  stapleConsolePrStatusText,
   type StapleConsoleBoard,
   type StapleConsoleCard,
   type StapleConsoleStepCell,
@@ -201,13 +202,16 @@ function ConsoleCard({
       {card.pullRequests.length > 0 ? (
         <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
           {card.pullRequests.map((pr) => (
-            <a key={pr.url} href={pr.url} target="_blank" rel="noreferrer" className="underline">
+            <a
+              key={pr.url}
+              href={pr.url}
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+              title={pr.source === "github" ? "Live from GitHub" : "From Paperclip records, not a live GitHub read"}
+            >
               {pr.label}
-              <span className="text-muted-foreground">
-                {" "}
-                {pr.state === "unknown" ? "state unknown" : pr.state}
-                {pr.state === "open" || pr.state === "draft" ? ` · CI ${pr.ci === "none" ? "not reported" : pr.ci}` : ""}
-              </span>
+              <span className="text-muted-foreground"> {stapleConsolePrStatusText(pr)}</span>
             </a>
           ))}
         </div>
