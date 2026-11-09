@@ -4,6 +4,7 @@ import { and, eq } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import type { MergeGateActor } from "../services/merge-gate/service.js";
+import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { mergeGateService } from "../services/merge-gate/wiring.js";
 import { assertCompanyAccess, hasCompanyAccess } from "./authz.js";
 
@@ -30,9 +31,9 @@ function gateActor(actor: Express.Request["actor"]): MergeGateActor {
 }
 
 /** Protected-main merge gate (FAC-840 B): the merge path agents use. */
-export function mergeGateRoutes(db: Db) {
+export function mergeGateRoutes(db: Db, options: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const router = Router();
-  const svc = mergeGateService(db);
+  const svc = mergeGateService(db, options);
 
   router.post("/issues/:issueId/merge-gate", async (req, res) => {
     const issueId = req.params.issueId as string;

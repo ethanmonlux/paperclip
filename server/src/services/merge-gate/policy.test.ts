@@ -6,6 +6,8 @@ import {
   evaluateBaseCi,
   evaluateHeadCi,
   evaluateReviewCoverage,
+  modelFamiliesFromRunUsage,
+  modelFamily,
   parseMergeReviewDocument,
   repositoryMergePolicy,
   requiredPathScopedChecks,
@@ -16,6 +18,8 @@ import {
 const HEAD = "a".repeat(40);
 const REVIEWED = "b".repeat(40);
 const facette = repositoryMergePolicy("ethanmonlux/facette");
+const paperclip = repositoryMergePolicy("ethanmonlux/paperclip");
+const unknownRepo = repositoryMergePolicy("ethanmonlux/other");
 
 const check = (name: string, conclusion: string | null, status = "completed"): MergeGateCheck =>
   ({ kind: "check_run", name, status, conclusion });
@@ -30,13 +34,13 @@ const greenFacette = [
 function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAttestation {
   return {
     reviewIssueId: "review-1", reviewIssueIdentifier: "STA-900", reviewIssueStatus: "done",
-    reviewerAgentId: "codex-reviewer", reviewerAdapterType: "codex_local", writtenByReviewer: true,
+    reviewerAgentId: "codex-reviewer", reviewerModelFamilies: ["openai"], writtenByReviewer: true,
     scope: "full", reviewedSha: HEAD, pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [],
     ...overrides,
   };
 }
 
-const author = { agentId: "claude-engineer", adapterType: "claude_local" };
+const author = { agentId: "claude-engineer", modelFamilies: ["anthropic"] };
 
 describe("conservative path filters", () => {
   it("replays STA-163: a .github/scripts change needs windows-fast, and a skipped windows-fast refuses the merge", () => {
@@ -44,7 +48,7 @@ describe("conservative path filters", () => {
     const required = requiredPathScopedChecks({ policy: facette, changedFiles });
     expect(required).toEqual(["windows-fast", "windows-native"]);
     const reasons = evaluateHeadCi({
-      headSha: HEAD, checksComplete: true, requiredChecks: required, changedFiles,
+      headSha: HEAD, policy: facette, checksComplete: true, requiredChecks: required, changedFiles,
       checks: [...greenFacette, check("windows-fast", "skipped"), check("windows-native", "skipped")],
     });
     expect(reasons.map(reason => reason.code)).toEqual(["required_check_skipped", "required_check_skipped"]);
@@ -65,17 +69,16 @@ describe("conservative path filters", () => {
     const changedFiles = ["account-web/app/page.tsx", "docs/billing.md", "README.md"];
     expect(requiredPathScopedChecks({ policy: facette, changedFiles })).toEqual([]);
     expect(evaluateHeadCi({
-      headSha: HEAD, checksComplete: true, requiredChecks: [], changedFiles,
+      headSha: HEAD, policy: facette, checksComplete: true, requiredChecks: [], changedFiles,
       checks: [...greenFacette, check("windows-fast", "skipped"), check("windows-native", "skipped")],
     })).toEqual([]);
   });
 
   it("never lets a Windows script count as irrelevant, in any repository", () => {
     expect(requiredPathScopedChecks({ policy: facette, changedFiles: ["docs/install.ps1"] })).toEqual(["windows-fast", "windows-native"]);
-    const generic = repositoryMergePolicy("ethanmonlux/paperclip");
     const reasons = evaluateHeadCi({
-      headSha: HEAD, checksComplete: true, changedFiles: ["scripts/install.cmd"],
-      requiredChecks: requiredPathScopedChecks({ policy: generic, changedFiles: ["scripts/install.cmd"] }),
+      headSha: HEAD, policy: unknownRepo, checksComplete: true, changedFiles: ["scripts/install.cmd"],
+      requiredChecks: requiredPathScopedChecks({ policy: unknownRepo, changedFiles: ["scripts/install.cmd"] }),
       checks: [check("verify", "success"), check("runner-windows", "skipped")],
     });
     expect(reasons).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("runner-windows") }]);
@@ -83,24 +86,64 @@ describe("conservative path filters", () => {
 
   it("requires a needed check that never appeared", () => {
     const reasons = evaluateHeadCi({
-      headSha: HEAD, checksComplete: true, changedFiles: ["agent/src/main.mjs"],
+      headSha: HEAD, policy: facette, checksComplete: true, changedFiles: ["agent/src/main.mjs"],
       requiredChecks: ["windows-fast", "windows-native"], checks: [...greenFacette, check("windows-fast", "success")],
     });
     expect(reasons).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("windows-native did not run") }]);
   });
 });
 
+describe("required CI coverage", () => {
+  it("never treats all-skipped CI as green", () => {
+    const reasons = evaluateHeadCi({ headSha: HEAD, policy: unknownRepo, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
+      checks: [check("tests", "skipped"), workflow("CI", "skipped")] });
+    expect(reasons).toMatchObject([{ code: "ci_absent", detail: expect.stringContaining("No check run passed") }]);
+  });
+
+  it("refuses a skipped non-Windows suite on an unknown Facette path even when both Windows jobs passed", () => {
+    const changedFiles = ["new-module/engine.ts"];
+    const requiredChecks = requiredPathScopedChecks({ policy: facette, changedFiles });
+    const reasons = evaluateHeadCi({ headSha: HEAD, policy: facette, checksComplete: true, requiredChecks, changedFiles,
+      checks: [check("changes", "success"), check("shell", "skipped"), check("agent", "success"), check("account-web", "success"),
+        check("pr-status-block", "success"), check("windows-fast", "success"), check("windows-native", "success")] });
+    expect(reasons).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("shell runs on every change") }]);
+  });
+
+  it("refuses an always-run suite that never appeared", () => {
+    const reasons = evaluateHeadCi({ headSha: HEAD, policy: facette, checksComplete: true, requiredChecks: [], changedFiles: ["docs/a.md"],
+      checks: greenFacette.filter(entry => entry.name !== "agent") });
+    expect(reasons).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("agent runs on every change") }]);
+  });
+
+  it("refuses any skip in an unknown repository, and allows only the listed selector skips in paperclip", () => {
+    expect(evaluateHeadCi({ headSha: HEAD, policy: unknownRepo, checksComplete: true, requiredChecks: [], changedFiles: ["src/a.ts"],
+      checks: [check("lint", "success"), check("tests", "skipped")] }))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("tests was skipped") }]);
+    const paperclipGreen = [check("ci / policy", "success"), check("ci / Typecheck + Release Registry", "success"), check("ci / Build", "success"),
+      check("ci / General tests (server (1/12))", "success"), check("ci / Verify serialized server suites (1/9)", "success"),
+      check("ci / Select Vitest files", "skipped"), workflow("PR", "success"), workflow("Storybook Visual", "skipped")];
+    expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"], checks: paperclipGreen }))
+      .toEqual([]);
+    expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
+      checks: [...paperclipGreen, check("ci / General tests (server (2/12))", "skipped")] }))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") }]);
+    expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
+      checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+  });
+});
+
 describe("exact-head CI", () => {
   it("does not merge while slow CI is still running, and does not call it failed", () => {
     const reasons = evaluateHeadCi({
-      headSha: HEAD, checksComplete: true, requiredChecks: [], changedFiles: ["docs/a.md"],
+      headSha: HEAD, policy: facette, checksComplete: true, requiredChecks: [], changedFiles: ["docs/a.md"],
       checks: [check("shell", "success"), check("windows-native", null, "in_progress"), workflow("CI", null, "in_progress")],
     });
     expect(reasons).toMatchObject([{ code: "ci_pending" }]);
   });
 
   it("refuses absent, failed, cancelled or partially read CI", () => {
-    const base = { headSha: HEAD, requiredChecks: [], changedFiles: ["docs/a.md"] };
+    const base = { headSha: HEAD, policy: facette, requiredChecks: [], changedFiles: ["docs/a.md"] };
     expect(evaluateHeadCi({ ...base, checksComplete: true, checks: [] })).toMatchObject([{ code: "ci_absent" }]);
     expect(evaluateHeadCi({ ...base, checksComplete: true, checks: [check("shell", "failure")] })).toMatchObject([{ code: "ci_failed" }]);
     expect(evaluateHeadCi({ ...base, checksComplete: true, checks: [check("shell", "cancelled")] })).toMatchObject([{ code: "ci_failed" }]);
@@ -173,8 +216,35 @@ describe("review coverage and merge bar", () => {
     expect(evaluate([review({ pullRequest: "ethanmonlux/facette#705" })])).toMatchObject([{ code: "review_missing" }]);
     expect(evaluate([review({ reviewIssueStatus: "in_progress" })])).toMatchObject([{ code: "review_not_independent" }]);
     expect(evaluate([review({ reviewerAgentId: "claude-engineer" })])).toMatchObject([{ code: "review_not_independent" }]);
-    expect(evaluate([review({ reviewerAdapterType: "claude_local" })])).toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("cross-model") }]);
+    expect(evaluate([review({ reviewerModelFamilies: ["anthropic"] })])).toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("cross-model") }]);
     expect(evaluate([review({ writtenByReviewer: false })])).toMatchObject([{ code: "review_not_independent" }]);
+  });
+
+  it("decides cross-model by recorded model family, not adapter", () => {
+    // Claude through pi_local is still Claude; Codex and Claude through one runner adapter differ.
+    expect(modelFamily({ model: "anthropic/claude-sonnet-5-5", provider: "openrouter" })).toBe("anthropic");
+    expect(modelFamily({ model: "gpt-6.1-sol", provider: "openai" })).toBe("openai");
+    expect(modelFamily({ model: "some-router-model", provider: "openrouter" })).toBeNull();
+    expect(evaluate([review({ reviewerModelFamilies: modelFamiliesFromRunUsage({ model: "anthropic/claude-sonnet-5-5", provider: "openrouter" }) })]))
+      .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("anthropic") }]);
+    expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
+      author: { agentId: "runner-claude", modelFamilies: modelFamiliesFromRunUsage({ model: "claude-opus-5-5", provider: "anthropic" }) },
+      reviews: [review({ reviewerAgentId: "runner-codex", reviewerModelFamilies: modelFamiliesFromRunUsage({ model: "gpt-6.1-sol", provider: "openai" }) })] }))
+      .toEqual([]);
+  });
+
+  it("fails closed when review or implementation provenance is missing", () => {
+    expect(evaluate([review({ reviewerModelFamilies: [] })])).toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("recorded no model") }]);
+    expect(evaluateReviewCoverage({ pullRequest: "ethanmonlux/facette#704", headSha: HEAD, deltaFor: () => ({ kind: "identical" }),
+      author: { agentId: "claude-engineer", modelFamilies: null }, reviews: [review()] }))
+      .toMatchObject([{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }]);
+  });
+
+  it("reads every model a run recorded", () => {
+    expect(modelFamiliesFromRunUsage({ model: "claude-opus-5-5", provider: "anthropic",
+      usageByModel: [{ model: "claude-haiku-5-5" }, { model: "gpt-6.1-mini" }] })).toEqual(["anthropic", "openai"]);
+    expect(modelFamiliesFromRunUsage({ provider: "openai" })).toEqual(["openai"]);
+    expect(modelFamiliesFromRunUsage(null)).toEqual([]);
   });
 
   it("holds the merge bar: 0 P0, 0 P1, every P2 tracked", () => {

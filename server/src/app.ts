@@ -842,7 +842,8 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(stapleConsoleRoutes(db));
-  api.use(mergeGateRoutes(db));
+  // The red-main owner issue the gate opens wakes its urgent-capable assignee.
+  api.use(mergeGateRoutes(db, { heartbeat: heartbeatService(db, { pluginWorkerManager: workerManager }) }));
   api.use(attentionRoutes(db));
   api.use(decisionTrainingRoutes(db));
   api.use(decisionRoutes(db, opts.decisionServiceOptions));

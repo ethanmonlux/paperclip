@@ -43,7 +43,7 @@ export interface GateCompare {
   aheadBy: number;
   behindBy: number;
   totalCommits: number;
-  commits: Array<{ sha: string; parentCount: number }>;
+  commits: Array<{ sha: string; parentCount: number; message?: string | null }>;
   files: PullRequestFileDiff[];
   /** False when GitHub truncated the commit or file list. */
   complete: boolean;
@@ -115,7 +115,8 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
       const result = asRecord(await request(`/compare/${sha(from)}...${sha(to)}?per_page=${PAGE_SIZE}`));
       const commits = (Array.isArray(result?.commits) ? result.commits : []).map(raw => {
         const commit = asRecord(raw);
-        return { sha: readString(commit?.sha) ?? "", parentCount: Array.isArray(commit?.parents) ? commit.parents.length : 1 };
+        return { sha: readString(commit?.sha) ?? "", parentCount: Array.isArray(commit?.parents) ? commit.parents.length : 1,
+          message: readString(asRecord(commit?.commit)?.message) };
       });
       const files = (Array.isArray(result?.files) ? result.files : []).map(toFile);
       const totalCommits = readNumber(result?.total_commits) ?? commits.length;

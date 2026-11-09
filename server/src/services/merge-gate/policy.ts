@@ -7,11 +7,13 @@
  * 1. it is current with its base (GitHub reports it zero commits behind and
  *    not conflicting), so CI on its head is CI on the merged result;
  * 2. CI at that exact head finished green, and every check the change needs
- *    ran. Path filters are read conservatively: a platform check a CI filter
- *    skipped counts only when every changed file is known to be irrelevant
- *    to that platform. Windows scripts always need Windows evidence, and an
- *    unknown path means the check must run;
- * 3. an independent review covered the source. A head that differs from the
+ *    ran and passed. A skipped check counts only when the repository policy
+ *    lists it as optional, or as path-scoped with every changed file known to
+ *    be irrelevant to it. Windows scripts always need Windows evidence, an
+ *    unknown path means the check must run, and CI where nothing passed is
+ *    never green;
+ * 3. an independent review covered the source, from a different model family
+ *    than every recorded implementation run. A head that differs from the
  *    reviewed head only by a clean merge from base needs CI only; resolved
  *    conflict hunks need a focused recheck at the new head; new source needs
  *    a review at the new head;
@@ -21,11 +23,15 @@
  */
 
 export interface RepositoryMergePolicy {
+  /** Suites that run on every pull request: each must have a passing check run. */
+  alwaysRequiredChecks: Array<{ label: string; pattern: RegExp }>;
   /**
    * Checks a CI path filter may skip. Each may be skipped (or absent) only
    * when every changed file matches one of its `irrelevantPaths`.
    */
   pathScopedChecks: Array<{ platform: string; checks: string[]; irrelevantPaths: RegExp[] }>;
+  /** Check runs that may skip on any change (selectors, not suites). Any other skip refuses. */
+  optionalSkips: RegExp[];
   mergeMethod: "merge" | "squash" | "rebase";
 }
 
@@ -50,16 +56,39 @@ const FACETTE_WINDOWS_IRRELEVANT: RegExp[] = [
   /^[^/]+\.md$/,
 ];
 
+const exactly = (name: string) => ({ label: name, pattern: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
+
 export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = {
+  // .github/workflows/ci.yml: these five jobs are unconditional; only the
+  // Windows jobs sit behind the `changes` path filter.
   "ethanmonlux/facette": {
+    alwaysRequiredChecks: ["changes", "shell", "agent", "account-web", "pr-status-block"].map(exactly),
     pathScopedChecks: [
       { platform: "windows", checks: ["windows-fast", "windows-native"], irrelevantPaths: FACETTE_WINDOWS_IRRELEVANT },
     ],
+    optionalSkips: [],
+    mergeMethod: "merge",
+  },
+  // .github/workflows/pr.yml (`ci / …` jobs). Sharded suites match by prefix;
+  // a skipped shard still refuses through the skip rule.
+  "ethanmonlux/paperclip": {
+    alwaysRequiredChecks: [
+      exactly("ci / policy"),
+      { label: "ci / Typecheck + Release Registry", pattern: /^ci \/ Typecheck\b/ },
+      exactly("ci / Build"),
+      { label: "ci / General tests (server …)", pattern: /^ci \/ General tests \(server\b/ },
+      { label: "ci / Verify serialized server suites", pattern: /^ci \/ Verify serialized server suites\b/ },
+    ],
+    pathScopedChecks: [],
+    optionalSkips: [/^ci \/ Select Vitest files$/],
     mergeMethod: "merge",
   },
 };
 
-export const DEFAULT_REPOSITORY_MERGE_POLICY: RepositoryMergePolicy = { pathScopedChecks: [], mergeMethod: "merge" };
+/** Unknown repositories: nothing may skip, and at least one check must pass. */
+export const DEFAULT_REPOSITORY_MERGE_POLICY: RepositoryMergePolicy = {
+  alwaysRequiredChecks: [], pathScopedChecks: [], optionalSkips: [], mergeMethod: "merge",
+};
 
 export function repositoryMergePolicy(repo: string): RepositoryMergePolicy {
   return REPOSITORY_MERGE_POLICIES[repo.toLowerCase()] ?? DEFAULT_REPOSITORY_MERGE_POLICY;
@@ -90,7 +119,8 @@ export type MergeGateReasonCode =
   | "review_stale"
   | "conflict_recheck_required"
   | "merge_bar_failed"
-  | "main_red";
+  | "main_red"
+  | "merge_in_progress";
 
 export interface MergeGateReason {
   code: MergeGateReasonCode;
@@ -124,11 +154,17 @@ export function requiredPathScopedChecks(input: {
   return required;
 }
 
-/** CI at the exact head: green, complete, and nothing a needed check skipped. */
+/**
+ * CI at the exact head: green, complete, at least one check passed, every
+ * suite the change needs passed, and nothing skipped that the policy does not
+ * explicitly allow to skip for this change.
+ */
 export function evaluateHeadCi(input: {
   headSha: string;
+  policy: RepositoryMergePolicy;
   checks: readonly MergeGateCheck[];
   checksComplete: boolean;
+  /** Path-scoped checks this change needs (`requiredPathScopedChecks`). */
   requiredChecks: readonly string[];
   changedFiles: readonly string[] | null;
 }): MergeGateReason[] {
@@ -147,22 +183,39 @@ export function evaluateHeadCi(input: {
   if (failed.length > 0) {
     return [{ code: "ci_failed", detail: `CI for ${sha} did not pass: ${failed.map(check => `${check.name} (${check.conclusion ?? "no conclusion"})`).slice(0, 5).join(", ")}.` }];
   }
-  const reasons: MergeGateReason[] = [];
   const checkRuns = input.checks.filter(check => check.kind === "check_run");
-  const ranGreen = new Set(checkRuns.filter(check => PASSING_CONCLUSIONS.has(check.conclusion ?? "")).map(check => check.name));
+  const passed = checkRuns.filter(check => PASSING_CONCLUSIONS.has(check.conclusion ?? ""));
+  if (passed.length === 0) {
+    return [{ code: "ci_absent", detail: `No check run passed on ${sha}; skipped or empty CI is not evidence. CI must run and pass.` }];
+  }
+  const reasons: MergeGateReason[] = [];
+  const reported = new Set<string>();
+  for (const suite of input.policy.alwaysRequiredChecks) {
+    if (passed.some(check => suite.pattern.test(check.name))) continue;
+    for (const check of checkRuns) if (suite.pattern.test(check.name)) reported.add(check.name);
+    reasons.push({ code: "required_check_skipped", detail: `${suite.label} runs on every change in this repository but did not pass on ${sha}. It must run and pass.` });
+  }
+  const ranGreen = new Set(passed.map(check => check.name));
   for (const name of input.requiredChecks) {
-    if (ranGreen.has(name)) continue;
+    if (ranGreen.has(name) || reported.has(name)) continue;
+    reported.add(name);
     const skipped = checkRuns.some(check => check.name === name && check.conclusion === "skipped");
     reasons.push({ code: "required_check_skipped", detail: skipped
       ? `${name} was skipped by a CI path filter, but this change touches paths that check covers or paths not known to be irrelevant to it. It must run and pass on ${sha}.`
       : `${name} did not run on ${sha}, but this change needs it. It must run and pass.` });
   }
+  // A skip is allowed only where the policy says so; a path filter that
+  // skipped anything else, or a disabled suite, is not a green result.
+  const skippablePathScoped = new Set(input.policy.pathScopedChecks.flatMap(scope => scope.checks)
+    .filter(name => !input.requiredChecks.includes(name)));
   const touchesWindowsScripts = (input.changedFiles ?? []).some(file => matchesAny(file, WINDOWS_EXECUTED_PATHS));
-  if (touchesWindowsScripts) {
-    for (const check of checkRuns) {
-      if (check.conclusion !== "skipped" || !WINDOWS_CHECK_NAME.test(check.name) || input.requiredChecks.includes(check.name)) continue;
-      reasons.push({ code: "required_check_skipped", detail: `${check.name} was skipped, but this change touches files a Windows suite executes. It must run and pass on ${sha}.` });
-    }
+  for (const check of checkRuns) {
+    if (check.conclusion !== "skipped" || reported.has(check.name)) continue;
+    if (skippablePathScoped.has(check.name) || matchesAny(check.name, input.policy.optionalSkips)) continue;
+    reported.add(check.name);
+    reasons.push({ code: "required_check_skipped", detail: touchesWindowsScripts && WINDOWS_CHECK_NAME.test(check.name)
+      ? `${check.name} was skipped, but this change touches files a Windows suite executes. It must run and pass on ${sha}.`
+      : `${check.name} was skipped on ${sha}, and this repository's merge policy does not list it as skippable for these paths. It must run and pass.` });
   }
   return reasons;
 }
@@ -187,7 +240,11 @@ export interface MergeReviewAttestation {
   reviewIssueIdentifier: string | null;
   reviewIssueStatus: string;
   reviewerAgentId: string | null;
-  reviewerAdapterType: string | null;
+  /**
+   * Model families recorded on the run that wrote the latest document
+   * revision. Empty when that run recorded no model: not independent.
+   */
+  reviewerModelFamilies: string[];
   /** The document revision was written by the review issue's assignee. */
   writtenByReviewer: boolean;
   scope: "full" | "conflict_hunks";
@@ -211,7 +268,7 @@ export type HeadDelta =
 
 /** Parse the `merge-review` document a reviewer writes on its review issue. */
 export function parseMergeReviewDocument(body: string): Omit<MergeReviewAttestation,
-  "reviewIssueId" | "reviewIssueIdentifier" | "reviewIssueStatus" | "reviewerAgentId" | "reviewerAdapterType" | "writtenByReviewer"> | null {
+  "reviewIssueId" | "reviewIssueIdentifier" | "reviewIssueStatus" | "reviewerAgentId" | "reviewerModelFamilies" | "writtenByReviewer"> | null {
   const field = (name: string) => {
     const match = new RegExp(`^\\s*[-*]?\\s*\`?${name}\`?\\s*:\\s*(.+?)\\s*$`, "im").exec(body);
     return match ? match[1]!.replace(/^`|`$/g, "").trim() : null;
@@ -239,13 +296,74 @@ function reviewLabel(review: MergeReviewAttestation) {
   return review.reviewIssueIdentifier ?? review.reviewIssueId;
 }
 
+/**
+ * Model family from a recorded model id, falling back to a first-party
+ * provider. Adapter names say nothing about the model (one adapter can run
+ * several families), and an aggregator provider says nothing either.
+ */
+const MODEL_FAMILIES: Array<[RegExp, string]> = [
+  [/claude|anthropic|\bopus\b|\bsonnet\b|\bhaiku\b|\bfable\b/i, "anthropic"],
+  [/\bgpt|codex|openai|chatgpt|(^|[/:.\s])o[1-9](\b|-)/i, "openai"],
+  [/gemini|gemma/i, "google"],
+  [/grok|\bxai\b/i, "xai"],
+  [/mistral|mixtral|codestral|devstral/i, "mistral"],
+  [/deepseek/i, "deepseek"],
+  [/qwen/i, "qwen"],
+  [/llama/i, "meta"],
+  [/kimi|moonshot/i, "moonshot"],
+  [/\bglm\b|zhipu/i, "zhipu"],
+];
+const FIRST_PARTY_PROVIDERS = new Set(["anthropic", "openai", "google", "xai", "mistral", "deepseek"]);
+
+export function modelFamily(input: { model?: string | null; provider?: string | null }): string | null {
+  const model = input.model?.trim();
+  if (model) {
+    for (const [pattern, family] of MODEL_FAMILIES) if (pattern.test(model)) return family;
+  }
+  const provider = input.provider?.trim().toLowerCase();
+  return provider && FIRST_PARTY_PROVIDERS.has(provider) ? provider : null;
+}
+
+/** Families a run recorded in its usage (`model`, `provider`, `usageByModel[].model`). */
+export function modelFamiliesFromRunUsage(usage: unknown): string[] {
+  const record = usage && typeof usage === "object" && !Array.isArray(usage) ? usage as Record<string, unknown> : null;
+  if (!record) return [];
+  const text = (value: unknown) => typeof value === "string" ? value : null;
+  const families = new Set<string>();
+  const provider = text(record.provider);
+  const top = modelFamily({ model: text(record.model), provider });
+  if (top) families.add(top);
+  for (const entry of Array.isArray(record.usageByModel) ? record.usageByModel : []) {
+    const model = entry && typeof entry === "object" ? text((entry as Record<string, unknown>).model) : null;
+    const family = modelFamily({ model, provider: model ? null : provider });
+    if (family) families.add(family);
+  }
+  return [...families].sort();
+}
+
+export interface MergeGateAuthor {
+  agentId: string | null;
+  /**
+   * Model families that authored the change: every recorded implementation
+   * run plus commit co-author trailers. Null when provenance is missing.
+   */
+  modelFamilies: string[] | null;
+}
+
 /** Independent: written by its assignee, done, another agent, and another model family. */
-function independenceProblem(review: MergeReviewAttestation, author: { agentId: string | null; adapterType: string | null }) {
+function independenceProblem(review: MergeReviewAttestation, author: MergeGateAuthor) {
   if (review.reviewIssueStatus !== "done") return `${reviewLabel(review)} is ${review.reviewIssueStatus}, not done.`;
   if (!review.writtenByReviewer || !review.reviewerAgentId) return `${reviewLabel(review)}'s merge-review document was not written by its assigned reviewer.`;
   if (author.agentId && review.reviewerAgentId === author.agentId) return `${reviewLabel(review)} was reviewed by the implementer.`;
-  if (author.adapterType && review.reviewerAdapterType === author.adapterType) {
-    return `${reviewLabel(review)} used the implementer's model family (${author.adapterType}); the review must be cross-model.`;
+  if (review.reviewerModelFamilies.length === 0) {
+    return `The run that wrote ${reviewLabel(review)}'s merge-review document recorded no model, so the gate cannot show the review is cross-model.`;
+  }
+  if (!author.modelFamilies || author.modelFamilies.length === 0) {
+    return `The gate found no recorded model for an implementation run of this task, so it cannot show ${reviewLabel(review)} is cross-model.`;
+  }
+  const shared = review.reviewerModelFamilies.filter(family => author.modelFamilies!.includes(family));
+  if (shared.length > 0) {
+    return `${reviewLabel(review)} used the implementer's model family (${shared.join(", ")}); the review must be cross-model.`;
   }
   return null;
 }
@@ -257,7 +375,7 @@ function independenceProblem(review: MergeReviewAttestation, author: { agentId: 
 export function evaluateReviewCoverage(input: {
   pullRequest: string;
   headSha: string;
-  author: { agentId: string | null; adapterType: string | null };
+  author: MergeGateAuthor;
   reviews: readonly MergeReviewAttestation[];
   deltaFor: (reviewedSha: string) => HeadDelta;
 }): MergeGateReason[] {

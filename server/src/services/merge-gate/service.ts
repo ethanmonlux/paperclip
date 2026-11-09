@@ -3,7 +3,10 @@
  *
  * `evaluateAndMerge` reads the pull request, its base and CI through GitHub,
  * reads the linked review documents, decides with ./policy.ts, and merges
- * only at the exact head it verified. A red main opens (or reuses) one
+ * only at the exact head it verified. The whole check-and-merge holds one
+ * lock per repository branch across server instances, and the base head is
+ * read again under that lock just before merging, so a second merge cannot
+ * land on a base its CI never ran against. A red main opens (or reuses) one
  * critical owner issue for that repository branch, assigned to an
  * urgent-capable agent, and parks the refused task on it with a blocker
  * relation, so the task resumes by itself when the fix lands.
@@ -11,6 +14,7 @@
 import { forbidden, notFound, unprocessable } from "../../errors.js";
 import { GitHubMergeGateError, type MergeGateGitHub } from "./github.js";
 import {
+  modelFamily,
   classifyHeadCommits,
   classifyOwnDiffChange,
   decideMerge,
@@ -20,6 +24,7 @@ import {
   repositoryMergePolicy,
   requiredPathScopedChecks,
   type HeadDelta,
+  type MergeGateAuthor,
   type MergeGateReason,
   type MergeReviewAttestation,
 } from "./policy.js";
@@ -27,6 +32,19 @@ import {
 export const MERGE_GATE_RED_MAIN_ORIGIN_KIND = "merge_gate_red_main";
 export const MERGE_REVIEW_DOCUMENT_KEY = "merge-review";
 const MAX_ANCESTOR_DEPTH = 8;
+export const MERGE_LOCK_BUSY = Symbol("merge-lock-busy");
+
+/** Families named in commit `Co-Authored-By:` trailers (e.g. "Claude Opus 5.5 <noreply@anthropic.com>"). */
+export function coAuthorModelFamilies(messages: ReadonlyArray<string | null | undefined>): string[] {
+  const families = new Set<string>();
+  for (const message of messages) {
+    for (const match of (message ?? "").matchAll(/^\s*co-authored-by:\s*(.+)$/gim)) {
+      const family = modelFamily({ model: match[1] });
+      if (family) families.add(family);
+    }
+  }
+  return [...families];
+}
 
 export interface MergeGateActor {
   type: "board" | "agent";
@@ -79,7 +97,17 @@ export interface MergeGateDependencies {
   github: (repo: string, token: string) => MergeGateGitHub;
   resolveToken: (companyId: string, actor: MergeGateActor) => Promise<string | null>;
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
-  loadAgentAdapter: (companyId: string, agentId: string) => Promise<string | null>;
+  /**
+   * Model families recorded by the task's implementation runs, excluding the
+   * given agents (reviewers, the merging coordinator). Null when a run that
+   * may have authored the change recorded no model.
+   */
+  loadAuthorModelFamilies: (companyId: string, input: { issueId: string; excludeAgentIds: string[] }) => Promise<string[] | null>;
+  /**
+   * Run `action` holding the merge lock for one repository branch, across
+   * server instances. Returns `MERGE_LOCK_BUSY` when another merge holds it.
+   */
+  withMergeLock: <T>(key: string, action: () => Promise<T>) => Promise<T | typeof MERGE_LOCK_BUSY>;
   loadReviews: (companyId: string, input: { reviewIssueIds: string[]; repo: string; pullNumber: number }) => Promise<MergeReviewAttestation[]>;
   /** Open (or return the open) red-main owner issue; at most one per repo branch. */
   ensureRedMainIssue: (input: {
@@ -169,17 +197,47 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
   const policy = repositoryMergePolicy(repo);
   const label = `${repo}#${request.pullNumber}`;
 
-  let pr;
-  try {
-    pr = await github.pullRequest(request.pullNumber);
-  } catch (err) {
-    throw unprocessable(err instanceof GitHubMergeGateError ? err.message : `Could not read ${label}`);
-  }
+  const readPullRequest = async () => {
+    try {
+      return await github.pullRequest(request.pullNumber);
+    } catch (err) {
+      throw unprocessable(err instanceof GitHubMergeGateError ? err.message : `Could not read ${label}`);
+    }
+  };
+  const first = await readPullRequest();
+  const context = { repo, label, policy, github, issue };
+  if (request.dryRun) return evaluateLocked(deps, request, context, first);
+  // One check-and-merge at a time per repository branch, so two merges
+  // cannot both pass against the same base and land one after the other.
+  const lockKey = `merge-gate:${repo.toLowerCase()}:${first.baseRef}`;
+  const result = await deps.withMergeLock(lockKey, async () => {
+    const pr = await readPullRequest();
+    if (pr.baseRef !== first.baseRef) {
+      return { outcome: "refused" as const, repo, pullNumber: request.pullNumber, headSha: pr.headSha.toLowerCase(), baseRef: pr.baseRef,
+        requiredChecks: [], redMainIssue: null,
+        reasons: [{ code: "base_update_required" as const, detail: `The pull request's base changed from ${first.baseRef} to ${pr.baseRef} during the check. Try again.` }] };
+    }
+    return evaluateLocked(deps, request, context, pr);
+  });
+  if (result !== MERGE_LOCK_BUSY) return result;
+  const reason: MergeGateReason = { code: "merge_in_progress", detail: `Another merge into ${repo} ${first.baseRef} is being checked or merged. Try again after it finishes; this head will then need to be current with the new base.` };
+  return { outcome: "refused", repo, pullNumber: request.pullNumber, headSha: first.headSha.toLowerCase(), baseRef: first.baseRef,
+    requiredChecks: [], reasons: [reason], redMainIssue: null };
+}
+
+async function evaluateLocked(
+  deps: MergeGateDependencies,
+  request: MergeGateRequest,
+  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue },
+  pr: Awaited<ReturnType<MergeGateGitHub["pullRequest"]>>,
+): Promise<MergeGateResult> {
+  const { repo, label, policy, github, issue } = context;
   const headSha = pr.headSha.toLowerCase();
-  const [baseSha, ownDiff, compareToBase] = await Promise.all([
-    github.branchHead(pr.baseRef),
+  const baseSha = (await github.branchHead(pr.baseRef)).toLowerCase();
+  // Everything below compares against this one base SHA, not the moving ref.
+  const [ownDiff, compareToBase] = await Promise.all([
     github.pullRequestFiles(request.pullNumber).catch(() => null),
-    github.compare(pr.baseRef, headSha).catch(() => null),
+    github.compare(baseSha, headSha).catch(() => null),
   ]);
   const [headChecks, baseChecks] = await Promise.all([github.checks(headSha), github.checks(baseSha)]);
 
@@ -202,15 +260,25 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
 
   const changedFiles = ownDiff ? ownDiff.map(file => file.filename) : null;
   const requiredChecks = requiredPathScopedChecks({ policy, changedFiles });
-  const ciReasons = evaluateHeadCi({ headSha, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
+  const ciReasons = evaluateHeadCi({ headSha, policy, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
 
-  const author = {
-    agentId: issue.assigneeAgentId,
-    adapterType: issue.assigneeAgentId ? await deps.loadAgentAdapter(request.companyId, issue.assigneeAgentId) : null,
-  };
   const reviews = await deps.loadReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber });
   // A review written by the merging coordinator is not independent of the merge.
   const independentOfMerger = reviews.filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId);
+  // Who authored the change is read from what the runs recorded, not from the
+  // assignee's current adapter configuration.
+  const runFamilies = await deps.loadAuthorModelFamilies(request.companyId, {
+    issueId: issue.id,
+    excludeAgentIds: [...new Set([
+      ...independentOfMerger.map(review => review.reviewerAgentId).filter((id): id is string => Boolean(id)),
+      ...(request.actor.agentId ? [request.actor.agentId] : []),
+    ])],
+  });
+  const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
+  const author: MergeGateAuthor = {
+    agentId: issue.assigneeAgentId,
+    modelFamilies: runFamilies === null ? null : [...new Set([...runFamilies, ...trailerFamilies])].sort(),
+  };
   const deltas = new Map<string, HeadDelta>();
   for (const review of independentOfMerger) {
     if (!deltas.has(review.reviewedSha)) {
@@ -244,6 +312,18 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
     return { outcome: parked ? "parked" : "refused", ...base };
   }
   if (request.dryRun) return { outcome: "mergeable", ...base };
+
+  // The lock stops other gate merges; this catches a base that moved some
+  // other way while the checks above ran.
+  const baseNow = (await github.branchHead(pr.baseRef).catch(() => null))?.toLowerCase() ?? null;
+  if (baseNow !== baseSha) {
+    const reason: MergeGateReason = { code: "base_update_required", detail: baseNow
+      ? `${pr.baseRef} moved from ${baseSha.slice(0, 12)} to ${baseNow.slice(0, 12)} while the gate was checking. Merge the base branch, push, and let CI run on the new head.`
+      : `The gate could not re-read ${pr.baseRef} before merging, so it cannot prove ${headSha.slice(0, 12)} is current.` };
+    await deps.log({ companyId: request.companyId, issueId: issue.id, actor: request.actor, action: "merge_gate.refused",
+      details: { repo, pullNumber: request.pullNumber, headSha, reasons: [reason] } });
+    return { outcome: "refused", ...base, reasons: [reason] };
+  }
 
   let merged;
   try {

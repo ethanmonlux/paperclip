@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MergeGateGitHub } from "./github.js";
 import type { MergeGateCheck, MergeReviewAttestation } from "./policy.js";
-import { evaluateAndMerge, reportRedMain, type GateIssue, type MergeGateDependencies } from "./service.js";
+import { coAuthorModelFamilies, evaluateAndMerge, MERGE_LOCK_BUSY, reportRedMain, type GateIssue, type MergeGateDependencies } from "./service.js";
 
 const HEAD = "a".repeat(40);
 const REVIEWED = "b".repeat(40);
 const BASE = "c".repeat(40);
+const NEW_BASE = "e".repeat(40);
 const COMPANY = "company-1";
 
 const ok = (name: string): MergeGateCheck => ({ kind: "check_run", name, status: "completed", conclusion: "success" });
@@ -18,14 +19,20 @@ function issue(overrides: Partial<GateIssue> & { id: string }): GateIssue {
   };
 }
 
-function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headChecks: MergeGateCheck[]; behindBy: number; headSha: string }> = {}) {
+/** One repository's base branch, shared by every pull request's fake. */
+function fakeBase() {
+  return { head: BASE };
+}
+
+function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headChecks: MergeGateCheck[]; behindBy: number; headSha: string; base: { head: string } }> = {}) {
   const headSha = overrides.headSha ?? HEAD;
-  const merge = vi.fn(async () => ({ merged: true, sha: "d".repeat(40), message: "Pull Request successfully merged" }));
+  const base = overrides.base ?? fakeBase();
+  // Merging advances the shared base, as GitHub would.
+  const merge = vi.fn(async () => { base.head = NEW_BASE; return { merged: true, sha: NEW_BASE, message: "Pull Request successfully merged" }; });
   const github: MergeGateGitHub = {
     pullRequest: async () => ({ state: "open", merged: false, draft: false, headSha, headRef: "sta-1", baseRef: "main", mergeable: true, mergeableState: "clean" }),
-    branchHead: async () => BASE,
+    branchHead: async () => base.head,
     compare: async (from, to) => {
-      if (from === "main") return { status: "ahead", aheadBy: 3, behindBy: overrides.behindBy ?? 0, totalCommits: 3, commits: [], files: [], complete: true };
       if (from === REVIEWED && to === HEAD) {
         return { status: "ahead", aheadBy: 3, behindBy: 0, totalCommits: 3, complete: true, files: [],
           commits: [{ sha: "m1", parentCount: 1 }, { sha: "m2", parentCount: 1 }, { sha: "merge", parentCount: 2 }] };
@@ -34,38 +41,57 @@ function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headCheck
         return { status: "ahead", aheadBy: 2, behindBy: 0, totalCommits: 2, complete: true, files: [],
           commits: [{ sha: "m1", parentCount: 1 }, { sha: "m2", parentCount: 1 }] };
       }
+      if (to === headSha) {
+        // compare(base...head): a head built on BASE is behind any newer base.
+        return { status: "ahead", aheadBy: 3, behindBy: from === BASE ? (overrides.behindBy ?? 0) : 1, totalCommits: 3, files: [], complete: true,
+          commits: [{ sha: "own", parentCount: 1, message: "feat: change\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" }] };
+      }
       // compare(base...reviewed): the PR's own diff at review time.
       return { status: "diverged", aheadBy: 1, behindBy: 2, totalCommits: 1, complete: true, commits: [],
         files: [{ filename: "account-web/app/page.tsx", status: "modified", blobSha: "x1", patch: "@@ -1 +1 @@\n-a\n+b" }] };
     },
     pullRequestFiles: async () => [{ filename: "account-web/app/page.tsx", status: "modified", blobSha: "x2", patch: "@@ -4 +4 @@\n-a\n+b" }],
-    checks: async sha => ({ complete: true, checks: sha === BASE ? (overrides.baseChecks ?? [ok("verify")]) : (overrides.headChecks ?? [ok("verify"), ok("shell")]) }),
+    checks: async sha => ({ complete: true, checks: sha === headSha ? (overrides.headChecks ?? [ok("verify"), ok("shell")]) : (overrides.baseChecks ?? [ok("verify")]) }),
     merge,
   };
-  return { github, merge };
+  return { github, merge, base };
 }
 
 function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAttestation {
   return {
     reviewIssueId: "review", reviewIssueIdentifier: "STA-REVIEW", reviewIssueStatus: "done", reviewerAgentId: "codex-reviewer",
-    reviewerAdapterType: "codex_local", writtenByReviewer: true, scope: "full", reviewedSha: HEAD,
+    reviewerModelFamilies: ["openai"], writtenByReviewer: true, scope: "full", reviewedSha: HEAD,
     pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [], ...overrides,
   };
 }
 
-function harness(input: { github: MergeGateGitHub; reviews?: MergeReviewAttestation[]; issues?: GateIssue[] }) {
+function harness(input: {
+  github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
+  authorFamilies?: string[] | null; locks?: Set<string>; onLoadReviews?: () => void;
+}) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
   issues.set("parent", issues.get("parent") ?? issue({ id: "parent", assigneeAgentId: "lead-coordinator" }));
   const owners = new Map<string, GateIssue>();
   const parked: Array<{ issueId: string; blockerIssueId: string }> = [];
   const logs: Array<{ action: string; details: Record<string, unknown> }> = [];
+  const locks = input.locks ?? new Set<string>();
+  const authorQueries: Array<{ issueId: string; excludeAgentIds: string[] }> = [];
   const deps: MergeGateDependencies = {
-    github: () => input.github,
+    github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
     loadIssue: async (_company, id) => issues.get(id) ?? null,
-    loadAgentAdapter: async (_company, id) => id.startsWith("claude") ? "claude_local" : "codex_local",
-    loadReviews: async () => input.reviews ?? [review()],
+    loadAuthorModelFamilies: async (_company, query) => {
+      authorQueries.push(query);
+      return input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
+    },
+    // The database lock is a try-lock shared across server instances.
+    withMergeLock: async (key, action) => {
+      if (locks.has(key)) return MERGE_LOCK_BUSY;
+      locks.add(key);
+      try { return await action(); } finally { locks.delete(key); }
+    },
+    loadReviews: async () => { input.onLoadReviews?.(); return input.reviews ?? [review()]; },
     ensureRedMainIssue: async request => {
       const key = `${request.repo}:${request.baseRef}`;
       const existing = owners.get(key);
@@ -80,14 +106,15 @@ function harness(input: { github: MergeGateGitHub; reviews?: MergeReviewAttestat
     parkOnIssue: async request => { parked.push({ issueId: request.issueId, blockerIssueId: request.blockerIssueId }); },
     log: async entry => { logs.push({ action: entry.action, details: entry.details }); },
   };
-  return { deps, issues, owners, parked, logs };
+  return { deps, issues, owners, parked, logs, authorQueries };
 }
 
 const coordinator = { type: "agent" as const, agentId: "coordinator", runId: "run-1" };
 const request = (overrides: Partial<Parameters<typeof evaluateAndMerge>[1]> = {}) => ({
   companyId: COMPANY, issueId: "task", repo: "ethanmonlux/facette", pullNumber: 704, actor: coordinator, ...overrides,
 });
-const accountWebCi = [ok("changes"), ok("shell"), ok("account-web"),
+const facetteAlwaysCi = [ok("changes"), ok("shell"), ok("agent"), ok("account-web"), ok("pr-status-block")];
+const accountWebCi = [...facetteAlwaysCi,
   { kind: "check_run" as const, name: "windows-fast", status: "completed", conclusion: "skipped" }];
 
 describe("merge gate service", () => {
@@ -145,7 +172,7 @@ describe("merge gate service", () => {
 
   it("lets the fix under the red-main issue merge while main is red", async () => {
     const red = [{ kind: "check_run" as const, name: "windows-fast", status: "completed", conclusion: "failure" }];
-    const { github, merge } = fakeGitHub({ headChecks: [...accountWebCi.slice(0, 3), ok("windows-fast"), ok("windows-native")], baseChecks: red });
+    const { github, merge } = fakeGitHub({ headChecks: [...facetteAlwaysCi, ok("windows-fast"), ok("windows-native")], baseChecks: red });
     const h = harness({ github });
     await reportRedMain(h.deps, { companyId: COMPANY, repo: "ethanmonlux/facette", baseRef: "main", evidence: "windows-fast fails on every PR", reportingIssueId: null, actor: coordinator });
     h.issues.set("fix", issue({ id: "fix", parentId: "red-main-1", assigneeAgentId: "claude-repair", createdByAgentId: "coordinator" }));
@@ -175,6 +202,49 @@ describe("merge gate service", () => {
     expect(h.logs).toEqual([]);
     const green = harness({ github: fakeGitHub({ headChecks: accountWebCi }).github });
     await expect(evaluateAndMerge(green.deps, request({ dryRun: true }))).resolves.toMatchObject({ outcome: "mergeable" });
+  });
+
+  it("serializes merges into one base: of two concurrent green PRs only one merges", async () => {
+    const base = fakeBase();
+    const first = fakeGitHub({ headChecks: accountWebCi, base });
+    const second = fakeGitHub({ headChecks: accountWebCi, base, headSha: "f".repeat(40) });
+    const locks = new Set<string>();
+    const h1 = harness({ github: first.github, locks });
+    const h2 = harness({ github: second.github, locks, reviews: [review({ reviewedSha: "f".repeat(40), pullRequest: "ethanmonlux/facette#705" })] });
+    const [one, two] = await Promise.all([evaluateAndMerge(h1.deps, request()), evaluateAndMerge(h2.deps, request({ pullNumber: 705 }))]);
+    expect(one).toMatchObject({ outcome: "merged" });
+    expect(two).toMatchObject({ outcome: "refused", reasons: [{ code: "merge_in_progress" }] });
+    expect(first.merge).toHaveBeenCalledTimes(1);
+    expect(second.merge).not.toHaveBeenCalled();
+    // Retried after the first landed, the second head is behind the new base.
+    await expect(evaluateAndMerge(h2.deps, request({ pullNumber: 705 })))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "base_update_required", detail: expect.stringContaining("1 commit(s) behind") }] });
+    expect(second.merge).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the base moves outside the gate while it is checking", async () => {
+    const { github, merge, base } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, onLoadReviews: () => { base.head = NEW_BASE; } });
+    await expect(evaluateAndMerge(h.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "base_update_required", detail: expect.stringContaining("moved") }] });
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("reads authorship from run provenance and commit trailers, and fails closed without it", async () => {
+    const { github } = fakeGitHub({ headChecks: accountWebCi });
+    // The implementer is now configured as Codex, but its runs and commits recorded Claude.
+    const sameFamily = harness({ github, authorFamilies: ["anthropic"], reviews: [review({ reviewerModelFamilies: ["anthropic"] })] });
+    await expect(evaluateAndMerge(sameFamily.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
+    expect(sameFamily.authorQueries).toEqual([{ issueId: "task", excludeAgentIds: ["codex-reviewer", "coordinator"] }]);
+    // A run with no recorded model leaves only the trailers, which still name Claude.
+    const trailersOnly = harness({ github, authorFamilies: [], reviews: [review({ reviewerModelFamilies: ["anthropic"] })] });
+    await expect(evaluateAndMerge(trailersOnly.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("anthropic") }] });
+    const missing = harness({ github, authorFamilies: null });
+    await expect(evaluateAndMerge(missing.deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }] });
+    expect(coAuthorModelFamilies(["fix\n\nCo-authored-by: Codex <codex@openai.com>", null])).toEqual(["openai"]);
   });
 
   it("does not count a review written by the merging coordinator", async () => {
