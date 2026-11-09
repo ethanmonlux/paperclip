@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { IssueWaitTarget } from "@paperclipai/shared";
 import {
   CI_NO_START_DEADLINE_MS,
   classifyCiWait,
@@ -153,7 +154,8 @@ describe("wait record validation", () => {
   const base = { nextCheckAt: minutesAgo(-2), timeoutAt: null };
   it("requires the exact SHA for ci and stamps pushedAt", () => {
     expect(() => prepareWaitRecordMonitor({ ...base, kind: "ci", target: { repo: "o/r" } }, now)).toThrow(/target.sha/);
-    const prepared = prepareWaitRecordMonitor({ ...base, kind: "ci", target: { repo: "o/r", sha } }, now);
+    const ciTarget: IssueWaitTarget = { repo: "o/r", sha };
+    const prepared = prepareWaitRecordMonitor({ ...base, kind: "ci", target: ciTarget }, now);
     expect(prepared.target?.pushedAt).toBe(now.toISOString());
   });
 

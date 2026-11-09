@@ -1,4 +1,4 @@
-import { isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/domain/wake-context.js";
+import { isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/index.js";
 
 /**
  * FAC-840 wait contract: an unfinished crashed run gets a bounded retry.
