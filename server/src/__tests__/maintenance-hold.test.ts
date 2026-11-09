@@ -23,7 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService, resolveHeartbeatSchedulingSuppression, stopTaskDrain } from "../services/heartbeat.ts";
+import { heartbeatService, resolveHeartbeatSchedulingSuppression, stopTaskDrain } from "../services/heartbeat.js";
 import { applyMaintenanceHold, readMaintenanceHold, readTaskDrain } from "../services/task-admission.js";
 import { maintenanceHoldService } from "../services/maintenance-hold.js";
 import { instanceSettingsRoutes } from "../routes/instance-settings.js";
