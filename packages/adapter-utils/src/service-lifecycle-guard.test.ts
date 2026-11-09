@@ -103,6 +103,42 @@ describe("service lifecycle guard paths", () => {
   });
 });
 
+/** Symlink aliases of the account's `.paperclip` directory and runtime dir, outside the home. */
+async function aliasMounts(account: Awaited<ReturnType<typeof fakeServiceAccount>>) {
+  const aliasRoot = path.join(account.root, "opt");
+  await fs.mkdir(aliasRoot, { recursive: true });
+  const toolsAlias = path.join(aliasRoot, "tools");
+  const runtimeAlias = path.join(aliasRoot, "runtime");
+  await fs.symlink(path.dirname(account.authFile), toolsAlias);
+  await fs.symlink(account.runtimeDir, runtimeAlias);
+  return { toolsAlias, runtimeAlias };
+}
+
+describe("service lifecycle guard aliases", () => {
+  it("covers guarded content where a symlink alias mount exposes it", async () => {
+    const account = await fakeServiceAccount();
+    const { toolsAlias, runtimeAlias } = await aliasMounts(account);
+    const args = await buildServiceLifecycleGuardArgs({
+      mounts: [{ path: toolsAlias, access: "rw" }, { path: runtimeAlias, access: "ro" }],
+      guards: account.guards,
+    });
+    expect(args).toEqual([
+      "--tmpfs", runtimeAlias,
+      "--ro-bind", "/dev/null", path.join(toolsAlias, "auth.json"),
+      "--ro-bind", account.cliStore, path.join(toolsAlias, "cli"),
+    ]);
+  });
+
+  it("covers a bind whose source differs from its destination", async () => {
+    const account = await fakeServiceAccount();
+    const args = await buildServiceLifecycleGuardArgs({
+      mounts: [{ path: "/workspace/link", source: path.dirname(account.authFile), access: "ro" }],
+      guards: account.guards,
+    });
+    expect(args).toEqual(["--ro-bind", "/dev/null", "/workspace/link/auth.json"]);
+  });
+});
+
 describe.runIf(process.platform === "linux")("sandbox service lifecycle authority", () => {
   it("re-covers lifecycle paths that agent extra paths would expose, after every other mount", async () => {
     const account = await fakeServiceAccount();
@@ -232,4 +268,42 @@ describe.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))("sandbox service lifec
       await expect(fs.readFile(account.authFile, "utf8")).resolves.toContain("board-secret");
     });
   }
+});
+
+describe.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))("sandbox service lifecycle aliases under bubblewrap", () => {
+  it("blocks the credential, install store and bus reached through symlink alias extra paths", async () => {
+    const account = await fakeServiceAccount();
+    const { toolsAlias, runtimeAlias } = await aliasMounts(account);
+    const probe = [
+      "const fs = require('node:fs');",
+      "const net = require('node:net');",
+      "const results = {};",
+      `results.auth = (() => { try { return fs.readFileSync(${JSON.stringify(path.join(toolsAlias, "auth.json"))}, 'utf8'); } catch (error) { return error.code; } })();`,
+      `results.cliWrite = (() => { try { fs.writeFileSync(${JSON.stringify(path.join(toolsAlias, "cli", "payload.txt"))}, 'x'); return 'written'; } catch (error) { return error.code; } })();`,
+      `const socket = net.connect(${JSON.stringify(path.join(runtimeAlias, "bus"))});`,
+      "socket.on('data', () => { results.bus = 'connected'; socket.destroy(); });",
+      "socket.on('error', (error) => { results.bus = error.code; });",
+      "socket.on('close', () => { console.log(JSON.stringify(results)); });",
+    ].join("\n");
+    const result = await runChildProcess("lifecycle-guard-alias-test", process.execPath, ["-e", probe], {
+      cwd: account.workspace,
+      env: {},
+      timeoutSec: 10,
+      graceSec: 1,
+      onLog: async () => {},
+      localProcessSandbox: {
+        workspaceDir: account.workspace,
+        filesystemScope: "workspace",
+        extraPaths: [{ path: toolsAlias, access: "rw" }, { path: runtimeAlias, access: "ro" }],
+        outboundRestorePaths: [toolsAlias],
+        serviceLifecycleGuards: account.guards,
+        command: process.env.PAPERCLIP_TEST_BWRAP,
+      },
+    });
+    expect(result.exitCode, result.stderr).toBe(0);
+    const observed = JSON.parse(result.stdout.trim().split("\n").at(-1)!);
+    expect(["", "EACCES"]).toContain(observed.auth);
+    expect({ ...observed, auth: "covered" }).toEqual({ auth: "covered", cliWrite: "EROFS", bus: "ENOENT" });
+    await expect(fs.readFile(account.authFile, "utf8")).resolves.toContain("board-secret");
+  });
 });

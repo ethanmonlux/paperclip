@@ -11,12 +11,18 @@ import {
 } from "../install-store.js";
 import { resolvePaperclipInstanceId } from "../config/home.js";
 import { detectServiceManager, launchdServiceName, systemdServiceName } from "../services/service-manager.js";
-import { assertServiceLifecycleOutsideAgentRun } from "../service-lifecycle-authority.js";
+import {
+  assertServiceLifecycleOutsideAgentRun,
+  assertServiceLifecycleQuiet,
+  countActiveServiceRuns,
+  type ActiveServiceRunsProbe,
+} from "../service-lifecycle-authority.js";
 
 type UninstallDependencies = {
   detectServiceManager: typeof detectServiceManager;
   platform: NodeJS.Platform;
   userHomeDir: string;
+  activeServiceRuns: ActiveServiceRunsProbe;
 };
 
 function otherServiceDefinitions(platform: NodeJS.Platform, userHomeDir: string, instanceId: string): string[] {
@@ -46,6 +52,9 @@ export async function uninstallCommand(
   const platform = dependencies.platform ?? process.platform;
   const userHomeDir = dependencies.userHomeDir ?? os.homedir();
   const detection = await detect({ instanceId, platform });
+  // Uninstall stops the service; never under live agent runs (FAC-840 C1).
+  await assertServiceLifecycleQuiet("uninstall Paperclip",
+    dependencies.activeServiceRuns ?? (() => countActiveServiceRuns({ instanceId, detect })));
   const otherDefinitions = otherServiceDefinitions(platform, userHomeDir, instanceId);
   if (otherDefinitions.length > 0) {
     throw new Error(`Cannot remove the shared managed CLI while other instance services are installed: ${otherDefinitions.join(", ")}. Uninstall those services first.`);

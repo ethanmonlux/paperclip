@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flipCurrentAtomic, initializeInstallStore, payloadPathFor, readInstallManifest, resolveInstallStorePaths, writeInstallManifestAtomic, type InstallRecord } from "../install-store.js";
 import { installCommand, type CommandRunner } from "../commands/install.js";
 import { updateCommand } from "../commands/update.js";
+import { uninstallCommand } from "../commands/uninstall.js";
 import {
   assertServiceLifecycleOutsideAgentRun,
   assertServiceLifecycleQuiet,
@@ -159,5 +160,39 @@ describe("update under lifecycle authority", () => {
     await updateCommand({ dryRun: true }, { paths, executablePath, runCommand, env, activeServiceRuns: async () => 5 });
     await updateCommand({ rollback: true, dryRun: true }, { paths, executablePath, env, activeServiceRuns: async () => 5 });
     expect(readInstallManifest(paths)?.version).toBe("2.0.0");
+  });
+});
+
+describe("uninstall under lifecycle authority", () => {
+  it("refuses a top-level uninstall while runs are active, before stopping the service or removing the payload", async () => {
+    const { paths, payload } = managedInstall();
+    const uninstall = vi.fn(async () => undefined);
+    const manager = { status: async () => ({ installed: true, active: true }), uninstall } as unknown as ServiceManager;
+    const countRunning = vi.fn(async () => 6);
+    await expect(uninstallCommand({
+      detectServiceManager: async () => ({ supported: true, manager }),
+      platform: "linux",
+      userHomeDir: path.join(root, "home"),
+      activeServiceRuns: () => countActiveServiceRuns({ detect: async () => ({ supported: true, manager }), countRunning }),
+    })).rejects.toThrow("Refusing to uninstall Paperclip while 6 agent runs are running");
+    expect(countRunning).toHaveBeenCalledTimes(1);
+    expect(uninstall).not.toHaveBeenCalled();
+    expect(fs.existsSync(payload)).toBe(true);
+    expect(fs.existsSync(paths.cliRoot)).toBe(true);
+  });
+
+  it("uninstalls once the service is quiet", async () => {
+    const { paths } = managedInstall();
+    const uninstall = vi.fn(async () => undefined);
+    const manager = { status: async () => ({ installed: true, active: true }), uninstall } as unknown as ServiceManager;
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    await uninstallCommand({
+      detectServiceManager: async () => ({ supported: true, manager }),
+      platform: "linux",
+      userHomeDir: path.join(root, "home"),
+      activeServiceRuns: async () => 0,
+    });
+    expect(uninstall).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(paths.cliRoot)).toBe(false);
   });
 });

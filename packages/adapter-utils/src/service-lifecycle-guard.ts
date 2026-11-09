@@ -30,8 +30,11 @@ export interface ServiceLifecycleGuardPath {
 }
 
 export interface ServiceLifecycleGuardMount {
+  /** Where the mount appears inside the sandbox. */
   path: string;
   access: "ro" | "rw";
+  /** The host path bound there, when it differs from `path`. Bubblewrap follows its symlinks. */
+  source?: string;
 }
 
 function uniqueAbsolute(paths: Array<string | null | undefined>): string[] {
@@ -96,10 +99,19 @@ export function mountReachesServiceLifecycleGuard(
   return isSameOrInside(guard.path, mount.path) || isSameOrInside(mount.path, guard.path);
 }
 
+async function realOrResolved(candidate: string): Promise<string> {
+  return fs.realpath(candidate).catch(() => path.resolve(candidate));
+}
+
 /**
  * Bubblewrap arguments that re-cover every guarded path a mount reaches. They
  * must follow all other mount arguments. Guarded paths missing on the host are
  * skipped: nothing can be mounted from them.
+ *
+ * Bubblewrap follows a mount source's symlinks, so reach is decided on real
+ * host paths, and the cover goes where the guarded content actually appears
+ * in the sandbox: an extra path that is an alias of `~/.paperclip` exposes
+ * `auth.json` under the alias, not at its canonical path.
  */
 export async function buildServiceLifecycleGuardArgs(input: {
   mounts: ServiceLifecycleGuardMount[];
@@ -109,19 +121,51 @@ export async function buildServiceLifecycleGuardArgs(input: {
   const guards = input.guards ?? resolveServiceLifecycleGuardPaths();
   const args: string[] = [];
   const applied = new Set<string>();
+  const mounts = await Promise.all(input.mounts.map(async (mount) => ({
+    ...mount,
+    real: await realOrResolved(mount.source ?? mount.path),
+  })));
   for (const guard of guards) {
-    const key = `${guard.protect}:${guard.path}`;
-    if (applied.has(key)) continue;
-    if (!input.mounts.some((mount) => mountReachesServiceLifecycleGuard(mount, guard))) continue;
     const stat = await fs.stat(guard.path).catch(() => null);
     if (!stat) continue;
-    applied.add(key);
-    if (guard.protect === "read_only") {
-      args.push("--ro-bind", guard.path, guard.path);
-    } else if (stat.isDirectory()) {
-      args.push("--tmpfs", guard.path);
-    } else {
-      args.push("--ro-bind", input.devNullPath ?? "/dev/null", guard.path);
+    const guardReal = await realOrResolved(guard.path);
+    for (const mount of mounts) {
+      if (guard.protect === "read_only" && mount.access !== "rw") continue;
+      let destination: string;
+      let bindSource: string;
+      let isDirectory: boolean;
+      if (isSameOrInside(guardReal, mount.real)) {
+        // The mount exposes the guarded path somewhere beneath its destination.
+        destination = path.join(mount.path, path.relative(mount.real, guardReal));
+        bindSource = guardReal;
+        isDirectory = stat.isDirectory();
+      } else if (isSameOrInside(mount.real, guardReal)) {
+        // The whole mount lies inside the guarded path. A hidden directory
+        // mounted at its own path is hidden whole, so nothing in it resolves;
+        // an alias elsewhere is covered at the alias.
+        const canonical = [guard.path, guardReal].find((candidate) => isSameOrInside(mount.path, candidate));
+        if (guard.protect === "hide" && stat.isDirectory() && canonical) {
+          destination = canonical;
+          bindSource = guardReal;
+          isDirectory = true;
+        } else {
+          destination = mount.path;
+          bindSource = mount.real;
+          isDirectory = (await fs.stat(mount.real).catch(() => null))?.isDirectory() ?? true;
+        }
+      } else {
+        continue;
+      }
+      const key = `${guard.protect}:${destination}`;
+      if (applied.has(key)) continue;
+      applied.add(key);
+      if (guard.protect === "read_only") {
+        args.push("--ro-bind", bindSource, destination);
+      } else if (isDirectory) {
+        args.push("--tmpfs", destination);
+      } else {
+        args.push("--ro-bind", input.devNullPath ?? "/dev/null", destination);
+      }
     }
   }
   return args;

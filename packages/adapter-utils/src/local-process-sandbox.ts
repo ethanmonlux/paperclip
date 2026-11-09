@@ -474,7 +474,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       }
       addParentDirectories(args, created, aliasPath);
       args.push("--bind", aliasTarget, aliasPath);
-      guardMounts.push({ path: aliasPath, access: "rw" });
+      guardMounts.push({ path: aliasPath, access: "rw", source: aliasTarget });
       created.add(aliasPath);
     }
 
