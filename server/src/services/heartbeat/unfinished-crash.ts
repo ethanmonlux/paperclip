@@ -1,3 +1,5 @@
+import { isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/domain/wake-context.js";
+
 /**
  * FAC-840 wait contract: an unfinished crashed run gets a bounded retry.
  *
@@ -20,4 +22,16 @@ export function isUnfinishedAdapterCrashRun(run: {
   if (run.status && run.status !== "failed") return false;
   if (run.errorCode !== "adapter_failed") return false;
   return run.exitCode === 0 || Boolean(run.signal);
+}
+
+/**
+ * An addressed-interaction wake (a pending card's addressee, or a resolved
+ * interaction's continuation) retries only through the interaction lane: it
+ * keeps `interaction_pending` so dispatch still admits a non-assignee
+ * addressee, and it stops once the card is no longer pending.
+ */
+export function isInteractionOwnedWake(contextSnapshot: unknown) {
+  const context = typeof contextSnapshot === "object" && contextSnapshot !== null && !Array.isArray(contextSnapshot)
+    ? contextSnapshot as Record<string, unknown> : {};
+  return context.wakeReason === "interaction_pending" || isResolvedInteractionContinuationWakeContext(context);
 }

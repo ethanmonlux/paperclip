@@ -13,6 +13,11 @@
  * owner that re-blocks without recording a wait cannot loop. After the cap the
  * task stays visible as `blocked_without_wait_path` in the blocked inbox and
  * Staple Console instead of being woken again.
+ *
+ * The scoped recovery worker drops an issue it has checked unless the check
+ * names a deadline, so a task still inside its grace period, or whose wake was
+ * refused, reports when to look again (`retryAt`), and a wake that failed to
+ * enqueue is counted in `failed` for the worker's retry.
  */
 import { and, eq, gte, isNull, lte, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, companies, issues, type Db } from "@paperclipai/db";
@@ -25,6 +30,8 @@ import { hasRecordedExternalOwner } from "./issue-graph-liveness.js";
 /** A run that just set Blocked may still be recording its wait. */
 export const ORPHAN_WAIT_GRACE_MS = 5 * 60_000;
 export const MAX_ORPHAN_WAKES_PER_DAY = 3;
+/** A refused wake (agent paused, wakes disabled) is offered again after this. */
+export const ORPHAN_REFUSED_WAKE_RETRY_MS = 10 * 60_000;
 const MAX_ORPHANS_PER_PASS = 100;
 const DAY_MS = 24 * 60 * 60_000;
 const SKIPPED_WAKE_STATUSES = ["skipped", "failed", "cancelled"];
@@ -52,7 +59,6 @@ export function orphanWaitWakeKey(issueId: string, blockedTransitionAt: Date | n
 
 /** Blocked, agent-owned tasks with no wait record in the database. Live paths are checked by the caller. */
 async function readOrphanCandidates(db: Db, opts: { companyId?: string | null; issueId?: string | null; now: Date }) {
-  const graceCutoff = new Date(opts.now.getTime() - ORPHAN_WAIT_GRACE_MS);
   const recoveryOriginKinds = Object.values(RECOVERY_ORIGIN_KINDS);
   return db.select({
     id: issues.id,
@@ -73,7 +79,6 @@ async function readOrphanCandidates(db: Db, opts: { companyId?: string | null; i
       sql`${issues.assigneeAgentId} is not null`,
       opts.companyId ? eq(issues.companyId, opts.companyId) : undefined,
       opts.issueId ? eq(issues.id, opts.issueId) : undefined,
-      or(isNull(issues.blockedTransitionAt), lte(issues.blockedTransitionAt, graceCutoff)),
       or(isNull(issues.monitorNextCheckAt), lte(issues.monitorNextCheckAt, opts.now)),
       // An unblock action owned by someone other than the assignee is a wait record.
       or(isNull(issues.unblockDescriptor),
@@ -106,11 +111,20 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
   hasLivePath: (companyId: string, issueId: string, agentId: string) => Promise<boolean>;
 }) {
   const now = opts.now ?? new Date();
-  const result = { orphans: 0, woken: 0, alreadyWoken: 0, capped: 0, livePathSkipped: 0, failed: 0, issueIds: [] as string[] };
+  const result = { orphans: 0, woken: 0, alreadyWoken: 0, capped: 0, livePathSkipped: 0, inGrace: 0, deferred: 0, failed: 0,
+    retryAt: null as number | null, issueIds: [] as string[] };
+  const retryAt = (at: number) => { result.retryAt = result.retryAt === null ? at : Math.min(result.retryAt, at); };
   const candidates = await readOrphanCandidates(db, { companyId: opts.companyId, issueId: opts.issueId, now });
   for (const candidate of candidates) {
     const agentId = candidate.assigneeAgentId!;
     if (hasRecordedExternalOwner(candidate.description)) continue;
+    const graceEndsAt = candidate.blockedTransitionAt
+      ? candidate.blockedTransitionAt.getTime() + ORPHAN_WAIT_GRACE_MS : null;
+    if (graceEndsAt !== null && graceEndsAt > now.getTime()) {
+      result.inGrace += 1;
+      retryAt(graceEndsAt);
+      continue;
+    }
     if (await opts.hasLivePath(candidate.companyId, candidate.id, agentId)) {
       result.livePathSkipped += 1;
       continue;
@@ -147,21 +161,25 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
         },
         issueStateGuard: { statuses: ["blocked"], assigneeAgentId: agentId },
       });
+      // Null is a refusal (wakes disabled, agent paused): no wake row exists,
+      // so offer it again later rather than dropping the obligation.
       if (!wake) {
-        result.failed += 1;
+        result.deferred += 1;
+        retryAt(now.getTime() + ORPHAN_REFUSED_WAKE_RETRY_MS);
         continue;
       }
-      result.woken += 1;
-      result.issueIds.push(candidate.id);
-      await logActivity(db, {
-        companyId: candidate.companyId, actorType: "system", actorId: "wait_contract", agentId,
-        action: "issue.wait_orphan_woken", entityType: "issue", entityId: candidate.id,
-        details: { identifier: candidate.identifier, idempotencyKey,
-          blockedTransitionAt: candidate.blockedTransitionAt?.toISOString() ?? null, wakesToday: priorWakes.length + 1 },
-      });
     } catch {
       result.failed += 1;
+      continue;
     }
+    result.woken += 1;
+    result.issueIds.push(candidate.id);
+    await logActivity(db, {
+      companyId: candidate.companyId, actorType: "system", actorId: "wait_contract", agentId,
+      action: "issue.wait_orphan_woken", entityType: "issue", entityId: candidate.id,
+      details: { identifier: candidate.identifier, idempotencyKey,
+        blockedTransitionAt: candidate.blockedTransitionAt?.toISOString() ?? null, wakesToday: priorWakes.length + 1 },
+    }).catch(() => undefined);
   }
   return result;
 }

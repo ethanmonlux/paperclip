@@ -6107,6 +6107,10 @@ export function recoveryService(
           (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, issueId, treeControlSvc)),
       });
       result.orphanWaitsWoken = orphans.woken;
+      // A failed orphan wake is retried by the worker; a grace period or a
+      // refused wake names when the worker looks again.
+      result.enqueueFailed += orphans.failed;
+      if (orphans.retryAt !== null) opts?.onDeferredDeadline?.(orphans.retryAt);
       if (orphans.woken > 0) {
         logger.warn({ woken: orphans.woken, issueIds: orphans.issueIds, capped: orphans.capped },
           "wait contract woke owners of blocked tasks with no wait record");
