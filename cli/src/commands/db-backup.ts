@@ -18,7 +18,7 @@ type DbBackupOptions = {
   json?: boolean;
 };
 
-function resolveConnectionString(configPath?: string): { value: string; source: string } {
+export function resolveConnectionString(configPath?: string): { value: string; source: string } {
   const envUrl = process.env.DATABASE_URL?.trim();
   if (envUrl) return { value: envUrl, source: "DATABASE_URL" };
 

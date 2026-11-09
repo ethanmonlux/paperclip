@@ -8,6 +8,7 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
+  placeMaintenanceHoldRequestSchema,
 } from "@paperclipai/shared";
 import { conflict, forbidden } from "../errors.js";
 import { assertAgentsReadyForEnvironmentChange } from "../services/plugin-environment-driver.js";
@@ -31,6 +32,7 @@ import {
   type ActivityPublication,
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
+import { maintenanceHoldService } from "../services/maintenance-hold.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoard, assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
@@ -144,6 +146,7 @@ export function instanceSettingsRoutes(
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
   const heartbeat = heartbeatService(db, { pluginWorkerManager: pluginWorkers });
+  const maintenanceHold = maintenanceHoldService(db);
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
@@ -472,6 +475,71 @@ export function instanceSettingsRoutes(
       });
     }
     res.json({ wasActive });
+  });
+
+  // Managed nightly maintenance window (FAC-840 C1). Only a board instance
+  // admin, which the managed upgrade script authenticates as, can place or
+  // release the hold; an agent key is refused by assertBoard. Wakes keep
+  // queueing durably while it is active, and it always lifts at its expiry.
+  async function logMaintenanceHoldActivity(req: Request, action: string, details: Record<string, unknown>) {
+    const actor = getActorInfo(req);
+    const companyIds = await svc.listCompanyIds();
+    const postCommitActivityPublications: ActivityPublication[] = [];
+    await db.transaction((tx) => Promise.all(companyIds.map((companyId) => logActivity(tx as unknown as Db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action,
+      entityType: "instance_settings",
+      entityId: "default",
+      details,
+    }, postCommitActivityPublications))));
+    publishActivitiesBestEffort(postCommitActivityPublications, action);
+  }
+
+  router.get("/instance/maintenance-hold", async (req, res) => {
+    assertBoardOrgAccess(req);
+    res.set("cache-control", "no-store");
+    res.json(await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()));
+  });
+
+  router.post("/instance/maintenance-hold", validate(placeMaintenanceHoldRequestSchema), async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const actor = getActorInfo(req);
+    const result = await maintenanceHold.place({
+      drainMs: req.body.drainMinutes === undefined ? null : req.body.drainMinutes * 60_000,
+      maxMs: req.body.maxMinutes === undefined ? null : req.body.maxMinutes * 60_000,
+      reason: req.body.reason ?? null,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+    });
+    await logMaintenanceHoldActivity(req, result.created ? "instance.maintenance_hold.placed" : "instance.maintenance_hold.renewed", {
+      holdId: result.row.id,
+      startedAt: result.row.startedAt,
+      drainDeadlineAt: result.row.drainDeadlineAt,
+      expiresAt: result.row.expiresAt,
+    });
+    res.status(result.created ? 201 : 200).json({ created: result.created, ...await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()) });
+  });
+
+  router.delete("/instance/maintenance-hold", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const reason = typeof req.query.reason === "string" ? req.query.reason : "released";
+    const released = await maintenanceHold.release(reason);
+    if (released.wasActive) {
+      await logMaintenanceHoldActivity(req, "instance.maintenance_hold.released", {
+        holdId: released.hold?.id ?? null,
+        reason: released.hold?.releaseReason ?? reason,
+      });
+      // Held work starts in priority order, staggered across agents.
+      void maintenanceHold.releaseHeldWork(heartbeat).catch(err => {
+        logger.error({ err }, "failed to start held work after the maintenance hold was released; it remains queued");
+      });
+    }
+    res.json({ wasActive: released.wasActive, ...await maintenanceHold.status(new Date(), () => heartbeat.getTaskDrainStatus()) });
   });
 
   // Cloud lifecycle read-back: the harness answers a tenant's archive

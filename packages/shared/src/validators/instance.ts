@@ -143,6 +143,15 @@ export const startTaskDrainRequestSchema = z.object({
   (typeof value.ttlMs === "number" && value.ttlMs >= 5_000 && value.ttlMs <= 300_000),
   { message: "Idle holds require ttlMs between 5000 and 300000", path: ["ttlMs"] });
 
+/** Managed nightly maintenance window (FAC-840 C1): place or renew the hold. */
+export const MAX_MAINTENANCE_HOLD_MINUTES = 240;
+export const placeMaintenanceHoldRequestSchema = z.object({
+  drainMinutes: z.number().int().min(0).max(MAX_MAINTENANCE_HOLD_MINUTES).optional(),
+  maxMinutes: z.number().int().min(1).max(MAX_MAINTENANCE_HOLD_MINUTES).optional(),
+  reason: z.string().trim().max(200).optional(),
+}).strict();
+export type PlaceMaintenanceHoldRequest = z.infer<typeof placeMaintenanceHoldRequestSchema>;
+
 export type InstanceGeneralSettings = z.infer<typeof instanceGeneralSettingsSchema>;
 // The patch schema removes each default so an absent key stays absent. Declare
 // the type from the full settings type, so every field keeps its precise type.
