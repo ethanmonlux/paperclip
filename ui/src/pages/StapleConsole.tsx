@@ -75,6 +75,7 @@ function StepBar({ steps }: { steps: StapleConsoleStepCell[] }) {
               cell.state === "done" && "bg-emerald-500",
               cell.state === "current" && "bg-sky-500",
               cell.state === "todo" && "bg-muted",
+              cell.state === "skipped" && "border border-dashed border-muted-foreground/40",
             )}
           />
           <div
@@ -133,6 +134,9 @@ function ConsoleCard({
       <div className="mt-3">
         <StepBar steps={card.steps} />
       </div>
+      {card.completionNote ? (
+        <p className="mt-1 text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{card.completionNote}</p>
+      ) : null}
 
       <dl className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
         <div>

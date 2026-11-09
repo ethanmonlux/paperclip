@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  agents,
   companies,
   createDb,
   issueAccessGrants,
+  issueComments,
+  issueExecutionDecisions,
   issueRelations,
+  issueWorkProducts,
   issues,
   projectAccessMembers,
   projects,
@@ -73,6 +77,61 @@ suite("staple console service", () => {
     expect(boardText(permitted)).toContain("Secret project task");
     expect(boardText(permitted)).toContain("Secret open descendant");
     expect(boardText(permitted)).not.toContain("Secret private root");
+  });
+
+  it("derives rounds from reviewer verdicts and native decisions, and Merged only from a merged PR (FAC-837/838)", async () => {
+    const companyId = await seedCompany();
+    const [coord, builder, reviewer] = await db.insert(agents).values([
+      { companyId, name: "Workflow Coordinator", role: "general", adapterType: "codex_local" },
+      { companyId, name: "Workflow Engineer", role: "engineer", adapterType: "claude_local" },
+      { companyId, name: "Workflow Reviewer", role: "qa", adapterType: "codex_local" },
+    ]).returning();
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60_000);
+    const [root] = await db.insert(issues).values({
+      companyId, title: "Console corrections", status: "blocked", assigneeAgentId: coord!.id, createdAt: hoursAgo(60),
+    }).returning();
+    const [impl] = await db.insert(issues).values({
+      companyId, title: "Implement console corrections", status: "in_progress", parentId: root!.id, assigneeAgentId: builder!.id, createdAt: hoursAgo(60),
+    }).returning();
+    // Finished two days ago, so only the card scope (not "finished today") keeps its verdict.
+    const [oldReview] = await db.insert(issues).values({
+      companyId, title: "Review PR #31", status: "done", parentId: root!.id, assigneeAgentId: reviewer!.id, createdAt: hoursAgo(60),
+      completedAt: hoursAgo(48),
+    }).returning();
+    const [review] = await db.insert(issues).values({
+      companyId, title: "Review PR #32", status: "in_progress", parentId: root!.id, assigneeAgentId: reviewer!.id, createdAt: hoursAgo(60),
+    }).returning();
+    await db.insert(issueComments).values([
+      { companyId, issueId: oldReview!.id, authorAgentId: reviewer!.id, body: "**PASS** at abc123.", createdAt: hoursAgo(49) },
+      { companyId, issueId: review!.id, authorAgentId: reviewer!.id, body: "**REQUEST CHANGES** for PR 32 at def456.", createdAt: hoursAgo(3) },
+      // The builder asking for re-review states no verdict, and a builder "PASS" on the review task never counts.
+      { companyId, issueId: review!.id, authorAgentId: builder!.id, body: "PASS: fixed, verification please.", createdAt: hoursAgo(2) },
+    ]);
+    await db.insert(issueExecutionDecisions).values({
+      companyId, issueId: impl!.id, stageId: randomUUID(), stageType: "review", actorAgentId: reviewer!.id,
+      outcome: "changes_requested", body: "Native stage verdict", createdAt: hoursAgo(1),
+    });
+
+    const [doneTask] = await db.insert(issues).values({
+      companyId, title: "Console nav link", status: "done", assigneeAgentId: coord!.id, completedAt: hoursAgo(0.5),
+    }).returning();
+    await db.insert(issueWorkProducts).values({
+      companyId, issueId: doneTask!.id, type: "pull_request", provider: "github", title: "PR 33",
+      url: "https://github.com/acme/widgets/pull/33", status: "active", metadata: { state: "open" },
+    });
+
+    const svc = stapleConsoleService(db, { credentialProvider: async () => null });
+    const userId = randomUUID();
+    const board = await svc.board(companyId, { type: "board", userId, authorizingUserId: userId });
+    const card = cards(board).find((candidate) => candidate.id === root!.id)!;
+    // Approval (old review), changes requested (open review), then a native changes-requested
+    // verdict with no correction run between: one correction, back in Build round 2.
+    expect(card.step).toBe("build");
+    expect(card.round).toBe(2);
+    const done = cards(board).find((candidate) => candidate.id === doneTask!.id)!;
+    expect(done).toMatchObject({ step: "review", completion: "task_done", mergedToday: false });
+    expect(done.completionNote).toBe("Task done; widgets#33 is still open, not merged");
+    expect(board.header.mergedToday).toBe(0);
   });
 
   it("keeps PR links with unknown state when GitHub fails or the refresh is capped, dropping only 404 guesses", async () => {

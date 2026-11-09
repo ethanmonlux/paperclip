@@ -8,6 +8,7 @@ import {
   stapleConsoleDefaultRepo,
   stapleConsoleFreshness,
   stapleConsolePrStatusText,
+  stapleConsoleVerdictOfComment,
   stuckBlockedWithoutBlocker,
   stuckCiNotStarted,
   stuckInProgressIdle,
@@ -18,6 +19,7 @@ import {
   type StapleConsoleIssueInput,
   type StapleConsoleIssueRunContext,
   type StapleConsolePullRequestInput,
+  type StapleConsoleReviewDecisionInput,
   type StapleConsoleRunInput,
 } from "./staple-console.js";
 
@@ -266,7 +268,7 @@ describe("buildStapleConsoleBoard", () => {
     expect(board.header.inFlight).toBe(1);
   });
 
-  it("returns to Build round 2 after a review sends work back", () => {
+  it("returns to Build round 2 after a review requests changes", () => {
     const board = buildStapleConsoleBoard(boardInput({
       issues: [
         issue({ id: "root", identifier: "STA-10", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
@@ -274,6 +276,7 @@ describe("buildStapleConsoleBoard", () => {
         issue({ id: "rev", identifier: "STA-12", title: "Independent review of PR #703", parentId: "root", status: "done", assigneeAgentId: "rev", completedAt: minutesAgo(90) }),
       ],
       runs: [run({ id: "r1", issueId: "impl", status: "running", startedAt: minutesAgo(20), finishedAt: null })],
+      reviewDecisions: [{ issueId: "rev", outcome: "changes_requested", at: minutesAgo(90), source: "verdict_comment" }],
     }));
     const card = board.lanes.flatMap((lane) => lane.cards)[0]!;
     expect(card.step).toBe("build");
@@ -307,6 +310,10 @@ describe("buildStapleConsoleBoard", () => {
         issue({ id: "m", identifier: "STA-30", title: "FAC-832: Self-serve accounts", status: "done", completedAt: minutesAgo(60), assigneeAgentId: "coord" }),
         issue({ id: "old", identifier: "STA-31", title: "FAC-626 | Account bridge", status: "done", completedAt: minutesAgo(60 * 30), assigneeAgentId: "coord" }),
       ],
+      pullRequests: [{
+        issueId: "m", repo: "ethanmonlux/facette", number: 900, url: "https://github.com/ethanmonlux/facette/pull/900",
+        state: "merged", mergedAt: minutesAgo(70), ci: "unknown", ciStartedAt: null, source: "github",
+      }],
     }));
     const cards = board.lanes.flatMap((lane) => lane.cards);
     expect(cards.map((card) => card.identifier)).toEqual(["STA-30"]);
@@ -342,6 +349,193 @@ describe("buildStapleConsoleBoard", () => {
     const card = board.lanes.find((lane) => lane.key === "updates")!.cards[0]!;
     expect(card.step).toBe("ci");
     expect(card.stepSince).toBe(minutesAgo(15));
+  });
+});
+
+describe("merged means a merged PR, not a Done task (FAC-837)", () => {
+  const root = (overrides: Partial<StapleConsoleIssueInput> = {}) => issue({
+    id: "root", identifier: "STA-60", title: "FAC-829: Content packs", status: "done",
+    completedAt: minutesAgo(30), assigneeAgentId: "coord", ...overrides,
+  });
+  const pr = (overrides: Partial<StapleConsolePullRequestInput>): StapleConsolePullRequestInput => ({
+    issueId: "root", repo: "ethanmonlux/facette", number: 77, url: "https://github.com/ethanmonlux/facette/pull/77",
+    state: "open", mergedAt: null, ci: "failure", ciStartedAt: minutesAgo(40), source: "github", ...overrides,
+  });
+  const onlyCard = (board: ReturnType<typeof buildStapleConsoleBoard>) => board.lanes.flatMap((lane) => lane.cards)[0]!;
+
+  it("keeps a Done task whose PR is still open with failing CI out of Merged and the merged count", () => {
+    const board = buildStapleConsoleBoard(boardInput({ issues: [root()], pullRequests: [pr({})] }));
+    const card = onlyCard(board);
+    expect(card.step).toBe("ci");
+    expect(card.completion).toBe("task_done");
+    expect(card.completionNote).toBe("Task done; facette#77 is still open, not merged");
+    expect(card.mergedToday).toBe(false);
+    expect(card.steps.find((cell) => cell.step === "merged")!.state).toBe("todo");
+    expect(card.pullRequests[0]).toMatchObject({ state: "open", ci: "failure" });
+    expect(board.header.mergedToday).toBe(0);
+  });
+
+  it("shows a Done task with no PR as task-only completion, not a merge", () => {
+    const board = buildStapleConsoleBoard(boardInput({ issues: [root()] }));
+    const card = onlyCard(board);
+    expect(card.step).toBe("done");
+    expect(card.completion).toBe("task_done");
+    expect(card.completionNote).toBe("Task done; no PR, so nothing was merged");
+    expect(card.mergedToday).toBe(false);
+    expect(card.steps.map((cell) => cell.state)).toEqual(["done", "done", "skipped", "skipped", "skipped"]);
+    expect(board.header.mergedToday).toBe(0);
+    expect(board.header.inFlight).toBe(0);
+  });
+
+  it("does not treat an unknown PR state as merged", () => {
+    const card = onlyCard(buildStapleConsoleBoard(boardInput({
+      issues: [root()],
+      pullRequests: [pr({ state: "unknown", ci: "unknown", source: "reference" })],
+    })));
+    expect(card.step).toBe("done");
+    expect(card.completionNote).toBe("Task done; facette#77 state unknown, merge not confirmed");
+    expect(card.mergedToday).toBe(false);
+  });
+
+  it("counts a confirmed merge on its merge date, not the task completion date", () => {
+    const today = onlyCard(buildStapleConsoleBoard(boardInput({
+      issues: [root({ completedAt: minutesAgo(5) })],
+      pullRequests: [pr({ state: "merged", mergedAt: minutesAgo(45), ci: "unknown" })],
+    })));
+    expect(today).toMatchObject({ step: "merged", completion: "merged", completionNote: null, mergedToday: true, stepSince: minutesAgo(45) });
+    expect(today.steps.map((cell) => cell.state)).toEqual(["done", "done", "done", "done", "current"]);
+
+    // Merged yesterday (Denver), task closed today: shown as finished, not merged today.
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [root({ completedAt: minutesAgo(5) })],
+      pullRequests: [pr({ state: "merged", mergedAt: minutesAgo(60 * 10), ci: "unknown" })],
+    }));
+    expect(onlyCard(board)).toMatchObject({ step: "merged", mergedToday: false });
+    expect(board.header.mergedToday).toBe(0);
+  });
+
+  it("keeps completed review or artifact work out of the merged count", () => {
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [
+        root({ title: "Independent 380 px visual review of the Console", assigneeAgentId: "rev" }),
+        issue({ id: "art", identifier: "STA-61", title: "Item art export (FAC-830)", status: "done", completedAt: minutesAgo(20), assigneeAgentId: "coord" }),
+      ],
+    }));
+    const cards = board.lanes.flatMap((lane) => lane.cards);
+    expect(cards).toHaveLength(2);
+    expect(cards.every((card) => card.step === "done" && card.completion === "task_done" && !card.mergedToday)).toBe(true);
+    expect(board.header.mergedToday).toBe(0);
+  });
+});
+
+describe("rounds come from review verdicts (FAC-838)", () => {
+  const issuesWithOpenReview = (reviewStatus = "in_progress") => [
+    issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+    issue({ id: "impl", identifier: "STA-71", title: "Implement backpack art", parentId: "root", status: "in_progress", assigneeAgentId: "eng" }),
+    issue({ id: "rev", identifier: "STA-72", title: "Independent review of PR #703", parentId: "root", status: reviewStatus, assigneeAgentId: "rev", startedAt: minutesAgo(200) }),
+  ];
+  const decision = (outcome: StapleConsoleReviewDecisionInput["outcome"], minutes: number): StapleConsoleReviewDecisionInput =>
+    ({ issueId: "rev", outcome, at: minutesAgo(minutes), source: "verdict_comment" });
+  const cardOf = (input: Partial<StapleConsoleInput>) =>
+    buildStapleConsoleBoard(boardInput(input)).lanes.flatMap((lane) => lane.cards)[0]!;
+
+  it("goes back to Build round 2 while the same review stays open after changes are requested", () => {
+    const card = cardOf({
+      issues: issuesWithOpenReview(),
+      runs: [
+        run({ id: "build1", issueId: "impl", startedAt: minutesAgo(300), createdAt: minutesAgo(300), finishedAt: minutesAgo(250) }),
+        run({ id: "review1", issueId: "rev", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(120) }),
+        run({ id: "fix", issueId: "impl", status: "running", startedAt: minutesAgo(30), createdAt: minutesAgo(30), finishedAt: null }),
+      ],
+      reviewDecisions: [decision("changes_requested", 120)],
+    });
+    expect(card.step).toBe("build");
+    expect(card.round).toBe(2);
+    expect(card.stepSince).toBe(minutesAgo(120));
+    expect(card.steps.find((cell) => cell.step === "build")).toEqual({ step: "build", state: "current", rounds: 2 });
+    expect(card.steps.find((cell) => cell.step === "review")).toEqual({ step: "review", state: "todo", rounds: 1 });
+  });
+
+  it("returns to Review round 2 once the reviewer picks the correction up in that same review", () => {
+    const card = cardOf({
+      issues: issuesWithOpenReview(),
+      runs: [
+        run({ id: "review1", issueId: "rev", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(120) }),
+        run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+        run({ id: "review2", issueId: "rev", agentId: "rev", status: "running", startedAt: minutesAgo(10), createdAt: minutesAgo(10), finishedAt: null }),
+      ],
+      reviewDecisions: [decision("changes_requested", 120)],
+    });
+    expect(card).toMatchObject({ step: "review", round: 2, stepSince: minutesAgo(10) });
+  });
+
+  it("stays round 1 after an approval with no correction, even when a later implementation run happens", () => {
+    const card = cardOf({
+      issues: [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "in_progress", assigneeAgentId: "coord" }),
+        issue({ id: "impl", identifier: "STA-71", title: "Implement backpack art", parentId: "root", status: "done", assigneeAgentId: "eng", completedAt: minutesAgo(150) }),
+        issue({ id: "rev", identifier: "STA-72", title: "Independent review of PR #703", parentId: "root", status: "done", assigneeAgentId: "rev", completedAt: minutesAgo(90) }),
+      ],
+      runs: [
+        run({ id: "build1", issueId: "impl", startedAt: minutesAgo(300), createdAt: minutesAgo(300), finishedAt: minutesAgo(250) }),
+        run({ id: "merge", issueId: "root", agentId: "coord", startedAt: minutesAgo(20), createdAt: minutesAgo(20), finishedAt: minutesAgo(15) }),
+      ],
+      reviewDecisions: [decision("approved", 90)],
+    });
+    expect(card).toMatchObject({ step: "review", round: 1, stepSince: minutesAgo(90) });
+    expect(card.steps.find((cell) => cell.step === "review")).toEqual({ step: "review", state: "current", rounds: 1 });
+  });
+
+  it("counts a second correction in the same open review as round 3, and an approval adds none", () => {
+    const runs = [
+      run({ id: "review1", issueId: "rev", agentId: "rev", startedAt: minutesAgo(400), createdAt: minutesAgo(400), finishedAt: minutesAgo(380) }),
+      run({ id: "fix1", issueId: "impl", startedAt: minutesAgo(350), createdAt: minutesAgo(350), finishedAt: minutesAgo(300) }),
+      run({ id: "review2", issueId: "rev", agentId: "rev", startedAt: minutesAgo(250), createdAt: minutesAgo(250), finishedAt: minutesAgo(200) }),
+      run({ id: "fix2", issueId: "impl", status: "running", startedAt: minutesAgo(40), createdAt: minutesAgo(40), finishedAt: null }),
+    ];
+    // A restated verdict with no correction run between does not open another round.
+    const twice = [decision("changes_requested", 380), decision("changes_requested", 375), decision("changes_requested", 200)];
+    const second = cardOf({ issues: issuesWithOpenReview(), runs, reviewDecisions: twice });
+    expect(second).toMatchObject({ step: "build", round: 3 });
+    expect(second.steps.find((cell) => cell.step === "review")!.rounds).toBe(2);
+
+    const approved = cardOf({
+      issues: issuesWithOpenReview(),
+      runs: [...runs.slice(0, 3), run({ id: "fix2", issueId: "impl", startedAt: minutesAgo(150), createdAt: minutesAgo(150), finishedAt: minutesAgo(100) }),
+        run({ id: "review3", issueId: "rev", agentId: "rev", startedAt: minutesAgo(60), createdAt: minutesAgo(60), finishedAt: minutesAgo(30) })],
+      reviewDecisions: [...twice, decision("approved", 30)],
+    });
+    expect(approved).toMatchObject({ step: "review", round: 3 });
+    expect(approved.steps.find((cell) => cell.step === "review")).toEqual({ step: "review", state: "current", rounds: 3 });
+  });
+
+  it("does not count a finished review without a recorded verdict as a correction", () => {
+    const card = cardOf({
+      issues: [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+        issue({ id: "impl", identifier: "STA-71", title: "Implement backpack art", parentId: "root", status: "in_progress", assigneeAgentId: "eng" }),
+        issue({ id: "rev", identifier: "STA-72", title: "Independent review of PR #703", parentId: "root", status: "done", assigneeAgentId: "rev", completedAt: minutesAgo(90) }),
+      ],
+      runs: [run({ id: "r1", issueId: "impl", status: "running", startedAt: minutesAgo(20), finishedAt: null })],
+    });
+    expect(card).toMatchObject({ step: "build", round: 1 });
+  });
+});
+
+describe("stapleConsoleVerdictOfComment", () => {
+  it("reads the verdict a reviewer states in the opening line", () => {
+    expect(stapleConsoleVerdictOfComment("**REQUEST CHANGES** for [PR 30](https://x) at `ca61c39`.")).toBe("changes_requested");
+    expect(stapleConsoleVerdictOfComment("Source review at 84197ff requires correction of one P1 task-privacy bypass")).toBe("changes_requested");
+    expect(stapleConsoleVerdictOfComment("**PASS — both review findings resolved in source** at `dfd96b0`. This supersedes REQUEST CHANGES.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("Source review passes the Workflow integration bar at `aaba163`: no remaining P0/P1.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("## Verdict: FAIL\nDetails")).toBe("changes_requested");
+    expect(stapleConsoleVerdictOfComment("Approved at abc123.")).toBe("approved");
+  });
+
+  it("returns null when the opening line states no verdict", () => {
+    expect(stapleConsoleVerdictOfComment("Correction verification please: PR 30 head dfd96b0, pushed 19:06Z.")).toBeNull();
+    expect(stapleConsoleVerdictOfComment("Passing this to the coordinator.\nREQUEST CHANGES")).toBeNull();
+    expect(stapleConsoleVerdictOfComment("Approval requested for the release.")).toBeNull();
   });
 });
 
