@@ -9,6 +9,7 @@ import {
   Users,
   MessageCircle,
   Inbox,
+  Gauge,
 } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -57,6 +58,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
   // tracks the live count, so the bar stays evenly divided in every mix.
   const items = useMemo<MobileNavItem[]>(
     () => coordinatorWorkspaceEnabled ? [
+      { type: "link", to: "/console", label: "Console", icon: Gauge },
       { type: "link", to: "/chats", label: "Chat", icon: MessageCircle },
       { type: "link", to: "/issues", label: "Tasks", icon: CircleCheck },
       { type: "link", to: "/decisions", label: "Inbox", icon: Inbox, badge: attentionCount },

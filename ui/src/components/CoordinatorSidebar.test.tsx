@@ -166,7 +166,7 @@ describe("Coordinator pinned pages", () => {
     localStorage.setItem("paperclip.coordinator.pinned-nav.v1:reviewer", JSON.stringify(["/routines", "/projects", "/unknown", "https://example.com"]));
     await renderSidebar();
     expect(Array.from(navigation().querySelectorAll("a")).map(link => link.getAttribute("href")))
-      .toEqual(["/chats", "/issues", "/decisions", "/routines", "/projects"]);
+      .toEqual(["/chats", "/issues", "/decisions", "/console", "/routines", "/projects"]);
     fixture.userId = "other-user";
     await renderSidebar();
     expect(pinnedPage("/projects")).toBeNull();
