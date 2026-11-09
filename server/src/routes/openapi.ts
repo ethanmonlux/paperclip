@@ -6250,6 +6250,15 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/staple-console",
+  tags: ["dashboard"],
+  summary: "Get the read-only Staple Console board",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
 // ─── Sidebar ─────────────────────────────────────────────────────────────────
 
 registry.registerPath({
