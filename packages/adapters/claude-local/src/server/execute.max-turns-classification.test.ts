@@ -31,8 +31,8 @@ const POISONED_TOOL_OUTPUT =
 
 function buildProcResult(resultEvent: Record<string, unknown>, extraStdout = "") {
   return {
-    exitCode: 1,
-    signal: null,
+    exitCode: 1 as number | null,
+    signal: null as string | null,
     timedOut: false,
     stdout: [
       JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
@@ -97,6 +97,30 @@ describe("claude_local failure classification precedence", () => {
     mockExecutionResult(
       buildProcResult({ is_error: true, subtype: "error", result: "API Error: 404 model not found" }),
     );
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorCode).toBe("model_not_found");
+  });
+
+  // FAC-840 replay of STA-159 run 759df0bd: the CLI stopped with no result
+  // event while its tool output quoted the detector phrase. The run was sealed
+  // model_not_found and the task blocked as "missing secret/env bindings".
+  it.each([
+    ["exit 0", { exitCode: 0, signal: null }],
+    ["signal kill", { exitCode: null, signal: "SIGTERM" }],
+  ])("keeps an unparsed %s crash retryable when tool output mentions model_not_found", async (_case, exit) => {
+    const truncated = buildProcResult({}, POISONED_TOOL_OUTPUT);
+    mockExecutionResult({ ...truncated, ...exit, stdout: truncated.stdout.split("\n").slice(0, 2).join("\n") });
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.errorMessage).toBe("Failed to parse claude JSON output");
+    expect(result.errorCode).not.toBe("model_not_found");
+  });
+
+  it("still reports model_not_found from an unparsed non-zero exit", async () => {
+    mockExecutionResult({ ...buildProcResult({}), stdout: "", stderr: "API Error: 404 model not found" });
 
     const result = await execute(buildContext() as never);
 

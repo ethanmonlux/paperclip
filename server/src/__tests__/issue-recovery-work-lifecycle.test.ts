@@ -25,14 +25,14 @@ function fixture() {
     select: () => query(), selectDistinct: () => query(true),
     transaction: async (callback: (tx: any) => Promise<unknown>) => callback({ execute, select: db.select, selectDistinct: db.selectDistinct, transaction: db.transaction }),
   });
-  const state = { draining: false, standby: false, suppressed: false, deadline: null as number | null, fail: false, incomplete: false };
+  const state = { draining: false, standby: false, suppressed: false, deadline: null as number | null, fail: false, incomplete: false, enqueueFailed: 0 };
   const check = vi.fn(async (scope: { onDeferredDeadline(at: number): void }) => {
     if (state.fail) throw new Error("database unavailable");
     if (state.deadline !== null && state.deadline > Date.now()) scope.onDeferredDeadline(state.deadline);
   });
   const orphanBlockers = vi.fn(async () => {}), recoveryActions = vi.fn(async () => {});
   const suppression = vi.fn(async () => state.suppressed);
-  const owner = { orphanBlockers, recoveryActions, stranded: check, dependencies: async (scope: any) => { await check(scope); return { enqueueFailed: 0 }; },
+  const owner = { orphanBlockers, recoveryActions, stranded: check, dependencies: async (scope: any) => { await check(scope); return { enqueueFailed: state.enqueueFailed }; },
     locks: check, watchdogs: async (scope: any) => { await check(scope); return { incomplete: state.incomplete ? 1 : 0 }; },
     schedulingSuppressed: suppression };
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !state.standby,
@@ -140,6 +140,15 @@ describe("issue recovery obligation lifecycle", () => {
     expect(f.coordinator.nextWakeAt()).toBe(1_600_000);
     await vi.advanceTimersByTimeAsync(600_000);
     expect(f.recoveryActions).toHaveBeenCalledTimes(2);
+    expect(f.coordinator.nextWakeAt()).toBeNull();
+  });
+  // FAC-840: an orphan wait wake that failed to enqueue counts as dependency debt.
+  it("retries a blocked task whose dependency or orphan wake failed to enqueue, with no new write", async () => {
+    const f = fixture(); f.rows.issues.push({ id: "issue", companyId: "selected" }); f.state.enqueueFailed = 1;
+    await f.worker.ready; const loaded = f.load.mock.calls.length, checked = f.check.mock.calls.length;
+    expect(f.coordinator.nextWakeAt()).toBe(1_030_000);
+    f.state.enqueueFailed = 0; await vi.advanceTimersByTimeAsync(30_000);
+    expect(f.check.mock.calls.length).toBeGreaterThan(checked); expect(f.load).toHaveBeenCalledTimes(loaded);
     expect(f.coordinator.nextWakeAt()).toBeNull();
   });
   it("keeps an incomplete watchdog subtree as concrete retry debt", async () => {

@@ -16,7 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeRunLogCoverageVerifier, formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -50,6 +50,11 @@ import { hasAcknowledgedNativeReassignmentStopIntent } from "../acknowledged-nat
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { heartbeatService } from "../heartbeat.js";
+import { createHeartbeatRetries, PENDING_ADDRESSEE_RETRY_REASON } from "./retries.js";
+import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
+import { createRunDispatch } from "../../modules/run-dispatch/index.js";
+import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../conversation-continuation.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -1154,6 +1159,68 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       .toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
     expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
   });
+
+  // FAC-840 replay of STA-153 through completion: a Coordinator woken to answer
+  // a card on its Engineer's task crashes (exit 0, unparseable output). The
+  // retry must stay an interaction_pending wake, or due promotion rejects the
+  // non-assignee successor as reassigned.
+  it("retries an addressee's exit-0 crash through its interaction lane and promotes the successor", async () => {
+    const f = await fixture();
+    const companyId = f.run.companyId;
+    await db.update(agents).set({ adapterType: "claude_local", status: "idle" }).where(eq(agents.id, f.agent.id));
+    const coordinator = { ...f.agent, adapterType: "claude_local", status: "idle" as const };
+    const [engineer] = await db.insert(agents).values({ companyId, name: "Engineer", adapterType: "claude_local" }).returning();
+    const [child] = await db.insert(issues).values({ companyId, title: "Engineer task", status: "blocked",
+      assigneeAgentId: engineer.id }).returning();
+    const [engineerRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: engineer.id, scopeKind: "issue",
+      issueId: child.id, status: "succeeded", finishedAt: new Date(), contextSnapshot: { issueId: child.id } }).returning();
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId: child.id, kind: "ask_user_questions",
+      status: "pending", addresseeAgentId: coordinator.id, createdByAgentId: engineer.id, sourceRunId: engineerRun.id,
+      continuationPolicy: "wake_assignee", payload: { version: 1, questions: [] } as never });
+    const [running] = await db.update(heartbeatRuns).set({ scopeKind: "issue", issueId: child.id, contextSnapshot: {
+      issueId: child.id, taskId: child.id, source: "issue.interaction.created", wakeReason: "interaction_pending",
+      interactionId, interactionKind: "ask_user_questions", sourceRunId: engineerRun.id,
+    } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const state = createHeartbeatRunState(db);
+    const retries = createHeartbeatRetries(db, {
+      hasCaseHandoffForRun: async run => Boolean(await pendingCaseHandoffForRun(db, run.id, run.companyId)),
+      runDispatch: createRunDispatch(db), getAgent: state.getAgent, getRun: state.getRun,
+      resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup,
+      resolveResponsibleUserIdForRunContext: vi.fn(async () => "founder"),
+      getAgentInvokability: agent => evaluateAgentInvokabilityFromDb(db, agent),
+      appendRunEvent: vi.fn(async () => undefined),
+      escalatePlanApprovalResumeFailureNeedsAttention: vi.fn(async () => null),
+      recordPlanApprovalResumeFailureRetry: vi.fn(async () => null),
+      setRunStatusIfRunning: vi.fn(async () => ({ updated: false, run: null })),
+      setWakeupStatus: vi.fn(async () => undefined), releaseIssueExecutionAndPromote: vi.fn(async () => undefined),
+      finalizeAgentStatus: vi.fn(async () => undefined), getWorktreeExecutionCutoff: vi.fn(async () => null),
+      applyRunDispatchPostCommitEffects: vi.fn(),
+    });
+    f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible.mockImplementation(
+      retries.scheduleInteractionContinuationInfrastructureRetryIfEligible);
+    f.deps.scheduleBoundedRetryForRun.mockImplementation(retries.scheduleBoundedRetryForRun);
+
+    await f.completion.completeRun({ ...f.input, run: running!, agent: coordinator, issueId: child.id,
+      sessionCodec: getAdapterSessionCodec("claude_local"),
+      adapterResult: { exitCode: 0, signal: null, timedOut: false, errorMessage: "Failed to parse claude JSON output",
+        resultJson: { stdout: '{"type":"system","subtype":"init"}', conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } });
+
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+    expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible)
+      .toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), coordinator);
+    // The generic crash lane would rename the wake transient_failure_retry.
+    expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id));
+    expect(successor).toMatchObject({ status: "scheduled_retry", agentId: coordinator.id,
+      scheduledRetryReason: PENDING_ADDRESSEE_RETRY_REASON });
+    expect(successor!.contextSnapshot).toMatchObject({ wakeReason: "interaction_pending", interactionId });
+
+    const promoted = await createRunDispatch(db).promoteDueScheduledRetries({
+      now: new Date(Date.parse(String(successor!.scheduledRetryAt)) + 1_000), cutoff: null });
+    expect(promoted.runIds).toContain(successor!.id);
+    expect(await read(successor!.id)).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "interaction_pending" } });
+  }, 30_000);
 
   it.each([false, true])("selects the answer retry from the real delivery producer and heartbeat queue (legacy context=%s)", async legacy => {
     const f = await fixture();

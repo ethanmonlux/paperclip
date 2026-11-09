@@ -111,6 +111,23 @@ function parsePrUrl(url: string | null) {
   return match ? { repo: match[1]!, number: Number(match[2]) } : null;
 }
 
+/** The live wait record the server evaluates (FAC-840), shown instead of a heuristic. */
+function consoleWaitRecord(monitor: Record<string, unknown> | null): { waitKind: string | null; waitDetail: string | null } {
+  const kind = typeof monitor?.kind === "string" ? monitor.kind : null;
+  if (!monitor || !kind) return { waitKind: null, waitDetail: null };
+  const observation = asRecord(monitor.observation);
+  const target = asRecord(monitor.target);
+  const repo = typeof target?.repo === "string" ? target.repo : null;
+  const sha = typeof target?.sha === "string" ? target.sha.slice(0, 9) : null;
+  const pr = typeof target?.pullNumber === "number" ? `#${target.pullNumber}` : null;
+  const label = repo ? `${repo}${pr ?? ""}${sha ? `@${sha}` : ""}` : null;
+  const detail = typeof observation?.detail === "string" ? observation.detail
+    : kind === "ci" && label ? `Waiting on CI for ${label}`
+    : kind === "pr_mergeable" && label ? `Waiting for ${label} to be mergeable`
+    : null;
+  return { waitKind: kind, waitDetail: detail };
+}
+
 function summarizeCheckRuns(body: unknown): { ci: StapleConsoleCiState; ciStartedAt: string | null } {
   const runs = Array.isArray(asRecord(body)?.check_runs) ? (asRecord(body)!.check_runs as unknown[]) : [];
   if (runs.length === 0) return { ci: "none", ciStartedAt: null };
@@ -234,6 +251,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         monitorNextCheckAt: iso(row.monitorNextCheckAt),
         monitorServiceName: monitorLive && typeof monitor.serviceName === "string" ? monitor.serviceName : null,
         monitorTriggeredAt: monitorLive && typeof monitor.lastTriggeredAt === "string" ? monitor.lastTriggeredAt : null,
+        ...consoleWaitRecord(monitorLive ? monitor : null),
       };
     });
     // Only open work and work finished today can appear on the board.
@@ -489,7 +507,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       scheduled.push({
         label: `${issue.identifier} monitor check`,
         at: issue.monitorNextCheckAt,
-        detail: issue.monitorServiceName ? `Waiting on ${issue.monitorServiceName}` : null,
+        detail: issue.waitDetail ?? (issue.monitorServiceName ? `Waiting on ${issue.monitorServiceName}` : null),
         source: "Paperclip issue monitor",
         available: true,
       });

@@ -567,6 +567,7 @@ export type IssueBlockedInboxReason =
   | "blocked_chain_stalled"
   | "invalid_review_participant"
   | "in_review_without_action_path"
+  | "blocked_without_wait_path"
   | "missing_successful_run_disposition"
   | "pending_board_decision"
   | "pending_user_decision"
@@ -763,6 +764,41 @@ export interface IssueExecutionStage {
   participants: IssueExecutionStageParticipant[];
 }
 
+/** The GitHub object a `ci` or `pr_mergeable` wait record names. */
+export interface IssueWaitTarget {
+  /** `owner/name`. */
+  repo: string;
+  /** Exact pushed head SHA; required for `ci`. */
+  sha?: string | null;
+  /** Pull request number; required for `pr_mergeable`, optional for `ci`. */
+  pullNumber?: number | null;
+  /** When the SHA was pushed; starts the no-start deadline for `ci`. */
+  pushedAt?: string | null;
+}
+
+export type IssueWaitObservationState =
+  | "not_started"
+  | "started"
+  | "queued_long"
+  | "passed"
+  | "failed"
+  | "startup_failure"
+  | "no_start"
+  | "base_update_required"
+  | "mergeable"
+  | "conflicting"
+  | "pending_mergeability"
+  | "closed"
+  | "superseded"
+  | "unobservable";
+
+/** The server's latest reading of a server-evaluated wait record. */
+export interface IssueWaitObservation {
+  state: IssueWaitObservationState;
+  checkedAt: string;
+  detail: string;
+}
+
 export interface IssueExecutionMonitorPolicy {
   nextCheckAt: string;
   notes: string | null;
@@ -773,6 +809,7 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  target?: IssueWaitTarget | null;
 }
 
 export interface RequiredQualityReview {
@@ -816,6 +853,8 @@ export interface IssueExecutionMonitorState {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  target?: IssueWaitTarget | null;
+  observation?: IssueWaitObservation | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
 }

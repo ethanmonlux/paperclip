@@ -77,6 +77,7 @@ export const issueBlockedInboxReasonSchema = z.enum([
   "blocked_chain_stalled",
   "invalid_review_participant",
   "in_review_without_action_path",
+  "blocked_without_wait_path",
   "missing_successful_run_disposition",
   "pending_board_decision",
   "pending_user_decision",
@@ -403,6 +404,24 @@ export const issueExecutionStageSchema = z.object({
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
 });
 
+/** GitHub object named by a `ci` or `pr_mergeable` wait record. */
+export const issueWaitTargetSchema = z.object({
+  repo: z.string().trim().regex(/^[\w.-]+\/[\w.-]+$/, "repo must be owner/name"),
+  sha: z.string().trim().regex(/^[0-9a-fA-F]{40}$/, "sha must be a full 40-character commit SHA")
+    .optional().nullable().default(null),
+  pullNumber: z.number().int().positive().optional().nullable().default(null),
+  pushedAt: z.string().datetime().optional().nullable().default(null),
+}).strict();
+
+export const issueWaitObservationSchema = z.object({
+  state: z.enum([
+    "not_started", "started", "queued_long", "passed", "failed", "startup_failure", "no_start",
+    "base_update_required", "mergeable", "conflicting", "pending_mergeability", "closed", "superseded", "unobservable",
+  ]),
+  checkedAt: z.string().datetime(),
+  detail: z.string().max(500),
+});
+
 export const issueExecutionMonitorPolicySchema = z.object({
   nextCheckAt: z.string().datetime(),
   notes: z.string().max(500).optional().nullable().default(null),
@@ -445,6 +464,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  target: issueWaitTargetSchema.optional().nullable().default(null),
 });
 
 export const requiredQualityReviewSchema = z.object({
@@ -518,6 +538,8 @@ export const issueExecutionMonitorStateSchema = z.object({
     .nullable()
     .optional()
     .default(null),
+  target: issueWaitTargetSchema.nullable().optional().default(null),
+  observation: issueWaitObservationSchema.nullable().optional().default(null),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
 });
