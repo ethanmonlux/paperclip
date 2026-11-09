@@ -21,6 +21,7 @@ import {
   type InstallChannel,
   type InstallRecord,
 } from "../install-store.js";
+import { assertServiceLifecycleOutsideAgentRun, assertServiceLifecycleQuiet, type ActiveServiceRunsProbe } from "../service-lifecycle-authority.js";
 
 const execFileAsync = promisify(execFile);
 export const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
@@ -363,9 +364,11 @@ async function confirmGitInstall(options: InstallOptions, repo: string, ref: str
 
 export async function installCommand(
   options: InstallOptions,
-  dependencies: { runCommand?: CommandRunner; now?: () => Date } = {},
+  dependencies: { runCommand?: CommandRunner; now?: () => Date; env?: NodeJS.ProcessEnv; activeServiceRuns?: ActiveServiceRunsProbe } = {},
 ): Promise<void> {
   assertSupportedNodeVersion();
+  assertServiceLifecycleOutsideAgentRun("install Paperclip", dependencies.env);
+  await assertServiceLifecycleQuiet("install Paperclip", dependencies.activeServiceRuns);
   const runCommand = dependencies.runCommand ?? runCommandWithDiagnostics;
   const gitRequest = resolveGitInstallRequest(options);
   if (gitRequest) {

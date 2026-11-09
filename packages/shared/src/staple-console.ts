@@ -333,8 +333,20 @@ export interface StapleConsoleUpNext {
   betaGap: boolean;
 }
 
+/** Active managed maintenance window (FAC-840 C1): admission is held, wakes queue. */
+export interface StapleConsoleMaintenanceHold {
+  since: string;
+  drainDeadlineAt: string;
+  expiresAt: string;
+  queuedWakes: number;
+  runningRuns: number;
+  parkedRuns: number;
+}
+
 export interface StapleConsoleBoard {
   generatedAt: string;
+  /** Present while the nightly maintenance hold is active. */
+  maintenanceHold?: StapleConsoleMaintenanceHold | null;
   issuePrefix: string;
   header: { mergedToday: number; inFlight: number; needsEthan: number; stuck: number };
   scheduled: StapleConsoleScheduledEvent[];
