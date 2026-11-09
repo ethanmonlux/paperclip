@@ -163,12 +163,40 @@ process.exit(result.status ?? 98);
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
+    if (failure === "broker-offline") expect(result.stderr).toContain("broker_transport_unavailable (ECONNREFUSED)");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
     await exec(path.join(bin, "git"), ["commit", "--allow-empty", "-m", "Offline work"], { cwd: root, env: {
       ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+
+  it("classifies a code-0 fetch failure under an environment proxy without logging its URL", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-failure-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", "-q", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    // Inject the failure at fetch: CI network routing can bypass a local proxy
+    // or leave its CONNECT request pending, neither of which tests this branch.
+    const preload = path.join(root, "fail-fetch.cjs");
+    await writeFile(preload, `globalThis.fetch = async () => {
+  const error = new TypeError("fetch failed");
+  error.cause = Object.assign(new Error("proxy transport failed"), { code: 0 });
+  throw error;
+};\n`);
+    const proxyUrl = "http://proxy-secret.invalid:3128";
+    const result = await exec(path.join(bin, "git"), ["remote"], { cwd: root, env: {
+      ...process.env, ...githubBrokerEnvironment({}, { url: "http://broker.invalid:3100", token: "private-capability" }),
+      PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, NODE_USE_ENV_PROXY: "1",
+      HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, NO_PROXY: "", no_proxy: "",
+      NODE_OPTIONS: `--require=${preload}`,
+    } });
+    expect(result.stderr).toContain("broker_transport_unavailable (proxy_transport_unclassified)");
+    expect(result.stderr).not.toContain(proxyUrl);
+    expect(result.stderr).not.toContain("private-capability");
+  }, 15_000); // transport retries add at least 1.5s before Node startup and CI scheduling
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
