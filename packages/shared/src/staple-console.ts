@@ -9,6 +9,8 @@
 
 export const STAPLE_CONSOLE_STEPS = ["queued", "build", "ci", "review", "merged"] as const;
 export type StapleConsoleStep = (typeof STAPLE_CONSOLE_STEPS)[number];
+/** A card's step: one of the five bar steps, or "done" for task-only completion with no merge evidence (FAC-837). */
+export type StapleConsoleCardStep = StapleConsoleStep | "done";
 
 export type StapleConsoleLaneKey =
   | "ember_vault"
@@ -217,6 +219,19 @@ export interface StapleConsolePullRequestInput {
   source: "github" | "work_product" | "reference";
 }
 
+export type StapleConsoleReviewOutcome = "approved" | "changes_requested";
+
+/**
+ * A recorded review verdict (FAC-838): a native execution-stage decision, or the reviewer's
+ * own verdict comment on a review task. Rounds come only from these, never from task counts.
+ */
+export interface StapleConsoleReviewDecisionInput {
+  issueId: string;
+  outcome: StapleConsoleReviewOutcome;
+  at: string;
+  source: "execution_decision" | "verdict_comment";
+}
+
 export interface StapleConsoleScheduledEvent {
   label: string;
   at: string | null;
@@ -240,6 +255,7 @@ export interface StapleConsoleInput {
   interactions: StapleConsoleInteractionInput[];
   approvals: StapleConsoleApprovalInput[];
   pullRequests: StapleConsolePullRequestInput[];
+  reviewDecisions?: StapleConsoleReviewDecisionInput[];
   scheduled: StapleConsoleScheduledEvent[];
   sources: StapleConsoleSourceStatus;
 }
@@ -295,10 +311,17 @@ export interface StapleConsoleCardPullRequest {
 
 export interface StapleConsoleStepCell {
   step: StapleConsoleStep;
-  state: "done" | "current" | "todo";
-  /** Current round on the current build/ci/review step; completed review rounds on Review. */
+  /** "skipped": no evidence the step happened, e.g. Merged on a task finished without a merged PR. */
+  state: "done" | "current" | "todo" | "skipped";
+  /** Current round on the current build/ci/review step; decided review rounds on Review. */
   rounds: number | null;
 }
+
+/**
+ * How finished work ended (FAC-837). "merged" needs PR merge evidence; "task_done" is a task
+ * marked Done whose source is not confirmed integrated (open, closed, unknown or no PR).
+ */
+export type StapleConsoleCompletion = "merged" | "task_done";
 
 export interface StapleConsoleCard {
   id: string;
@@ -309,8 +332,11 @@ export interface StapleConsoleCard {
   laneSource: string;
   betaTag: StapleConsoleBetaTag | null;
   facIds: number[];
-  step: StapleConsoleStep;
+  step: StapleConsoleCardStep;
   round: number;
+  completion: StapleConsoleCompletion | null;
+  /** Plain statement of a task-only completion, e.g. "Task done; paperclip#30 is still open, not merged". */
+  completionNote: string | null;
   steps: StapleConsoleStepCell[];
   stepSince: string | null;
   lastActivityAt: string | null;
@@ -321,6 +347,7 @@ export interface StapleConsoleCard {
   waitingOn: StapleConsoleWaitingChip[];
   stuck: StapleConsoleStuckFlag[];
   needsEthan: StapleConsoleNeedsEthan[];
+  /** Confirmed PR merge today; task completion alone never counts. */
   mergedToday: boolean;
 }
 
@@ -458,10 +485,38 @@ function isCoordinatorAgent(agent: StapleConsoleAgentInput | undefined) {
   return agent.role === "general" || /coordinator|master builder/i.test(agent.name);
 }
 
-function isReviewIssue(issue: StapleConsoleIssueInput, agent: StapleConsoleAgentInput | undefined) {
+export function isStapleConsoleReviewIssue(
+  issue: Pick<StapleConsoleIssueInput, "title">,
+  agent: StapleConsoleAgentInput | undefined,
+) {
   if (/\b(review|verify|verification)\b/i.test(issue.title)) return true;
   if (!agent) return false;
   return agent.role === "qa" || /reviewer/i.test(agent.name);
+}
+const isReviewIssue = isStapleConsoleReviewIssue;
+
+const VERDICT_PATTERNS: Array<{ outcome: StapleConsoleReviewOutcome; pattern: RegExp }> = [
+  { outcome: "changes_requested", pattern: /\brequest(?:s|ed|ing)?\s+changes\b/i },
+  { outcome: "changes_requested", pattern: /\bchanges\s+requested\b/i },
+  { outcome: "changes_requested", pattern: /\b(?:requires?|needs?)\s+(?:a\s+)?(?:focused\s+)?correction\b/i },
+  { outcome: "changes_requested", pattern: /^(?:verdict:?\s*)?(?:fail(?:ed|s)?|rejected?)\b/i },
+  { outcome: "approved", pattern: /^(?:verdict:?\s*)?(?:pass(?:ed|es)?|approved?|lgtm)\b/i },
+  { outcome: "approved", pattern: /\b(?:review|verification)\s+(?:is\s+complete:?\s+)?(?:passes|passed|approved|pass)\b/i },
+];
+
+/**
+ * The verdict a reviewer's comment states in its opening line, or null when it states none
+ * (FAC-838). The earliest verdict phrase wins, so "PASS ... supersedes REQUEST CHANGES" is a pass.
+ */
+export function stapleConsoleVerdictOfComment(body: string): StapleConsoleReviewOutcome | null {
+  const firstLine = body.trim().split(/\r?\n/, 1)[0] ?? "";
+  const text = firstLine.replace(/[*_`#>]/g, "").replace(/^[\s\-\u2014:]+/, "").slice(0, 300);
+  let best: { outcome: StapleConsoleReviewOutcome; index: number } | null = null;
+  for (const { outcome, pattern } of VERDICT_PATTERNS) {
+    const match = pattern.exec(text);
+    if (match && (!best || match.index < best.index)) best = { outcome, index: match.index };
+  }
+  return best?.outcome ?? null;
 }
 
 function lastRunActivity(run: StapleConsoleRunInput): string | null {
@@ -750,6 +805,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
   for (const pr of input.pullRequests) {
     prsByIssue.set(pr.issueId, [...(prsByIssue.get(pr.issueId) ?? []), pr]);
   }
+  const decisionsByIssueId = new Map<string, StapleConsoleReviewDecisionInput[]>();
+  for (const decision of input.reviewDecisions ?? []) {
+    decisionsByIssueId.set(decision.issueId, [...(decisionsByIssueId.get(decision.issueId) ?? []), decision]);
+  }
 
   const streams = groupWorkstreams(issues, agentsById);
   const cardIdOfIssue = new Map<string, string>();
@@ -787,66 +846,127 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     const lastActivityAt = latest(memberRuns.map(lastRunActivity));
 
     // ---- Step and round
+    // Rounds come from recorded review verdicts (FAC-838): each changes-requested verdict that
+    // follows a correction attempt (or opens the history) starts a new Build round. An approval
+    // never adds one, and a review task may stay open across its focused corrections.
     const doneReviews = reviewMembers.filter((issue) => issue.status === "done");
     const openReview = reviewMembers.find((issue) => !isStapleConsoleTerminal(issue.status)) ?? null;
     const lastReviewDoneAt = latest(doneReviews.map((issue) => issue.completedAt ?? issue.updatedAt));
     const lastReviewDoneMs = ms(lastReviewDoneAt);
-    const buildRunStarts = [root, ...buildMembers].flatMap((issue) =>
-      (runsByIssue.get(issue.id) ?? []).map((run) => run.startedAt ?? run.createdAt));
+    const buildSide = [root, ...buildMembers];
+    const buildRunStartMs = buildSide.flatMap((issue) =>
+      (runsByIssue.get(issue.id) ?? []).map((run) => ms(run.startedAt ?? run.createdAt) ?? 0));
+    const buildRunStartedBetween = (fromMs: number, toMs: number) =>
+      buildRunStartMs.some((start) => start > fromMs && start <= toMs);
+    const decisions = members.flatMap((issue) => decisionsByIssueId.get(issue.id) ?? [])
+      .filter((decision) => ms(decision.at) !== null)
+      .sort((a, b) => ms(a.at)! - ms(b.at)!);
+    let corrections = 0;
+    let previous: StapleConsoleReviewDecisionInput | null = null;
+    for (const decision of decisions) {
+      if (decision.outcome === "changes_requested" && (
+        !previous
+        || previous.outcome === "approved"
+        || buildRunStartedBetween(ms(previous.at)!, ms(decision.at)!)
+      )) corrections += 1;
+      previous = decision;
+    }
+    const lastDecision = decisions.at(-1) ?? null;
+    const lastDecisionMs = lastDecision ? ms(lastDecision.at)! : null;
+    const round = 1 + corrections;
+    const reviewedRounds = corrections + (lastDecision?.outcome === "approved" ? 1 : 0)
+      || (doneReviews.length > 0 ? 1 : 0);
     const buildActivityAfterReview = lastReviewDoneMs !== null && (
-      buildRunStarts.some((start) => (ms(start) ?? 0) > lastReviewDoneMs)
+      buildRunStartMs.some((start) => start > lastReviewDoneMs)
       || buildMembers.some((issue) => (ms(issue.createdAt) ?? 0) > lastReviewDoneMs)
     );
     const openBuild = buildMembers.filter((issue) => !isStapleConsoleTerminal(issue.status));
-    const anyPrMerged = prs.some((pr) => pr.state === "merged");
+    const mergedPrs = prs.filter((pr) => pr.state === "merged");
     const openPr = prs.find((pr) => pr.state === "open" || pr.state === "draft") ?? null;
     const ciMonitor = members.find((issue) =>
       !isStapleConsoleTerminal(issue.status)
       && (issue.waitKind === "ci" || /github|actions|\bci\b/i.test(issue.monitorServiceName ?? "")));
-    const buildRunActive = [root, ...buildMembers].some((issue) => activeRunOf(runsByIssue.get(issue.id) ?? []));
+    const buildRunActive = buildSide.some((issue) => activeRunOf(runsByIssue.get(issue.id) ?? []));
+    const ciWaiting = Boolean(ciMonitor || (openPr && openPr.ci === "pending"));
+    const lastBuildRunAt = latest(buildSide.flatMap((issue) => (runsByIssue.get(issue.id) ?? []).map((run) => run.finishedAt)));
+    // After changes were requested, the review is back in play once a reviewer run starts or a
+    // new review task opens later than the last correction run started.
+    const lastBuildStartMs = buildRunStartMs.length > 0 ? Math.max(...buildRunStartMs) : null;
+    const reviewReengagedAt = lastDecisionMs === null ? null : latest(reviewMembers.flatMap((issue) => [
+      ...(runsByIssue.get(issue.id) ?? []).map((run) => run.startedAt ?? run.createdAt),
+      issue.createdAt,
+    ]).filter((at) => (ms(at) ?? 0) > lastDecisionMs && (lastBuildStartMs === null || (ms(at) ?? 0) > lastBuildStartMs)));
+    const correcting = lastDecision?.outcome === "changes_requested" && !(openReview && reviewReengagedAt);
 
-    let step: StapleConsoleStep;
+    // Merged needs PR merge evidence (FAC-837); task completion alone is not source integration.
+    const mergedAt = latest(mergedPrs.map((pr) => pr.mergedAt));
+    const mergeConfirmed = mergedPrs.length > 0 && !openPr;
+    let completion: StapleConsoleCompletion | null = null;
+    let completionNote: string | null = null;
+    let step: StapleConsoleCardStep;
     let stepSince: string | null;
-    let round = doneReviews.length + (openReview ? 1 : 0);
-    if (root.status === "done" || (anyPrMerged && !openReview && openBuild.length === 0)) {
+    if (mergeConfirmed && (root.status === "done" || (!openReview && openBuild.length === 0))) {
       step = "merged";
-      round = Math.max(1, doneReviews.length);
-      stepSince = latest(prs.map((pr) => pr.mergedAt)) ?? root.completedAt;
+      completion = "merged";
+      stepSince = mergedAt ?? root.completedAt;
+    } else if (root.status === "done") {
+      completion = "task_done";
+      stepSince = root.completedAt ?? root.updatedAt;
+      const label = (pr: StapleConsolePullRequestInput) => `${pr.repo.split("/")[1] ?? pr.repo}#${pr.number}`;
+      if (openPr) {
+        step = openPr.ci === "pending" || openPr.ci === "failure" ? "ci" : "review";
+        completionNote = `Task done; ${label(openPr)} is still open, not merged`;
+      } else {
+        step = "done";
+        const unknownPr = prs.find((pr) => pr.state === "unknown");
+        completionNote = unknownPr
+          ? `Task done; ${label(unknownPr)} state unknown, merge not confirmed`
+          : prs.length > 0
+            ? `Task done; ${label(prs[0]!)} closed without merging`
+            : "Task done; no PR, so nothing was merged";
+      }
+    } else if (correcting) {
+      step = ciWaiting && !buildRunActive ? "ci" : "build";
+      stepSince = step === "ci"
+        ? ciMonitor?.monitorTriggeredAt ?? openPr?.ciStartedAt ?? lastBuildRunAt
+        : lastDecision!.at;
     } else if (openReview) {
       step = "review";
-      stepSince = openReview.startedAt ?? openReview.createdAt;
-    } else if (doneReviews.length > 0 && !buildActivityAfterReview && openBuild.length === 0) {
-      // Last review finished and nothing went back to Build: awaiting merge.
+      stepSince = reviewReengagedAt ?? openReview.startedAt ?? openReview.createdAt;
+    } else if (lastDecision?.outcome === "approved" && openBuild.length === 0) {
+      // Approved and nothing new to build: awaiting merge. Later merge/CI runs are not a correction.
       step = "review";
-      round = doneReviews.length;
+      stepSince = lastDecision.at;
+    } else if (!lastDecision && doneReviews.length > 0 && !buildActivityAfterReview && openBuild.length === 0) {
+      // Last review finished without a recorded verdict and nothing went back to Build.
+      step = "review";
       stepSince = lastReviewDoneAt;
-    } else if (
-      (ciMonitor || (openPr && openPr.ci === "pending")) && !buildRunActive
-    ) {
+    } else if (ciWaiting && !buildRunActive) {
       step = "ci";
-      round = doneReviews.length + 1;
-      stepSince = ciMonitor?.monitorTriggeredAt ?? openPr?.ciStartedAt
-        ?? latest([root, ...buildMembers].flatMap((issue) => (runsByIssue.get(issue.id) ?? []).map((run) => run.finishedAt)));
+      stepSince = ciMonitor?.monitorTriggeredAt ?? openPr?.ciStartedAt ?? lastBuildRunAt;
     } else if (openBuild.length > 0 || openPr || buildRunActive || root.status === "in_progress") {
       step = "build";
-      round = doneReviews.length + 1;
-      stepSince = doneReviews.length > 0
-        ? lastReviewDoneAt
-        : earliest([...openBuild.map((issue) => issue.startedAt ?? issue.createdAt), root.startedAt]);
+      stepSince = lastDecision?.outcome === "changes_requested"
+        ? lastDecision.at
+        : doneReviews.length > 0 && !lastDecision
+          ? lastReviewDoneAt
+          : earliest([...openBuild.map((issue) => issue.startedAt ?? issue.createdAt), root.startedAt]);
     } else {
       step = "queued";
-      round = Math.max(1, round);
       stepSince = root.createdAt;
     }
-    round = Math.max(1, round);
-    const currentIndex = STAPLE_CONSOLE_STEPS.indexOf(step);
+    const reviewEvidence = doneReviews.length > 0 || decisions.length > 0;
+    const currentIndex = step === "done" ? -1 : STAPLE_CONSOLE_STEPS.indexOf(step);
     const steps: StapleConsoleStepCell[] = STAPLE_CONSOLE_STEPS.map((cellStep, index) => ({
       step: cellStep,
-      state: index < currentIndex ? "done" : index === currentIndex ? "current" : "todo",
+      state: step === "done"
+        // Task-only completion: Build happened; CI, Review and Merge show only with evidence.
+        ? cellStep === "queued" || cellStep === "build" || (cellStep === "review" && reviewEvidence) ? "done" : "skipped"
+        : index < currentIndex ? "done" : index === currentIndex ? "current" : "todo",
       rounds: cellStep === step && (step === "build" || step === "ci" || step === "review")
         ? round
-        : cellStep === "review" && doneReviews.length > 0
-          ? doneReviews.length
+        : cellStep === "review" && reviewedRounds > 0
+          ? reviewedRounds
           : null,
     }));
 
@@ -914,10 +1034,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       if (flag) stuck.push(flag);
     }
 
-    const mergedAt = step === "merged" ? stepSince : null;
-    const mergedToday = mergedAt !== null && stapleConsoleDayKey(mergedAt) === todayKey;
-    // Show open workstreams and those merged today; older finished work is history.
-    if (isStapleConsoleTerminal(root.status) && !mergedToday) continue;
+    const mergedToday = completion === "merged" && mergedAt !== null && stapleConsoleDayKey(mergedAt) === todayKey;
+    const completedToday = root.completedAt !== null && stapleConsoleDayKey(root.completedAt) === todayKey;
+    // Show open workstreams and those merged or finished today; older finished work is history.
+    if (isStapleConsoleTerminal(root.status) && !mergedToday && !completedToday) continue;
     if (root.status === "backlog" && members.length === 1 && memberRuns.length === 0) continue;
 
     const lane = resolveLane(stream, byId, byIdentifier);
@@ -939,6 +1059,8 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       facIds: lane.facIds,
       step,
       round,
+      completion,
+      completionNote,
       steps,
       stepSince,
       lastActivityAt,
@@ -964,7 +1086,7 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
   cards.sort((a, b) =>
     Number(b.needsEthan.length > 0) - Number(a.needsEthan.length > 0)
     || Number(b.stuck.length > 0) - Number(a.stuck.length > 0)
-    || Number(a.step === "merged") - Number(b.step === "merged")
+    || Number(a.completion !== null) - Number(b.completion !== null)
     || (ms(b.lastActivityAt) ?? 0) - (ms(a.lastActivityAt) ?? 0));
 
   const referencedFacs = new Set<number>();
