@@ -141,6 +141,12 @@ export interface IssueGraphLivenessInput {
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   externalResponseWaits?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
+  /**
+   * Blocked issues whose blockers are all done and whose dependency wake is
+   * spent or withheld for a self-block (dependency-wake-ownership.ts). Their
+   * blocker relations no longer record a wait. Omitted: every relation does.
+   */
+  dependencyWakeDisownedIssueIds?: string[];
   now?: Date | string;
 }
 
@@ -206,6 +212,31 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
+/** Server readings that mean CI for the wait's exact SHA has started. */
+const STARTED_CI_OBSERVATION_STATES = new Set(["started", "queued_long"]);
+
+/**
+ * FAC-840: a `ci` wait's timeoutAt is its no-start deadline. Once the server
+ * has read the target and seen CI start, slow CI keeps waiting (classifyCiWait
+ * never expires it), so the elapsed deadline no longer ends the wait. Only the
+ * server writes the reading into executionState, and it is kept only while the
+ * monitor still names the same target.
+ */
+export function hasServerObservedStartedCiWait(executionPolicy: unknown, executionState: unknown) {
+  const policyMonitor = readRecord(readRecord(executionPolicy)?.monitor);
+  const stateMonitor = readRecord(readRecord(executionState)?.monitor);
+  const policyTarget = readRecord(policyMonitor?.target);
+  const stateTarget = readRecord(stateMonitor?.target);
+  if (policyMonitor?.kind !== "ci" || !policyTarget || !stateTarget) return false;
+  const sameTarget = typeof policyTarget.repo === "string" && typeof policyTarget.sha === "string" &&
+    policyTarget.repo === stateTarget.repo &&
+    typeof stateTarget.sha === "string" && policyTarget.sha.toLowerCase() === stateTarget.sha.toLowerCase() &&
+    (policyTarget.pullNumber ?? null) === (stateTarget.pullNumber ?? null);
+  if (!sameTarget) return false;
+  const state = readRecord(stateMonitor?.observation)?.state;
+  return typeof state === "string" && STARTED_CI_OBSERVATION_STATES.has(state);
+}
+
 /** A saved, unconsumed check remains dispatchable when its due time passes. */
 export function hasUnconsumedIssueMonitorPath(issue: IssueLivenessIssueInput, now: Date | string | number) {
   const nowMs = typeof now === "number" ? now : readDateMs(now) ?? Date.now();
@@ -214,7 +245,8 @@ export function hasUnconsumedIssueMonitorPath(issue: IssueLivenessIssueInput, no
 
   const { policyMonitor, stateMonitor } = monitorFromIssue(issue);
   const timeoutAtMs = readDateMs(policyMonitor?.timeoutAt ?? stateMonitor?.timeoutAt);
-  if (timeoutAtMs !== null && timeoutAtMs <= nowMs) return false;
+  if (timeoutAtMs !== null && timeoutAtMs <= nowMs &&
+      !hasServerObservedStartedCiWait(issue.executionPolicy, issue.executionState)) return false;
 
   const maxAttempts = readPositiveInteger(policyMonitor?.maxAttempts ?? stateMonitor?.maxAttempts);
   const stateAttemptCount = readPositiveInteger(stateMonitor?.attemptCount) ?? 0;
@@ -506,6 +538,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const pendingInteractions = input.pendingInteractions ?? [];
   const pendingApprovals = input.pendingApprovals ?? [];
   const openRecoveryIssues = input.openRecoveryIssues ?? [];
+  const dependencyWakeDisowned = new Set(input.dependencyWakeDisownedIssueIds ?? []);
 
   for (const relation of input.relations) {
     const list = blockersByBlockedIssueId.get(relation.blockedIssueId) ?? [];
@@ -755,9 +788,12 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       if (review) findings.push(review);
     }
 
-    // Any blocker edge, resolved or not, belongs to the dependency backstop.
+    // A blocker edge belongs to the dependency backstop unless all blockers are
+    // done and the dependency wake can no longer reach the task (FAC-851).
     const hasBlockerEdge = (blockersByBlockedIssueId.get(issue.id) ?? []).some((relation) => relation.companyId === issue.companyId);
-    if (issue.status === "blocked" && !chainFinding && !hasBlockerEdge && !unresolvedBlockers.has(issue.id)) {
+    const blockerEdgesWaitForNothing = !hasUnresolvedBlockerEdge && dependencyWakeDisowned.has(issue.id);
+    if (issue.status === "blocked" && !chainFinding && (!hasBlockerEdge || blockerEdgesWaitForNothing) &&
+        !unresolvedBlockers.has(issue.id)) {
       const orphan = orphanedWaitFinding(issue);
       if (orphan) findings.push(orphan);
     }

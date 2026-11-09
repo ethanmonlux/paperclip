@@ -5,6 +5,7 @@ import { forbidden, unprocessable } from "../errors.js";
 import type { accessService } from "./access.js";
 import { authorizationDeniedDetails, type AuthorizationActor } from "./authorization.js";
 import { prepareWaitRecordMonitor } from "./wait-records.js";
+import { hasServerObservedStartedCiWait } from "./recovery/issue-graph-liveness.js";
 import { applyIssueMonitorPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, redactIssueMonitorExternalRef, setIssueExecutionPolicyMonitorScheduledBy } from "./issue-execution-policy.js";
 
 type NormalizedExecutionPolicy = ReturnType<typeof normalizeIssueExecutionPolicy>;
@@ -179,7 +180,9 @@ export function eligibleIssueMonitorWait(
   const nextCheckAt = scheduledIssueMonitorWait(issue, agentId);
   if (!nextCheckAt) return null;
   const monitor = normalizeIssueExecutionPolicy(issue.executionPolicy)!.monitor!;
-  if ((monitor.timeoutAt && Date.parse(monitor.timeoutAt) <= now.getTime()) ||
+  // A started CI wait outlives its no-start deadline (FAC-840, same rule as liveness).
+  if ((monitor.timeoutAt && Date.parse(monitor.timeoutAt) <= now.getTime() &&
+       !hasServerObservedStartedCiWait(issue.executionPolicy, issue.executionState)) ||
       (monitor.maxAttempts != null && issue.monitorAttemptCount >= monitor.maxAttempts)) return null;
   return nextCheckAt;
 }
