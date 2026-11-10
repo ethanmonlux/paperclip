@@ -752,6 +752,8 @@ export type {
   IssueExecutionDecision,
   IssueComment,
   IssueRecentComments,
+  IssueChatBootstrap,
+  IssueChatBootstrapItem,
   IssueQueuedCommentEntry,
   IssueQueuedCommentProtocol,
   IssueQueuedCommentQueue,
