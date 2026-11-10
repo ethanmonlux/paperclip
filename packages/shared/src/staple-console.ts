@@ -954,7 +954,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       const label = (pr: StapleConsolePullRequestInput) => `${pr.repo.split("/")[1] ?? pr.repo}#${pr.number}`;
       if (openPr) {
         step = openPr.ci === "pending" || openPr.ci === "failure" ? "ci" : "review";
-        completionNote = `Task done; ${label(openPr)} is still open, not merged`;
+        // Only a live GitHub read proves the PR is still open; a recorded status can be stale.
+        completionNote = openPr.source === "github"
+          ? `Task done; ${label(openPr)} is still open, not merged`
+          : `Task done; ${label(openPr)} recorded open, merge not confirmed`;
       } else {
         step = "done";
         const unknownPr = prs.find((pr) => pr.state === "unknown");
