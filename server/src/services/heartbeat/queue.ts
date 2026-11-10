@@ -4,6 +4,15 @@ import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { deferredWorkIntentWait } from "../work-intent-outbox.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import {
+  decideUrgentBurst,
+  formatGiB,
+  isUrgentIssuePriority,
+  issuePriorityRank,
+  queuedRunRank,
+  readAvailableMemoryBytes as readHostAvailableMemoryBytes,
+  type UrgentBurstRecord,
+} from "./urgent-lane.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
@@ -231,6 +240,8 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
   getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
   isRunAdmissionClosed?: () => boolean;
+  /** Free host memory for the urgent-lane burst gate; defaults to /proc/meminfo. */
+  readAvailableMemoryBytes?: () => number;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
   executeRun: (runId: string) => Promise<void>;
   releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
@@ -509,20 +520,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   const claimDueTimerHeartbeat = (agent: typeof agents.$inferSelect, now: Date, intervalSec: number) =>
     claimDueTimerHeartbeatForAgent(db, agent, now, intervalSec);
 
-  function issueRunPriorityRank(priority: string | null | undefined) {
-    switch (priority) {
-      case "critical":
-        return 0;
-      case "high":
-        return 1;
-      case "medium":
-        return 2;
-      case "low":
-        return 3;
-      default:
-        return 4;
-    }
-  }
+  const issueRunPriorityRank = issuePriorityRank;
+  const readAvailableMemoryBytes = dependencies.readAvailableMemoryBytes ?? (() => readHostAvailableMemoryBytes());
 
   async function listQueuedRunDependencyReadiness(
     companyId: string,
@@ -2089,6 +2088,149 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  const URGENT_BURST_GRANTED = "heartbeat.urgent_burst_granted";
+  const URGENT_BURST_REVERTED = "heartbeat.urgent_burst_reverted";
+  const URGENT_BURST_PARKED = "heartbeat.urgent_burst_parked";
+  /** Burst bookkeeping older than this is settled and never re-read. */
+  const URGENT_BURST_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
+
+  async function logUrgentLane(agent: typeof agents.$inferSelect, action: string, runId: string, issueId: string,
+    details: Record<string, unknown>) {
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: agent.id,
+      runId,
+      action,
+      entityType: "issue",
+      entityId: issueId,
+      issueId,
+      details,
+    });
+  }
+
+  /**
+   * Burst runs that are still open (granted, not yet reverted). A burst whose
+   * run has ended is reverted here: its extra slot already disappeared with
+   * the run, so this only records the revert on the urgent issue. Settling on
+   * the next dispatch pass covers every way a run can end, including crashes.
+   */
+  async function settleUrgentBursts(agent: typeof agents.$inferSelect) {
+    const since = new Date(Date.now() - URGENT_BURST_LOOKBACK_MS);
+    const grants = await db
+      .select({
+        runId: activityLog.runId,
+        issueId: activityLog.entityId,
+        details: activityLog.details,
+        runStatus: heartbeatRuns.status,
+      })
+      .from(activityLog)
+      .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, activityLog.runId))
+      .where(and(
+        eq(activityLog.companyId, agent.companyId),
+        eq(activityLog.agentId, agent.id),
+        eq(activityLog.action, URGENT_BURST_GRANTED),
+        gte(activityLog.createdAt, since),
+        sql`not exists (
+          select 1 from ${activityLog} reverted
+          where reverted.run_id = ${activityLog.runId} and reverted.action = ${URGENT_BURST_REVERTED}
+        )`,
+      ));
+    let open = 0;
+    for (const grant of grants) {
+      if (!grant.runId) continue;
+      if (grant.runStatus === "queued" || grant.runStatus === "running") {
+        open += 1;
+        continue;
+      }
+      const granted = parseObject(grant.details);
+      await logUrgentLane(agent, URGENT_BURST_REVERTED, grant.runId, grant.issueId, {
+        runStatus: grant.runStatus,
+        maxConcurrentRuns: granted.baseMaxConcurrentRuns ?? null,
+        message: `Urgent burst run ended (${grant.runStatus}); ${agent.name} is back to maxConcurrentRuns ${String(granted.baseMaxConcurrentRuns ?? "unchanged")}.`,
+      });
+    }
+    return open;
+  }
+
+  /**
+   * The agent is full. Pick its oldest dependency-ready critical queued run
+   * and decide whether it may start as a memory-gated burst. Otherwise the
+   * run stays parked at the front of the queue; the park is logged once.
+   */
+  async function planUrgentBurst(
+    agent: typeof agents.$inferSelect,
+    maxConcurrentRuns: number,
+    runningCount: number,
+    openBursts: number,
+    cutoff: Date | null,
+  ): Promise<{ runId: string; issueId: string; record: UrgentBurstRecord } | null> {
+    const candidates = await db
+      .select({ run: heartbeatRuns, issueId: issues.id, priority: issues.priority })
+      .from(heartbeatRuns)
+      .innerJoin(issues, and(
+        eq(issues.companyId, heartbeatRuns.companyId),
+        sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      ))
+      .where(and(
+        eq(heartbeatRuns.agentId, agent.id),
+        eq(heartbeatRuns.status, "queued"),
+        eq(issues.priority, "critical"),
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(10);
+    if (candidates.length === 0) return null;
+    const readiness = await listQueuedRunDependencyReadiness(agent.companyId, candidates.map(candidate => candidate.run));
+    const candidate = candidates.find(row => readiness.get(row.issueId)?.isDependencyReady ?? true);
+    if (!candidate || !isUrgentIssuePriority(candidate.priority)) return null;
+    const decision = decideUrgentBurst({
+      issuePriority: candidate.priority,
+      maxConcurrentRuns,
+      runningCount,
+      runningBurstCount: openBursts,
+      availableMemoryBytes: readAvailableMemoryBytes(),
+    });
+    if (decision.grant) {
+      return {
+        runId: candidate.run.id,
+        issueId: candidate.issueId,
+        record: {
+          grantedAt: new Date().toISOString(),
+          baseMaxConcurrentRuns: maxConcurrentRuns,
+          effectiveMaxConcurrentRuns: decision.effectiveMaxConcurrentRuns,
+          availableMemoryBytes: decision.availableMemoryBytes,
+        },
+      };
+    }
+    const [alreadyParked] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, candidate.run.id), eq(activityLog.action, URGENT_BURST_PARKED)))
+      .limit(1);
+    if (!alreadyParked) {
+      await logUrgentLane(agent, URGENT_BURST_PARKED, candidate.run.id, candidate.issueId, {
+        reason: decision.reason,
+        maxConcurrentRuns,
+        runningCount,
+        availableMemoryBytes: decision.availableMemoryBytes,
+        message: decision.reason === "insufficient_memory"
+          ? `No burst for this urgent run: ${formatGiB(decision.availableMemoryBytes)} free is below a full run cap plus headroom. It is parked at the front of ${agent.name}'s queue and starts in the next free slot.`
+          : `No burst for this urgent run: ${agent.name} already has a burst run. It is parked at the front of the queue and starts in the next free slot.`,
+      });
+    }
+    return null;
+  }
+
+  async function recordUrgentBurst(agent: typeof agents.$inferSelect,
+    burst: { runId: string; issueId: string; record: UrgentBurstRecord }) {
+    await logUrgentLane(agent, URGENT_BURST_GRANTED, burst.runId, burst.issueId, {
+      ...burst.record,
+      message: `Urgent burst: ${agent.name} runs this critical issue now with maxConcurrentRuns ${burst.record.effectiveMaxConcurrentRuns} (normally ${burst.record.baseMaxConcurrentRuns}), ${formatGiB(burst.record.availableMemoryBytes)} free. It reverts when this run ends.`,
+    });
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if (isRunAdmissionClosed() || (await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -2110,11 +2252,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
+      const openBursts = await settleUrgentBursts(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
+      let availableSlots = Math.max(
         0,
         policy.maxConcurrentRuns - runningCount,
       );
+      // No free slot: only an urgent run may start, as a one-run burst.
+      const burst = availableSlots <= 0
+        ? await planUrgentBurst(agent, policy.maxConcurrentRuns, runningCount, openBursts, cutoff)
+        : null;
+      if (burst) availableSlots = 1;
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -2124,6 +2272,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           and(
             eq(heartbeatRuns.agentId, agentId),
             eq(heartbeatRuns.status, "queued"),
+            burst ? eq(heartbeatRuns.id, burst.runId) : undefined,
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
           ),
         )
@@ -2182,23 +2331,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           : true;
         const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
         const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId
-          ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        const rightRank = rightIssueId
-          ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
+        // A ready urgent (critical) issue runs ahead of every other queued
+        // run, including in-progress work (FAC-840 B urgent lane).
+        const [leftRank, leftPriorityRank] = queuedRunRank({
+          hasIssue: Boolean(leftIssueId), dependencyReady: leftReady,
+          issueStatus: leftIssue?.status, issuePriority: leftIssue?.priority,
+        });
+        const [rightRank, rightPriorityRank] = queuedRunRank({
+          hasIssue: Boolean(rightIssueId), dependencyReady: rightReady,
+          issueStatus: rightIssue?.status, issuePriority: rightIssue?.priority,
+        });
         if (leftRank !== rightRank) return leftRank - rightRank;
-        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
-        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
         if (leftPriorityRank !== rightPriorityRank)
           return leftPriorityRank - rightPriorityRank;
         return left.createdAt.getTime() - right.createdAt.getTime();
@@ -2225,6 +2368,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
+      if (burst && claimedRuns.some(run => run.id === burst.runId)) await recordUrgentBurst(agent, burst);
 
       for (const claimedRun of claimedRuns) {
         const execution = executeRun(claimedRun.id).catch((err) => {
