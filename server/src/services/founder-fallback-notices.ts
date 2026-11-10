@@ -25,20 +25,26 @@ import { subscribeAllCompanyLiveEvents } from "./live-events.js";
 import { subscribeTaskDrainChanges } from "./task-admission.js";
 
 /**
- * Deterministic founder fallback (FAC-597 B1).
+ * Deterministic founder alerts (FAC-597 B1, STA-219).
  *
- * The agent assigned to a chat endpoint normally owns every ordinary message in
- * its founder DM. When that agent is unavailable, this sweep enqueues short,
- * model-free, clearly labelled notices into the same DM through the native
- * outbox, so retry, UNKNOWN, restart and idempotency stay native. A decision
- * addressed to the founder on another task has no native route into that DM,
- * so it gets its own notice after the bound even while the agent is available.
- * A notice is re-proved at the transport claim and cancelled before any I/O
- * when its condition no longer holds. Disabled unless explicitly configured.
+ * The founder hears only about items they can act on: a decision addressed to
+ * them on another task, or an escalation to the DM agent that nobody picked up.
+ * Agent availability, pause, recovery and fallback mode are internal state and
+ * never reach the founder; they belong on the Console. Each alert is one plain
+ * line per item with one link to the card, at most five per message. When an
+ * alerted item resolves, one short "Done" line retracts it. A still-pending
+ * item is reminded at most every four hours, and nothing but a critical item
+ * is sent between 23:00 and 07:00 Mountain. Whether the DM agent is available
+ * changes nothing the founder sees.
+ *
+ * Notices are model-free and go through the native outbox, so retry, UNKNOWN,
+ * restart and idempotency stay native. Each notice is re-proved at the
+ * transport claim and cancelled before any I/O when it no longer holds.
+ * Disabled unless explicitly configured.
  *
  * The sweep is not a poll. It runs at startup, on wake hints from agent, run,
  * interaction and chat-configuration changes, and at the real deadline when a
- * known condition crosses the bound. With no such deadline it stays idle.
+ * known condition crosses a bound. With no such deadline it stays idle.
  */
 
 export const FOUNDER_FALLBACK_KEY_PREFIX = "founder-fallback:v1:";
@@ -46,9 +52,18 @@ const DEFAULT_BOUND_MINUTES = 20;
 const MIN_BOUND_MINUTES = 5;
 const MAX_BOUND_MINUTES = 360;
 const MAX_ITEMS_PER_SWEEP = 5;
+const MINUTE_MS = 60_000;
+export const FOUNDER_REMINDER_INTERVAL_MS = 4 * 60 * MINUTE_MS;
+/** Reminders after the first delivered alert of one item. */
+export const MAX_FOUNDER_REMINDERS = 2;
+/** Published alerts this recent are checked for a resolution to retract. */
+const RETRACTION_WINDOW_MS = 14 * 24 * 60 * MINUTE_MS;
+export const FOUNDER_TIME_ZONE = "America/Denver";
+const QUIET_START_HOUR = 23;
+const QUIET_END_HOUR = 7;
 const FAILED_RUN_STATUSES = ["failed", "timed_out"];
-const OPEN_PUBLICATION_STATES: (typeof chatPublications.$inferSelect.state)[] = ["pending", "retry", "streaming", "published", "delivery_unknown"];
-const IN_FLIGHT_STATES: (typeof chatPublications.$inferSelect.state)[] = ["pending", "retry", "streaming"];
+const IN_FLIGHT_STATES: (typeof chatPublications.$inferSelect.state)[] = ["pending", "retry", "streaming", "awaiting_consent"];
+const REACHED_STATES: (typeof chatPublications.$inferSelect.state)[] = ["published", "delivery_unknown"];
 /** Re-arms of one notice cancelled before any provider I/O; later cancellations stay final and visible. */
 export const MAX_FOUNDER_FALLBACK_REARMS = 20;
 
@@ -59,7 +74,7 @@ export function founderFallbackSettingsFromEnv(env: NodeJS.ProcessEnv = process.
   const bounded = Number.isInteger(minutes)
     ? Math.min(MAX_BOUND_MINUTES, Math.max(MIN_BOUND_MINUTES, minutes))
     : DEFAULT_BOUND_MINUTES;
-  return { enabled: env.PAPERCLIP_FOUNDER_FALLBACK_NOTICES === "true", boundMs: bounded * 60_000 };
+  return { enabled: env.PAPERCLIP_FOUNDER_FALLBACK_NOTICES === "true", boundMs: bounded * MINUTE_MS };
 }
 
 type Tx = Db;
@@ -76,32 +91,45 @@ type Target = {
 type Unavailability = { anchor: string; state: "error" | "paused" | "terminated"; since: Date; runId: string | null };
 
 /**
- * `attempt` is absent on the first notice. A notice cancelled before any
- * provider I/O is re-armed as a new row with the next attempt suffix, so each
- * row keeps its own effect identity and the unique key still deduplicates.
+ * `asks` is one message listing up to five items; `done` retracts one item.
+ * `agent`, `recovered` and single `item` keys are retired formats: they still
+ * parse so queued rows are cancelled at the claim and delivered rows still
+ * count as an alert of their item, but none is created any more.
+ *
+ * `attempt` is absent on the first row. A later row of the same identity gets
+ * the next attempt suffix, so each row keeps its own effect identity and the
+ * unique key still deduplicates.
  */
 export type FounderFallbackKey =
   | { endpointId: string; kind: "agent" | "recovered"; agentId: string; anchor: string; attempt?: number }
-  | { endpointId: string; kind: "item"; interactionId: string; attempt?: number };
+  | { endpointId: string; kind: "item" | "done"; interactionId: string; attempt?: number }
+  | { endpointId: string; kind: "asks"; interactionIds: string[]; attempt?: number };
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const KEY_RE = new RegExp(
-  `^founder-fallback:v1:(${UUID}):(?:(agent|recovered):(${UUID}):(error\\.(?:${UUID}|none)|paused\\.\\d{1,15}|terminated)|item:(${UUID}))(?::a([1-9]\\d{0,2}))?$`,
+  `^founder-fallback:v1:(${UUID}):(?:(agent|recovered):(${UUID}):(error\\.(?:${UUID}|none)|paused\\.\\d{1,15}|terminated)|(item|done):(${UUID})|asks:(${UUID}(?:\\+${UUID}){0,${MAX_ITEMS_PER_SWEEP - 1}}))(?::a([1-9]\\d{0,2}))?$`,
 );
 
 export function founderFallbackKey(key: FounderFallbackKey): string {
-  const base = key.kind === "item"
-    ? `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:item:${key.interactionId}`
-    : `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:${key.kind}:${key.agentId}:${key.anchor}`;
+  const base = key.kind === "item" || key.kind === "done"
+    ? `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:${key.kind}:${key.interactionId}`
+    : key.kind === "asks"
+      ? `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:asks:${key.interactionIds.join("+")}`
+      : `${FOUNDER_FALLBACK_KEY_PREFIX}${key.endpointId}:${key.kind}:${key.agentId}:${key.anchor}`;
   return key.attempt ? `${base}:a${key.attempt}` : base;
 }
 
 export function parseFounderFallbackKey(value: string): FounderFallbackKey | null {
   const match = KEY_RE.exec(value);
   if (!match) return null;
-  const attempt = match[6] ? { attempt: Number(match[6]) } : {};
+  const attempt = match[8] ? { attempt: Number(match[8]) } : {};
+  if (match[7]) {
+    const interactionIds = match[7].split("+");
+    if (new Set(interactionIds).size !== interactionIds.length) return null;
+    return { endpointId: match[1]!, kind: "asks", interactionIds, ...attempt };
+  }
   return match[5]
-    ? { endpointId: match[1]!, kind: "item", interactionId: match[5], ...attempt }
+    ? { endpointId: match[1]!, kind: match[5] as "item" | "done", interactionId: match[6]!, ...attempt }
     : { endpointId: match[1]!, kind: match[2] as "agent" | "recovered", agentId: match[3]!, anchor: match[4]!, ...attempt };
 }
 
@@ -112,6 +140,13 @@ function withoutAttempt(key: FounderFallbackKey): FounderFallbackKey {
 
 function withAttempt(base: string, attempt: number) {
   return attempt ? `${base}:a${attempt}` : base;
+}
+
+/** Interactions an alert row covers: an `asks` batch or a retired single `item`. */
+function alertedInteractionIds(key: FounderFallbackKey | null): string[] {
+  if (key?.kind === "asks") return key.interactionIds;
+  if (key?.kind === "item") return [key.interactionId];
+  return [];
 }
 
 type PublicationOutcome = Pick<typeof chatPublications.$inferSelect, "state" | "publishedAt" | "providerMessageId" | "redactedError">;
@@ -130,8 +165,39 @@ export function isFounderFallbackPublication(publication: { idempotencyKey: stri
   return publication.idempotencyKey.startsWith(FOUNDER_FALLBACK_KEY_PREFIX);
 }
 
-function utc(date: Date) {
-  return `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+function founderHour(date: Date) {
+  const hour = new Intl.DateTimeFormat("en-US", { timeZone: FOUNDER_TIME_ZONE, hour: "numeric", hourCycle: "h23" })
+    .formatToParts(date).find(part => part.type === "hour")?.value;
+  return Number(hour) % 24;
+}
+
+/** 23:00 to 07:00 founder local time. */
+export function inFounderQuietHours(date: Date) {
+  const hour = founderHour(date);
+  return hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR;
+}
+
+/** The first quarter hour at or after `date` outside quiet hours (07:00 local). */
+export function founderQuietHoursEnd(date: Date) {
+  const step = 15 * MINUTE_MS;
+  let at = Math.ceil(date.getTime() / step) * step;
+  while (inFounderQuietHours(new Date(at))) at += step;
+  return at;
+}
+
+function founderLocalTime(date: Date, now: Date) {
+  const sameDay = now.getTime() - date.getTime() < 20 * 60 * MINUTE_MS;
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: FOUNDER_TIME_ZONE, hour: "numeric", minute: "2-digit", timeZoneName: "short",
+    ...(sameDay ? {} : { weekday: "short" }),
+  }).format(date);
+}
+
+function waited(ms: number) {
+  const minutes = Math.max(0, Math.floor(ms / MINUTE_MS));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
 }
 
 function clip(value: string | null | undefined, max: number) {
@@ -139,8 +205,16 @@ function clip(value: string | null | undefined, max: number) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-function header(agent: Agent) {
-  return `Paperclip fallback notice (automatic, not from ${clip(agent.name, 60)}).`;
+const ESTIMATE_RE = /(?:~|≈|about\s+|approx\.?\s+)?\b(\d{1,3})\s*-?\s*(min(?:ute)?s?|h(?:ou)?rs?|hours?)\b/i;
+const PC_RE = /\b(?:at (?:the |your )?(?:pc|desk|computer)|pc|desktop|laptop|computer)\b/i;
+const PHONE_RE = /\b(?:phone|mobile)\b/i;
+
+/** Effort and place, only when the card states them; never invented. */
+export function founderAskHints(text: string): { estimate: string | null; where: "PC" | "phone" | null } {
+  const match = ESTIMATE_RE.exec(text);
+  const estimate = match ? `~${Number(match[1])} ${/^h/i.test(match[2]!) ? "h" : "min"}` : null;
+  const where = PC_RE.test(text) ? "PC" : PHONE_RE.test(text) ? "phone" : null;
+  return { estimate, where };
 }
 
 /**
@@ -260,13 +334,6 @@ async function escalationMissed(tx: Tx, agent: Agent, interaction: Interaction, 
   return !run;
 }
 
-function stateSentence(agent: Agent, state: Unavailability) {
-  const name = clip(agent.name, 60);
-  if (state.state === "terminated") return `${name} has been terminated.`;
-  if (state.state === "paused") return `${name} has been paused since ${utc(state.since)}.`;
-  return `${name} has been in error since ${utc(state.since)}${state.runId ? ` (run ${state.runId.slice(0, 8)} failed)` : ""}.`;
-}
-
 /** The founder's own task-read decision, never widened by instance admin. */
 async function founderCanReadIssue(tx: Tx, target: Target, issueId: string) {
   const decision = await authorizationService(tx).decide({
@@ -289,79 +356,131 @@ async function itemReason(
   const toFounder = interaction.addresseeUserId === target.founderUserId;
   if (!toAgent && !toFounder) return null;
   if (!(await founderCanReadIssue(tx, target, interaction.issueId))) return null;
-  if (eligible(state, now, boundMs)) return { kind: "unavailable", state };
-  if (toAgent && !state && await escalationMissed(tx, target.agent, interaction, now, boundMs)) return { kind: "missed" };
   // Nothing routes a founder decision on another task into this DM natively,
   // so the agent's availability does not decide whether the founder hears of it.
-  if (toFounder && now.getTime() - interaction.createdAt.getTime() >= boundMs) return { kind: "awaiting_founder" };
+  if (toFounder) return now.getTime() - interaction.createdAt.getTime() >= boundMs ? { kind: "awaiting_founder" } : null;
+  if (eligible(state, now, boundMs)) return { kind: "unavailable", state };
+  if (!state && await escalationMissed(tx, target.agent, interaction, now, boundMs)) return { kind: "missed" };
   return null;
 }
 
-/**
- * Counts only items on tasks the founder may read, with the same decision an
- * item notice requires, so the summary reveals no aggregate of hidden tasks.
- */
-async function agentNoticeText(tx: Tx, target: Target, state: Unavailability) {
-  const perIssue = await tx.select({
-    issueId: issueThreadInteractions.issueId,
-    escalations: sql<number>`count(*) filter (where ${issueThreadInteractions.addresseeAgentId} = ${target.agent.id})::int`,
-    decisions: sql<number>`count(*) filter (where ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})::int`,
-  }).from(issueThreadInteractions).where(and(
-    eq(issueThreadInteractions.companyId, target.endpoint.companyId),
-    eq(issueThreadInteractions.status, "pending"),
-    sql`${issueThreadInteractions.issueId} <> ${target.issueId}`,
-    sql`(${issueThreadInteractions.addresseeAgentId} = ${target.agent.id} or ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})`,
-  )).groupBy(issueThreadInteractions.issueId).orderBy(asc(issueThreadInteractions.issueId));
-  let escalations = 0, decisions = 0;
-  for (const row of perIssue) {
-    if (!(await founderCanReadIssue(tx, target, row.issueId))) continue;
-    escalations += row.escalations;
-    decisions += row.decisions;
-  }
-  const name = clip(target.agent.name, 60);
-  return [
-    header(target.agent),
-    stateSentence(target.agent, state),
-    `Waiting on ${name}: ${escalations} escalation(s). Waiting on you: ${decisions} decision(s).`,
-    `Until ${name} recovers, Paperclip sends a separate fallback notice here for each one.`,
-  ].join("\n");
+type IssueRef = { identifier: string | null; title: string | null; priority: string; prefix: string | null };
+
+async function issueRef(tx: Tx, interaction: Interaction): Promise<IssueRef | null> {
+  const [row] = await tx.select({
+    identifier: issues.identifier, title: issues.title, priority: issues.priority, prefix: companies.issuePrefix,
+  }).from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
+    .where(and(eq(issues.id, interaction.issueId), eq(issues.companyId, interaction.companyId)));
+  return row ?? null;
+}
+
+function interactionText(interaction: Interaction) {
+  const payload = interaction.payload as { prompt?: unknown; question?: unknown } | null;
+  const prompt = typeof payload?.prompt === "string" ? payload.prompt : typeof payload?.question === "string" ? payload.question : null;
+  return interaction.title ?? interaction.summary ?? prompt ?? interaction.kind;
+}
+
+/** One plain line the founder can act on, without agent or fallback state. */
+function askLine(interaction: Interaction, reason: ItemReason) {
+  const ask = clip(interactionText(interaction), 120);
+  return reason.kind === "awaiting_founder" ? ask : `Stuck, needs a board action: ${ask}`;
+}
+
+function cardLink(interaction: Interaction, ref: IssueRef | null) {
+  return publicChatTaskUrl(interaction.issueId, { prefix: ref?.prefix ?? null, identifier: ref?.identifier ?? null })
+    ?? ref?.identifier ?? null;
+}
+
+type Ask = { interaction: Interaction; reason: ItemReason; ref: IssueRef | null; reminder: boolean; sequence: number };
+
+function askText(asks: Ask[], now: Date) {
+  return asks.map(({ interaction, reason, ref, reminder }) => {
+    const hints = founderAskHints(`${interaction.title ?? ""} ${interaction.summary ?? ""} ${interactionText(interaction)}`);
+    const parts = [
+      `${reminder ? "[Still needs you]" : "[Needs you]"} ${askLine(interaction, reason)}`,
+      hints.estimate,
+      hints.where,
+      `waiting ${waited(now.getTime() - interaction.createdAt.getTime())} (since ${founderLocalTime(interaction.createdAt, now)})`,
+    ].filter(Boolean);
+    const link = cardLink(interaction, ref);
+    return [parts.join(" · "), link].filter(Boolean).join("\n");
+  }).join("\n\n");
+}
+
+function doneText(interaction: Interaction, ref: IssueRef | null) {
+  const ask = clip(interactionText(interaction), 120);
+  return `[Done] No action needed: ${ask}${ref?.identifier ? ` (${ref.identifier})` : ""}`;
 }
 
 function noticePayload(text: string) {
   return projectSafeChatPublication({ classification: "external", source: "safe_milestone", text });
 }
 
-async function itemNoticeText(tx: Tx, target: Target, interaction: Interaction, reason: ItemReason, now: Date) {
-  const [issue] = await tx.select({ identifier: issues.identifier, title: issues.title }).from(issues)
-    .where(and(eq(issues.id, interaction.issueId), eq(issues.companyId, interaction.companyId)));
-  const [creator] = interaction.createdByAgentId
-    ? await tx.select({ name: agents.name }).from(agents).where(eq(agents.id, interaction.createdByAgentId))
-    : [];
-  const name = clip(target.agent.name, 60);
-  const toFounder = interaction.addresseeUserId === target.founderUserId;
-  const minutes = Math.floor((now.getTime() - interaction.createdAt.getTime()) / 60_000);
-  const why = reason.kind === "unavailable"
-    ? stateSentence(target.agent, reason.state)
-    : reason.kind === "awaiting_founder"
-      ? `This decision has waited ${minutes} min for your answer.`
-      : `${name} has not started a run on that task since this escalation reached it ${minutes} min ago.`;
-  const url = publicChatTaskUrl(interaction.issueId);
-  return [
-    header(target.agent),
-    `Why: ${why}`,
-    `${issue?.identifier ?? "Task"} · ${clip(issue?.title, 120)}`,
-    `${toFounder ? "Decision waiting for you" : `Escalation to ${name}`}${creator ? ` from ${clip(creator.name, 60)}` : ""}, raised ${utc(interaction.createdAt)}: "${clip(interaction.title ?? interaction.summary ?? interaction.kind, 160)}"`,
-    toFounder
-      ? `Answer it on that task in Paperclip; a reply in this chat does not resolve it.${url ? ` ${url}` : ""}`
-      : `Open the task for the evidence.${url ? ` ${url}` : ""}`,
-  ].join("\n");
+const PRIORITY_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+type AlertRow = Pick<typeof chatPublications.$inferSelect,
+  "idempotencyKey" | "state" | "publishedAt" | "providerMessageId" | "redactedError" | "createdAt" | "updatedAt">;
+type Coverage = { rows: number; inFlight: boolean; blocked: boolean; unsent: number; lastReachedAt: number | null; reached: number };
+
+const alertColumns = {
+  idempotencyKey: chatPublications.idempotencyKey,
+  state: chatPublications.state,
+  publishedAt: chatPublications.publishedAt,
+  providerMessageId: chatPublications.providerMessageId,
+  redactedError: chatPublications.redactedError,
+  createdAt: chatPublications.createdAt,
+  updatedAt: chatPublications.updatedAt,
+};
+
+/** Alert rows on one endpoint that cover any of `interactionIds`, by interaction. */
+async function alertCoverage(tx: Tx, companyId: string, endpointId: string, interactionIds: string[]) {
+  const coverage = new Map<string, Coverage>();
+  if (!interactionIds.length) return coverage;
+  const wanted = new Set(interactionIds);
+  const rows: AlertRow[] = await tx.select(alertColumns).from(chatPublications).where(and(
+    eq(chatPublications.companyId, companyId),
+    eq(chatPublications.endpointId, endpointId),
+    or(
+      like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:asks:%`),
+      like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:item:%`),
+    ),
+    or(...interactionIds.map(id => like(chatPublications.idempotencyKey, `%${id}%`))),
+  ));
+  for (const row of rows) {
+    const key = parseFounderFallbackKey(row.idempotencyKey);
+    if (!key || key.endpointId !== endpointId) continue;
+    for (const id of alertedInteractionIds(key)) {
+      if (!wanted.has(id)) continue;
+      const entry = coverage.get(id) ?? { rows: 0, inFlight: false, blocked: false, unsent: 0, lastReachedAt: null, reached: 0 };
+      entry.rows += 1;
+      if (IN_FLIGHT_STATES.includes(row.state)) entry.inFlight = true;
+      else if (founderFallbackDefinitelyUnsent(row)) entry.unsent += 1;
+      else if (REACHED_STATES.includes(row.state)) {
+        entry.reached += 1;
+        const at = (row.publishedAt ?? row.updatedAt ?? row.createdAt).getTime();
+        entry.lastReachedAt = Math.max(entry.lastReachedAt ?? at, at);
+      } else entry.blocked = true;
+      coverage.set(id, entry);
+    }
+  }
+  return coverage;
 }
 
-function recoveredText(agent: Agent) {
-  return [
-    header(agent),
-    `${clip(agent.name, 60)} is available again (status ${agent.status}) and resumes founder alerts here. Items it missed stay open on their own tasks.`,
-  ].join("\n");
+type AskPlan = { send: "first" | "reminder" } | { inFlight: true } | { dueAt: number } | null;
+
+/**
+ * One item's next alert: the first one, a reminder at most every four hours
+ * after a delivered one, or nothing while one is in flight, once a row failed
+ * or may have been delivered without proof, or after the reminder limit.
+ */
+function askPlan(coverage: Coverage | undefined, now: Date): AskPlan {
+  if (!coverage) return { send: "first" };
+  if (coverage.inFlight) return { inFlight: true };
+  if (coverage.blocked) return null;
+  if (!coverage.reached) return coverage.unsent < MAX_FOUNDER_FALLBACK_REARMS ? { send: "first" } : null;
+  if (coverage.reached > MAX_FOUNDER_REMINDERS) return null;
+  const dueAt = coverage.lastReachedAt! + FOUNDER_REMINDER_INTERVAL_MS;
+  return dueAt <= now.getTime() ? { send: "reminder" } : { dueAt };
 }
 
 export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSettings, clock: () => Date = () => new Date()) {
@@ -402,10 +521,8 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       publishedAt: chatPublications.publishedAt,
     }).from(chatPublications).where(and(
       eq(chatPublications.companyId, companyId),
-      or(
-        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:item:${interactionId}`),
-        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:item:${interactionId}:a%`),
-      ),
+      like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%`),
+      like(chatPublications.idempotencyKey, `%${interactionId}%`),
     )).orderBy(asc(chatPublications.createdAt), asc(chatPublications.idempotencyKey));
     return {
       configured: settings.enabled,
@@ -414,12 +531,14 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       targets,
       publications: rows.filter(row => {
         const key = parseFounderFallbackKey(row.idempotencyKey);
-        return key?.kind === "item" && key.interactionId === interactionId && key.endpointId === row.endpointId;
+        if (!key || key.endpointId !== row.endpointId) return false;
+        return key.kind === "done" ? key.interactionId === interactionId : alertedInteractionIds(key).includes(interactionId);
       }),
     };
   }
+
   /**
-   * Re-prove one fallback publication. Called inside the outbox transport
+   * Re-prove one founder publication. Called inside the outbox transport
    * claim, with the publication row locked, and before every insert.
    */
   async function authorizeFounderFallbackPublication(
@@ -431,52 +550,42 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
   ): Promise<boolean> {
     if (!settings.enabled) return false;
     const key = parseFounderFallbackKey(publication.idempotencyKey);
-    if (!key || key.endpointId !== publication.endpointId) return false;
+    // Agent availability, recovery and the old per-item format are retired.
+    if (!key || key.endpointId !== publication.endpointId || (key.kind !== "asks" && key.kind !== "done")) return false;
     const [endpoint] = await tx.select().from(chatEndpoints)
       .where(and(eq(chatEndpoints.id, key.endpointId), eq(chatEndpoints.companyId, publication.companyId)));
     const target = endpoint ? await resolveTarget(tx, endpoint) : null;
     if (!target || target.conversationId !== publication.conversationId || target.issueId !== publication.issueId) return false;
+    const load = async (id: string) => (await tx.select().from(issueThreadInteractions)
+      .where(and(eq(issueThreadInteractions.id, id), eq(issueThreadInteractions.companyId, publication.companyId))))[0];
+    if (key.kind === "done") {
+      const interaction = await load(key.interactionId);
+      if (!interaction || interaction.status === "pending" || interaction.issueId === target.issueId) return false;
+      if (!(await founderCanReadIssue(tx, target, interaction.issueId))) return false;
+      const coverage = (await alertCoverage(tx, publication.companyId, key.endpointId, [interaction.id])).get(interaction.id);
+      return !!coverage?.reached;
+    }
     const now = clock();
     const state = await unavailability(tx, target.agent);
-    if (key.kind !== "item") {
-      if (key.agentId !== target.agent.id) return false;
-      if (key.kind === "recovered") return !state;
-      if (!eligible(state, now, settings.boundMs) || state.anchor !== key.anchor) return false;
-      // A queued summary is sent only while its counts still match what the
-      // founder can read; otherwise it is cancelled before I/O and re-armed.
-      if (publication.payload === undefined) return true;
-      const sent = (publication.payload as { text?: unknown } | null)?.text;
-      return sent === noticePayload(await agentNoticeText(tx, target, state)).text;
+    // Every listed item must still need the founder; otherwise the whole
+    // message is cancelled before I/O and the rest are listed again.
+    for (const id of key.interactionIds) {
+      const interaction = await load(id);
+      if (!interaction || !(await itemReason(tx, target, interaction, state, now, settings.boundMs))) return false;
     }
-    const [interaction] = await tx.select().from(issueThreadInteractions)
-      .where(and(eq(issueThreadInteractions.id, key.interactionId), eq(issueThreadInteractions.companyId, publication.companyId)));
-    return !!interaction && !!(await itemReason(tx, target, interaction, state, now, settings.boundMs));
+    return true;
   }
 
-  async function insert(target: Target, key: string, text: (tx: Tx) => Promise<string> | string) {
-    return db.transaction(async raw => {
-      const tx = raw as unknown as Tx;
-      const row = {
-        companyId: target.endpoint.companyId, endpointId: target.endpoint.id,
-        conversationId: target.conversationId, issueId: target.issueId, idempotencyKey: key,
-      };
-      if (!(await authorizeFounderFallbackPublication(tx, row))) return 0;
-      await notifyChatPublicationWork(tx);
-      return (await tx.insert(chatPublications).values({
-        ...row,
-        payload: noticePayload(await text(tx)),
-        state: "pending",
-      }).onConflictDoNothing().returning({ id: chatPublications.id })).length;
-    });
+  async function insert(tx: Tx, target: Target, key: string, text: string) {
+    const row = {
+      companyId: target.endpoint.companyId, endpointId: target.endpoint.id,
+      conversationId: target.conversationId, issueId: target.issueId, idempotencyKey: key,
+    };
+    if (!(await authorizeFounderFallbackPublication(tx, row))) return 0;
+    await notifyChatPublicationWork(tx);
+    return (await tx.insert(chatPublications).values({ ...row, payload: noticePayload(text), state: "pending" })
+      .onConflictDoNothing().returning({ id: chatPublications.id })).length;
   }
-
-  const outcomeColumns = {
-    key: chatPublications.idempotencyKey,
-    state: chatPublications.state,
-    publishedAt: chatPublications.publishedAt,
-    providerMessageId: chatPublications.providerMessageId,
-    redactedError: chatPublications.redactedError,
-  };
 
   /**
    * For each base key, the attempt to insert next, or null when a row of that
@@ -484,22 +593,22 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
    * re-arms. Re-arming applies only while every earlier row was cancelled
    * before provider I/O.
    */
-  async function nextAttempts(companyId: string, bases: string[]) {
+  async function nextAttempts(tx: Tx, companyId: string, bases: string[]) {
     const plan = new Map<string, number | null>();
     if (!bases.length) return plan;
-    const firsts = new Map((await db.select(outcomeColumns).from(chatPublications).where(and(
+    const firsts = new Map((await tx.select(alertColumns).from(chatPublications).where(and(
       eq(chatPublications.companyId, companyId),
       inArray(chatPublications.idempotencyKey, bases),
-    ))).map(row => [row.key, row]));
+    ))).map(row => [row.idempotencyKey, row]));
     for (const base of bases) {
       const first = firsts.get(base);
       if (!first) { plan.set(base, 0); continue; }
       if (!founderFallbackDefinitelyUnsent(first)) { plan.set(base, null); continue; }
-      const retries = (await db.select(outcomeColumns).from(chatPublications).where(and(
+      const retries = (await tx.select(alertColumns).from(chatPublications).where(and(
         eq(chatPublications.companyId, companyId),
         like(chatPublications.idempotencyKey, `${base}:a%`),
       ))).flatMap(row => {
-        const key = parseFounderFallbackKey(row.key);
+        const key = parseFounderFallbackKey(row.idempotencyKey);
         return key?.attempt && founderFallbackKey(withoutAttempt(key)) === base ? [{ row, attempt: key.attempt }] : [];
       });
       const settled = retries.every(({ row }) => founderFallbackDefinitelyUnsent(row));
@@ -511,89 +620,98 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
   }
 
   /**
-   * An agent episode stays open until a sweep observes the agent available and
-   * queues its recovery notice. A new anchor of the same kind while it is open
-   * (another failed retry, a re-pause) is the same unavailability, not a new
-   * alert; a change of kind (error to paused, paused to terminated) is. A
-   * cancelled or failed notice never reached the founder, so it holds nothing,
-   * and a recovery notice cancelled before I/O does not close the episode.
+   * Plans and inserts one endpoint's notices in a transaction holding the
+   * endpoint's advisory lock, so concurrent sweeps and restarts cannot list one
+   * item in two messages.
    */
-  async function openAgentEpisode(target: Target, state: Unavailability) {
-    const [last] = await db.select({ key: chatPublications.idempotencyKey }).from(chatPublications).where(and(
-      eq(chatPublications.companyId, target.endpoint.companyId),
-      like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${target.endpoint.id}:agent:${target.agent.id}:%`),
-      inArray(chatPublications.state, OPEN_PUBLICATION_STATES),
-    )).orderBy(desc(chatPublications.createdAt), desc(chatPublications.id)).limit(1);
-    const episode = last ? parseFounderFallbackKey(last.key) : null;
-    if (!episode || episode.kind !== "agent" || !episode.anchor.startsWith(state.state)) return false;
-    const recovered = founderFallbackKey({ ...withoutAttempt(episode), kind: "recovered" } as FounderFallbackKey);
-    return (await nextAttempts(target.endpoint.companyId, [recovered])).get(recovered) !== null;
-  }
-
   async function sweepTarget(target: Target, now: Date) {
-    let inserted = 0;
-    let awaitingOutbox = false;
     let dueAt: number | null = null;
     const due = (at: number) => { dueAt = dueAt === null ? at : Math.min(dueAt, at); };
     const companyId = target.endpoint.companyId;
-    const state = await unavailability(db, target.agent);
     const endpointId = target.endpoint.id;
-    const boundAt = state ? state.since.getTime() + settings.boundMs : null;
-    if (boundAt !== null && boundAt > now.getTime()) due(boundAt);
-    if (eligible(state, now, settings.boundMs)) {
-      const key = founderFallbackKey({ endpointId, kind: "agent", agentId: target.agent.id, anchor: state.anchor });
-      const attempt = (await nextAttempts(companyId, [key])).get(key);
-      if (attempt != null && !(await openAgentEpisode(target, state))) {
-        inserted += await insert(target, withAttempt(key, attempt), tx => agentNoticeText(tx, target, state));
+    const quiet = inFounderQuietHours(now);
+    const result = await db.transaction(async raw => {
+      const tx = raw as unknown as Tx;
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`founder-fallback:${endpointId}`}))`);
+      let inserted = 0;
+      let awaitingOutbox = false;
+      const state = await unavailability(tx, target.agent);
+      const boundAt = state ? state.since.getTime() + settings.boundMs : null;
+
+      const pending = await tx.select().from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        eq(issueThreadInteractions.status, "pending"),
+        sql`${issueThreadInteractions.issueId} <> ${target.issueId}`,
+        sql`(${issueThreadInteractions.addresseeAgentId} = ${target.agent.id} or ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})`,
+      )).orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
+      const coverage = await alertCoverage(tx, companyId, endpointId, pending.map(row => row.id));
+      const asks: Ask[] = [];
+      for (const interaction of pending) {
+        if (interaction.createdAt > now) continue;
+        const plan = askPlan(coverage.get(interaction.id), now);
+        if (!plan) continue;
+        if ("inFlight" in plan) { awaitingOutbox = true; continue; }
+        if ("dueAt" in plan) { due(plan.dueAt); continue; }
+        // An escalation to an unavailable agent qualifies at the outage bound;
+        // a founder decision, or one to an available agent, at its own age.
+        const missedAt = interaction.createdAt.getTime() + settings.boundMs;
+        const qualifiesAt = interaction.addresseeUserId !== target.founderUserId && boundAt !== null ? boundAt : missedAt;
+        if (qualifiesAt > now.getTime()) due(qualifiesAt);
+        const reason = await itemReason(tx, target, interaction, state, now, settings.boundMs);
+        if (!reason) continue;
+        const ref = await issueRef(tx, interaction);
+        if (quiet && ref?.priority !== "critical") { due(founderQuietHoursEnd(now)); continue; }
+        asks.push({ interaction, reason, ref, reminder: plan.send === "reminder", sequence: coverage.get(interaction.id)?.rows ?? 0 });
       }
-    }
-    if (!state) {
-      // Close only the most recent delivered (or possibly delivered) episode.
-      const [last] = await db.select({ key: chatPublications.idempotencyKey, state: chatPublications.state }).from(chatPublications).where(and(
+      asks.sort((a, b) => (PRIORITY_RANK[a.ref?.priority ?? "medium"] ?? 2) - (PRIORITY_RANK[b.ref?.priority ?? "medium"] ?? 2)
+        || a.interaction.createdAt.getTime() - b.interaction.createdAt.getTime());
+      const batch = asks.slice(0, MAX_ITEMS_PER_SWEEP);
+      if (asks.length > batch.length) due(now.getTime());
+      if (batch.length) {
+        // Unique per item set: any earlier row of this set raised each item's count.
+        const attempt = Math.max(...batch.map(ask => ask.sequence));
+        const key = founderFallbackKey({ endpointId, kind: "asks", interactionIds: batch.map(ask => ask.interaction.id), ...(attempt ? { attempt } : {}) });
+        inserted += await insert(tx, target, key, askText(batch, now));
+      }
+
+      // Retract each alerted item that has since resolved, once.
+      const alerted = await tx.select({ idempotencyKey: chatPublications.idempotencyKey }).from(chatPublications).where(and(
         eq(chatPublications.companyId, companyId),
-        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:agent:${target.agent.id}:%`),
-        inArray(chatPublications.state, [...IN_FLIGHT_STATES, "published", "delivery_unknown"]),
-      )).orderBy(desc(chatPublications.createdAt), desc(chatPublications.id)).limit(1);
-      const episode = last ? parseFounderFallbackKey(last.key) : null;
-      if (last && IN_FLIGHT_STATES.includes(last.state)) {
-        // The outbox settles this row: cancelled at its claim, or delivered.
-        // Its settlement, not a timer, decides whether a recovery notice follows.
-        awaitingOutbox = true;
-      } else if (episode && episode.kind === "agent") {
-        const key = founderFallbackKey({ ...withoutAttempt(episode), kind: "recovered" } as FounderFallbackKey);
-        const attempt = (await nextAttempts(companyId, [key])).get(key);
-        if (attempt != null) inserted += await insert(target, withAttempt(key, attempt), () => recoveredText(target.agent));
+        eq(chatPublications.endpointId, endpointId),
+        or(
+          like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:asks:%`),
+          like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:item:%`),
+        ),
+        inArray(chatPublications.state, REACHED_STATES),
+        sql`${chatPublications.createdAt} >= ${new Date(now.getTime() - RETRACTION_WINDOW_MS).toISOString()}::timestamptz`,
+      ));
+      const alertedIds = [...new Set(alerted.flatMap(row => alertedInteractionIds(parseFounderFallbackKey(row.idempotencyKey))))];
+      const resolved = alertedIds.length ? await tx.select().from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        inArray(issueThreadInteractions.id, alertedIds),
+        sql`${issueThreadInteractions.status} <> 'pending'`,
+      )).orderBy(asc(issueThreadInteractions.updatedAt), asc(issueThreadInteractions.id)) : [];
+      const doneKeys = resolved.map(interaction => founderFallbackKey({ endpointId, kind: "done", interactionId: interaction.id }));
+      const donePlan = await nextAttempts(tx, companyId, doneKeys);
+      let dones = 0;
+      for (const [index, interaction] of resolved.entries()) {
+        const attempt = donePlan.get(doneKeys[index]!);
+        if (attempt == null) continue;
+        if (quiet) { due(founderQuietHoursEnd(now)); break; }
+        if (dones >= MAX_ITEMS_PER_SWEEP) { due(now.getTime()); break; }
+        const count = await insert(tx, target, withAttempt(doneKeys[index]!, attempt), doneText(interaction, await issueRef(tx, interaction)));
+        dones += count;
+        inserted += count;
       }
-    }
-    const pending = await db.select().from(issueThreadInteractions).where(and(
-      eq(issueThreadInteractions.companyId, companyId),
-      eq(issueThreadInteractions.status, "pending"),
-      sql`(${issueThreadInteractions.addresseeAgentId} = ${target.agent.id} or ${issueThreadInteractions.addresseeUserId} = ${target.founderUserId})`,
-    )).orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
-    const keyed = pending.map(interaction => ({ interaction, key: founderFallbackKey({ endpointId, kind: "item", interactionId: interaction.id }) }));
-    const plan = await nextAttempts(companyId, keyed.map(item => item.key));
-    let items = 0;
-    for (const { interaction, key } of keyed) {
-      const attempt = plan.get(key);
-      if (attempt == null) continue;
-      const missedAt = interaction.createdAt.getTime() + settings.boundMs;
-      const toFounder = interaction.addresseeUserId === target.founderUserId && interaction.issueId !== target.issueId;
-      if ((toFounder || (!state && interaction.addresseeAgentId === target.agent.id)) && missedAt > now.getTime()) due(missedAt);
-      if (interaction.createdAt > now) continue;
-      if (items >= MAX_ITEMS_PER_SWEEP) { due(now.getTime()); continue; }
-      const reason = await itemReason(db, target, interaction, state, now, settings.boundMs);
-      if (!reason) continue;
-      const count = await insert(target, withAttempt(key, attempt), tx => itemNoticeText(tx, target, interaction, reason, now));
-      items += count;
-      inserted += count;
-    }
-    return { inserted, awaitingOutbox, dueAt: dueAt as number | null };
+      return { inserted, awaitingOutbox };
+    });
+    return { ...result, dueAt: dueAt as number | null };
   }
 
   /**
    * `nextDueAt` is the earliest real deadline of a known condition, or null.
-   * `awaitingOutbox` means a recovered agent's notice is still in flight, so
-   * the outcome of that outbox row decides the next step.
+   * `awaitingOutbox` means an alert is still in flight, so the outcome of that
+   * outbox row (delivered, or cancelled and listed again) decides the next step.
    */
   async function sweep(signal?: AbortSignal): Promise<{ targets: number; inserted: number; nextDueAt: number | null; awaitingOutbox: boolean }> {
     if (!settings.enabled) return { targets: 0, inserted: 0, nextDueAt: null, awaitingOutbox: false };
