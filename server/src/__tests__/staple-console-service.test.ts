@@ -130,7 +130,7 @@ suite("staple console service", () => {
     expect(card.round).toBe(2);
     const done = cards(board).find((candidate) => candidate.id === doneTask!.id)!;
     expect(done).toMatchObject({ step: "review", completion: "task_done", mergedToday: false });
-    expect(done.completionNote).toBe("Task done; widgets#33 is still open, not merged");
+    expect(done.completionNote).toBe("Task done; widgets#33 recorded open, merge not confirmed");
     expect(board.header.mergedToday).toBe(0);
   });
 
@@ -175,7 +175,7 @@ suite("staple console service", () => {
     expect(ids).toContain(openPrTask!.id);
     expect(ids).not.toContain(mergedPrTask!.id);
     expect(cards(board).find((card) => card.id === openPrTask!.id)).toMatchObject({
-      step: "review", completion: "task_done", completionNote: "Task done; widgets#40 is still open, not merged",
+      step: "review", completion: "task_done", completionNote: "Task done; widgets#40 recorded open, merge not confirmed",
     });
     expect(cards(board).find((card) => card.id === nativeTask!.id)).toMatchObject({ step: "review", round: 1 });
     expect(board.header.inFlight).toBe(2);
