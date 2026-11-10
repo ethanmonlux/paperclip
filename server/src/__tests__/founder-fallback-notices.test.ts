@@ -510,6 +510,54 @@ const support = await getEmbeddedPostgresTestSupport();
       .toEqual([asksKey(f, [ordinary.id]), doneKey(f, critical.id)].sort());
   });
 
+  it("re-checks quiet hours at the transport claim, so a row queued at 22:59 waits for 07:00 (STA-273)", async () => {
+    const f = await fixture();
+    const criticalIssueId = randomUUID();
+    await db.insert(issues).values({ id: criticalIssueId, companyId: f.companyId, title: "Live outage", identifier: "F-9", priority: "critical" });
+    // 22:59 MST: still outside quiet hours.
+    const evening = new Date("2026-11-04T05:59:00.000Z");
+    const ordinary = await interaction(f, { addresseeUserId: f.founderUserId, title: "Ordinary card", createdAt: new Date(evening.getTime() - 30 * MINUTE) });
+    const resolved = await interaction(f, { addresseeUserId: f.founderUserId, title: "Answered card", createdAt: new Date(evening.getTime() - 60 * MINUTE) });
+    const critical = await interaction(f, { issueId: criticalIssueId, addresseeUserId: f.founderUserId, title: "Approve the rollback",
+      createdAt: new Date(evening.getTime() - 30 * MINUTE) });
+    // The answered card was already alerted and delivered; its [Done] is queued at 22:59.
+    now = new Date(evening.getTime() - 35 * MINUTE);
+    expect((await f.service.sweep()).inserted).toBe(1);
+    await deliver(f);
+    await resolve(resolved.id);
+    now = evening;
+    expect((await f.service.sweep()).inserted).toBe(2);
+    const queued = (await rows(f)).filter(row => row.state === "pending");
+    const ask = queued.find(row => row.idempotencyKey === asksKey(f, [critical.id, ordinary.id]));
+    const done = queued.find(row => row.idempotencyKey === doneKey(f, resolved.id));
+    expect(ask && done).toBeTruthy();
+    expect(await f.service.authorizeFounderFallbackPublication(db, ask!)).toBe(true);
+    expect(await f.service.authorizeFounderFallbackPublication(db, done!)).toBe(true);
+
+    // Claimed at 23:01 MST: a batch with any ordinary item and every [Done] are
+    // cancelled before I/O; an all-critical batch still goes out.
+    now = new Date("2026-11-04T06:01:00.000Z");
+    expect(await f.service.authorizeFounderFallbackPublication(db, ask!)).toBe(false);
+    expect(await f.service.authorizeFounderFallbackPublication(db, done!)).toBe(false);
+    await db.update(chatPublications).set({ state: "cancelled", redactedError: "Notice no longer applies" })
+      .where(inArray(chatPublications.id, [ask!.id, done!.id]));
+    const morning = Date.parse("2026-11-04T14:00:00.000Z");
+    expect(await f.service.sweep()).toMatchObject({ inserted: 1, nextDueAt: morning });
+    const [criticalOnly] = (await rows(f)).filter(row => row.state === "pending");
+    expect(criticalOnly!.idempotencyKey).toBe(asksKey(f, [critical.id], 1));
+    expect(await f.service.authorizeFounderFallbackPublication(db, criticalOnly!)).toBe(true);
+    await deliver(f);
+
+    // At 07:00 the ordinary ask is listed again, beside the critical item's
+    // reminder (four hours after 23:01), and the retraction goes out.
+    now = new Date(morning);
+    expect((await f.service.sweep()).inserted).toBe(2);
+    const relisted = (await rows(f)).filter(row => row.state === "pending");
+    expect(relisted.map(row => row.idempotencyKey).sort())
+      .toEqual([asksKey(f, [critical.id, ordinary.id], 2), `${doneKey(f, resolved.id)}:a1`].sort());
+    for (const row of relisted) expect(await f.service.authorizeFounderFallbackPublication(db, row)).toBe(true);
+  });
+
   it("fails closed unless every DM sender links to the same active company owner", async () => {
     const f = await fixture();
     await interaction(f, { addresseeUserId: f.founderUserId });

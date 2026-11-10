@@ -562,20 +562,26 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     if (!target || target.conversationId !== publication.conversationId || target.issueId !== publication.issueId) return false;
     const load = async (id: string) => (await tx.select().from(issueThreadInteractions)
       .where(and(eq(issueThreadInteractions.id, id), eq(issueThreadInteractions.companyId, publication.companyId))))[0];
+    const now = clock();
+    // A row queued before 23:00 and claimed after it waits for 07:00: cancelled
+    // here before I/O, it is listed again by the first sweep after quiet hours.
+    const quiet = settings.quietHours !== false && inFounderQuietHours(now);
     if (key.kind === "done") {
+      if (quiet) return false;
       const interaction = await load(key.interactionId);
       if (!interaction || interaction.status === "pending" || interaction.issueId === target.issueId) return false;
       if (!(await founderCanReadIssue(tx, target, interaction.issueId))) return false;
       const coverage = (await alertCoverage(tx, publication.companyId, key.endpointId, [interaction.id])).get(interaction.id);
       return !!coverage?.reached;
     }
-    const now = clock();
     const state = await unavailability(tx, target.agent);
-    // Every listed item must still need the founder; otherwise the whole
-    // message is cancelled before I/O and the rest are listed again.
+    // Every listed item must still need the founder, and in quiet hours be
+    // critical; otherwise the whole message is cancelled before I/O and the
+    // rest are listed again.
     for (const id of key.interactionIds) {
       const interaction = await load(id);
       if (!interaction || !(await itemReason(tx, target, interaction, state, now, settings.boundMs))) return false;
+      if (quiet && (await issueRef(tx, interaction))?.priority !== "critical") return false;
     }
     return true;
   }
