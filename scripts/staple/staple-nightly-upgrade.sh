@@ -6,6 +6,7 @@
 #   staple-nightly-upgrade hold              02:30: place the maintenance hold (admission held, wakes queue)
 #   staple-nightly-upgrade [--dry-run]       03:30: upgrade under the hold, then release it
 #   QUIET_MODE=1 staple-nightly-upgrade      hourly: opportunistic daytime install, only when already quiet
+#   staple-nightly-upgrade ci-state CHECKS WORKFLOWS   print the Gate 0 state for saved GitHub JSON (no side effects)
 #
 # The maintenance hold (FAC-840 C1, STA-182) replaces waiting for a natural zero-run moment, which a
 # 16-agent instance never reaches. While it is active the server starts no new run; every wake,
@@ -18,6 +19,45 @@
 # It holds admission the same way but cannot park stragglers and does not survive the restart.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+# Gate 0 state for one commit (STA-224). $1 = GitHub check-runs JSON, $2 = workflow-runs JSON.
+# Prints one line; names are separated by "; " because job names can contain commas:
+#   green              every check run and workflow run completed success/skipped/neutral
+#   pending:<names>    nothing failed yet, but a check or workflow run is queued or in progress: retry later
+#   red:<names>        a check or workflow run completed otherwise (failure, cancelled, timed_out,
+#                      startup_failure, action_required, ...): wins over pending
+#   none               no check runs at all
+#   error:<reason>     the GitHub response is unreadable or truncated
+# Everything except green blocks the install.
+ci_state() {
+  python3 - "$1" "$2" <<'PY'
+import json,sys
+OK=("success","skipped","neutral")
+def load(path, key):
+    try: d=json.load(open(path))
+    except Exception: d=None
+    if not isinstance(d,dict) or not isinstance(d.get(key),list):
+        msg=d.get("message","") if isinstance(d,dict) else ""
+        print("error:%s unreadable%s" % (key.replace("_","-"), (" ("+str(msg)[:80]+")") if msg else "")); sys.exit()
+    items=d[key]
+    if isinstance(d.get("total_count"),int) and d["total_count"]>len(items):
+        print("error:%s truncated (%d of %d)" % (key.replace("_","-"), len(items), d["total_count"])); sys.exit()
+    return items
+checks=load(sys.argv[1],"check_runs"); runs=load(sys.argv[2],"workflow_runs")
+red=[]; pending=[]
+for kind,items in (("workflow ",runs),("",checks)):
+    for x in items:
+        name=kind+str(x.get("name") or "?")
+        if x.get("status")!="completed": pending.append(name)
+        elif x.get("conclusion") not in OK: red.append("%s (%s)" % (name, x.get("conclusion")))
+if red: print("red:"+"; ".join(red[:5]))
+elif pending: print("pending:"+"; ".join(pending[:5]))
+elif not checks: print("none")
+else: print("green")
+PY
+}
+if [ "${1:-}" = ci-state ]; then ci_state "${2:?check-runs JSON}" "${3:?workflow-runs JSON}"; exit $?; fi
+
 MODE=upgrade; DRY=0
 for a in "$@"; do
   case "$a" in
@@ -119,7 +159,7 @@ exec 9>"$LOGDIR/upgrade.lock"; flock -n 9 || { echo "another upgrade run holds t
 health_commit() { curl -s -m 10 $API/api/health | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null; }
 REPORT_ISSUE_FILE=$LOGDIR/report-issue-id
 report() {  # $1 = one-line outcome, $2 = detail
-  if [ "$QUIET_MODE" = 1 ] && [[ "$1" == Skipped:* ]]; then say "quiet-mode skip (not reported): $1"; return; fi
+  if [ "$QUIET_MODE" = 1 ] && [[ "$1" == Skipped:* || "$1" == Waiting:* ]]; then say "quiet-mode skip (not reported): $1"; return; fi
   local id; id=$(cat "$REPORT_ISSUE_FILE" 2>/dev/null)
   if [ -z "$id" ]; then
     id=$(api -X POST $API/api/companies/$CID/issues -d "$(python3 -c 'import json;print(json.dumps({"title":"Nightly Staple upgrade log","description":"One comment per nightly run of ~/.local/bin/staple-nightly-upgrade (03:30 MT). Logs: ~/.paperclip/nightly/. Created by Claude for Ethan.","status":"backlog","priority":"low"}))')" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("id",""))')
@@ -140,14 +180,19 @@ if [ "$QUIET_MODE" != 1 ]; then api_status "$API/api/instance/maintenance-hold" 
 if [ -z "$TARGET" ] || [ -z "$INSTALLED" ]; then report "Skipped: could not read installed or target commit" "installed='$INSTALLED' target='$TARGET'"; exit 1; fi
 if [ "$INSTALLED" = "$TARGET" ]; then say "Already on master. Nothing to do."; exit 0; fi
 
-# Gate 0: target commit must have green CI (all check runs success/skipped/neutral, none pending)
-CI=$(curl -s -m 30 "https://api.github.com/repos/$REPO/commits/$TARGET/check-runs?per_page=100" | python3 -c '
-import json,sys
-d=json.load(sys.stdin); r=d.get("check_runs",[])
-bad=[x["name"] for x in r if x["status"]!="completed" or x.get("conclusion") not in ("success","skipped","neutral")]
-print("green" if r and not bad else ("none" if not r else "red:"+",".join(bad[:5])))')
+# Gate 0: target commit must have green CI. A run still queued or in progress is pending, not red:
+# no install now, and the next watcher check retries (STA-224).
+CI_CHECKS=$(mktemp); CI_RUNS=$(mktemp)
+curl -s -m 30 "https://api.github.com/repos/$REPO/commits/$TARGET/check-runs?per_page=100" > "$CI_CHECKS"
+curl -s -m 30 "https://api.github.com/repos/$REPO/actions/runs?head_sha=$TARGET&per_page=100" > "$CI_RUNS"
+CI=$(ci_state "$CI_CHECKS" "$CI_RUNS"); rm -f "$CI_CHECKS" "$CI_RUNS"
 say "CI on target: $CI"
-if [ "$CI" != "green" ]; then report "Skipped: master ${TARGET:0:8} CI is not green ($CI)" "Nothing changed. Installed stays ${INSTALLED:0:8}."; exit 0; fi
+case "$CI" in
+  green) ;;
+  pending:*) say "pending, retry: master ${TARGET:0:8} CI still running (${CI#pending:})"
+    report "Waiting: master ${TARGET:0:8} CI still running (${CI#pending:})" "Pending, retry at the next watcher check; nothing failed. Installed stays ${INSTALLED:0:8}."; exit 0 ;;
+  *) report "Skipped: master ${TARGET:0:8} CI is not green ($CI)" "Nothing changed. Installed stays ${INSTALLED:0:8}."; exit 0 ;;
+esac
 
 # Gate 1: quiet, made by the maintenance hold rather than waited for.
 if [ "$QUIET_MODE" = 1 ]; then

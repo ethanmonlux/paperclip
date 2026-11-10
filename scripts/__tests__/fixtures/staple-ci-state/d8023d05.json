@@ -1,0 +1,495 @@
+{
+ "sha": "d8023d058f44aca2a0c036c07d0c5505bf488e7f",
+ "watcherCheckedAt": "2026-11-10T00:31:00Z",
+ "source": "GitHub readback after completion: commits/<sha>/check-runs and actions/runs?head_sha=<sha> (STA-224)",
+ "checkRuns": [
+  {
+   "name": "rerun",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T01:01:21Z",
+   "completed_at": "2026-11-10T01:01:14Z"
+  },
+  {
+   "name": "export",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T01:01:14Z",
+   "completed_at": "2026-11-10T01:01:13Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T01:01:14Z",
+   "completed_at": "2026-11-10T01:01:13Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:59:30Z",
+   "completed_at": "2026-11-10T00:59:29Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:50:08Z",
+   "completed_at": "2026-11-10T00:50:07Z"
+  },
+  {
+   "name": "rerun",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:43:12Z",
+   "completed_at": "2026-11-10T00:43:04Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:43:04Z",
+   "completed_at": "2026-11-10T00:43:03Z"
+  },
+  {
+   "name": "export",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:43:03Z",
+   "completed_at": "2026-11-10T00:43:03Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:34:43Z",
+   "completed_at": "2026-11-10T00:34:43Z"
+  },
+  {
+   "name": "promote_canary_channel",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:33:13Z",
+   "completed_at": "2026-11-10T00:33:13Z"
+  },
+  {
+   "name": "Require exact-source verification",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:30:46Z",
+   "completed_at": "2026-11-10T00:30:46Z"
+  },
+  {
+   "name": "merge-and-push",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-10T00:30:48Z",
+   "completed_at": "2026-11-10T00:33:13Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:20:09Z",
+   "completed_at": "2026-11-10T00:19:59Z"
+  },
+  {
+   "name": "notify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:08Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Reuse exact-source verification",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:06Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "select_beta",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:04Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "preflight_stable",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:04Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Cloud image candidate admission v1",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:04Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "publish",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:16:03Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "canonicalize_stable_notes",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:59Z"
+  },
+  {
+   "name": "smoke_canary_onboarding",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "draft_stable_notes",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "publish_stable",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "preview_stable",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "publish_canary",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "publish_nightly",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Verify preview artifacts",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "smoke_beta",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "publish_beta",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Publish preview migrator",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Publish preview cloud image",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Build preview migrator",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "release_runner_binaries",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "release_runner_source",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "verify_beta_candidate",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "verify_stable",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "smoke_nightly",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Build preview cloud image",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Check preview artifacts",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:59Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "select_nightly",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:58Z",
+   "completed_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Cloud source verified v1",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "build",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "verify",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "Cloud candidate admission v1",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "Watch exact-source verification",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "reuse_canary_image",
+   "status": "completed",
+   "conclusion": "skipped",
+   "started_at": "2026-11-10T00:15:57Z",
+   "completed_at": "2026-11-10T00:15:57Z"
+  },
+  {
+   "name": "build-and-push (linux/amd64, ubuntu-latest, amd64)",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-10T00:18:09Z",
+   "completed_at": "2026-11-10T00:30:45Z"
+  },
+  {
+   "name": "build-and-push (linux/arm64, ubuntu-24.04-arm, arm64)",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-10T00:16:40Z",
+   "completed_at": "2026-11-10T00:23:26Z"
+  },
+  {
+   "name": "refresh",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-10T00:22:04Z",
+   "completed_at": "2026-11-10T00:22:40Z"
+  },
+  {
+   "name": "backup-checkpoint",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-11-10T00:17:38Z",
+   "completed_at": "2026-11-10T00:19:55Z"
+  }
+ ],
+ "workflowRuns": [
+  {
+   "name": "CI runner-loss rerun",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T01:01:13Z",
+   "updated_at": "2026-11-10T01:01:14Z"
+  },
+  {
+   "name": "CI profile",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T01:01:13Z",
+   "updated_at": "2026-11-10T01:01:14Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T01:01:13Z",
+   "updated_at": "2026-11-10T01:01:19Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:59:28Z",
+   "updated_at": "2026-11-10T00:59:30Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:50:07Z",
+   "updated_at": "2026-11-10T00:50:08Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:43:03Z",
+   "updated_at": "2026-11-10T00:43:04Z"
+  },
+  {
+   "name": "CI profile",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:43:02Z",
+   "updated_at": "2026-11-10T00:43:04Z"
+  },
+  {
+   "name": "CI runner-loss rerun",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:43:02Z",
+   "updated_at": "2026-11-10T00:43:04Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:34:42Z",
+   "updated_at": "2026-11-10T00:34:43Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:19:59Z",
+   "updated_at": "2026-11-10T00:20:00Z"
+  },
+  {
+   "name": "PR merge review notification",
+   "event": "workflow_run",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:15:57Z",
+   "updated_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Docker",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:33:14Z"
+  },
+  {
+   "name": "Cloud readiness d8023d058f44aca2a0c036c07d0c5505bf488e7f",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Cloud migrator artifacts d8023d058f44aca2a0c036c07d0c5505bf488e7f",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:15:58Z"
+  },
+  {
+   "name": "Release",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "skipped",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:15:59Z"
+  },
+  {
+   "name": "Refresh Lockfile",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:22:40Z"
+  },
+  {
+   "name": "Backup checkpoint qualification",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "success",
+   "created_at": "2026-11-10T00:15:56Z",
+   "updated_at": "2026-11-10T00:19:55Z"
+  }
+ ]
+}

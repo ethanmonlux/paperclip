@@ -21,6 +21,14 @@ while it is active.
 The hourly `QUIET_MODE=1` run remains as a daytime path. It acts only after three zero-run checks,
 and then holds the lull with a short hold.
 
+Gate 0 installs a master commit only when its CI is `green`. It reads the check runs and workflow
+runs for that exact SHA. A job still queued or in progress is `pending`: nothing is installed, the
+log records `pending, retry`, and the next watcher check tries again (STA-224). A completed failure,
+`cancelled`, `timed_out`, `startup_failure` or `action_required` is `red`. No check runs is `none`,
+and an unreadable or truncated GitHub response is `error`. Each of these blocks the install. To
+classify saved GitHub responses, run `staple-nightly-upgrade ci-state CHECKS.json WORKFLOWS.json`.
+It has no side effects.
+
 Activation is outside agent runs: copy the script to `~/.local/bin/staple-nightly-upgrade`, and add
 the 02:30 trigger, either the `systemd/` units or an equivalent cron line
 (`30 2 * * * ~/.local/bin/staple-nightly-upgrade hold`).
