@@ -615,6 +615,10 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
   "0436_legal_reavers.sql",
   "0447_legacy_controller_process.sql",
   "0450_petite_frightful_four.sql",
+  "0454_curious_ben_parker.sql",
+  "0455_lumpy_ronan.sql",
+  "0456_pending_budget_cancellation_index.sql",
+  "0457_chat_review_lookup_indexes.sql",
 
 
   "0384_funny_adam_warlock.sql",

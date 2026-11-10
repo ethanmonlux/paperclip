@@ -1,19 +1,24 @@
 /** Shared types for the control-plane restart chaos harness (plan §5). */
+import type { ProviderFaultEvent, ProviderFaultKind, ProviderFaultRule, ProviderMessage } from "./provider-faults.js";
+import type { QuestionArtifacts, QuestionRecord } from "./question-handoff.js";
 
 /** K14 (upgrade mid-run): a graceful stop, then the replacement starts from the current build (`--upgrade-from`). */
 export const FAULT_KINDS = ["K1", "K2", "K4", "K6", "K14"] as const;
 export type FaultKind = (typeof FAULT_KINDS)[number];
-/** A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them. */
-export type TaskFaultKind = FaultKind | "K13";
+/**
+ * A task's planned fault. "K13" (restart storm) tasks have none of their own; the wave's storm crosses them.
+ * PV1–PV3 (provider message faults, provider-faults.ts) restart nothing: the task's rule is armed in the Codex shim.
+ */
+export type TaskFaultKind = FaultKind | "K13" | ProviderFaultKind;
 
 /** G1: an approval-gated action across a restart. H1: a budget hard stop crossed mid-run with a restart (its own wave). */
-export const WORKLOAD_IDS = ["A1", "B1", "B5", "C1", "M1", "G1", "H1", "R1"] as const;
+export const WORKLOAD_IDS = ["A1", "B1", "B5", "C1", "M1", "G1", "H1", "R1", "S1", "Q1"] as const;
 export type WorkloadId = (typeof WORKLOAD_IDS)[number];
 
 export const ADAPTER_IDS = ["codex", "claude", "opencode"] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
 
-export const TRIGGER_IDS = ["time", "comment", "retry", "queued", "tool", "result", "approval", "paused"] as const;
+export const TRIGGER_IDS = ["time", "comment", "retry", "queued", "tool", "result", "approval", "paused", "stop"] as const;
 export type TriggerId = (typeof TRIGGER_IDS)[number];
 
 export const ENVIRONMENT_KINDS = ["local", "daytona"] as const;
@@ -40,6 +45,7 @@ export interface WaveOptions {
   daytonaReuseLease?: boolean;
   /** `--k4-hold-max-seconds`: upper end of the seeded K4 hold (default 300 s, cap 600 s). */
   k4HoldMaxMs?: number;
+  faultAfterMs?: number;
   /**
    * Known product signatures this wave deliberately masks. "rc06" keeps the
    * company budget amount but disables its hard stop, so a stuck
@@ -73,7 +79,17 @@ export interface WaveOptions {
    */
   upgradeFrom?: string;
   workspaceRepo?: string;
+  storage?: "s3";
+  storageFaults?: Array<"ST1" | "ST2" | "ST3">;
+  storageFaultMs?: [number, number];
+  storageWindows?: import("./storage-chaos.js").StorageFaultWindow[];
   workspaceCommit?: string;
+  workspaceGitUrl?: string;
+  /** Provider message faults from `--faults` (PV1 delay, PV2 drop, PV3 duplicate); see provider-faults.ts. */
+  providerFaults?: ProviderFaultKind[];
+  providerFaultMessage?: ProviderMessage;
+  /** PV1 delays, cycled across tasks (`--provider-fault-delays`). */
+  providerFaultDelaysMs?: number[];
 }
 
 export interface StormFault {
@@ -109,6 +125,8 @@ export interface TaskPlan {
    * its offset from the task's launch. Replaces the single planned fault.
    */
   replayFaults?: ScheduledFault[];
+  /** PV1–PV3 tasks: the provider message rule armed for this task's nonce. */
+  providerFault?: ProviderFaultRule;
 }
 
 export interface ScheduledFault {
@@ -183,7 +201,12 @@ export interface RetryAttempt {
   httpStatus: number | null;
   accepted: boolean | null;
   error: string | null;
+  via?: "ui" | "api";
+  bannerText?: string | null;
 }
+
+export const UI_RETRY_BUTTON_MISSING = "ui_retry_button_missing";
+export const UI_RETRY_NO_REQUEST = "ui_retry_no_request";
 
 export interface FaultReceipt {
   faultId: string;
@@ -221,6 +244,7 @@ export interface OracleArtifacts {
   workspacePath: string | null;
   /** B5: distinct `.bench/progress` values the harness itself saw while the task was live. */
   benchProgressObserved?: number;
+  stop?: { runId: string | null; runStatus: string | null; runsStartedBeforeContinue: string[]; continuePosted: boolean; missed?: boolean };
   children?: Array<{ id: string; title?: string | null; status: string | null; assigneeAgentId: string | null; documents: Record<string, string | null> }>;
   childStalls?: Array<{ childIssueId: string; recoveryActionId: string | null }>;
   stallWakes?: Array<{ stalledIssueId: string | null; recoveryActionId: string | null }>;
@@ -228,6 +252,10 @@ export interface OracleArtifacts {
   approvals?: Array<{ id: string; status: string; title: string | null }>;
   /** G1 and H1: the board's actions and what the observer saw around them. */
   governance?: GovernanceRecord;
+  /** Q1: the saved question and the task's runs. */
+  question?: QuestionArtifacts;
+  /** PV1–PV3: the shim's log lines for this task. */
+  providerFaultEvents?: ProviderFaultEvent[];
 }
 
 /** What the board did for a governance task (G1, H1), and what the observer saw. */
@@ -281,7 +309,8 @@ export interface TaskRecord {
   finalStatus: string | null;
   deadlineAt: number | null;
   timedOut: boolean;
-  followUp: { at: number; postedAt?: number; commentId: string | null; error: string | null; duringRun?: boolean } | null;
+  followUp: { at: number; sentAt?: number; postedAt?: number; commentId: string | null; error: string | null; duringRun?: boolean } | null;
+  stop?: { at: number; runId: string | null; httpStatus: number | null; error: string | null; missed?: boolean };
   faultIds: string[];
   sweep: RestSweep | null;
   /** Workspace files present just before the first fault that hit this task (R2). */
@@ -295,6 +324,9 @@ export interface TaskRecord {
   workspaceMovedTo?: string;
   /** Set when the pre-fault snapshot could not read the workspace; R2 then fails visibly. */
   preFaultSnapshotError?: string | null;
+  remoteWorkspace?: boolean;
+  remoteFiles?: Record<string, string | null>;
+  remoteFileErrors?: Record<string, string>;
   /** Pre-fault files missing at rest; null when not checked. */
   lostFiles: string[] | null;
   /** B5: distinct bench progress values the observer read during polling. */
@@ -308,6 +340,8 @@ export interface TaskRecord {
   governance?: GovernanceRecord;
   /** K14 waves: the build serving when the task launched. */
   serverBuildAtLaunch?: "upgrade_from" | "current";
+  /** Q1: the saved question and the board's answer. */
+  question?: QuestionRecord;
 }
 
 export interface TaskGrade {
