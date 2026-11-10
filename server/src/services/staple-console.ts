@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueExecutionDecisions,
   issueRelations,
   issues,
   issueThreadInteractions,
@@ -21,15 +22,18 @@ import {
   buildStapleConsoleBoard,
   clipStapleConsoleText,
   extractStapleConsolePrRefs,
+  isStapleConsoleReviewIssue,
   isStapleConsoleTerminal,
   nextStapleConsoleLocalTime,
   stapleConsoleDayKey,
   stapleConsoleDefaultRepo,
+  stapleConsoleVerdictOfComment,
   type StapleConsoleBoard,
   type StapleConsoleCiState,
   type StapleConsoleIssueInput,
   type StapleConsolePrState,
   type StapleConsolePullRequestInput,
+  type StapleConsoleReviewDecisionInput,
   type StapleConsoleScheduledEvent,
   type StapleConsoleSourceStatus,
   type StapleConsoleMaintenanceHold,
@@ -55,6 +59,9 @@ import { getServerInfoSnapshot } from "../server-info.js";
 /** Runs older than this are not needed for any FAC-620 rule or card timing. */
 const RUN_LOOKBACK_MS = 7 * 24 * 60 * 60_000;
 const MAX_RUNS = 4_000;
+/** Review verdicts decide correction rounds (FAC-838); a review can span many days of corrections. */
+const REVIEW_DECISION_LOOKBACK_MS = 30 * 24 * 60 * 60_000;
+const MAX_REVIEW_COMMENTS = 2_000;
 const MAX_GITHUB_PRS_PER_REFRESH = 25;
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
@@ -296,6 +303,17 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       .filter((row) => !isStapleConsoleTerminal(row.status)
         || (row.completedAt && stapleConsoleDayKey(iso(row.completedAt)!) === todayKey))
       .map((row) => row.id);
+    const liveIdSet = new Set(liveIds);
+    // Finished tasks under live work still hold that card's PRs, runs and review verdicts (FAC-837/838).
+    const rowById = new Map(issueRows.map((row) => [row.id, row]));
+    const cardScopeIds = issueRows.filter((row) => {
+      const seen = new Set<string>();
+      for (let current: typeof row | undefined = row; current && !seen.has(current.id); current = rowById.get(current.parentId ?? "")) {
+        if (liveIdSet.has(current.id)) return true;
+        seen.add(current.id);
+      }
+      return false;
+    }).map((row) => row.id);
     const allIds = issueRows.map((row) => row.id);
 
     const [agentRows, relationRows, runRows, wakeRows, interactionRows, approvalRows, workProductRows] = await Promise.all([
@@ -304,7 +322,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         .select({ blockerIssueId: issueRelations.issueId, blockedIssueId: issueRelations.relatedIssueId })
         .from(issueRelations)
         .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks"))),
-      liveIds.length === 0 ? [] : db
+      cardScopeIds.length === 0 ? [] : db
         .select({
           id: heartbeatRuns.id,
           issueId: heartbeatRuns.issueId,
@@ -320,7 +338,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, companyId),
-          inArray(heartbeatRuns.issueId, liveIds),
+          inArray(heartbeatRuns.issueId, cardScopeIds),
           or(gte(heartbeatRuns.createdAt, new Date(nowMs - RUN_LOOKBACK_MS)), eq(heartbeatRuns.status, "running")),
         ))
         .orderBy(desc(heartbeatRuns.createdAt))
@@ -372,7 +390,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           inArray(issueApprovals.issueId, liveIds),
           readableApproval,
         )),
-      liveIds.length === 0 ? [] : db
+      cardScopeIds.length === 0 ? [] : db
         .select({
           issueId: issueWorkProducts.issueId,
           url: issueWorkProducts.url,
@@ -383,12 +401,65 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         .where(and(
           eq(issueWorkProducts.companyId, companyId),
           eq(issueWorkProducts.type, "pull_request"),
-          inArray(issueWorkProducts.issueId, liveIds),
+          inArray(issueWorkProducts.issueId, cardScopeIds),
         )),
     ]);
 
+    // ---- Review verdicts (FAC-838): native execution-stage decisions, and the verdict a review
+    // task's own reviewer states in a comment. Comments by anyone else (the builder asking for
+    // re-review, the coordinator) never count.
+    const agentById = new Map(agentRows.map((agent) => [agent.id, { id: agent.id, name: agent.name, role: agent.role ?? null }]));
+    const cardScopeIdSet = new Set(cardScopeIds);
+    const reviewIssueRows = issueRows.filter((row) =>
+      cardScopeIdSet.has(row.id) && isStapleConsoleReviewIssue(row, agentById.get(row.assigneeAgentId ?? "")));
+    const decisionSince = new Date(nowMs - REVIEW_DECISION_LOOKBACK_MS);
+    const [executionDecisionRows, reviewCommentRows] = await Promise.all([
+      cardScopeIds.length === 0 ? [] : db
+        .select({ issueId: issueExecutionDecisions.issueId, outcome: issueExecutionDecisions.outcome, createdAt: issueExecutionDecisions.createdAt })
+        .from(issueExecutionDecisions)
+        .where(and(
+          eq(issueExecutionDecisions.companyId, companyId),
+          eq(issueExecutionDecisions.stageType, "review"),
+          inArray(issueExecutionDecisions.outcome, ["approved", "changes_requested"]),
+          inArray(issueExecutionDecisions.issueId, cardScopeIds),
+          gte(issueExecutionDecisions.createdAt, decisionSince),
+        )),
+      reviewIssueRows.length === 0 ? [] : db
+        .select({
+          issueId: issueComments.issueId,
+          authorAgentId: issueComments.authorAgentId,
+          body: sql<string>`left(${issueComments.body}, 400)`,
+          createdAt: issueComments.createdAt,
+        })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.companyId, companyId),
+          inArray(issueComments.issueId, reviewIssueRows.map((row) => row.id)),
+          isNull(issueComments.deletedAt),
+          eq(issueComments.origin, "comment"),
+          sql`${issueComments.authorAgentId} is not null`,
+          gte(issueComments.createdAt, decisionSince),
+        ))
+        .orderBy(desc(issueComments.createdAt))
+        .limit(MAX_REVIEW_COMMENTS),
+    ]);
+    const reviewerOf = new Map(reviewIssueRows.map((row) => [row.id, row.assigneeAgentId]));
+    const reviewDecisions: StapleConsoleReviewDecisionInput[] = executionDecisionRows.map((row) => ({
+      issueId: row.issueId,
+      outcome: row.outcome as StapleConsoleReviewDecisionInput["outcome"],
+      at: iso(row.createdAt)!,
+      source: "execution_decision" as const,
+    }));
+    for (const row of reviewCommentRows) {
+      const author = agentById.get(row.authorAgentId ?? "");
+      const byReviewer = row.authorAgentId === reviewerOf.get(row.issueId)
+        || (author && isStapleConsoleReviewIssue({ title: "" }, author));
+      const outcome = byReviewer ? stapleConsoleVerdictOfComment(row.body) : null;
+      if (outcome) reviewDecisions.push({ issueId: row.issueId, outcome, at: iso(row.createdAt)!, source: "verdict_comment" });
+    }
+
     // ---- Pull requests: Paperclip records first, then a cached live GitHub read.
-    const byId = new Map(issueRows.map((row) => [row.id, row]));
+    const byId = rowById;
     const readableRelations = relationRows.filter((row) => byId.has(row.blockerIssueId) && byId.has(row.blockedIssueId));
     const titleChain = (id: string) => {
       const titles: string[] = [];
@@ -416,7 +487,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         source: "work_product",
       });
     }
-    for (const id of liveIds) {
+    for (const id of cardScopeIds) {
       const row = byId.get(id)!;
       for (const ref of extractStapleConsolePrRefs(row.title, row.description, stapleConsoleDefaultRepo(titleChain(id)))) {
         if (pullRequests.some((pr) => pr.issueId === id && pr.repo.toLowerCase() === ref.repo.toLowerCase() && pr.number === ref.number)) continue;
@@ -555,7 +626,6 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       });
     }
 
-    const liveIdSet = new Set(liveIds);
     const maintenanceHold = await readMaintenanceHoldBanner();
     const built = buildStapleConsoleBoard({
       now: nowIso,
@@ -601,6 +671,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         };
       }),
       pullRequests: confirmedPullRequests,
+      reviewDecisions,
       scheduled,
       sources: { github },
     });
