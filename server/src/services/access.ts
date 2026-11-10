@@ -757,7 +757,7 @@ export function accessService(db: Db) {
           .from(issues)
           .where(assignedOpenIssueWhere)
           .for("update");
-        await assertCapabilityRoutingForIssues(tx as Db, {
+        await assertCapabilityRoutingForIssues(tx as unknown as Db, {
           companyId,
           assigneeAgentId: assignmentPatch.assigneeAgentId,
           issueIds: transferred.map((row) => row.id),
