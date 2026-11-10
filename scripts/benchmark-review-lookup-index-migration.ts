@@ -15,7 +15,7 @@ import { seedGitHubReviewWait } from "../server/src/__tests__/helpers/github-rev
 const size = (name: string, fallback: number) => Number(process.env[name] ?? fallback);
 const RUNS = size("RUNS", 200_000), RUN_CONTEXT_KIB = size("RUN_CONTEXT_KIB", 8);
 const LINKS = size("LINKS", 500_000), DELIVERIES = size("DELIVERIES", 100_000);
-const migrationName = "0456_chat_review_lookup_indexes";
+const migrationName = "0457_chat_review_lookup_indexes";
 const migration = readFileSync(new URL(`../packages/db/src/migrations/${migrationName}.sql`, import.meta.url), "utf8");
 const indexNames = [...migration.matchAll(/IF NOT EXISTS "([a-z_]+)"/g)].map(match => match[1]!);
 

@@ -24,7 +24,7 @@ const runCount = Number(arg("runs", "30000"));
 const eventsPerRun = Number(arg("events-per-run", "100"));
 const sampleCount = Number(arg("samples", "9"));
 const revision = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-const migrationPath = "packages/db/src/migrations/0454_lumpy_ronan.sql";
+const migrationPath = "packages/db/src/migrations/0455_lumpy_ronan.sql";
 const indexName = "heartbeat_run_events_retry_exhausted_idx";
 const keepAlive = setInterval(() => {}, 1000);
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;

@@ -7,7 +7,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const indexName = "heartbeat_runs_company_native_workspace_idx";
-const migrationFile = "0453_curious_ben_parker.sql";
+const migrationFile = "0454_curious_ben_parker.sql";
 
 (support.supported ? describe : describe.skip)("workspace companion expression index", () => {
   it("builds outside a transaction and preserves ordered prepared/finalized references", async () => {

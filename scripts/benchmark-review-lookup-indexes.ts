@@ -36,7 +36,7 @@ const checkModule = "server/src/services/chat-channels/github/review-check-state
 const waitModule = "server/src/services/chat-channels/github/review-wait.ts";
 assert.equal(git("show", `${baselineRevision}:${waitModule}`), readFileSync(path.join(root, waitModule), "utf8"),
   "The review-wait module must be unchanged; only its indexes differ");
-const migration = readFileSync(path.join(root, "packages/db/src/migrations/0456_chat_review_lookup_indexes.sql"), "utf8");
+const migration = readFileSync(path.join(root, "packages/db/src/migrations/0457_chat_review_lookup_indexes.sql"), "utf8");
 const indexStatements = migration.split("--> statement-breakpoint").map(statement => statement.trim()).filter(Boolean);
 const indexNames = indexStatements.map(statement => statement.match(/IF NOT EXISTS "([a-z_]+)"/)![1]!);
 

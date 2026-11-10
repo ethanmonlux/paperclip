@@ -1,6 +1,6 @@
 {
-  "id": "f98af245-4a2e-4c3d-b89e-6ed3e81a074c",
-  "prevId": "d54bfeb4-dedb-4f8b-9195-a4d4aa67d71f",
+  "id": "d54bfeb4-dedb-4f8b-9195-a4d4aa67d71f",
+  "prevId": "64e8be1e-e0cb-4cd8-85e0-0fdcce5eafde",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -34552,34 +34552,6 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
-        },
-        "heartbeat_run_events_retry_exhausted_idx": {
-          "name": "heartbeat_run_events_retry_exhausted_idx",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "run_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": false,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"heartbeat_run_events\".\"event_type\" = 'lifecycle' and \"heartbeat_run_events\".\"message\" like 'Bounded retry exhausted%'",
-          "concurrently": true,
-          "method": "btree",
-          "with": {}
         }
       },
       "foreignKeys": {
@@ -44440,6 +44412,134 @@
           "onUpdate": "no action"
         }
       },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.maintenance_holds": {
+      "name": "maintenance_holds",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "singleton_key": {
+          "name": "singleton_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'instance'"
+        },
+        "started_at": {
+          "name": "started_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "drain_deadline_at": {
+          "name": "drain_deadline_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "reason": {
+          "name": "reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_by_actor_type": {
+          "name": "started_by_actor_type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "started_by_actor_id": {
+          "name": "started_by_actor_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "parked_at": {
+          "name": "parked_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "parked_run_count": {
+          "name": "parked_run_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "released_at": {
+          "name": "released_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "release_reason": {
+          "name": "release_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "maintenance_holds_single_active_idx": {
+          "name": "maintenance_holds_single_active_idx",
+          "columns": [
+            {
+              "expression": "singleton_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"maintenance_holds\".\"released_at\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "maintenance_holds_started_idx": {
+          "name": "maintenance_holds_started_idx",
+          "columns": [
+            {
+              "expression": "started_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
