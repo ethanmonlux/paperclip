@@ -1,0 +1,72 @@
+name: Staple certification
+
+# Nightly full-suite certification (STA-223). PRs run change-scoped checks only
+# (.github/staple-ci-scope.json); this runs the complete pr-trusted.yml suite on
+# one commit and records the verdict as the commit status `staple/certified`.
+# staple-nightly-upgrade installs only the newest master commit certified
+# `success`, so a regression outside a PR's scope is caught here and never
+# installed.
+#
+# Schedule: 22:45 America/Denver standard time (23:45 daylight time), after the
+# 20:31 upstream sync has normally merged. An urgent fix re-certifies the same
+# day with a manual dispatch on master; the hourly quiet-window install then
+# picks it up. The watcher on the Staple side reads failed runs and opens the
+# repair tasks, because this cloud runner cannot reach Staple.
+on:
+  schedule:
+    - cron: "45 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: staple-certification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mark_pending:
+    name: Mark certification pending
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record staple/certified pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
+          -f state=pending -f context=staple/certified -f target_url="$RUN_URL"
+          -f description="Full suite running (run $GITHUB_RUN_ID)"
+
+  ci:
+    needs: [mark_pending]
+    uses: ./.github/workflows/pr-trusted.yml
+
+  record:
+    name: Record certification
+    needs: [mark_pending, ci]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record staple/certified verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SUITE_RESULT: ${{ needs.ci.result }}
+        run: |
+          # Only a complete, successful suite certifies. A cancelled or skipped
+          # suite is an error, never a pass; the installer then keeps looking.
+          case "$SUITE_RESULT" in
+            success) state=success; description="Full suite passed (run $GITHUB_RUN_ID)" ;;
+            failure) state=failure; description="Full suite failed (run $GITHUB_RUN_ID)" ;;
+            *) state=error; description="Full suite did not finish: $SUITE_RESULT (run $GITHUB_RUN_ID)" ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context=staple/certified -f target_url="$RUN_URL" -f description="$description"
+          echo "staple/certified=$state on $GITHUB_SHA ($SUITE_RESULT)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$state" = success ]

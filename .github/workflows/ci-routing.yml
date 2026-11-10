@@ -379,6 +379,7 @@ jobs:
           CI_INCREMENTAL_MODE: ${{ vars.CI_INCREMENTAL_MODE || 'enabled' }}
           STACK_JSON: ${{ toJSON(github.event.pull_request.stack) }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD_REF: ${{ github.head_ref }}
           EVENT_MERGE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -409,15 +410,18 @@ jobs:
               > "$directory/${file##*/}" || fallback
           done
           if [[ "$repository" != 'paperclipai/paperclip' ]]; then
-            # The fork runs every job for cross-workspace packages and nested
-            # lockfiles or manifests. Only this plan sees the extra inputs:
+            # The fork runs every job for database schema changes and nested
+            # lockfiles or manifests. packages/shared and packages/adapter-utils
+            # already feed every server lane through packages/**; the Staple
+            # scope below decides which heavy suites they need (STA-223).
+            # Only this plan sees the extra inputs:
             # turbo.json stays upstream's because local verify and Turbo task
             # hashing read it too.
             node -e '
               const fs = require("node:fs"), file = process.argv[1];
               const config = JSON.parse(fs.readFileSync(file, "utf8"));
               config.globalDependencies.push("**/pnpm-lock.yaml", "**/package-lock.json", "**/yarn.lock",
-                "**/Cargo.lock", "**/Cargo.toml", "packages/shared/**", "packages/db/**", "packages/adapter-utils/**");
+                "**/Cargo.lock", "**/Cargo.toml", "packages/db/**");
               fs.writeFileSync(file, JSON.stringify(config));
             ' "$directory/turbo.json" || fallback
           fi
@@ -434,4 +438,25 @@ jobs:
           export CI_TASK_CONFIG="$directory/turbo.json"
           export CI_TASK_MATRIX="$directory/ci-task-matrix.json"
           export CI_DIFF_REPOSITORY="$directory/repository.git"
-          node "$directory/ci-plan.mjs" || fallback
+          # Staple fork (STA-223): narrow PR plans with the scope map from the same
+          # tested merge. Without the map, or if narrowing fails, the plan stays whole.
+          scoped='false'
+          if [[ "$repository" != 'paperclipai/paperclip' ]]; then
+            scoped='true'
+            for file in .github/staple-ci-scope.json .github/scripts/staple-ci-scope.mjs; do
+              gh api -H 'Accept: application/vnd.github.raw+json' \
+                "/repos/$repository/contents/$file?ref=$trusted" \
+                > "$directory/${file##*/}" 2>/dev/null || scoped='false'
+            done
+          fi
+          if [[ "$scoped" != 'true' ]]; then
+            node "$directory/ci-plan.mjs" || fallback
+            exit 0
+          fi
+          unscoped="$directory/unscoped-plan"
+          GITHUB_OUTPUT="$unscoped" node "$directory/ci-plan.mjs" || fallback
+          if ! CI_PLAN_OUTPUT="$unscoped" CI_SCOPE="$directory/staple-ci-scope.json" \
+              node "$directory/staple-ci-scope.mjs"; then
+            echo '::warning title=Staple PR scope::Scope narrowing failed; running the unscoped plan.'
+            grep '^plan=' "$unscoped" >> "$GITHUB_OUTPUT" || fallback
+          fi
