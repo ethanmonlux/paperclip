@@ -1,0 +1,197 @@
+import assert from "node:assert/strict";
+import { execFile, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import test from "node:test";
+
+// STA-223: the installer installs only the newest master commit the nightly full suite certified
+// (`staple/certified` = success), and a red nightly becomes urgent-lane repair tasks.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const script = path.join(repoRoot, "scripts", "staple", "staple-nightly-upgrade.sh");
+const redRun = path.join(repoRoot, "scripts", "__tests__", "fixtures", "staple-certify-red");
+
+const sha = (name) => name.padEnd(40, "0");
+const status = (state, context = "staple/certified") => ({ context, state });
+
+/** Writes a first-parent chain (newest first) and per-commit statuses, then asks the installer to pick. */
+function pick({ installed, chain, statuses = {}, passingRuns }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-certified-"));
+  try {
+    writeFileSync(path.join(dir, "chain"), chain.map(sha).join("\n") + "\n");
+    for (const [name, list] of Object.entries(statuses)) {
+      writeFileSync(path.join(dir, `statuses-${sha(name)}.json`), JSON.stringify(list));
+    }
+    if (passingRuns) {
+      writeFileSync(path.join(dir, "certify-runs.json"), JSON.stringify({
+        workflow_runs: passingRuns.map((name) => ({ head_sha: sha(name), conclusion: "success" })),
+      }));
+    }
+    const result = spawnSync("bash", [script, "certified-pick", sha(installed), path.join(dir, "chain")], {
+      encoding: "utf8", env: { ...process.env, STAPLE_GITHUB_FIXTURES: dir },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return { out: result.stdout.trim().replaceAll(/[0-9a-f]0{20,}/g, (value) => value.replace(/0+$/, "")), log: result.stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("refuses an uncertified newer commit and installs the newest certified one", () => {
+  // m4 is master: uncertified. m3 failed its nightly, m2 is still running, m1 is certified.
+  const result = pick({
+    installed: "m0", chain: ["m4", "m3", "m2", "m1", "m0"],
+    statuses: { m3: [status("failure")], m2: [status("pending")], m1: [status("success", "other"), status("success")] },
+  });
+  assert.equal(result.out, "target:m1 installed-in-chain:yes");
+  assert.match(result.log, /m4000000 staple\/certified=missing/);
+  assert.match(result.log, /m3000000 staple\/certified=failure/);
+  assert.match(result.log, /m2000000 staple\/certified=pending/);
+});
+
+test("the current status for the context wins: a re-run that failed uncertifies the commit", () => {
+  // GitHub lists statuses newest first.
+  assert.equal(pick({ installed: "m0", chain: ["m2", "m1", "m0"],
+    statuses: { m2: [status("failure"), status("success")], m1: [status("success")] } }).out, "target:m1 installed-in-chain:yes");
+});
+
+test("does nothing when the installed build is already the newest certified commit", () => {
+  assert.equal(pick({ installed: "m1", chain: ["m3", "m2", "m1", "m0"], statuses: { m0: [status("success")] } }).out, "installed-newest");
+});
+
+test("never installs a certified commit older than the installed build", () => {
+  // m1 is certified but older than the installed m2: reaching the installed commit stops the search.
+  assert.equal(pick({ installed: "m2", chain: ["m3", "m2", "m1"], statuses: { m1: [status("success")] } }).out, "installed-newest");
+});
+
+test("fails closed when no commit in the window is certified", () => {
+  assert.equal(pick({ installed: "zz", chain: ["m2", "m1"] }).out, "none");
+  assert.equal(pick({ installed: "zz", chain: [] }).out, "error:empty history");
+});
+
+test("an installed build outside the window is flagged so the installer checks it moves forward", () => {
+  assert.equal(pick({ installed: "zz", chain: ["m2", "m1"], statuses: { m1: [status("success")] } }).out, "target:m1 installed-in-chain:no");
+});
+
+test("a commit without a passing certification run is skipped without a status read", () => {
+  // m2 carries a stray success status but no passing run; m1 has both.
+  const result = pick({ installed: "m0", chain: ["m2", "m1", "m0"], passingRuns: ["m1"],
+    statuses: { m2: [status("success")], m1: [status("success")] } });
+  assert.equal(result.out, "target:m1 installed-in-chain:yes");
+  assert.match(result.log, /m2000000 staple\/certified=missing \(no passing certification run\)/);
+});
+
+test("a broken change outside a PR's scope is caught by the nightly and never installed", () => {
+  // A UI-only PR (m2) skipped the server suites it did not touch; its regression only shows in the
+  // nightly full suite, which marks master red. The installer keeps the last certified commit, m1.
+  // After the repair (m3) merges and an urgent dispatch certifies it, the next check installs m3.
+  const red = { m2: [status("failure")], m1: [status("success")] };
+  assert.equal(pick({ installed: "m1", chain: ["m2", "m1"], statuses: red }).out, "installed-newest");
+  assert.equal(pick({ installed: "m1", chain: ["m3", "m2", "m1"], statuses: { ...red, m3: [status("pending")] } }).out, "installed-newest");
+  assert.equal(pick({ installed: "m1", chain: ["m3", "m2", "m1"], statuses: { ...red, m3: [status("success")] } }).out, "target:m3 installed-in-chain:yes");
+});
+
+/** Fake Staple API: two repair agents, whose running runs the test sets. Records created issues. */
+async function withStaple(running, action) {
+  const created = [];
+  const agents = [
+    { id: "agent-engineer", name: "Workflow Engineer", status: "idle" },
+    { id: "agent-repair", name: "Repair Engineer", status: "idle" },
+    { id: "agent-other", name: "Workflow Coordinator", status: "idle" },
+  ];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      assert.equal(req.headers.authorization, "Bearer staple-test-token");
+      const send = (value) => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify(value)); };
+      if (req.method === "GET" && req.url.endsWith("/agents")) return send(agents);
+      if (req.method === "GET" && req.url.includes("/heartbeat-runs?status=running")) {
+        return send(running.map((agentId, index) => ({ id: `run-${index}`, agentId, status: "running" })));
+      }
+      if (req.method === "POST" && req.url.endsWith("/issues")) {
+        const issue = JSON.parse(body);
+        created.push(issue);
+        return send({ id: `issue-${created.length}`, identifier: `STA-T${created.length}`, ...issue });
+      }
+      res.statusCode = 404; send({ error: "not found" });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const home = mkdtempSync(path.join(tmpdir(), "staple-certify-home-"));
+  mkdirSync(path.join(home, ".paperclip"));
+  writeFileSync(path.join(home, ".paperclip", "auth.json"), JSON.stringify({ token: "staple-test-token" }));
+  const report = async (...args) => {
+    const { stdout } = await promisify(execFile)("bash", [script, "certify-report", ...args], { env: {
+      ...process.env, HOME: home, STAPLE_GITHUB_FIXTURES: redRun, STAPLE_API: `http://127.0.0.1:${server.address().port}`,
+      STAPLE_COMPANY_ID: "company-test",
+    } });
+    return stdout;
+  };
+  try {
+    return await action({ report, created, home });
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("a simulated red nightly opens one critical repair task per failing suite, once", async () => {
+  // Real GitHub data: run 42762197624 failed General tests (server (5/12)) and the verify aggregate.
+  await withStaple([], async ({ report, created, home }) => {
+    const out = await report();
+    assert.match(out, /opened STA-T1 for General tests on 3c733e90, assigned to Workflow Engineer \(0 running\)/);
+    assert.equal(created.length, 1, "the verify aggregate is not a separate repair");
+    const [task] = created;
+    assert.equal(task.title, "Nightly certification red: General tests on master 3c733e90");
+    assert.equal(task.priority, "critical");
+    assert.equal(task.status, "todo");
+    assert.equal(task.assigneeAgentId, "agent-engineer");
+    assert.match(task.description, /3c733e90399d73ca3c1829e69bd5a52f1c46ea09/);
+    assert.match(task.description, /actions\/runs\/42762197624/);
+    assert.match(task.description, /ci \/ General tests \(server \(5\/12\)\)/);
+    assert.match(task.description, /Failed step: Run grouped general test suites through Turbo/);
+    assert.match(task.description, /remote-workspace-cohort-migration\.test\.ts`: AssertionError: expected 6 to be 8/);
+    assert.match(task.description, /workflow_dispatch/);
+    assert.match(readFileSync(path.join(home, ".paperclip", "nightly", "certify-reported"), "utf8"), /^42762197624 \* 3c733e90/m);
+
+    assert.match(await report(), /red run 42762197624 on 3c733e90 already reported/);
+    assert.equal(created.length, 1, "a run is reported once");
+  });
+});
+
+test("a busy Workflow Engineer hands the repair to the Repair Engineer", async () => {
+  await withStaple(["agent-engineer"], async ({ report, created }) => {
+    assert.match(await report(), /assigned to Repair Engineer \(0 running\)/);
+    assert.equal(created[0].assigneeAgentId, "agent-repair");
+  });
+});
+
+test("dry run prints the repair tasks without creating them or recording the run", async () => {
+  await withStaple([], async ({ report, created, home }) => {
+    const out = await report("--dry-run");
+    assert.match(out, /DRY RUN: would open critical task 'Nightly certification red: General tests on master 3c733e90'/);
+    assert.equal(created.length, 0);
+    assert.throws(() => readFileSync(path.join(home, ".paperclip", "nightly", "certify-reported")));
+  });
+});
+
+test("a green or cancelled nightly opens nothing", async () => {
+  for (const conclusion of ["success", "cancelled"]) {
+    const dir = mkdtempSync(path.join(tmpdir(), "staple-certify-green-"));
+    try {
+      writeFileSync(path.join(dir, "actions_workflows_staple_certify_yml_runs_branch_master_status_completed_per_page_1.json"),
+        JSON.stringify({ workflow_runs: [{ id: 7, head_sha: sha("m1"), conclusion }] }));
+      const result = spawnSync("bash", [script, "certify-report"], { encoding: "utf8", env: {
+        ...process.env, HOME: dir, STAPLE_GITHUB_FIXTURES: dir, STAPLE_API: "http://127.0.0.1:9",
+      } });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, new RegExp(`run 7 on m1000000 is ${conclusion}; no repair needed`));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});

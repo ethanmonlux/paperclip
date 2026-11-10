@@ -19,9 +19,11 @@ env:
   # Set the CI_VITEST_RETRY repository variable to 0 to switch retries off.
   PAPERCLIP_VITEST_RETRY: ${{ vars.CI_VITEST_RETRY }}
 
+# A new push to a PR cancels its superseded run. Other callers (the nightly
+# staple-certify.yml certification) queue per commit and are never cancelled.
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('ci-certify-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate:
@@ -30,14 +32,16 @@ jobs:
   test_selection:
     name: Select Vitest files
     needs: [gate]
-    # Forks get path-scoped job groups from the task plan, but file-level Vitest
-    # selection stays upstream-only until a fork sets CI_VITEST_SELECTION=enabled.
+    # Forks get path-scoped job groups from the task plan. File-level Vitest
+    # selection runs upstream, in a fork that sets CI_VITEST_SELECTION=enabled,
+    # or when the Staple PR scope (STA-223) narrowed the plan.
     if: >-
       needs.gate.outputs.full_ci == 'true' && needs.gate.outputs.plan != '' &&
       fromJSON(needs.gate.outputs.plan).mode == 'enabled' &&
       fromJSON(needs.gate.outputs.plan).forceReason == null &&
       (vars.CI_VITEST_SELECTION == '' || vars.CI_VITEST_SELECTION == 'enabled') &&
-      (github.repository == 'paperclipai/paperclip' || vars.CI_VITEST_SELECTION == 'enabled')
+      (github.repository == 'paperclipai/paperclip' || vars.CI_VITEST_SELECTION == 'enabled' ||
+       fromJSON(needs.gate.outputs.plan).staple.vitestSelection == true)
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 10
     # An unavailable optimization must not suppress the original test matrix.
@@ -154,8 +158,11 @@ jobs:
       # workflow, and Dependabot when the lockfile bytes come from a verified
       # Dependabot commit. Run the policy from the current base-branch tip so a
       # pull request cannot rewrite the check that judges it.
+      # PR-diff checks need the event's base and head. The nightly certification
+      # (staple-certify.yml) runs on a master commit, which these already judged.
       - name: Block untrusted lockfile edits
         id: lockfile_writer
+        if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -211,6 +218,7 @@ jobs:
           run_install: false
 
       - name: Validate migration ordering against target branch
+        if: github.event_name == 'pull_request'
         run: >-
           node .github/scripts/check-pr-migration-order.mjs
           "${{ github.event.pull_request.base.sha }}"
@@ -251,8 +259,8 @@ jobs:
       - name: Test e2e shard partition
         run: node "$CI_NODE_TEST" ./scripts/__tests__/e2e-shard.test.mjs
 
-      - name: Test Staple installer CI gate
-        run: node "$CI_NODE_TEST" ./scripts/__tests__/staple-nightly-ci-state.test.mjs
+      - name: Test Staple installer CI gate and certification
+        run: node "$CI_NODE_TEST" ./scripts/__tests__/staple-nightly-ci-state.test.mjs ./scripts/__tests__/staple-nightly-certified.test.mjs
 
       - name: Test release verify workflow wiring
         run: node "$CI_NODE_TEST" ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/__tests__/eval-schedule-monitor.test.mjs ./scripts/__tests__/prepare-runner-release-image.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs ./scripts/reuse-canary-image.test.mjs
@@ -264,6 +272,7 @@ jobs:
         run: node ./scripts/release-package-map.mjs check
 
       - name: Verify release package bootstrap for changed manifests
+        if: github.event_name == 'pull_request'
         run: |
           mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
@@ -803,7 +812,9 @@ jobs:
   verify:
     name: verify
     if: ${{ always() }}
-    needs: [gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support]
+    # The single stable aggregate check (STA-223): it covers every planned suite,
+    # e2e included, so required-check names do not change with a PR's scope.
+    needs: [gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards]
     runs-on: ${{ needs.gate.outputs.runner }}
     timeout-minutes: 5
     steps:
@@ -822,7 +833,7 @@ jobs:
           const plan = process.env.CI_PLAN ? JSON.parse(process.env.CI_PLAN) : null;
           if (plan) assert.equal(plan.version, 1, 'Supported task plan required');
           if (plan?.testSelection) assert.equal(results.test_selection.result, 'success', 'Published selection must succeed');
-          for (const job of ["typecheck_release_registry","general_tests","verify_paperclip_runner","build","docker_context_integrity","sandbox_provider_tests","verify_serialized_server","canary_dry_run","verify_runner_e2e_support"]) {
+          for (const job of ["typecheck_release_registry","general_tests","verify_paperclip_runner","build","docker_context_integrity","sandbox_provider_tests","verify_serialized_server","canary_dry_run","verify_runner_e2e_support","e2e_shards"]) {
             if (plan) assert.equal(typeof plan.jobs[job]?.run, 'boolean', 'Missing suite decision: ' + job);
             const selected = process.env.FULL_CI === 'true' && (!plan || plan.jobs[job].run);
             assert.equal(results[job].result, selected ? 'success' : 'skipped', job);

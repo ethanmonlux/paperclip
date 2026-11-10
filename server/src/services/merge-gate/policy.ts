@@ -84,11 +84,13 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
     planValidatedSkips: [],
     mergeMethod: "merge",
   },
-  // .github/workflows/pr.yml calls pr-trusted.yml (`ci / …` jobs). Its CI
-  // plan may skip suites; `ci / verify` and `ci / e2e` always run and fail
-  // unless each planned suite has the result the plan chose. The suites below
-  // must pass on every change regardless of the plan. Sharded suites match by
-  // prefix; a skipped shard of one still refuses.
+  // .github/workflows/pr.yml calls pr-trusted.yml (`ci / …` jobs). Its PR
+  // plan is change-scoped (STA-223, .github/staple-ci-scope.json): it may skip
+  // any test suite, and the nightly staple-certify.yml run certifies the full
+  // suite before an install. `ci / verify` is the stable aggregate: it always
+  // runs and fails unless every planned suite, e2e included, has the result
+  // the plan chose. `ci / e2e` does the same for the e2e shards. Policy,
+  // typecheck and build pass on every change regardless of the plan.
   "ethanmonlux/paperclip": {
     alwaysRequiredChecks: [
       exactly("ci / policy"),
@@ -96,8 +98,6 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       exactly("ci / e2e"),
       { label: "ci / Typecheck + Release Registry", pattern: /^ci \/ Typecheck\b/ },
       exactly("ci / Build"),
-      { label: "ci / General tests (server …)", pattern: /^ci \/ General tests \(server\b/ },
-      { label: "ci / Verify serialized server suites", pattern: /^ci \/ Verify serialized server suites\b/ },
     ],
     // runner-windows.yml starts only for these paths (its `paths:` trigger).
     pathScopedChecks: [{
@@ -122,7 +122,9 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       {
         validator: "ci / verify",
         checks: [
-          /^ci \/ General tests \((chat|workspaces-[a-z])\b/,
+          /^ci \/ General tests \(/,
+          /^ci \/ Verify serialized server suites\b/,
+          /^ci \/ e2e shard \(/,
           /^ci \/ Verify Paperclip Runner \(/,
           /^ci \/ Docker context integrity$/,
           /^ci \/ Sandbox provider tests$/,

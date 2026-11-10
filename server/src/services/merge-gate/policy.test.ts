@@ -125,9 +125,12 @@ describe("required CI coverage", () => {
       check("ci / Select Vitest files", "skipped"), workflow("PR", "success"), workflow("Storybook Visual", "skipped")];
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"], checks: paperclipGreen }))
       .toEqual([]);
+    // A plan-skipped shard counts only behind a green ci / verify.
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
-      checks: [...paperclipGreen, check("ci / General tests (server (2/12))", "skipped")] }))
-      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") }]);
+      checks: [...paperclipGreen, check("ci / General tests (server (2/12))", "skipped")] })).toEqual([]);
+    expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
+      checks: [...paperclipGreen.filter(entry => entry.name !== "ci / verify"), check("ci / General tests (server (2/12))", "skipped")] }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") })]));
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
       checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
@@ -173,6 +176,19 @@ describe("paperclip CI policy (STA-218)", () => {
       expect.stringContaining("ci / e2e runs on every change"),
       expect.stringContaining("ci / Docker context integrity was skipped"),
       expect.stringContaining("ci / e2e shard (1/8) was skipped"),
+    ]));
+  });
+
+  it("accepts a change-scoped UI PR whose plan skipped every server suite behind a green ci / verify (STA-223)", () => {
+    const uiOnly = PAPERCLIP_ORDINARY_PR.map(entry =>
+      /General tests \((server|chat)|serialized server|e2e shard|Verify Paperclip Runner|Docker context|Canary|Runner support/.test(entry.name)
+        ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(uiOnly, ["ui/src/components/Sidebar.tsx"])).toEqual([]);
+    const withoutVerify = uiOnly.filter(entry => entry.name !== "ci / verify");
+    expect(evaluate(withoutVerify, ["ui/src/components/Sidebar.tsx"]).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("ci / verify runs on every change"),
+      expect.stringContaining("ci / General tests (server (1/12)) was skipped"),
+      expect.stringContaining("ci / Verify serialized server suites (1/9) was skipped"),
     ]));
   });
 
