@@ -67,7 +67,8 @@ const REACHED_STATES: (typeof chatPublications.$inferSelect.state)[] = ["publish
 /** Re-arms of one notice cancelled before any provider I/O; later cancellations stay final and visible. */
 export const MAX_FOUNDER_FALLBACK_REARMS = 20;
 
-export type FounderFallbackSettings = { enabled: boolean; boundMs: number };
+/** `quietHours: false` only for tests on the real clock; production always keeps them. */
+export type FounderFallbackSettings = { enabled: boolean; boundMs: number; quietHours?: boolean };
 
 export function founderFallbackSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): FounderFallbackSettings {
   const minutes = Number(env.PAPERCLIP_FOUNDER_FALLBACK_BOUND_MINUTES);
@@ -190,7 +191,7 @@ function founderLocalTime(date: Date, now: Date) {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: FOUNDER_TIME_ZONE, hour: "numeric", minute: "2-digit", timeZoneName: "short",
     ...(sameDay ? {} : { weekday: "short" }),
-  }).format(date);
+  }).format(date).replace(/[\u202f\u00a0]/g, " ");
 }
 
 function waited(ms: number) {
@@ -477,7 +478,7 @@ function askPlan(coverage: Coverage | undefined, now: Date): AskPlan {
   if (!coverage) return { send: "first" };
   if (coverage.inFlight) return { inFlight: true };
   if (coverage.blocked) return null;
-  if (!coverage.reached) return coverage.unsent < MAX_FOUNDER_FALLBACK_REARMS ? { send: "first" } : null;
+  if (!coverage.reached) return coverage.unsent <= MAX_FOUNDER_FALLBACK_REARMS ? { send: "first" } : null;
   if (coverage.reached > MAX_FOUNDER_REMINDERS) return null;
   const dueAt = coverage.lastReachedAt! + FOUNDER_REMINDER_INTERVAL_MS;
   return dueAt <= now.getTime() ? { send: "reminder" } : { dueAt };
@@ -629,12 +630,20 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     const due = (at: number) => { dueAt = dueAt === null ? at : Math.min(dueAt, at); };
     const companyId = target.endpoint.companyId;
     const endpointId = target.endpoint.id;
-    const quiet = inFounderQuietHours(now);
+    const quiet = settings.quietHours !== false && inFounderQuietHours(now);
     const result = await db.transaction(async raw => {
       const tx = raw as unknown as Tx;
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`founder-fallback:${endpointId}`}))`);
       let inserted = 0;
-      let awaitingOutbox = false;
+      // An ask still in flight is settled by the outbox: delivered (and
+      // retracted once resolved), or cancelled at its claim and listed again.
+      const [inFlight] = await tx.select({ id: chatPublications.id }).from(chatPublications).where(and(
+        eq(chatPublications.companyId, companyId),
+        eq(chatPublications.endpointId, endpointId),
+        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}${endpointId}:asks:%`),
+        inArray(chatPublications.state, IN_FLIGHT_STATES),
+      )).limit(1);
+      const awaitingOutbox = !!inFlight;
       const state = await unavailability(tx, target.agent);
       const boundAt = state ? state.since.getTime() + settings.boundMs : null;
 
@@ -647,16 +656,16 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       const coverage = await alertCoverage(tx, companyId, endpointId, pending.map(row => row.id));
       const asks: Ask[] = [];
       for (const interaction of pending) {
-        if (interaction.createdAt > now) continue;
         const plan = askPlan(coverage.get(interaction.id), now);
         if (!plan) continue;
-        if ("inFlight" in plan) { awaitingOutbox = true; continue; }
+        if ("inFlight" in plan) continue;
         if ("dueAt" in plan) { due(plan.dueAt); continue; }
         // An escalation to an unavailable agent qualifies at the outage bound;
         // a founder decision, or one to an available agent, at its own age.
         const missedAt = interaction.createdAt.getTime() + settings.boundMs;
         const qualifiesAt = interaction.addresseeUserId !== target.founderUserId && boundAt !== null ? boundAt : missedAt;
         if (qualifiesAt > now.getTime()) due(qualifiesAt);
+        if (interaction.createdAt > now) continue;
         const reason = await itemReason(tx, target, interaction, state, now, settings.boundMs);
         if (!reason) continue;
         const ref = await issueRef(tx, interaction);
