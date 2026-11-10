@@ -134,6 +134,53 @@ suite("staple console service", () => {
     expect(board.header.mergedToday).toBe(0);
   });
 
+  it("keeps Done work with an open PR past its completion day, and reads a native review stage (FAC-837/838)", async () => {
+    const companyId = await seedCompany();
+    const [builder, reviewer] = await db.insert(agents).values([
+      { companyId, name: "Workflow Engineer", role: "engineer", adapterType: "claude_local" },
+      { companyId, name: "Workflow Reviewer", role: "qa", adapterType: "codex_local" },
+    ]).returning();
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60_000);
+    const [openPrTask, mergedPrTask] = await db.insert(issues).values([
+      { companyId, title: "Console nav link", status: "done", assigneeAgentId: builder!.id, completedAt: hoursAgo(48) },
+      { companyId, title: "Console header", status: "done", assigneeAgentId: builder!.id, completedAt: hoursAgo(48) },
+    ]).returning();
+    await db.insert(issueWorkProducts).values([
+      {
+        companyId, issueId: openPrTask!.id, type: "pull_request", provider: "github", title: "PR 40",
+        url: "https://github.com/acme/widgets/pull/40", status: "active", metadata: { state: "open" },
+      },
+      {
+        companyId, issueId: mergedPrTask!.id, type: "pull_request", provider: "github", title: "PR 41",
+        url: "https://github.com/acme/widgets/pull/41", status: "merged", metadata: { state: "merged" },
+      },
+    ]);
+    const stageId = randomUUID();
+    const [nativeTask] = await db.insert(issues).values({
+      companyId, title: "Console rounds", status: "in_review", assigneeAgentId: reviewer!.id,
+      executionPolicy: { mode: "normal", commentRequired: false, stages: [
+        { id: stageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: reviewer!.id }] },
+      ] },
+      executionState: {
+        status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewer!.id }, returnAssignee: { type: "agent", agentId: builder!.id },
+        reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+      },
+    }).returning();
+
+    const svc = stapleConsoleService(db, { credentialProvider: async () => null });
+    const userId = randomUUID();
+    const board = await svc.board(companyId, { type: "board", userId, authorizingUserId: userId });
+    const ids = cards(board).map((card) => card.id);
+    expect(ids).toContain(openPrTask!.id);
+    expect(ids).not.toContain(mergedPrTask!.id);
+    expect(cards(board).find((card) => card.id === openPrTask!.id)).toMatchObject({
+      step: "review", completion: "task_done", completionNote: "Task done; widgets#40 is still open, not merged",
+    });
+    expect(cards(board).find((card) => card.id === nativeTask!.id)).toMatchObject({ step: "review", round: 1 });
+    expect(board.header.inFlight).toBe(2);
+  });
+
   it("keeps PR links with unknown state when GitHub fails or the refresh is capped, dropping only 404 guesses", async () => {
     const companyId = await seedCompany();
     const url = (number: number) => `https://github.com/acme/widgets/pull/${number}`;
