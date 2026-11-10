@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   classifyHeadCommits,
@@ -125,9 +126,12 @@ describe("required CI coverage", () => {
       check("ci / Select Vitest files", "skipped"), workflow("PR", "success"), workflow("Storybook Visual", "skipped")];
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"], checks: paperclipGreen }))
       .toEqual([]);
+    // A plan-skipped shard counts only behind a green ci / verify.
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
-      checks: [...paperclipGreen, check("ci / General tests (server (2/12))", "skipped")] }))
-      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") }]);
+      checks: [...paperclipGreen, check("ci / General tests (server (2/12))", "skipped")] })).toEqual([]);
+    expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
+      checks: [...paperclipGreen.filter(entry => entry.name !== "ci / verify"), check("ci / General tests (server (2/12))", "skipped")] }))
+      .toEqual(expect.arrayContaining([expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") })]));
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
       checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
@@ -176,6 +180,19 @@ describe("paperclip CI policy (STA-218)", () => {
     ]));
   });
 
+  it("accepts a change-scoped UI PR whose plan skipped every server suite behind a green ci / verify (STA-223)", () => {
+    const uiOnly = PAPERCLIP_ORDINARY_PR.map(entry =>
+      /General tests \((server|chat)|serialized server|e2e shard|Verify Paperclip Runner|Docker context|Canary|Runner support/.test(entry.name)
+        ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(uiOnly, ["ui/src/components/Sidebar.tsx"])).toEqual([]);
+    const withoutVerify = uiOnly.filter(entry => entry.name !== "ci / verify");
+    expect(evaluate(withoutVerify, ["ui/src/components/Sidebar.tsx"]).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("ci / verify runs on every change"),
+      expect.stringContaining("ci / General tests (server (1/12)) was skipped"),
+      expect.stringContaining("ci / Verify serialized server suites (1/9) was skipped"),
+    ]));
+  });
+
   it("still refuses a skipped required suite, even with ci / verify green", () => {
     const skippedBuild = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / Build" ? { ...entry, conclusion: "skipped" } : entry);
     expect(evaluate(skippedBuild)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
@@ -191,6 +208,43 @@ describe("paperclip CI policy (STA-218)", () => {
     expect(evaluate(PAPERCLIP_ORDINARY_PR, files))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("Runner Rust (Windows x64) did not run") }]);
     expect(evaluate([...PAPERCLIP_ORDINARY_PR, check("Runner Rust (Windows x64)", "success")], files)).toEqual([]);
+  });
+
+  it("starts the Windows runner workflow for every path the gate needs it for (PR #41, STA-223)", () => {
+    // PR #41 touched .github/scripts; the gate needed Windows evidence the
+    // workflow's `paths:` trigger never started, so it could not merge.
+    const workflow = readFileSync(new URL("../../../../.github/workflows/runner-windows.yml", import.meta.url), "utf8");
+    const triggers = (event: string) => {
+      const block = workflow.split(`\n  ${event}:\n`)[1]?.split(/\n  \S/)[0] ?? "";
+      return [...block.matchAll(/^\s+- '?([^'\s]+)'?$/gm)].map(match => new RegExp(`^${match[1]!
+        .replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\0").replace(/\*/g, "[^/]*").replace(/\0/g, ".*")}$`));
+    };
+    const samples = [
+      ".github/scripts/staple-ci-scope.mjs", ".github/scripts/tests/ci-plan.test.mjs", "setup.ps1", "scripts/dev/setup.ps1",
+      "tools/a.psm1", "tools/a.psd1", "bin/run.cmd", "bin/run.bat", ".github/workflows/runner-windows.yml",
+      "packages/paperclip-runner/runner/src/lib.rs", "packages/paperclip-runner/rust-toolchain.toml", "tests/runner-e2e/fixtures/a.json",
+    ];
+    for (const event of ["pull_request", "push"]) {
+      const filters = triggers(event);
+      expect(filters.length).toBeGreaterThan(0);
+      for (const file of samples) {
+        expect(requiredPathScopedChecks({ policy: paperclip, changedFiles: [file] })).toEqual(["Runner Rust (Windows x64)"]);
+        expect(filters.some(filter => filter.test(file)), `${event} trigger misses ${file}`).toBe(true);
+      }
+      expect(filters.some(filter => filter.test("server/src/app.ts"))).toBe(false);
+    }
+  });
+
+  it("accepts the label-only CI work benchmark jobs as skipped on a CI-file change (PR #41)", () => {
+    const files = [".github/workflows/pr-trusted.yml", ".github/scripts/staple-ci-scope.mjs"];
+    const benchmark = ["paired", "rust_prime", "rust_restore"].map(name => check(name, "skipped"));
+    const windows = check("Runner Rust (Windows x64)", "success");
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, windows, ...benchmark, workflow("CI work benchmark", "skipped")], files)).toEqual([]);
+    // Labelled, they must still pass.
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, windows, check("paired", "failure")], files))
+      .toMatchObject([{ code: "ci_failed", detail: expect.stringContaining("paired (failure)") }]);
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, ...benchmark], files))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("Runner Rust (Windows x64) did not run") }]);
   });
 });
 

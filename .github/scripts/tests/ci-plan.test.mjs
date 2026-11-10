@@ -385,6 +385,7 @@ const endpoint = process.argv.find(arg => arg.startsWith('/repos/'));
 fs.appendFileSync(process.env.TEST_GH_LOG, endpoint + '\\n');
 if (!endpoint?.startsWith('/repos/${fork}/contents/')) process.exit(3);
 if (process.env.TEST_FETCH_FAILURE === 'true') process.exit(1);
+if (process.env.TEST_SCOPE_MISSING === 'true' && endpoint.includes('staple-ci-scope')) process.exit(1);
 const [file, query] = endpoint.split('/contents/')[1].split('?');
 if (query !== 'ref=' + process.env.EVENT_MERGE_SHA) process.exit(2);
 process.stdout.write(fs.readFileSync(path.join(process.env.TEST_TRUSTED_ROOT, file)));
@@ -407,37 +408,59 @@ process.stdout.write(fs.readFileSync(path.join(process.env.TEST_TRUSTED_ROOT, fi
     };
     const jobsRun = (resultPlan) => Object.fromEntries(Object.entries(resultPlan.jobs).map(([job, lane]) => [job, lane.selected]));
 
+    // The Staple PR scope (STA-223, .github/staple-ci-scope.json) narrows the fork's plan: build and
+    // typecheck always, the suites the task plan picks for the changed paths, and e2e, Runner,
+    // Docker and canary only for the paths they cover.
     const ui = run("ui");
     assert.equal(ui.forceReason, null);
     assert.equal(ui.diff.base, merges.ui.base);
     assert.deepEqual(ui.changed, ["ui/src/components/Sidebar.tsx"]);
-    assert.deepEqual(jobsRun(ui), { typecheck_release_registry: 1, general_tests: 2, docker_context_integrity: 1,
-      sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 1, verify_serialized_server: 0, canary_dry_run: 1,
-      e2e_shards: 8, verify_runner_e2e_support: 1 });
+    assert.equal(ui.staple.scope, "change-scoped");
+    assert.deepEqual(jobsRun(ui), { typecheck_release_registry: 1, general_tests: 2, docker_context_integrity: 0,
+      sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 1, verify_serialized_server: 0, canary_dry_run: 0,
+      e2e_shards: 0, verify_runner_e2e_support: 0 });
+    // Without the scope map the fork keeps the unscoped task plan.
+    assert.deepEqual(jobsRun(run("ui", { TEST_SCOPE_MISSING: "true" })), { typecheck_release_registry: 1, general_tests: 2,
+      docker_context_integrity: 1, sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 1, verify_serialized_server: 0,
+      canary_dry_run: 1, e2e_shards: 8, verify_runner_e2e_support: 1 });
 
+    // server/src/index.ts is agent lifecycle: e2e and the chat lane run, Runner does not.
     const server = run("server");
     assert.equal(server.forceReason, null);
-    assert.deepEqual(jobsRun(server), { typecheck_release_registry: 1, general_tests: 18, docker_context_integrity: 1,
-      sandbox_provider_tests: 0, verify_paperclip_runner: 5, build: 1, verify_serialized_server: 9, canary_dry_run: 1,
-      e2e_shards: 8, verify_runner_e2e_support: 1 });
-    assert.ok(!server.jobs.verify_paperclip_runner.matrix.include.some((entry) => entry.task === "ci:runner-rust"));
+    assert.deepEqual(jobsRun(server), { typecheck_release_registry: 1, general_tests: 18, docker_context_integrity: 0,
+      sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 1, verify_serialized_server: 9, canary_dry_run: 0,
+      e2e_shards: 8, verify_runner_e2e_support: 0 });
 
     const rust = run("rust");
     // Runner Rust lives under packages/**, which every Node consumer also reads.
+    assert.ok(rust.jobs.verify_paperclip_runner.run);
     assert.ok(rust.jobs.verify_paperclip_runner.matrix.include.some((entry) => entry.task === "ci:runner-rust"));
-    assert.ok(rust.jobs.e2e_shards.run);
+    assert.ok(!rust.jobs.e2e_shards.run);
 
     const plans = run("plans");
     assert.equal(plans.forceReason, null);
-    assert.ok(Object.values(plans.jobs).every((lane) => !lane.run));
+    assert.deepEqual(Object.keys(plans.jobs).filter((job) => plans.jobs[job].run), ["typecheck_release_registry", "build"]);
+
+    // An upstream sync keeps its whole task plan.
+    const sync = run("ui", { EVENT_HEAD_REF: "staple/upstream-sync-2026-11-10" });
+    assert.equal(sync.staple.scope, "full");
+    assert.equal(sync.jobs.e2e_shards.selected, 8);
 
     const lockfile = run("lockfile");
     assert.match(lockfile.forceReason, /Global CI input changed: pnpm-lock.yaml/);
     assert.ok(Object.values(lockfile.jobs).every((lane) => lane.selected === lane.total));
 
-    // Shared packages and nested lockfiles or manifests feed every consumer, so they run the full matrix.
-    for (const [name, file] of [["shared", "packages/shared/src/types/issue.ts"], ["db", "packages/db/src/schema/issues.ts"],
-      ["adapterUtils", "packages/adapter-utils/src/index.ts"], ["cargoLock", "packages/paperclip-runner/runner/Cargo.lock"],
+    // packages/shared and packages/adapter-utils feed every server lane through packages/**; only
+    // adapter-utils (agent lifecycle) needs e2e.
+    const shared = run("shared");
+    assert.equal(shared.forceReason, null);
+    assert.ok(shared.jobs.general_tests.run && shared.jobs.verify_serialized_server.run && !shared.jobs.e2e_shards.run);
+    const adapterUtils = run("adapterUtils");
+    assert.equal(adapterUtils.forceReason, null);
+    assert.equal(adapterUtils.jobs.e2e_shards.selected, 8);
+
+    // Database schema and nested lockfiles or manifests feed every consumer, so they run the full matrix.
+    for (const [name, file] of [["db", "packages/db/src/schema/issues.ts"], ["cargoLock", "packages/paperclip-runner/runner/Cargo.lock"],
       ["cargoManifest", "packages/paperclip-runner/runner/crates/runner-core/Cargo.toml"],
       ["nestedPnpmLock", "packages/plugins/sandbox-providers/daytona/pnpm-lock.yaml"],
       ["npmLock", "packages/paperclip-runner/scripts/pi-distribution/package-lock.json"]]) {

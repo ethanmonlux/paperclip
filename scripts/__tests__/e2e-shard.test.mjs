@@ -266,7 +266,8 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support\]$/m,
+    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards\]$/m,
+    "verify is the single stable aggregate and must cover e2e (STA-223)",
   );
   assert.equal(runAggregate(verify, true).status, 0);
   assert.equal(runAggregate(verify, false).status, 0);
@@ -275,7 +276,8 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
       "an optional selector cannot block the successful original matrix");
   }
   for (const job of ["gate", "policy", "typecheck_release_registry", "general_tests", "verify_paperclip_runner",
-    "build", "docker_context_integrity", "sandbox_provider_tests", "verify_serialized_server", "canary_dry_run", "verify_runner_e2e_support"]) {
+    "build", "docker_context_integrity", "sandbox_provider_tests", "verify_serialized_server", "canary_dry_run", "verify_runner_e2e_support",
+    "e2e_shards"]) {
     for (const result of ["failure", "cancelled", "skipped"]) {
       assert.notEqual(runAggregate(verify, true, { [job]: result }).status, 0, `${job}: ${result}`);
     }
