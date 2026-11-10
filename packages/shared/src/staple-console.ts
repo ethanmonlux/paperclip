@@ -492,11 +492,13 @@ function isCoordinatorAgent(agent: StapleConsoleAgentInput | undefined) {
 }
 
 export function isStapleConsoleReviewIssue(
-  issue: Pick<StapleConsoleIssueInput, "title">,
+  issue: Pick<StapleConsoleIssueInput, "title" | "reviewerAgentIds">,
   agent: StapleConsoleAgentInput | undefined,
 ) {
   if (/\b(review|verify|verification)\b/i.test(issue.title)) return true;
   if (!agent) return false;
+  // Assigned to its own native review stage's reviewer: still an implementation task (FAC-838).
+  if (issue.reviewerAgentIds?.includes(agent.id)) return false;
   return agent.role === "qa" || /reviewer/i.test(agent.name);
 }
 const isReviewIssue = isStapleConsoleReviewIssue;

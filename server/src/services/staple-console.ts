@@ -457,7 +457,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     // re-review, the coordinator) never count.
     const agentById = new Map(agentRows.map((agent) => [agent.id, { id: agent.id, name: agent.name, role: agent.role ?? null }]));
     const cardScopeIdSet = new Set(cardScopeIds);
-    const reviewIssueRows = issueRows.filter((row) =>
+    const reviewIssueRows = issueInputs.filter((row) =>
       cardScopeIdSet.has(row.id) && isStapleConsoleReviewIssue(row, agentById.get(row.assigneeAgentId ?? "")));
     const decisionSince = new Date(nowMs - REVIEW_DECISION_LOOKBACK_MS);
     const [executionDecisionRows, reviewCommentRows] = await Promise.all([
