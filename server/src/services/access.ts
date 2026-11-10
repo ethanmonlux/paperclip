@@ -28,6 +28,7 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertCapabilityRoutingForIssues } from "./capability-routing.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
@@ -749,6 +750,19 @@ export function accessService(db: Db) {
         eq(issues.assigneeUserId, existing.principalId),
         sql`${issues.status} not in ('done', 'cancelled')`,
       );
+      if (assignmentPatch.assigneeAgentId) {
+        // The transfer assigns each task to the agent, so route each by its labels.
+        const transferred = await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(assignedOpenIssueWhere)
+          .for("update");
+        await assertCapabilityRoutingForIssues(tx as Db, {
+          companyId,
+          assigneeAgentId: assignmentPatch.assigneeAgentId,
+          issueIds: transferred.map((row) => row.id),
+        });
+      }
       await notifyNativeStatusReassessment(tx, { companyId });
       await notifyDeferredExecutionEligibility(tx, { companyId });
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);

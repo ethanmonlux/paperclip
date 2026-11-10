@@ -11522,14 +11522,6 @@ export function issueService(db: Db) {
           { kind: "work" },
         );
       }
-      // Route only a change of assignee, so existing work stays claimable.
-      if (nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId) {
-        await assertCapabilityRouting(dbOrTx as Db, {
-          companyId: existing.companyId,
-          assigneeAgentId: nextAssigneeAgentId,
-          labels: nextLabelIds !== undefined ? { labelIds: nextLabelIds } : { issueId: existing.id },
-        });
-      }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(
           existing.companyId,
@@ -11629,6 +11621,16 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Route only a change of assignee, so existing work stays claimable.
+        // Compare with the locked row: an assignment released since the
+        // unlocked read is a new claim.
+        if (nextAssigneeAgentId && nextAssigneeAgentId !== receiptExisting.assigneeAgentId) {
+          await assertCapabilityRouting(tx as Db, {
+            companyId: existing.companyId,
+            assigneeAgentId: nextAssigneeAgentId,
+            labels: nextLabelIds !== undefined ? { labelIds: nextLabelIds } : { issueId: existing.id },
+          });
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {
@@ -12352,7 +12354,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
     ) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
+        .select({ companyId: issues.companyId })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
@@ -12360,14 +12362,6 @@ export function issueService(db: Db) {
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
-      // Checkout claims only unassigned work; route that claim like an assignment.
-      if (!issueCompany.assigneeAgentId) {
-        await assertCapabilityRouting(db, {
-          companyId: issueCompany.companyId,
-          assigneeAgentId: agentId,
-          labels: { issueId: id },
-        });
-      }
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
@@ -12445,6 +12439,22 @@ export function issueService(db: Db) {
         await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
         await notifyRoutineExecutionStatus(tx, id);
+        // Checkout claims only unassigned work; route that claim like an
+        // assignment. Decide from the locked row, so work released after
+        // the unlocked read is still routed.
+        const locked = await tx
+          .select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (locked && !locked.assigneeAgentId) {
+          await assertCapabilityRouting(tx as unknown as Db, {
+            companyId: issueCompany.companyId,
+            assigneeAgentId: agentId,
+            labels: { issueId: id },
+          });
+        }
         return tx
           .update(issues)
           .set({

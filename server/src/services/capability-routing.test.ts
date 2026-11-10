@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, issueLabels, issues, labels } from "@paperclipai/db";
+import { agents, companies, companyMemberships, createDb, issueLabels, issues, labels } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
 import { evaluateCapabilityRouting, parseAgentRouting, type RoutingAgent } from "./capability-routing.js";
+import { accessService } from "./access.js";
 import { issueService } from "./issues.js";
 
 // The portfolio lanes as configured for FAC-840 C2.
@@ -140,6 +141,7 @@ describeEmbeddedPostgres("issueService capability routing", () => {
     await db.delete(issueLabels);
     await db.delete(issues);
     await db.delete(labels);
+    await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -233,5 +235,85 @@ describeEmbeddedPostgres("issueService capability routing", () => {
     await expect(svc.checkout(issue.id, ids.kaia, ["todo"], null)).rejects.toMatchObject(mismatch("exclusive_label_missing"));
     await expect(svc.checkout(issue.id, ids.portfolio, ["todo"], null))
       .resolves.toMatchObject({ assigneeAgentId: ids.portfolio });
+  });
+  // Holds the task row lock while `start` runs, changes the row as a
+  // concurrent writer would, and commits once `start` waits on the lock.
+  async function raceWithLockedWrite<T>(issueId: string, write: Partial<typeof issues.$inferInsert>, start: () => Promise<T>) {
+    let operation!: Promise<T>;
+    await db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
+      await tx.update(issues).set(write).where(eq(issues.id, issueId));
+      const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`) as unknown as Array<{ pid: number }>;
+      operation = start();
+      operation.catch(() => undefined);
+      let waiting = false;
+      for (let attempt = 0; attempt < 200 && !waiting; attempt++) {
+        const [state] = await db.execute(sql`select exists (
+          select 1 from pg_stat_activity where ${backend.pid} = any(pg_blocking_pids(pid))
+        ) as waiting`) as unknown as Array<{ waiting: boolean }>;
+        waiting = state.waiting;
+        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(waiting).toBe(true);
+    });
+    return operation;
+  }
+
+  it("routes a checkout of work released after the unlocked read (FAC-885)", async () => {
+    const { companyId, ids } = await seedLanes();
+    const issue = await svc.create(companyId, {
+      title: "Boss names", status: "todo", priority: "high", assigneeAgentId: ids.portfolio,
+    });
+    await expect(raceWithLockedWrite(issue.id, { assigneeAgentId: null }, () => svc.checkout(issue.id, ids.kaia, ["todo"], null)))
+      .rejects.toMatchObject(mismatch("exclusive_label_missing"));
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    expect(persisted?.assigneeAgentId).toBeNull();
+  });
+
+  it("routes an update whose assignee changed after the unlocked read (FAC-885)", async () => {
+    const { companyId, ids } = await seedLanes();
+    const issueId = randomUUID();
+    // Held by Kaia from before routing was configured, then moved concurrently.
+    await db.insert(issues).values({ id: issueId, companyId, title: "Boss names", status: "todo", assigneeAgentId: ids.kaia });
+    await expect(raceWithLockedWrite(issueId, { assigneeAgentId: ids.portfolio }, () => svc.update(issueId, { assigneeAgentId: ids.kaia })))
+      .rejects.toMatchObject(mismatch("exclusive_label_missing"));
+    const [persisted] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(persisted?.assigneeAgentId).toBe(ids.portfolio);
+  });
+
+  it("routes each task a member archive transfers to an agent, rolling back a mixed batch (FAC-884)", async () => {
+    const { companyId, ids, kaiaLabelId } = await seedLanes();
+    const access = accessService(db);
+    const principalId = `member-${randomUUID()}`;
+    const member = await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId, status: "active", membershipRole: "operator",
+    }).returning().then((rows) => rows[0]!);
+    const kaiaWork = await svc.create(companyId, {
+      title: "Kaia gear selector art", status: "in_progress", priority: "high", assigneeUserId: principalId, labelIds: [kaiaLabelId],
+    });
+    const general = await svc.create(companyId, {
+      title: "Boss names", status: "todo", priority: "high", assigneeUserId: principalId,
+    });
+
+    await expect(access.archiveMember(companyId, member.id, { reassignment: { assigneeAgentId: ids.kaia } }))
+      .rejects.toMatchObject({
+        status: 422,
+        details: expect.objectContaining({ code: "agent_capability_mismatch", reason: "exclusive_label_missing", issueId: general.id }),
+      });
+    const [unarchived] = await db.select().from(companyMemberships).where(eq(companyMemberships.id, member.id));
+    expect(unarchived?.status).toBe("active");
+    const held = await db.select({ id: issues.id, assigneeUserId: issues.assigneeUserId, status: issues.status })
+      .from(issues).where(eq(issues.companyId, companyId));
+    expect(held).toEqual(expect.arrayContaining([
+      { id: kaiaWork.id, assigneeUserId: principalId, status: "in_progress" },
+      { id: general.id, assigneeUserId: principalId, status: "todo" },
+    ]));
+
+    // Once the general task moves elsewhere, Kaia can take the remaining Kaia work.
+    await svc.update(general.id, { assigneeUserId: null, assigneeAgentId: ids.portfolio });
+    await expect(access.archiveMember(companyId, member.id, { reassignment: { assigneeAgentId: ids.kaia } }))
+      .resolves.toMatchObject({ reassignedIssueCount: 1 });
+    const [transferred] = await db.select().from(issues).where(eq(issues.id, kaiaWork.id));
+    expect(transferred?.assigneeAgentId).toBe(ids.kaia);
   });
 });

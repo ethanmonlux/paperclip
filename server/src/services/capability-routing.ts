@@ -1,6 +1,6 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, issueLabels, labels } from "@paperclipai/db";
+import { agents, issueLabels, issues, labels } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 
 /**
@@ -184,9 +184,39 @@ async function loadLabelNames(
   return rows.filter((row) => row.companyId === companyId).map((row) => row.name);
 }
 
+async function loadCompanyRoutingAgents(db: Db, companyId: string): Promise<RoutingAgent[]> {
+  return db
+    .select({ id: agents.id, name: agents.name, status: agents.status, metadata: agents.metadata })
+    .from(agents)
+    .where(eq(agents.companyId, companyId));
+}
+
+function mismatchError(
+  companyId: string,
+  assignee: RoutingAgent,
+  decision: Extract<CapabilityRoutingDecision, { allowed: false }>,
+  issue?: { id: string; identifier: string | null },
+) {
+  const message = issue
+    ? `${issue.identifier ?? issue.id} cannot move to ${assignee.name}: ${decision.message}`
+    : decision.message;
+  return unprocessable(message, {
+    code: "agent_capability_mismatch",
+    reason: decision.reason,
+    companyId,
+    assigneeAgentId: assignee.id,
+    ...(issue ? { issueId: issue.id } : {}),
+    requiredCapabilities: decision.requiredCapabilities,
+    missingCapabilities: decision.missingCapabilities,
+    eligibleAgents: decision.eligibleAgents,
+  });
+}
+
 /**
  * Rejects an assignment that the agents' declared routing does not allow.
  * Call it only when the assignee changes, so existing work stays claimable.
+ * Inside a transaction, call it after locking the task row so the "changes"
+ * decision and the labels are the locked current state.
  */
 export async function assertCapabilityRouting(
   db: Db,
@@ -197,23 +227,49 @@ export async function assertCapabilityRouting(
   },
 ) {
   if (!input.assigneeAgentId) return;
-  const companyAgents: RoutingAgent[] = await db
-    .select({ id: agents.id, name: agents.name, status: agents.status, metadata: agents.metadata })
-    .from(agents)
-    .where(eq(agents.companyId, input.companyId));
+  const companyAgents = await loadCompanyRoutingAgents(db, input.companyId);
   const assignee = companyAgents.find((agent) => agent.id === input.assigneeAgentId);
   if (!assignee || parseAgentRouting(assignee.metadata).kind === "none") return;
 
   const labelNames = await loadLabelNames(db, input.companyId, input.labels);
   const decision = evaluateCapabilityRouting({ assignee, agents: companyAgents, labelNames });
   if (decision.allowed) return;
-  throw unprocessable(decision.message, {
-    code: "agent_capability_mismatch",
-    reason: decision.reason,
-    companyId: input.companyId,
-    assigneeAgentId: assignee.id,
-    requiredCapabilities: decision.requiredCapabilities,
-    missingCapabilities: decision.missingCapabilities,
-    eligibleAgents: decision.eligibleAgents,
-  });
+  throw mismatchError(input.companyId, assignee, decision);
+}
+
+/**
+ * Routes a bulk transfer of existing tasks to one agent. Rejects the whole
+ * transfer, naming the first task the agent may not take.
+ */
+export async function assertCapabilityRoutingForIssues(
+  db: Db,
+  input: { companyId: string; assigneeAgentId: string | null | undefined; issueIds: string[] },
+) {
+  if (!input.assigneeAgentId || input.issueIds.length === 0) return;
+  const companyAgents = await loadCompanyRoutingAgents(db, input.companyId);
+  const assignee = companyAgents.find((agent) => agent.id === input.assigneeAgentId);
+  if (!assignee || parseAgentRouting(assignee.metadata).kind === "none") return;
+
+  const issueIds = [...new Set(input.issueIds)];
+  const issueRows = await db
+    .select({ id: issues.id, identifier: issues.identifier })
+    .from(issues)
+    .where(and(eq(issues.companyId, input.companyId), inArray(issues.id, issueIds)));
+  const labelRows = await db
+    .select({ issueId: issueLabels.issueId, name: labels.name })
+    .from(issueLabels)
+    .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+    .where(and(inArray(issueLabels.issueId, issueIds), eq(labels.companyId, input.companyId)));
+  const labelNamesByIssue = new Map<string, string[]>();
+  for (const row of labelRows) {
+    labelNamesByIssue.set(row.issueId, [...(labelNamesByIssue.get(row.issueId) ?? []), row.name]);
+  }
+  for (const issue of issueRows.sort((left, right) => (left.identifier ?? left.id).localeCompare(right.identifier ?? right.id))) {
+    const decision = evaluateCapabilityRouting({
+      assignee,
+      agents: companyAgents,
+      labelNames: labelNamesByIssue.get(issue.id) ?? [],
+    });
+    if (!decision.allowed) throw mismatchError(input.companyId, assignee, decision, issue);
+  }
 }
