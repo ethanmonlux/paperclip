@@ -227,6 +227,7 @@ import { getRunLogStore, isRunLogStoreType } from "./run-log-store.js";
 import { recoverSettledNativeRunLog } from "./native-runtime/native-run-log-recovery.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertCapabilityRouting } from "./capability-routing.js";
 import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   isExternalChatPresentationContext,
@@ -10393,6 +10394,11 @@ export function issueService(db: Db) {
         await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
+        await assertCapabilityRouting(db, {
+          companyId,
+          assigneeAgentId: data.assigneeAgentId,
+          labels: { labelIds: inputLabelIds ?? [] },
+        });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
@@ -11809,6 +11815,16 @@ export function issueService(db: Db) {
             code: "issue_execution_lock_changed",
           });
         }
+        // Route only a change of assignee, so existing work stays claimable.
+        // Compare with the locked row: an assignment released since the
+        // unlocked read is a new claim.
+        if (nextAssigneeAgentId && nextAssigneeAgentId !== receiptExisting.assigneeAgentId) {
+          await assertCapabilityRouting(tx as Db, {
+            companyId: existing.companyId,
+            assigneeAgentId: nextAssigneeAgentId,
+            labels: nextLabelIds !== undefined ? { labelIds: nextLabelIds } : { issueId: existing.id },
+          });
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {
@@ -12624,6 +12640,22 @@ export function issueService(db: Db) {
         await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
         await notifyRoutineExecutionStatus(tx, id);
+        // Checkout claims only unassigned work; route that claim like an
+        // assignment. Decide from the locked row, so work released after
+        // the unlocked read is still routed.
+        const locked = await tx
+          .select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (locked && !locked.assigneeAgentId) {
+          await assertCapabilityRouting(tx as unknown as Db, {
+            companyId: issueCompany.companyId,
+            assigneeAgentId: agentId,
+            labels: { issueId: id },
+          });
+        }
         return tx
           .update(issues)
           .set({

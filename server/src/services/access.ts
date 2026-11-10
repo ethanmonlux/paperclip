@@ -28,6 +28,7 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertCapabilityRoutingForIssues } from "./capability-routing.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 
@@ -772,6 +773,14 @@ export function accessService(db: Db) {
         .set(assignmentPatch)
         .where(and(assignedOpenIssueWhere, ne(issues.status, "in_progress")))
         .returning({ id: issues.id });
+      // The transfer assigns each moved task to the agent, so route each by its
+      // labels. Check the rows the updates returned, so a task assigned to the
+      // member during the archive is routed too; a rejection rolls back.
+      await assertCapabilityRoutingForIssues(tx as unknown as Db, {
+        companyId,
+        assigneeAgentId: assignmentPatch.assigneeAgentId,
+        issueIds: [...resetInProgress, ...reassigned].map((row) => row.id),
+      });
 
       await tx
         .delete(principalPermissionGrants)
