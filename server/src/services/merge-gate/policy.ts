@@ -117,6 +117,9 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       // or a manual dispatch, the preview deploy a manual `deploy_preview`.
       /^Storybook visual regression$/,
       /^Deploy selected branch Storybook$/,
+      // ci-work-benchmark.yml starts for CI-file changes, but its jobs run
+      // only with the `profile-ci` label.
+      /^(paired|rust_prime|rust_restore)$/,
     ],
     planValidatedSkips: [
       {

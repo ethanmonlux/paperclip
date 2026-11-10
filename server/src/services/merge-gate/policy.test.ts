@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   classifyHeadCommits,
@@ -207,6 +208,43 @@ describe("paperclip CI policy (STA-218)", () => {
     expect(evaluate(PAPERCLIP_ORDINARY_PR, files))
       .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("Runner Rust (Windows x64) did not run") }]);
     expect(evaluate([...PAPERCLIP_ORDINARY_PR, check("Runner Rust (Windows x64)", "success")], files)).toEqual([]);
+  });
+
+  it("starts the Windows runner workflow for every path the gate needs it for (PR #41, STA-223)", () => {
+    // PR #41 touched .github/scripts; the gate needed Windows evidence the
+    // workflow's `paths:` trigger never started, so it could not merge.
+    const workflow = readFileSync(new URL("../../../../.github/workflows/runner-windows.yml", import.meta.url), "utf8");
+    const triggers = (event: string) => {
+      const block = workflow.split(`\n  ${event}:\n`)[1]?.split(/\n  \S/)[0] ?? "";
+      return [...block.matchAll(/^\s+- '?([^'\s]+)'?$/gm)].map(match => new RegExp(`^${match[1]!
+        .replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "\0").replace(/\*/g, "[^/]*").replace(/\0/g, ".*")}$`));
+    };
+    const samples = [
+      ".github/scripts/staple-ci-scope.mjs", ".github/scripts/tests/ci-plan.test.mjs", "setup.ps1", "scripts/dev/setup.ps1",
+      "tools/a.psm1", "tools/a.psd1", "bin/run.cmd", "bin/run.bat", ".github/workflows/runner-windows.yml",
+      "packages/paperclip-runner/runner/src/lib.rs", "packages/paperclip-runner/rust-toolchain.toml", "tests/runner-e2e/fixtures/a.json",
+    ];
+    for (const event of ["pull_request", "push"]) {
+      const filters = triggers(event);
+      expect(filters.length).toBeGreaterThan(0);
+      for (const file of samples) {
+        expect(requiredPathScopedChecks({ policy: paperclip, changedFiles: [file] })).toEqual(["Runner Rust (Windows x64)"]);
+        expect(filters.some(filter => filter.test(file)), `${event} trigger misses ${file}`).toBe(true);
+      }
+      expect(filters.some(filter => filter.test("server/src/app.ts"))).toBe(false);
+    }
+  });
+
+  it("accepts the label-only CI work benchmark jobs as skipped on a CI-file change (PR #41)", () => {
+    const files = [".github/workflows/pr-trusted.yml", ".github/scripts/staple-ci-scope.mjs"];
+    const benchmark = ["paired", "rust_prime", "rust_restore"].map(name => check(name, "skipped"));
+    const windows = check("Runner Rust (Windows x64)", "success");
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, windows, ...benchmark, workflow("CI work benchmark", "skipped")], files)).toEqual([]);
+    // Labelled, they must still pass.
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, windows, check("paired", "failure")], files))
+      .toMatchObject([{ code: "ci_failed", detail: expect.stringContaining("paired (failure)") }]);
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, ...benchmark], files))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("Runner Rust (Windows x64) did not run") }]);
   });
 });
 

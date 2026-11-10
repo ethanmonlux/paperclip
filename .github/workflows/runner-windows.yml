@@ -3,6 +3,9 @@ name: Runner Windows
 # Builds and tests the native Runner on Windows x64. This is a standalone
 # workflow because pr.yml runs pr-trusted.yml from master: a lane added there
 # would not run on the pull request that adds or changes it.
+# The protected-main merge gate needs this check for Windows scripts and
+# .github/scripts as well (WINDOWS_EXECUTED_PATHS), so it starts for them too;
+# otherwise the gate would wait for a check CI never starts (STA-223).
 on:
   pull_request:
     paths:
@@ -15,6 +18,12 @@ on:
       - packages/paperclip-runner/test-fixtures/**
       - packages/paperclip-runner/test/fixtures/**
       - tests/runner-e2e/fixtures/**
+      - .github/scripts/**
+      - '**.ps1'
+      - '**.psm1'
+      - '**.psd1'
+      - '**.cmd'
+      - '**.bat'
   push:
     branches: [master]
     paths:
@@ -27,6 +36,12 @@ on:
       - packages/paperclip-runner/test-fixtures/**
       - packages/paperclip-runner/test/fixtures/**
       - tests/runner-e2e/fixtures/**
+      - .github/scripts/**
+      - '**.ps1'
+      - '**.psm1'
+      - '**.psd1'
+      - '**.cmd'
+      - '**.bat'
   workflow_dispatch:
 
 permissions: {}
