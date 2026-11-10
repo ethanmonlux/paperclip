@@ -430,31 +430,31 @@ describe.skipIf(!support.supported)("bounded workspace cohort migration", () => 
     });
     const capture = vi.spyOn(workspaceArchive, "captureRemoteWorkspaceDirectory");
     let entered = 0, release!: () => void, interrupt = mode === "resume";
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Hold uploads until all eight workers overlap. Each worker captures before
+    // it uploads and that takes load-dependent time, so there is no wall-clock
+    // release: held uploads only leave early once their cohort stops.
     const barrier = new Promise<void>(done => { release = done; });
     vi.spyOn(storage, "putFile").mockImplementation(async input => {
       uploads++; maximumUploads = Math.max(maximumUploads, uploads);
       try {
         if (interrupt && ++entered === 2) throw new Error("large_cohort_upload_interrupted");
         if (!interrupt) {
-          if (++entered === 1) timer = setTimeout(() => release(), 5000);
-          if (entered === 8) release();
+          if (++entered === 8 || input.signal?.aborted) release();
+          input.signal?.addEventListener("abort", () => release(), { once: true });
           await barrier;
         }
         return await put(input);
       } finally { uploads--; }
     });
     let savedOperations: Array<{ id: string; metadata: Record<string, unknown> | null }> = [], savedSnapshotIds: string[] = [];
-    try {
-      if (mode === "resume") {
-        await expect(run(f, { workspaceIds, concurrency: 1 })).rejects.toThrow("large_cohort_upload_interrupted");
-        savedOperations = (await db.select().from(workspaceOperations)).filter(row => workspaceIds.includes(row.executionWorkspaceId!));
-        savedSnapshotIds = (await db.select().from(executionWorkspaceSnapshots)).filter(row => workspaceIds.includes(row.executionWorkspaceId)).map(row => row.id);
-        expect(savedOperations).toHaveLength(10); expect(savedSnapshotIds).toHaveLength(2);
-        interrupt = false; entered = 0;
-      }
-      await expect(run(f, { workspaceIds, concurrency: 8 })).resolves.toMatchObject({ applied: true });
-    } finally { clearTimeout(timer); }
+    if (mode === "resume") {
+      await expect(run(f, { workspaceIds, concurrency: 1 })).rejects.toThrow("large_cohort_upload_interrupted");
+      savedOperations = (await db.select().from(workspaceOperations)).filter(row => workspaceIds.includes(row.executionWorkspaceId!));
+      savedSnapshotIds = (await db.select().from(executionWorkspaceSnapshots)).filter(row => workspaceIds.includes(row.executionWorkspaceId)).map(row => row.id);
+      expect(savedOperations).toHaveLength(10); expect(savedSnapshotIds).toHaveLength(2);
+      interrupt = false; entered = 0;
+    }
+    await expect(run(f, { workspaceIds, concurrency: 8 })).resolves.toMatchObject({ applied: true });
     expect(maximumReaders).toBe(8); expect(maximumReservations).toBe(8); expect(maximumUploads).toBe(8);
     expect(readers).toBe(0); expect(reservations).toBe(0); expect(uploads).toBe(0);
     const operations = (await db.select().from(workspaceOperations)).filter(row => workspaceIds.includes(row.executionWorkspaceId!));
