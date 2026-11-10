@@ -11,7 +11,7 @@ import {
   FOUNDER_FALLBACK_KEY_PREFIX, FOUNDER_REMINDER_INTERVAL_MS, MAX_FOUNDER_FALLBACK_REARMS, MAX_FOUNDER_REMINDERS,
   createFounderFallbackNotices, founderAskHints, founderFallbackDefinitelyUnsent, founderFallbackKey,
   founderFallbackSettingsFromEnv, founderQuietHoursEnd, inFounderQuietHours, isFounderFallbackPublication,
-  isFounderFallbackWakeEvent, parseFounderFallbackKey, registerFounderFallbackNoticeWork,
+  isFounderFallbackWakeEvent, parseFounderFallbackKey, registerFounderFallbackNoticeWork, type FounderFallbackKey,
 } from "../services/founder-fallback-notices.js";
 import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "../services/chat-publication-errors.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -26,7 +26,7 @@ describe("founder fallback keys and settings", () => {
   it("round-trips every key kind and rejects anything else", () => {
     const endpointId = randomUUID(), agentId = randomUUID(), interactionId = randomUUID(), runId = randomUUID();
     const five = Array.from({ length: 5 }, () => randomUUID());
-    for (const key of [
+    const keys: FounderFallbackKey[] = [
       { endpointId, kind: "asks", interactionIds: [interactionId] },
       { endpointId, kind: "asks", interactionIds: five, attempt: 3 },
       { endpointId, kind: "done", interactionId },
@@ -38,7 +38,8 @@ describe("founder fallback keys and settings", () => {
       { endpointId, kind: "item", interactionId },
       { endpointId, kind: "item", interactionId, attempt: 1 },
       { endpointId, kind: "agent", agentId, anchor: "terminated", attempt: 20 },
-    ] as const) {
+    ];
+    for (const key of keys) {
       const value = founderFallbackKey(key);
       expect(value.startsWith(FOUNDER_FALLBACK_KEY_PREFIX)).toBe(true);
       expect(isFounderFallbackPublication({ idempotencyKey: value })).toBe(true);
