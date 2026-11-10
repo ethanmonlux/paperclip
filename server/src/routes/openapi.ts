@@ -6260,6 +6260,44 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{issueId}/merge-gate",
+  tags: ["issues"],
+  summary: "Merge a task's pull request through the protected-main gate",
+  description: "The only merge path for agents (direct merges are refused). The coordinator that delegated the task calls it with the task's pull request. It merges at the exact head only when the PR is current with its base, CI at that head is green with every needed check run and passed (a skip counts only where the repository policy allows it for the changed paths; skipped-only CI is never green), an independent review from a different model family than the recorded implementation runs covers the source (a clean base update needs CI only; resolved conflicts need a scope conflict_hunks recheck at the new head), the merge bar holds (0 P0, 0 P1, every P2 tracked), and the base branch is not red. Reviewers record a `merge-review` issue document with lines `pullRequest: owner/repo#N`, `reviewedSha: <40-hex>`, `scope: full|conflict_hunks`, `p0: N`, `p1: N`, `p2: none|ISSUE-1, ISSUE-2`. A red base parks the task on the single red-main owner issue and wakes its assignee. One check-and-merge runs at a time per repository branch (`merge_in_progress` otherwise), and the base is re-read before merging. `dryRun` evaluates without merging.",
+  request: {
+    params: z.object({ issueId: z.string() }),
+    body: jsonBody(z.object({
+      repo: z.string().describe("owner/name"),
+      pullNumber: z.number().int(),
+      expectedHeadSha: z.string().optional(),
+      reviewIssueIds: z.array(z.string()).optional(),
+      mergeMethod: z.enum(["merge", "squash", "rebase"]).optional(),
+      dryRun: z.boolean().optional(),
+    })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/merge-gate/red-main",
+  tags: ["issues"],
+  summary: "Report a red base branch to its single owner issue",
+  description: "Opens, or returns the open, critical red-main owner issue for the repository branch and parks the reporting task on it. While it is open the merge gate stops merges into that branch except the fix under that issue.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(z.object({
+      repo: z.string(),
+      baseRef: z.string().optional(),
+      evidence: z.string(),
+      reportingIssueId: z.string().optional(),
+    })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
 // ─── Sidebar ─────────────────────────────────────────────────────────────────
 
 registry.registerPath({

@@ -146,6 +146,7 @@ import { agentChatMessageRoutes } from "./routes/agent-chat-messages.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { stapleConsoleRoutes } from "./routes/staple-console.js";
+import { mergeGateRoutes } from "./routes/merge-gate.js";
 import { attentionRoutes } from "./routes/attention.js";
 import { decisionTrainingRoutes } from "./routes/decision-training.js";
 import { decisionRoutes } from "./routes/decisions.js";
@@ -841,6 +842,8 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(stapleConsoleRoutes(db));
+  // The red-main owner issue the gate opens wakes its urgent-capable assignee.
+  api.use(mergeGateRoutes(db, { heartbeat: heartbeatService(db, { pluginWorkerManager: workerManager }) }));
   api.use(attentionRoutes(db));
   api.use(decisionTrainingRoutes(db));
   api.use(decisionRoutes(db, opts.decisionServiceOptions));
