@@ -50,7 +50,82 @@ function connectorRepositoryTool(args) {
   if (program !== 'gh' || args[0] !== 'repo' || args.includes('--help') || args.includes('-h')) return null;
   return connectorRepositoryTools.get(args[1]) || null;
 }
+// Agents merge only through the protected-main gate (FAC-840 B), which checks
+// base currency, exact-head CI, review coverage and red main before merging.
+// This runs before any credential is captured. GraphQL bodies are read from
+// argv, --input files/stdin and -F field=@file values; a body the guard
+// cannot read or parse is refused rather than forwarded.
+const mergeMutations = /\b(mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest|mergeBranch)\b/;
+const ghApiValueFlags = new Set(['-X', '--method', '-H', '--header', '-f', '--raw-field', '-F', '--field', '-q', '--jq', '-t', '--template', '--input', '-p', '--preview', '--cache', '--hostname']);
+function readGhInput(source, state) {
+  if (source === '-') {
+    if (state.stdin === null) state.stdin = fs.readFileSync(0);
+    return state.stdin.toString('utf8');
+  }
+  return fs.readFileSync(source, 'utf8');
+}
+function graphqlBodyMerges(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return true; }
+  const requests = Array.isArray(parsed) ? parsed : [parsed];
+  return requests.length === 0 || requests.some(entry => !entry || typeof entry !== 'object' || typeof entry.query !== 'string' || mergeMutations.test(entry.query));
+}
+function inspectGhCommand(args) {
+  const state = { merge: null, stdin: null };
+  if (program !== 'gh' || args.includes('--help') || args.includes('-h')) return state;
+  if (args[0] === 'pr' && args[1] === 'merge') { state.merge = 'gh pr merge'; return state; }
+  if (args[0] !== 'api') return state;
+  if (args.some(arg => mergeMutations.test(arg))) { state.merge = 'gh api graphql merge'; return state; }
+  let method = null;
+  let hasBody = false;
+  const operands = [];
+  const inputs = [];
+  const fieldFiles = [];
+  for (let index = 1; index < args.length; index++) {
+    const arg = args[index];
+    let flag = arg, value = null;
+    const eq = arg.indexOf('=');
+    if (arg.startsWith('--') && eq > 0) { flag = arg.slice(0, eq); value = arg.slice(eq + 1); }
+    else if (/^-[XHfFqtp]./.test(arg)) { flag = arg.slice(0, 2); value = arg.slice(2); }
+    if (ghApiValueFlags.has(flag)) {
+      if (value === null) { value = args[index + 1] === undefined ? '' : String(args[index + 1]); index += 1; }
+      if (flag === '-X' || flag === '--method') method = value.replace(/^=/, '').toUpperCase();
+      if (flag === '--input') { inputs.push(value); hasBody = true; }
+      if (flag === '-f' || flag === '--raw-field') hasBody = true;
+      if (flag === '-F' || flag === '--field') {
+        hasBody = true;
+        const at = value.indexOf('=@');
+        if (at >= 0) fieldFiles.push(value.slice(at + 2));
+      }
+      continue;
+    }
+    if (!arg.startsWith('-')) operands.push(arg);
+  }
+  const effectiveMethod = method || (hasBody ? 'POST' : 'GET');
+  const endpoints = operands.map(operand => operand.split('?')[0].replace(/^https:\/\/api\.github\.com/, '').replace(/^\/+/, ''));
+  if (effectiveMethod !== 'GET' && endpoints.some(endpoint => /^repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/merge$/.test(endpoint))) {
+    state.merge = 'gh api pulls/merge'; return state;
+  }
+  if (effectiveMethod !== 'GET' && endpoints.some(endpoint => /^repos\/[^/]+\/[^/]+\/merges$/.test(endpoint))) {
+    state.merge = 'gh api repos/merges'; return state;
+  }
+  if (!endpoints.includes('graphql')) return state;
+  try {
+    for (const source of fieldFiles) if (mergeMutations.test(readGhInput(source, state))) { state.merge = 'gh api graphql merge'; return state; }
+    for (const source of inputs) if (graphqlBodyMerges(readGhInput(source, state))) { state.merge = 'gh api graphql merge (request body)'; return state; }
+  } catch { state.merge = 'gh api graphql (unreadable request body)'; }
+  return state;
+}
 async function main() {
+  const inspected = inspectGhCommand(process.argv.slice(2));
+  const directMerge = inspected.merge;
+  if (directMerge) {
+    process.stderr.write('Paperclip: direct pull request merges (' + directMerge + ') are disabled for agents. ' +
+      'The coordinator merges through the protected-main gate: POST /api/issues/<task-id>/merge-gate with {"repo":"owner/name","pullNumber":N} ' +
+      '(add "dryRun":true to see what is missing).\n');
+    process.exitCode = 1;
+    return;
+  }
   let env = { ...process.env };
 ${options.brokerFile ? String.raw`
   delete env.PAPERCLIP_API_URL;
@@ -183,7 +258,9 @@ ${options.brokerFile ? String.raw`
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
+  // stdin the guard already read is handed to gh unchanged.
+  const child = spawn(executable, process.argv.slice(2), { env, stdio: inspected.stdin === null ? 'inherit' : ['pipe', 'inherit', 'inherit'] });
+  if (inspected.stdin !== null) child.stdin.end(inspected.stdin);
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
   child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });

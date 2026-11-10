@@ -128,6 +128,27 @@ function workProductState(status: string, metadata: Record<string, unknown> | nu
   return "unknown";
 }
 
+/** The native review stage on a task itself (FAC-838): who reviews it, and whether that review is waiting. */
+function nativeReviewStage(
+  state: Record<string, unknown> | null,
+  policy: Record<string, unknown> | null,
+): Pick<StapleConsoleIssueInput, "reviewerAgentIds" | "reviewStageActive"> {
+  const reviewerAgentIds = new Set<string>();
+  const stages: unknown = policy?.stages;
+  for (const stage of Array.isArray(stages) ? stages : []) {
+    const record = asRecord(stage);
+    const participants: unknown = record?.type === "review" ? record.participants : null;
+    for (const participant of Array.isArray(participants) ? participants : []) {
+      const agentId = asRecord(participant)?.agentId;
+      if (typeof agentId === "string") reviewerAgentIds.add(agentId);
+    }
+  }
+  const inReview = state?.currentStageType === "review";
+  const current = asRecord(state?.currentParticipant)?.agentId;
+  if (inReview && typeof current === "string") reviewerAgentIds.add(current);
+  return { reviewerAgentIds: [...reviewerAgentIds], reviewStageActive: inReview && state?.status === "pending" };
+}
+
 function parsePrUrl(url: string | null) {
   const match = url ? /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/.exec(url) : null;
   return match ? { repo: match[1]!, number: Number(match[2]) } : null;
@@ -273,12 +294,14 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         updatedAt: issues.updatedAt,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         executionState: issues.executionState,
+        executionPolicy: issues.executionPolicy,
       })
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.visibility, "open"), executionIssueCondition(), readableIssue));
 
     const issueInputs: StapleConsoleIssueInput[] = issueRows.map((row) => {
-      const monitor = asRecord(asRecord(row.executionState)?.monitor);
+      const state = asRecord(row.executionState);
+      const monitor = asRecord(state?.monitor);
       const monitorLive = monitor && !monitor.clearedAt;
       return {
         id: row.id,
@@ -296,16 +319,41 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         monitorServiceName: monitorLive && typeof monitor.serviceName === "string" ? monitor.serviceName : null,
         monitorTriggeredAt: monitorLive && typeof monitor.lastTriggeredAt === "string" ? monitor.lastTriggeredAt : null,
         ...consoleWaitRecord(monitorLive ? monitor : null),
+        ...nativeReviewStage(state, asRecord(row.executionPolicy)),
       };
     });
-    // Only open work and work finished today can appear on the board.
-    const liveIds = issueRows
+    const rowById = new Map(issueRows.map((row) => [row.id, row]));
+    const allIds = issueRows.map((row) => row.id);
+    // A Done task whose recorded PR is still open stays live past its completion day (FAC-837).
+    const unmergedSince = nowMs - REVIEW_DECISION_LOOKBACK_MS;
+    const recentDoneIds = issueRows
+      .filter((row) => row.status === "done" && row.completedAt && row.completedAt.getTime() >= unmergedSince)
+      .map((row) => row.id);
+    const openPrRows = recentDoneIds.length === 0 ? [] : await db
+      .select({ issueId: issueWorkProducts.issueId, status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+      .from(issueWorkProducts)
+      .where(and(
+        eq(issueWorkProducts.companyId, companyId),
+        eq(issueWorkProducts.type, "pull_request"),
+        inArray(issueWorkProducts.issueId, recentDoneIds),
+      ));
+    // Only open work, work finished today and Done work with an unmerged PR can appear on the board.
+    const liveIdSet = new Set(issueRows
       .filter((row) => !isStapleConsoleTerminal(row.status)
         || (row.completedAt && stapleConsoleDayKey(iso(row.completedAt)!) === todayKey))
-      .map((row) => row.id);
-    const liveIdSet = new Set(liveIds);
+      .map((row) => row.id));
+    for (const row of openPrRows) {
+      const prState = workProductState(row.status, asRecord(row.metadata));
+      if (prState !== "open" && prState !== "draft") continue;
+      // Its whole workstream comes along, so the card keeps its root's runs and verdicts.
+      const seen = new Set<string>();
+      for (let current = rowById.get(row.issueId); current && !seen.has(current.id); current = rowById.get(current.parentId ?? "")) {
+        seen.add(current.id);
+        liveIdSet.add(current.id);
+      }
+    }
+    const liveIds = [...liveIdSet];
     // Finished tasks under live work still hold that card's PRs, runs and review verdicts (FAC-837/838).
-    const rowById = new Map(issueRows.map((row) => [row.id, row]));
     const cardScopeIds = issueRows.filter((row) => {
       const seen = new Set<string>();
       for (let current: typeof row | undefined = row; current && !seen.has(current.id); current = rowById.get(current.parentId ?? "")) {
@@ -314,7 +362,6 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       }
       return false;
     }).map((row) => row.id);
-    const allIds = issueRows.map((row) => row.id);
 
     const [agentRows, relationRows, runRows, wakeRows, interactionRows, approvalRows, workProductRows] = await Promise.all([
       db.select({ id: agents.id, name: agents.name, role: agents.role }).from(agents).where(eq(agents.companyId, companyId)),
@@ -410,12 +457,17 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     // re-review, the coordinator) never count.
     const agentById = new Map(agentRows.map((agent) => [agent.id, { id: agent.id, name: agent.name, role: agent.role ?? null }]));
     const cardScopeIdSet = new Set(cardScopeIds);
-    const reviewIssueRows = issueRows.filter((row) =>
+    const reviewIssueRows = issueInputs.filter((row) =>
       cardScopeIdSet.has(row.id) && isStapleConsoleReviewIssue(row, agentById.get(row.assigneeAgentId ?? "")));
     const decisionSince = new Date(nowMs - REVIEW_DECISION_LOOKBACK_MS);
     const [executionDecisionRows, reviewCommentRows] = await Promise.all([
       cardScopeIds.length === 0 ? [] : db
-        .select({ issueId: issueExecutionDecisions.issueId, outcome: issueExecutionDecisions.outcome, createdAt: issueExecutionDecisions.createdAt })
+        .select({
+          issueId: issueExecutionDecisions.issueId,
+          outcome: issueExecutionDecisions.outcome,
+          actorAgentId: issueExecutionDecisions.actorAgentId,
+          createdAt: issueExecutionDecisions.createdAt,
+        })
         .from(issueExecutionDecisions)
         .where(and(
           eq(issueExecutionDecisions.companyId, companyId),
@@ -449,13 +501,16 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       outcome: row.outcome as StapleConsoleReviewDecisionInput["outcome"],
       at: iso(row.createdAt)!,
       source: "execution_decision" as const,
+      reviewerAgentId: row.actorAgentId,
     }));
     for (const row of reviewCommentRows) {
       const author = agentById.get(row.authorAgentId ?? "");
       const byReviewer = row.authorAgentId === reviewerOf.get(row.issueId)
         || (author && isStapleConsoleReviewIssue({ title: "" }, author));
       const outcome = byReviewer ? stapleConsoleVerdictOfComment(row.body) : null;
-      if (outcome) reviewDecisions.push({ issueId: row.issueId, outcome, at: iso(row.createdAt)!, source: "verdict_comment" });
+      if (outcome) {
+        reviewDecisions.push({ issueId: row.issueId, outcome, at: iso(row.createdAt)!, source: "verdict_comment", reviewerAgentId: row.authorAgentId });
+      }
     }
 
     // ---- Pull requests: Paperclip records first, then a cached live GitHub read.

@@ -149,6 +149,10 @@ export interface StapleConsoleIssueInput {
   waitKind?: string | null;
   /** The server's latest reading of a ci / pr_mergeable wait, or its target. */
   waitDetail?: string | null;
+  /** Agents in this task's own native review stage (FAC-838): their runs here are review, not correction. */
+  reviewerAgentIds?: string[];
+  /** This task's native review stage is waiting on its reviewer. */
+  reviewStageActive?: boolean;
 }
 
 export interface StapleConsoleAgentInput {
@@ -230,6 +234,8 @@ export interface StapleConsoleReviewDecisionInput {
   outcome: StapleConsoleReviewOutcome;
   at: string;
   source: "execution_decision" | "verdict_comment";
+  /** The reviewer agent that recorded it, when known. */
+  reviewerAgentId?: string | null;
 }
 
 export interface StapleConsoleScheduledEvent {
@@ -486,35 +492,49 @@ function isCoordinatorAgent(agent: StapleConsoleAgentInput | undefined) {
 }
 
 export function isStapleConsoleReviewIssue(
-  issue: Pick<StapleConsoleIssueInput, "title">,
+  issue: Pick<StapleConsoleIssueInput, "title" | "reviewerAgentIds">,
   agent: StapleConsoleAgentInput | undefined,
 ) {
   if (/\b(review|verify|verification)\b/i.test(issue.title)) return true;
   if (!agent) return false;
+  // Assigned to its own native review stage's reviewer: still an implementation task (FAC-838).
+  if (issue.reviewerAgentIds?.includes(agent.id)) return false;
   return agent.role === "qa" || /reviewer/i.test(agent.name);
 }
 const isReviewIssue = isStapleConsoleReviewIssue;
 
 const VERDICT_PATTERNS: Array<{ outcome: StapleConsoleReviewOutcome; pattern: RegExp }> = [
-  { outcome: "changes_requested", pattern: /\brequest(?:s|ed|ing)?\s+changes\b/i },
-  { outcome: "changes_requested", pattern: /\bchanges\s+requested\b/i },
-  { outcome: "changes_requested", pattern: /\b(?:requires?|needs?)\s+(?:a\s+)?(?:focused\s+)?correction\b/i },
-  { outcome: "changes_requested", pattern: /^(?:verdict:?\s*)?(?:fail(?:ed|s)?|rejected?)\b/i },
-  { outcome: "approved", pattern: /^(?:verdict:?\s*)?(?:pass(?:ed|es)?|approved?|lgtm)\b/i },
-  { outcome: "approved", pattern: /\b(?:review|verification)\s+(?:is\s+complete:?\s+)?(?:passes|passed|approved|pass)\b/i },
+  { outcome: "approved", pattern: /\bno\s+(?:further\s+|more\s+)?changes\s+(?:are\s+)?(?:requested|required|needed)\b/gi },
+  { outcome: "changes_requested", pattern: /\brequest(?:s|ed|ing)?\s+changes\b/gi },
+  { outcome: "changes_requested", pattern: /\bchanges\s+requested\b/gi },
+  { outcome: "changes_requested", pattern: /\b(?:requires?|needs?)\s+(?:a\s+)?(?:focused\s+)?correction\b/gi },
+  { outcome: "changes_requested", pattern: /^(?:verdict:?\s*)?(?:fail(?:ed|s)?|rejected?)\b/gi },
+  { outcome: "approved", pattern: /^(?:verdict:?\s*)?(?:pass(?:ed|es)?|approved?|lgtm)\b/gi },
+  { outcome: "approved", pattern: /\b(?:review|verification)\s+(?:is\s+complete:?\s+)?(?:passes|passed|approved|pass)\b/gi },
 ];
+// A phrase right after a negation ("no changes requested") or naming an earlier verdict ("the
+// previous REQUEST CHANGES"), or one followed by "is resolved", is not this comment's verdict.
+const NEGATED_OR_PRIOR_BEFORE = /\b(?:no|not|without|never|zero|0|previous(?:ly)?|earlier|prior|former|old)\s+(?:[\w-]+\s+){0,2}$/i;
+const RESOLVED_AFTER = /^\s+(?:[\w#-]+\s+){0,4}?(?:is|are|was|were|has been|have been)\s+(?:now\s+)?(?:resolved|addressed|fixed|cleared|superseded)\b/i;
 
 /**
  * The verdict a reviewer's comment states in its opening line, or null when it states none
  * (FAC-838). The earliest verdict phrase wins, so "PASS ... supersedes REQUEST CHANGES" is a pass.
+ * Negated or past-tense references ("no changes requested", "the earlier REQUEST CHANGES is
+ * resolved") never request changes.
  */
 export function stapleConsoleVerdictOfComment(body: string): StapleConsoleReviewOutcome | null {
   const firstLine = body.trim().split(/\r?\n/, 1)[0] ?? "";
   const text = firstLine.replace(/[*_`#>]/g, "").replace(/^[\s\-\u2014:]+/, "").slice(0, 300);
   let best: { outcome: StapleConsoleReviewOutcome; index: number } | null = null;
   for (const { outcome, pattern } of VERDICT_PATTERNS) {
-    const match = pattern.exec(text);
-    if (match && (!best || match.index < best.index)) best = { outcome, index: match.index };
+    for (const match of text.matchAll(pattern)) {
+      const before = text.slice(0, match.index);
+      const after = text.slice(match.index + match[0].length);
+      if (NEGATED_OR_PRIOR_BEFORE.test(before) || RESOLVED_AFTER.test(after)) continue;
+      if (!best || match.index < best.index) best = { outcome, index: match.index };
+      break;
+    }
   }
   return best?.outcome ?? null;
 }
@@ -854,8 +874,19 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     const lastReviewDoneAt = latest(doneReviews.map((issue) => issue.completedAt ?? issue.updatedAt));
     const lastReviewDoneMs = ms(lastReviewDoneAt);
     const buildSide = [root, ...buildMembers];
-    const buildRunStartMs = buildSide.flatMap((issue) =>
-      (runsByIssue.get(issue.id) ?? []).map((run) => ms(run.startedAt ?? run.createdAt) ?? 0));
+    // A native review stage runs on the task itself: its reviewer's runs there are review
+    // participation, never a correction attempt.
+    const buildRuns: StapleConsoleRunInput[] = [];
+    const nativeReviewRuns: StapleConsoleRunInput[] = [];
+    for (const issue of buildSide) {
+      const reviewers = new Set([
+        ...(issue.reviewerAgentIds ?? []),
+        ...(decisionsByIssueId.get(issue.id) ?? []).flatMap((decision) => decision.reviewerAgentId ? [decision.reviewerAgentId] : []),
+      ]);
+      for (const run of runsByIssue.get(issue.id) ?? []) (reviewers.has(run.agentId) ? nativeReviewRuns : buildRuns).push(run);
+    }
+    const nativeReviewActive = buildSide.some((issue) => issue.reviewStageActive && !isStapleConsoleTerminal(issue.status));
+    const buildRunStartMs = buildRuns.map((run) => ms(run.startedAt ?? run.createdAt) ?? 0);
     const buildRunStartedBetween = (fromMs: number, toMs: number) =>
       buildRunStartMs.some((start) => start > fromMs && start <= toMs);
     const decisions = members.flatMap((issue) => decisionsByIssueId.get(issue.id) ?? [])
@@ -886,17 +917,25 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     const ciMonitor = members.find((issue) =>
       !isStapleConsoleTerminal(issue.status)
       && (issue.waitKind === "ci" || /github|actions|\bci\b/i.test(issue.monitorServiceName ?? "")));
-    const buildRunActive = buildSide.some((issue) => activeRunOf(runsByIssue.get(issue.id) ?? []));
+    const buildRunActive = activeRunOf(buildRuns) !== null;
     const ciWaiting = Boolean(ciMonitor || (openPr && openPr.ci === "pending"));
-    const lastBuildRunAt = latest(buildSide.flatMap((issue) => (runsByIssue.get(issue.id) ?? []).map((run) => run.finishedAt)));
-    // After changes were requested, the review is back in play once a reviewer run starts or a
-    // new review task opens later than the last correction run started.
+    const lastBuildRunAt = latest(buildRuns.map((run) => run.finishedAt));
+    // After changes were requested, the review is back in play once a reviewer run actually starts
+    // (a queued one is not participation) or a new review task opens, later than the last
+    // correction run started.
     const lastBuildStartMs = buildRunStartMs.length > 0 ? Math.max(...buildRunStartMs) : null;
-    const reviewReengagedAt = lastDecisionMs === null ? null : latest(reviewMembers.flatMap((issue) => [
-      ...(runsByIssue.get(issue.id) ?? []).map((run) => run.startedAt ?? run.createdAt),
+    const afterCorrection = (at: string | null) => at !== null && lastDecisionMs !== null
+      && (ms(at) ?? 0) > lastDecisionMs && (lastBuildStartMs === null || (ms(at) ?? 0) > lastBuildStartMs);
+    const startedAt = (run: StapleConsoleRunInput) => PENDING_RUN_STATUSES.has(run.status) ? null : run.startedAt;
+    const reviewTaskReengagedAt = latest(reviewMembers.flatMap((issue) => [
+      ...(runsByIssue.get(issue.id) ?? []).map(startedAt),
       issue.createdAt,
-    ]).filter((at) => (ms(at) ?? 0) > lastDecisionMs && (lastBuildStartMs === null || (ms(at) ?? 0) > lastBuildStartMs)));
-    const correcting = lastDecision?.outcome === "changes_requested" && !(openReview && reviewReengagedAt);
+    ]).filter(afterCorrection));
+    const nativeReengagedAt = latest(nativeReviewRuns.map(startedAt).filter(afterCorrection));
+    const reviewReengagedAt = latest([reviewTaskReengagedAt, nativeReengagedAt]);
+    const reviewOpen = Boolean(openReview) || nativeReviewActive
+      || (lastDecision?.outcome === "changes_requested" && nativeReengagedAt !== null);
+    const correcting = lastDecision?.outcome === "changes_requested" && !(reviewOpen && reviewReengagedAt);
 
     // Merged needs PR merge evidence (FAC-837); task completion alone is not source integration.
     const mergedAt = latest(mergedPrs.map((pr) => pr.mergedAt));
@@ -930,9 +969,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       stepSince = step === "ci"
         ? ciMonitor?.monitorTriggeredAt ?? openPr?.ciStartedAt ?? lastBuildRunAt
         : lastDecision!.at;
-    } else if (openReview) {
+    } else if (reviewOpen) {
       step = "review";
-      stepSince = reviewReengagedAt ?? openReview.startedAt ?? openReview.createdAt;
+      stepSince = reviewReengagedAt
+        ?? (openReview ? openReview.startedAt ?? openReview.createdAt : earliest(nativeReviewRuns.map(startedAt)) ?? root.updatedAt);
     } else if (lastDecision?.outcome === "approved" && openBuild.length === 0) {
       // Approved and nothing new to build: awaiting merge. Later merge/CI runs are not a correction.
       step = "review";
@@ -1036,8 +1076,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
 
     const mergedToday = completion === "merged" && mergedAt !== null && stapleConsoleDayKey(mergedAt) === todayKey;
     const completedToday = root.completedAt !== null && stapleConsoleDayKey(root.completedAt) === todayKey;
-    // Show open workstreams and those merged or finished today; older finished work is history.
-    if (isStapleConsoleTerminal(root.status) && !mergedToday && !completedToday) continue;
+    // Show open workstreams, those merged or finished today, and Done tasks whose PR is still open
+    // (FAC-837: unmerged work stays in flight past its completion day); older finished work is history.
+    const unmergedDone = completion === "task_done" && openPr !== null;
+    if (isStapleConsoleTerminal(root.status) && !mergedToday && !completedToday && !unmergedDone) continue;
     if (root.status === "backlog" && members.length === 1 && memberRuns.length === 0) continue;
 
     const lane = resolveLane(stream, byId, byIdentifier);

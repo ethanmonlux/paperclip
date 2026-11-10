@@ -426,6 +426,22 @@ describe("merged means a merged PR, not a Done task (FAC-837)", () => {
     expect(cards.every((card) => card.step === "done" && card.completion === "task_done" && !card.mergedToday)).toBe(true);
     expect(board.header.mergedToday).toBe(0);
   });
+
+  it("keeps a Done task with an open PR in flight after its completion day", () => {
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [root({ completedAt: minutesAgo(60 * 24) })],
+      pullRequests: [pr({})],
+    }));
+    expect(onlyCard(board)).toMatchObject({ step: "ci", completion: "task_done", mergedToday: false });
+    expect(board.header.inFlight).toBe(1);
+
+    // Once that PR is closed without merging, yesterday's Done task is history again.
+    const closed = buildStapleConsoleBoard(boardInput({
+      issues: [root({ completedAt: minutesAgo(60 * 24) })],
+      pullRequests: [pr({ state: "closed" })],
+    }));
+    expect(closed.lanes.flatMap((lane) => lane.cards)).toHaveLength(0);
+  });
 });
 
 describe("rounds come from review verdicts (FAC-838)", () => {
@@ -509,6 +525,114 @@ describe("rounds come from review verdicts (FAC-838)", () => {
     expect(approved.steps.find((cell) => cell.step === "review")).toEqual({ step: "review", state: "current", rounds: 3 });
   });
 
+  it("stays in Build while the reviewer's next run is only queued", () => {
+    const card = cardOf({
+      issues: issuesWithOpenReview(),
+      runs: [
+        run({ id: "review1", issueId: "rev", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(120) }),
+        run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+        run({ id: "review2", issueId: "rev", agentId: "rev", status: "queued", startedAt: null, createdAt: minutesAgo(10), finishedAt: null }),
+      ],
+      reviewDecisions: [decision("changes_requested", 120)],
+    });
+    expect(card).toMatchObject({ step: "build", round: 2, stepSince: minutesAgo(120) });
+  });
+
+  describe("a native review stage on the implementation task itself", () => {
+    const nativeIssue = (overrides: Partial<StapleConsoleIssueInput>) => issue({
+      id: "impl", identifier: "STA-80", title: "FAC-818: Backpack art", status: "in_progress",
+      assigneeAgentId: "eng", reviewerAgentIds: ["rev"], ...overrides,
+    });
+    const native = (outcome: StapleConsoleReviewDecisionInput["outcome"], minutes: number): StapleConsoleReviewDecisionInput =>
+      ({ issueId: "impl", outcome, at: minutesAgo(minutes), source: "execution_decision", reviewerAgentId: "rev" });
+
+    it("does not count a reviewer continuation as a correction when the verdict is restated", () => {
+      const card = cardOf({
+        issues: [nativeIssue({})],
+        runs: [
+          run({ id: "build1", issueId: "impl", startedAt: minutesAgo(300), createdAt: minutesAgo(300), finishedAt: minutesAgo(250) }),
+          run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(150) }),
+          run({ id: "review2", issueId: "impl", agentId: "rev", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(80) }),
+        ],
+        reviewDecisions: [native("changes_requested", 150), native("changes_requested", 80)],
+      });
+      expect(card).toMatchObject({ step: "build", round: 2 });
+    });
+
+    it("returns to Review round 2 when the reviewer picks up a real fix on the same task", () => {
+      const card = cardOf({
+        issues: [nativeIssue({ status: "in_review", assigneeAgentId: "rev", reviewStageActive: true })],
+        runs: [
+          run({ id: "build1", issueId: "impl", startedAt: minutesAgo(300), createdAt: minutesAgo(300), finishedAt: minutesAgo(250) }),
+          run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(150) }),
+          run({ id: "fix", issueId: "impl", startedAt: minutesAgo(120), createdAt: minutesAgo(120), finishedAt: minutesAgo(90) }),
+          run({ id: "review2", issueId: "impl", agentId: "rev", status: "running", startedAt: minutesAgo(10), createdAt: minutesAgo(10), finishedAt: null }),
+        ],
+        reviewDecisions: [native("changes_requested", 150)],
+      });
+      expect(card).toMatchObject({ step: "review", round: 2, stepSince: minutesAgo(10) });
+    });
+
+    it("stays in Build after the fix while the reviewer's run is only queued", () => {
+      const card = cardOf({
+        issues: [nativeIssue({ status: "in_review", assigneeAgentId: "rev", reviewStageActive: true })],
+        runs: [
+          run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(200), createdAt: minutesAgo(200), finishedAt: minutesAgo(150) }),
+          run({ id: "fix", issueId: "impl", startedAt: minutesAgo(120), createdAt: minutesAgo(120), finishedAt: minutesAgo(90) }),
+          run({ id: "review2", issueId: "impl", agentId: "rev", status: "queued", startedAt: null, createdAt: minutesAgo(10), finishedAt: null }),
+        ],
+        reviewDecisions: [native("changes_requested", 150)],
+      });
+      expect(card).toMatchObject({ step: "build", round: 2 });
+    });
+
+    describe("on an implementation child assigned to its native reviewer", () => {
+      const childIssues = [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+        nativeIssue({ identifier: "STA-81", title: "Implement backpack art", parentId: "root", status: "in_review", assigneeAgentId: "rev", reviewStageActive: true }),
+      ];
+
+      it("counts the builder's correction between two change requests as round 3", () => {
+        const card = cardOf({
+          issues: childIssues,
+          runs: [
+            run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(220), createdAt: minutesAgo(220), finishedAt: minutesAgo(200) }),
+            run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+            run({ id: "review2", issueId: "impl", agentId: "rev", startedAt: minutesAgo(30), createdAt: minutesAgo(30), finishedAt: minutesAgo(20) }),
+          ],
+          reviewDecisions: [native("changes_requested", 200), native("changes_requested", 20)],
+        });
+        expect(card).toMatchObject({ step: "build", round: 3, stepSince: minutesAgo(20) });
+        expect(card.members.find((member) => member.identifier === "STA-81")?.role).toBe("build");
+      });
+
+      it("returns to Review round 2 when the reviewer picks up the fix", () => {
+        const card = cardOf({
+          issues: childIssues,
+          runs: [
+            run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(220), createdAt: minutesAgo(220), finishedAt: minutesAgo(200) }),
+            run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+            run({ id: "review2", issueId: "impl", agentId: "rev", status: "running", startedAt: minutesAgo(10), createdAt: minutesAgo(10), finishedAt: null }),
+          ],
+          reviewDecisions: [native("changes_requested", 200)],
+        });
+        expect(card).toMatchObject({ step: "review", round: 2, stepSince: minutesAgo(10) });
+      });
+    });
+  });
+
+  it("still treats a separate task assigned to a reviewer as a review task", () => {
+    const card = cardOf({
+      issues: [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+        issue({ id: "impl", identifier: "STA-71", title: "Implement backpack art", parentId: "root", status: "done", assigneeAgentId: "eng", completedAt: minutesAgo(150) }),
+        issue({ id: "check", identifier: "STA-73", title: "Check PR #703", parentId: "root", status: "in_progress", assigneeAgentId: "rev", startedAt: minutesAgo(30) }),
+      ],
+    });
+    expect(card.step).toBe("review");
+    expect(card.members.find((member) => member.identifier === "STA-73")?.role).toBe("review");
+  });
+
   it("does not count a finished review without a recorded verdict as a correction", () => {
     const card = cardOf({
       issues: [
@@ -536,6 +660,16 @@ describe("stapleConsoleVerdictOfComment", () => {
     expect(stapleConsoleVerdictOfComment("Correction verification please: PR 30 head dfd96b0, pushed 19:06Z.")).toBeNull();
     expect(stapleConsoleVerdictOfComment("Passing this to the coordinator.\nREQUEST CHANGES")).toBeNull();
     expect(stapleConsoleVerdictOfComment("Approval requested for the release.")).toBeNull();
+  });
+
+  it("does not read negated or earlier verdicts as a request for changes", () => {
+    expect(stapleConsoleVerdictOfComment("No changes requested; approved for merge.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("Source review: no changes requested.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("**No further changes required** at `f29bf4b`.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("The earlier REQUEST CHANGES is resolved at `f29bf4b`; nothing new found.")).toBeNull();
+    expect(stapleConsoleVerdictOfComment("Changes requested in round 1 are resolved; the review passes at `f29bf4b`.")).toBe("approved");
+    expect(stapleConsoleVerdictOfComment("REQUEST CHANGES — the round 1 fix is not resolved.")).toBe("changes_requested");
+    expect(stapleConsoleVerdictOfComment("Not approved: REQUEST CHANGES for two P1s.")).toBe("changes_requested");
   });
 });
 

@@ -1,5 +1,11 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
-export const ISSUE_SUMMARIES_MAX_IDS = 5;
+/**
+ * IDs per `/issues/summaries` request. Large enough that a typical recent-task
+ * list is one request; callers split longer lists into parallel chunks.
+ */
+export const ISSUE_SUMMARIES_MAX_IDS = 50;
+/** Tasks per chat bootstrap request. The list preloads larger sets in chunks. */
+export const ISSUE_CHAT_BOOTSTRAP_MAX_IDS = 10;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
@@ -379,6 +385,8 @@ export const ISSUE_ORIGIN_KINDS = [
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   "chat_channel",
+  // The merge gate's single owner issue for a red base branch (FAC-840 B).
+  "merge_gate_red_main",
 ] as const;
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];
 export type PluginIssueOriginKind = `plugin:${string}`;
