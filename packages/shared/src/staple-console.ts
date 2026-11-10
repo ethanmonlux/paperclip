@@ -7,6 +7,18 @@
  * Nothing here writes, schedules or approves anything.
  */
 
+import {
+  deriveStapleConsoleCapabilities,
+  parseStapleConsoleCapabilityMap,
+  type StapleConsoleCapabilityBoard,
+  type StapleConsoleCapabilityMapDocumentInput,
+  type StapleConsoleClaimTaskFacts,
+  type StapleConsoleProofPullRequest,
+  type StapleConsoleProofReview,
+} from "./staple-console-capabilities.js";
+
+export * from "./staple-console-capabilities.js";
+
 export const STAPLE_CONSOLE_STEPS = ["queued", "build", "ci", "review", "merged"] as const;
 export type StapleConsoleStep = (typeof STAPLE_CONSOLE_STEPS)[number];
 /** A card's step: one of the five bar steps, or "done" for task-only completion with no merge evidence (FAC-837). */
@@ -221,6 +233,10 @@ export interface StapleConsolePullRequestInput {
   headCommittedAt?: string | null;
   /** Where PR state came from: live GitHub read, a Paperclip work product, or only a title reference. */
   source: "github" | "work_product" | "reference";
+  /** Merge commit of a merged PR, from GitHub. */
+  mergeCommitSha?: string | null;
+  /** The installed Staple build contains the merge commit; null when it cannot be told. */
+  inInstalledBuild?: boolean | null;
 }
 
 export type StapleConsoleReviewOutcome = "approved" | "changes_requested";
@@ -246,6 +262,15 @@ export interface StapleConsoleScheduledEvent {
   available: boolean;
 }
 
+/** The newest comment on a task, for a card's expanded view. */
+export interface StapleConsoleCommentInput {
+  issueId: string;
+  authorAgentId: string | null;
+  authorUserId: string | null;
+  body: string;
+  createdAt: string;
+}
+
 export interface StapleConsoleSourceStatus {
   github: { available: boolean; detail: string };
 }
@@ -261,9 +286,17 @@ export interface StapleConsoleInput {
   interactions: StapleConsoleInteractionInput[];
   approvals: StapleConsoleApprovalInput[];
   pullRequests: StapleConsolePullRequestInput[];
+  /** PRs a capability claim names directly; their `issueId` is empty. */
+  claimPullRequests?: StapleConsolePullRequestInput[];
   reviewDecisions?: StapleConsoleReviewDecisionInput[];
   scheduled: StapleConsoleScheduledEvent[];
   sources: StapleConsoleSourceStatus;
+  /** Latest comment per task (any subset); cards show the newest among their tasks. */
+  comments?: StapleConsoleCommentInput[];
+  /** The `capability-map` document (Level 2), when one is readable. */
+  capabilityMap?: StapleConsoleCapabilityMapDocumentInput | null;
+  /** Short SHA of the installed Staple build. */
+  installedBuild?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +346,9 @@ export interface StapleConsoleCardPullRequest {
   state: StapleConsolePrState;
   ci: StapleConsoleCiState;
   source: StapleConsolePullRequestInput["source"];
+  mergedAt: string | null;
+  mergeCommitSha: string | null;
+  inInstalledBuild: boolean | null;
 }
 
 export interface StapleConsoleStepCell {
@@ -333,6 +369,15 @@ export interface StapleConsoleCard {
   id: string;
   identifier: string;
   title: string;
+  /** Plain feature name: the capability map's name, else the title without IDs and asides. */
+  name: string;
+  /** Who is on it now: the running agent, else the newest open task's assignee. */
+  ownerName: string | null;
+  /** Finished today (merged, or Done with no open PR): listed once under Shipped today. */
+  shipped: boolean;
+  /** The latest recorded review verdict (Level 4 proof). */
+  review: { outcome: StapleConsoleReviewOutcome; reviewerName: string | null; at: string } | null;
+  lastComment: { issueIdentifier: string; authorName: string | null; at: string; excerpt: string } | null;
   status: string;
   lane: StapleConsoleLaneKey;
   laneSource: string;
@@ -355,6 +400,21 @@ export interface StapleConsoleCard {
   needsEthan: StapleConsoleNeedsEthan[];
   /** Confirmed PR merge today; task completion alone never counts. */
   mergedToday: boolean;
+}
+
+/**
+ * Level 1 "Needs attention" (FAC-620 v2): founder questions, stuck work and Done work whose
+ * PR nobody is merging. Empty means "Nothing needs you; nothing stalled."
+ */
+export interface StapleConsoleAttentionItem {
+  kind: "needs_you" | "stuck" | "unowned_merge";
+  cardId: string;
+  identifier: string;
+  name: string;
+  /** The one-line question or reason. */
+  text: string;
+  href: string;
+  linkLabel: string;
 }
 
 export interface StapleConsoleUpNext {
@@ -384,6 +444,8 @@ export interface StapleConsoleBoard {
   header: { mergedToday: number; inFlight: number; needsEthan: number; stuck: number };
   scheduled: StapleConsoleScheduledEvent[];
   lanes: Array<{ key: StapleConsoleLaneKey; label: string; cards: StapleConsoleCard[] }>;
+  attention: StapleConsoleAttentionItem[];
+  capabilities: StapleConsoleCapabilityBoard;
   upNext: StapleConsoleUpNext[];
   sources: StapleConsoleSourceStatus;
 }
@@ -449,6 +511,23 @@ export function clipStapleConsoleText(text: string, max = 400): string {
   const cut = text.slice(0, max - 1);
   const space = cut.lastIndexOf(" ");
   return `${(space > max * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/**
+ * A plain feature name from a task title (FAC-620 v2): drops leading task IDs ("FAC-829: ",
+ * "FAC-626 source | "), asides that cite IDs, and a trailing aside, then clips at a word.
+ */
+export function stapleConsoleDisplayName(title: string, max = 64): string {
+  let name = title
+    .replace(/\s*\([^()]*\b[A-Z][A-Z0-9]*-\d+[^()]*\)/g, "")
+    .replace(/^\s*(?:[A-Z][A-Z0-9]*-\d+(?:\/\d+)?(?:\s+[a-z0-9][\w-]*){0,3}\s*[|:]\s*)+/, "")
+    .replace(/^\s*[A-Z][A-Z0-9]*-\d+\s+/, "")
+    .trim();
+  const aside = /\s*\([^()]*\)\s*$/.exec(name);
+  if (aside && aside.index >= 16) name = name.slice(0, aside.index).trim();
+  name = name.replace(/[\s|:,;-]+$/, "");
+  if (!name) return title.trim();
+  return clipStapleConsoleText(name.charAt(0).toUpperCase() + name.slice(1), max);
 }
 
 export function formatStapleConsoleDuration(durationMs: number): string {
@@ -829,6 +908,19 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
   for (const decision of input.reviewDecisions ?? []) {
     decisionsByIssueId.set(decision.issueId, [...(decisionsByIssueId.get(decision.issueId) ?? []), decision]);
   }
+  const parsedMap = input.capabilityMap ? parseStapleConsoleCapabilityMap(input.capabilityMap.body) : null;
+  const featureNames = parsedMap?.ok ? parsedMap.map.names ?? {} : {};
+  const nameOf = (issue: StapleConsoleIssueInput) => featureNames[issue.identifier] ?? stapleConsoleDisplayName(issue.title);
+  const agentName = (agentId: string | null | undefined) => agentsById.get(agentId ?? "")?.name ?? null;
+  const assigneeName = (issue: StapleConsoleIssueInput) => agentName(issue.assigneeAgentId) ?? (issue.assigneeUserId ? "Ethan" : null);
+  const latestCommentByIssue = new Map<string, StapleConsoleCommentInput>();
+  for (const comment of input.comments ?? []) {
+    const existing = latestCommentByIssue.get(comment.issueId);
+    if (!existing || (ms(comment.createdAt) ?? 0) > (ms(existing.createdAt) ?? 0)) latestCommentByIssue.set(comment.issueId, comment);
+  }
+  // Red reasons per task, for the capability claims that link them.
+  const stuckReasonByIssue = new Map<string, string>();
+  const needsEthanByIssue = new Map<string, string>();
 
   const streams = groupWorkstreams(issues, agentsById);
   const cardIdOfIssue = new Map<string, string>();
@@ -1076,6 +1168,8 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
         : null;
       if (flag) stuck.push(flag);
     }
+    for (const flag of stuck) if (!stuckReasonByIssue.has(flag.issueIdentifier)) stuckReasonByIssue.set(flag.issueIdentifier, flag.reason);
+    for (const item of needsEthan) if (!needsEthanByIssue.has(item.issueIdentifier)) needsEthanByIssue.set(item.issueIdentifier, item.question);
 
     const mergedToday = completion === "merged" && mergedAt !== null && stapleConsoleDayKey(mergedAt) === todayKey;
     const completedToday = root.completedAt !== null && stapleConsoleDayKey(root.completedAt) === todayKey;
@@ -1091,12 +1185,35 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       title: issue.title,
       status: issue.status,
       role: issue.id === root.id ? "coordinator" : reviewIds.has(issue.id) ? "review" : "build",
-      assigneeName: agentsById.get(issue.assigneeAgentId ?? "")?.name ?? (issue.assigneeUserId ? "Ethan" : null),
+      assigneeName: assigneeName(issue),
     });
+    const newestOpenMember = members
+      .filter((issue) => issue.id !== root.id && !isStapleConsoleTerminal(issue.status))
+      .sort((a, b) => (ms(b.createdAt) ?? 0) - (ms(a.createdAt) ?? 0))[0];
+    const lastComment = members
+      .map((issue) => ({ issue, comment: latestCommentByIssue.get(issue.id) }))
+      .filter((entry): entry is { issue: StapleConsoleIssueInput; comment: StapleConsoleCommentInput } => Boolean(entry.comment))
+      .sort((a, b) => (ms(b.comment.createdAt) ?? 0) - (ms(a.comment.createdAt) ?? 0))[0];
     cards.push({
       id: root.id,
       identifier: root.identifier,
       title: root.title,
+      name: nameOf(root),
+      ownerName: (activeRun ? agentName(activeRun.agentId) : null)
+        ?? (newestOpenMember ? assigneeName(newestOpenMember) : null)
+        ?? assigneeName(root),
+      shipped: completion !== null && !unmergedDone,
+      review: lastDecision
+        ? { outcome: lastDecision.outcome, reviewerName: agentName(lastDecision.reviewerAgentId), at: lastDecision.at }
+        : null,
+      lastComment: lastComment
+        ? {
+          issueIdentifier: lastComment.issue.identifier,
+          authorName: agentName(lastComment.comment.authorAgentId) ?? (lastComment.comment.authorUserId ? "Ethan" : null),
+          at: lastComment.comment.createdAt,
+          excerpt: clipStapleConsoleText(lastComment.comment.body.replace(/\s+/g, " ").trim(), 240),
+        }
+        : null,
       status: root.status,
       lane: lane.lane,
       laneSource: lane.laneSource,
@@ -1119,6 +1236,9 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
         state: pr.state,
         ci: pr.ci,
         source: pr.source,
+        mergedAt: pr.mergedAt,
+        mergeCommitSha: pr.mergeCommitSha ?? null,
+        inInstalledBuild: pr.inInstalledBuild ?? null,
       })),
       waitingOn,
       stuck,
@@ -1150,6 +1270,108 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     }))
     .sort((a, b) => Number(b.betaGap) - Number(a.betaGap));
 
+  // Level 1: founder questions first, then stuck work, then Done work whose PR nobody merges.
+  const attention: StapleConsoleAttentionItem[] = [];
+  for (const card of cards) {
+    for (const item of card.needsEthan) {
+      attention.push({
+        kind: "needs_you",
+        cardId: card.id,
+        identifier: item.issueIdentifier,
+        name: card.name,
+        text: item.question,
+        href: item.href,
+        linkLabel: item.kind === "approval" ? "Open approval" : item.kind === "assigned_to_user" ? "Open task" : "Answer",
+      });
+    }
+  }
+  for (const card of cards) {
+    const first = card.stuck[0];
+    if (!first) continue;
+    attention.push({
+      kind: "stuck",
+      cardId: card.id,
+      identifier: first.issueIdentifier,
+      name: card.name,
+      text: card.stuck.length > 1 ? `${first.reason} (+${card.stuck.length - 1} more)` : first.reason,
+      href: `/issues/${first.issueIdentifier}`,
+      linkLabel: "Open",
+    });
+  }
+  for (const card of cards) {
+    if (card.completion !== "task_done" || card.shipped) continue;
+    const openPr = card.pullRequests.find((pr) => pr.state === "open" || pr.state === "draft");
+    attention.push({
+      kind: "unowned_merge",
+      cardId: card.id,
+      identifier: card.identifier,
+      name: card.name,
+      text: card.completionNote ?? "Task done, merge not confirmed",
+      href: openPr?.url ?? `/issues/${card.identifier}`,
+      linkLabel: openPr ? "Open PR" : "Open",
+    });
+  }
+
+  // Level 2: capability claims, colored from the tasks and PRs they link.
+  const onBoard = new Set(cards.map((card) => card.id));
+  const prRank = { github: 3, work_product: 2, reference: 1 } as const;
+  const proofPr = (pr: StapleConsolePullRequestInput): StapleConsoleProofPullRequest => ({
+    label: `${pr.repo.split("/")[1] ?? pr.repo}#${pr.number}`,
+    url: pr.url,
+    state: pr.state,
+    mergedAt: pr.mergedAt,
+    mergeCommitSha: pr.mergeCommitSha ?? null,
+    ci: pr.ci,
+    source: pr.source,
+    inInstalledBuild: pr.inInstalledBuild ?? null,
+  });
+  const scopeOf = (issue: StapleConsoleIssueInput) => {
+    const scope = [issue];
+    for (let index = 0; index < scope.length && scope.length < 50; index += 1) {
+      for (const child of childrenOf.get(scope[index]!.id) ?? []) if (!scope.includes(child)) scope.push(child);
+    }
+    return scope;
+  };
+  const capabilities = deriveStapleConsoleCapabilities(input.capabilityMap, parsedMap, {
+    task: (identifier): StapleConsoleClaimTaskFacts | null => {
+      const issue = byIdentifier.get(identifier);
+      if (!issue) return null;
+      const scope = scopeOf(issue);
+      const prs = new Map<string, StapleConsolePullRequestInput>();
+      for (const pr of scope.flatMap((member) => prsByIssue.get(member.id) ?? [])) {
+        const key = `${pr.repo.toLowerCase()}#${pr.number}`;
+        const existing = prs.get(key);
+        if (!existing || prRank[pr.source] > prRank[existing.source]) prs.set(key, pr);
+      }
+      const openScope = scope.filter((member) => !isStapleConsoleTerminal(member.status));
+      const reviews: StapleConsoleProofReview[] = scope.flatMap((member) => (decisionsByIssueId.get(member.id) ?? []).map((decision) => ({
+        issueIdentifier: member.identifier,
+        outcome: decision.outcome,
+        reviewerName: agentName(decision.reviewerAgentId),
+        at: decision.at,
+      })));
+      const cardId = cardIdOfIssue.get(issue.id);
+      return {
+        identifier: issue.identifier,
+        name: nameOf(issue),
+        status: issue.status,
+        terminal: isStapleConsoleTerminal(issue.status),
+        owned: Boolean(issue.assigneeAgentId || issue.assigneeUserId),
+        stuckReason: openScope.map((member) => stuckReasonByIssue.get(member.identifier)).find(Boolean) ?? null,
+        needsEthanReason: openScope.map((member) => needsEthanByIssue.get(member.identifier)).find(Boolean) ?? null,
+        cardId: cardId && onBoard.has(cardId) ? cardId : null,
+        pullRequests: [...prs.values()].map(proofPr),
+        reviews,
+      };
+    },
+    pullRequest: (ref) => {
+      const matches = [...input.pullRequests, ...(input.claimPullRequests ?? [])].filter((pr) =>
+        pr.repo.toLowerCase() === ref.repo.toLowerCase() && pr.number === ref.number);
+      const best = matches.sort((a, b) => prRank[b.source] - prRank[a.source])[0];
+      return best ? proofPr(best) : null;
+    },
+  }, input.installedBuild ?? null);
+
   const lanes = STAPLE_CONSOLE_LANES.map((lane) => ({
     key: lane.key,
     label: lane.label,
@@ -1167,6 +1389,8 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     },
     scheduled: input.scheduled,
     lanes,
+    attention,
+    capabilities,
     upNext,
     sources: input.sources,
   };

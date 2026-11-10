@@ -58,9 +58,16 @@ suite("staple console GitHub source", () => {
     expect(credentials.resolveManagedGitHubCredential).toHaveBeenCalledWith(db, expect.anything(), companyId, {
       responsibleUserId: founder, agentId: null, allowStandingDelegation: false,
     });
-    expect(requests).toEqual([{ url: "https://api.github.com/repos/acme/paperclip/pulls/26", token: "Bearer founder-grant" }]);
+    // The PR, then its merged head's checks (Level 4 CI proof).
+    expect(requests).toEqual([
+      { url: "https://api.github.com/repos/acme/paperclip/pulls/26", token: "Bearer founder-grant" },
+      { url: "https://api.github.com/repos/acme/paperclip/commits/abc/check-runs?per_page=100", token: "Bearer founder-grant" },
+    ]);
     expect(cards(live)[0]!.pullRequests).toEqual([
-      { label: "paperclip#26", url, state: "merged", ci: "unknown", source: "github" },
+      {
+        label: "paperclip#26", url, state: "merged", ci: "unknown", source: "github",
+        mergedAt: "2026-11-09T13:24:00Z", mergeCommitSha: null, inInstalledBuild: null,
+      },
     ]);
     expect(live.sources.github).toEqual({
       available: true, detail: expect.stringContaining("your connected GitHub account (founder-gh)"),
@@ -69,13 +76,13 @@ suite("staple console GitHub source", () => {
     // A second refresh revalidates the grant but reuses the PR read checked with this same token.
     await svc.board(companyId, asUser(founder));
     expect(credentials.resolveManagedGitHubCredential).toHaveBeenCalledTimes(2);
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
 
     // Another viewer with no grant of their own never gets the founder's grant or cached read.
     const recorded = await svc.board(companyId, asUser(viewer));
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
     expect(cards(recorded)[0]!.pullRequests).toEqual([
-      { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product" },
+      { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product", mergedAt: null, mergeCommitSha: null, inInstalledBuild: null },
     ]);
     expect(recorded.sources.github).toEqual({ available: false, detail: expect.stringContaining("recorded status (not live)") });
 
@@ -85,8 +92,8 @@ suite("staple console GitHub source", () => {
     });
     credentials.resolveManagedGitHubCredential.mockResolvedValue(grant("founder-rotated"));
     await svc.board(companyId, asUser(founder));
-    expect(requests.at(-1)).toEqual({ url: "https://api.github.com/repos/acme/paperclip/pulls/26", token: "Bearer founder-rotated" });
-    expect(requests).toHaveLength(2);
+    expect(requests.at(-2)).toEqual({ url: "https://api.github.com/repos/acme/paperclip/pulls/26", token: "Bearer founder-rotated" });
+    expect(requests).toHaveLength(4);
 
     // The same token in another company does not reuse this company's read.
     const otherCompanyId = randomUUID();
@@ -96,14 +103,14 @@ suite("staple console GitHub source", () => {
       companyId: otherCompanyId, issueId: otherTask!.id, type: "pull_request", provider: "github", title: "PR 26", url, status: "active",
     });
     await svc.board(otherCompanyId, asUser(founder));
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(6);
 
     // Revoking the grant stops live reads on the next refresh, even though the PR read is still cached.
     credentials.resolveManagedGitHubCredential.mockResolvedValue({ configured: true, error: "Grant revoked" });
     const revoked = await svc.board(companyId, asUser(founder));
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(6);
     expect(cards(revoked)[0]!.pullRequests).toEqual([
-      { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product" },
+      { label: "paperclip#26", url, state: "open", ci: "unknown", source: "work_product", mergedAt: null, mergeCommitSha: null, inInstalledBuild: null },
     ]);
 
     // An agent caller has no personal grant, so the managed path is not consulted at all.
