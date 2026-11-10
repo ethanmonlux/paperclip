@@ -585,6 +585,52 @@ describe("rounds come from review verdicts (FAC-838)", () => {
       });
       expect(card).toMatchObject({ step: "build", round: 2 });
     });
+
+    describe("on an implementation child assigned to its native reviewer", () => {
+      const childIssues = [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+        nativeIssue({ identifier: "STA-81", title: "Implement backpack art", parentId: "root", status: "in_review", assigneeAgentId: "rev", reviewStageActive: true }),
+      ];
+
+      it("counts the builder's correction between two change requests as round 3", () => {
+        const card = cardOf({
+          issues: childIssues,
+          runs: [
+            run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(220), createdAt: minutesAgo(220), finishedAt: minutesAgo(200) }),
+            run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+            run({ id: "review2", issueId: "impl", agentId: "rev", startedAt: minutesAgo(30), createdAt: minutesAgo(30), finishedAt: minutesAgo(20) }),
+          ],
+          reviewDecisions: [native("changes_requested", 200), native("changes_requested", 20)],
+        });
+        expect(card).toMatchObject({ step: "build", round: 3, stepSince: minutesAgo(20) });
+        expect(card.members.find((member) => member.identifier === "STA-81")?.role).toBe("build");
+      });
+
+      it("returns to Review round 2 when the reviewer picks up the fix", () => {
+        const card = cardOf({
+          issues: childIssues,
+          runs: [
+            run({ id: "review1", issueId: "impl", agentId: "rev", startedAt: minutesAgo(220), createdAt: minutesAgo(220), finishedAt: minutesAgo(200) }),
+            run({ id: "fix", issueId: "impl", startedAt: minutesAgo(100), createdAt: minutesAgo(100), finishedAt: minutesAgo(60) }),
+            run({ id: "review2", issueId: "impl", agentId: "rev", status: "running", startedAt: minutesAgo(10), createdAt: minutesAgo(10), finishedAt: null }),
+          ],
+          reviewDecisions: [native("changes_requested", 200)],
+        });
+        expect(card).toMatchObject({ step: "review", round: 2, stepSince: minutesAgo(10) });
+      });
+    });
+  });
+
+  it("still treats a separate task assigned to a reviewer as a review task", () => {
+    const card = cardOf({
+      issues: [
+        issue({ id: "root", identifier: "STA-70", title: "FAC-818: Backpack art", status: "blocked", assigneeAgentId: "coord" }),
+        issue({ id: "impl", identifier: "STA-71", title: "Implement backpack art", parentId: "root", status: "done", assigneeAgentId: "eng", completedAt: minutesAgo(150) }),
+        issue({ id: "check", identifier: "STA-73", title: "Check PR #703", parentId: "root", status: "in_progress", assigneeAgentId: "rev", startedAt: minutesAgo(30) }),
+      ],
+    });
+    expect(card.step).toBe("review");
+    expect(card.members.find((member) => member.identifier === "STA-73")?.role).toBe("review");
   });
 
   it("does not count a finished review without a recorded verdict as a correction", () => {
