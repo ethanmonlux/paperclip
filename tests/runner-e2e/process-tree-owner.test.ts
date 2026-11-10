@@ -1,7 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { expect, it } from "vitest";
 import { createProcessTreeOwner, stopOwnedProcessTree } from "./process-tree-owner.js";
 import { readProcessTable, type ProcessObservation } from "./process-tree.js";
+import { runnerE2ETypeScriptProcessArgs } from "./web-server-command.js";
 
 function row(pid: number, parentPid: number, processGroupId: number, started = `start-${pid}`, state = "S"): ProcessObservation {
   return { pid, parentPid, processGroupId, started, state, kind: "node" };
@@ -160,6 +165,56 @@ it.skipIf(process.platform === "win32")("rejects an overflowing inspector instea
     await exited;
     expect(inspector.signalCode).toBe("SIGKILL");
   } finally { if (inspector.exitCode === null && inspector.signalCode === null) inspector.kill("SIGKILL"); }
+});
+
+const psInspector = () => spawn("ps", ["-e", "-o", "pid=,ppid=,pgid=,lstart=,stat=,comm="], {
+  env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore"], detached: true,
+});
+
+it.runIf(process.platform === "linux")("reads the identities ps reports without starting an inspector", async () => {
+  const [fromProc, fromPs] = [await readProcessTable(), await readProcessTable(psInspector)];
+  const identity = (rows: ProcessObservation[] | null, pid: number) => {
+    const found = rows?.find(candidate => candidate.pid === pid);
+    return found && { pid, parentPid: found.parentPid, processGroupId: found.processGroupId, started: found.started, kind: found.kind };
+  };
+  for (const pid of [process.pid, process.ppid]) {
+    expect(identity(fromProc, pid)).toBeDefined();
+    expect(identity(fromProc, pid)).toEqual(identity(fromPs, pid));
+  }
+});
+
+it.runIf(process.platform === "linux")("keeps inspecting while a launcher signals the caller's process group", async () => {
+  // A spawned inspector stays in the caller's group until its setsid(), so a
+  // group signal in that window killed it and failed the caller's audit.
+  const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-process-table-"));
+  const reader = path.join(root, "reader.mts");
+  await writeFile(reader, `
+    import { readProcessTable } from ${JSON.stringify(path.join(import.meta.dirname, "process-tree.ts"))};
+    let signals = 0, reads = 0, failed = 0;
+    process.on('SIGTERM', () => { signals += 1; });
+    process.send!('ready');
+    while (signals < 100) { reads += 1; if (!await readProcessTable()) failed += 1; }
+    process.send!({ reads, failed }, () => process.exit(0));
+  `);
+  const child = spawn(process.execPath, runnerE2ETypeScriptProcessArgs(path.resolve(import.meta.dirname, "../.."), reader), {
+    detached: true, stdio: ["ignore", "ignore", "inherit", "ipc"],
+  });
+  try {
+    await once(child, "message");
+    const result = once(child, "message");
+    let done = false;
+    void result.finally(() => { done = true; });
+    while (!done && child.exitCode === null) {
+      process.kill(-child.pid!, "SIGTERM");
+      await new Promise(resolve => setTimeout(resolve, 2));
+    }
+    const [{ reads, failed }] = await result;
+    expect(reads).toBeGreaterThan(0);
+    expect(failed).toBe(0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) process.kill(-child.pid!, "SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 it.skipIf(process.platform === 'win32')('bounds fallback even when the known direct child cannot be killed', async () => {
