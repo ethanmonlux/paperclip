@@ -162,6 +162,25 @@ const support = await getEmbeddedPostgresTestSupport();
     .orderBy(asc(chatPublications.createdAt), asc(chatPublications.idempotencyKey));
   const text = (row: typeof chatPublications.$inferSelect) => String((row.payload as { text?: unknown }).text ?? "");
 
+  it("reports the original founder decision and its exact outbox effect", async () => {
+    const f = await fixture();
+    const decision = await interaction(f, { addresseeUserId: f.founderUserId });
+    at(21);
+    const before = await f.service.interactionReceipt(f.companyId, f.otherIssueId, decision.id);
+    expect(before).toMatchObject({ configured: true, interactionStatus: "pending", publications: [],
+      targets: [{ endpointId: f.endpointId, conversationId: f.conversationId, eligible: true, reason: "awaiting_founder" }] });
+    expect((await f.service.sweep()).inserted).toBe(1);
+    const after = await f.service.interactionReceipt(f.companyId, f.otherIssueId, decision.id);
+    expect(after?.publications).toMatchObject([{ endpointId: f.endpointId, conversationId: f.conversationId,
+      idempotencyKey: founderFallbackKey({ endpointId: f.endpointId, kind: "item", interactionId: decision.id }), state: "pending" }]);
+    expect(after?.publications[0]).not.toHaveProperty("providerUrl");
+    expect(after?.publications[0]).not.toHaveProperty("redactedError");
+    expect(await f.service.interactionReceipt(f.companyId, f.dmIssueId, decision.id)).toBeNull();
+    const escalation = await interaction(f, { addresseeAgentId: f.agentId });
+    expect((await f.service.interactionReceipt(f.companyId, f.otherIssueId, escalation.id))?.targets)
+      .toMatchObject([{ endpointId: f.endpointId, eligible: true, reason: "missed" }]);
+  });
+
   it("stays quiet while the endpoint agent is available or only briefly unavailable", async () => {
     const f = await fixture();
     await interaction(f, { addresseeAgentId: f.agentId });

@@ -8382,6 +8382,16 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/interactions/{interactionId}/founder-fallback-receipt",
+  tags: ["issues"],
+  summary: "Read the founder fallback notice receipt for an interaction",
+  description: "Read-only. Reports whether founder fallback notices are enabled in this server process, each founder DM that qualifies for the interaction and the matching outbox rows (idempotency key, destination, state). Provider links and error text are omitted; use the endpoint publication status route with endpoint access.",
+  request: { params: z.object({ id: z.string(), interactionId: z.string().uuid() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{id}/interactions/{interactionId}/resolve-from-comment",
   tags: ["issues"],

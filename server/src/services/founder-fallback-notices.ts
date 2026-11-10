@@ -366,6 +366,59 @@ function recoveredText(agent: Agent) {
 
 export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSettings, clock: () => Date = () => new Date()) {
   /**
+   * Read-only receipt for an interaction on an issue the caller may read:
+   * the live setting, each qualifying founder DM and the exact outbox rows.
+   * Provider links and error text stay behind endpoint access.
+   */
+  async function interactionReceipt(companyId: string, issueId: string, interactionId: string) {
+    const [interaction] = await db.select().from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, companyId),
+      eq(issueThreadInteractions.issueId, issueId),
+      eq(issueThreadInteractions.id, interactionId),
+    ));
+    if (!interaction) return null;
+    const now = clock();
+    const endpoints = await db.select().from(chatEndpoints).where(and(
+      eq(chatEndpoints.companyId, companyId),
+      eq(chatEndpoints.status, "active"),
+      eq(chatEndpoints.allowDirectMessages, true),
+    ));
+    const targets = [];
+    for (const endpoint of endpoints) {
+      const target = await resolveTarget(db, endpoint);
+      if (!target || (interaction.addresseeUserId !== target.founderUserId && interaction.addresseeAgentId !== target.agent.id)) continue;
+      const reason = await itemReason(db, target, interaction, await unavailability(db, target.agent), now, settings.boundMs);
+      targets.push({ endpointId: endpoint.id, conversationId: target.conversationId, eligible: !!reason, reason: reason?.kind ?? null });
+    }
+    const rows = await db.select({
+      id: chatPublications.id,
+      endpointId: chatPublications.endpointId,
+      conversationId: chatPublications.conversationId,
+      idempotencyKey: chatPublications.idempotencyKey,
+      state: chatPublications.state,
+      attempts: chatPublications.attempts,
+      nextAttemptAt: chatPublications.nextAttemptAt,
+      createdAt: chatPublications.createdAt,
+      publishedAt: chatPublications.publishedAt,
+    }).from(chatPublications).where(and(
+      eq(chatPublications.companyId, companyId),
+      or(
+        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:item:${interactionId}`),
+        like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%:item:${interactionId}:a%`),
+      ),
+    )).orderBy(asc(chatPublications.createdAt), asc(chatPublications.idempotencyKey));
+    return {
+      configured: settings.enabled,
+      boundMs: settings.boundMs,
+      interactionStatus: interaction.status,
+      targets,
+      publications: rows.filter(row => {
+        const key = parseFounderFallbackKey(row.idempotencyKey);
+        return key?.kind === "item" && key.interactionId === interactionId && key.endpointId === row.endpointId;
+      }),
+    };
+  }
+  /**
    * Re-prove one fallback publication. Called inside the outbox transport
    * claim, with the publication row locked, and before every insert.
    */
@@ -569,7 +622,7 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
     return { targets, inserted, nextDueAt, awaitingOutbox };
   }
 
-  return { authorizeFounderFallbackPublication, sweep };
+  return { authorizeFounderFallbackPublication, sweep, interactionReceipt };
 }
 
 /**

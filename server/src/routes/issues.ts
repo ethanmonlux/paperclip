@@ -67,6 +67,7 @@ import {
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import { createFounderFallbackNotices, founderFallbackSettingsFromEnv } from "../services/founder-fallback-notices.js";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
@@ -17727,6 +17728,18 @@ export function issueRoutes(
     const interactions =
       await issueThreadInteractionService(db).listForIssue(id);
     res.json(interactions);
+  });
+
+  router.get("/issues/:id/interactions/:interactionId/founder-fallback-receipt", async (req, res) => {
+    const issue = await getAccessibleResource(req, res, getIssueById(req, req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const interactionId = req.params.interactionId as string;
+    if (!isUuidLike(interactionId)) throw badRequest("Valid interaction ID required");
+    const receipt = await createFounderFallbackNotices(db, founderFallbackSettingsFromEnv())
+      .interactionReceipt(issue.companyId, issue.id, interactionId);
+    if (!receipt) throw notFound("Interaction not found");
+    res.json(receipt);
   });
 
   router.post(
