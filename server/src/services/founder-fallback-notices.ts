@@ -102,8 +102,10 @@ type Unavailability = { anchor: string; state: "error" | "paused" | "terminated"
  * unique key still deduplicates.
  */
 export type FounderFallbackKey =
-  | { endpointId: string; kind: "agent" | "recovered"; agentId: string; anchor: string; attempt?: number }
-  | { endpointId: string; kind: "item" | "done"; interactionId: string; attempt?: number }
+  | { endpointId: string; kind: "agent"; agentId: string; anchor: string; attempt?: number }
+  | { endpointId: string; kind: "recovered"; agentId: string; anchor: string; attempt?: number }
+  | { endpointId: string; kind: "item"; interactionId: string; attempt?: number }
+  | { endpointId: string; kind: "done"; interactionId: string; attempt?: number }
   | { endpointId: string; kind: "asks"; interactionIds: string[]; attempt?: number };
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -129,9 +131,10 @@ export function parseFounderFallbackKey(value: string): FounderFallbackKey | nul
     if (new Set(interactionIds).size !== interactionIds.length) return null;
     return { endpointId: match[1]!, kind: "asks", interactionIds, ...attempt };
   }
-  return match[5]
-    ? { endpointId: match[1]!, kind: match[5] as "item" | "done", interactionId: match[6]!, ...attempt }
-    : { endpointId: match[1]!, kind: match[2] as "agent" | "recovered", agentId: match[3]!, anchor: match[4]!, ...attempt };
+  if (match[5]) {
+    return { endpointId: match[1]!, kind: match[5] === "done" ? "done" : "item", interactionId: match[6]!, ...attempt };
+  }
+  return { endpointId: match[1]!, kind: match[2] === "recovered" ? "recovered" : "agent", agentId: match[3]!, anchor: match[4]!, ...attempt };
 }
 
 function withoutAttempt(key: FounderFallbackKey): FounderFallbackKey {

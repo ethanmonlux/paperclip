@@ -251,8 +251,10 @@ const support = await getEmbeddedPostgresTestSupport();
       await flush();
       expect(await sweepAt("2026-11-09T23:59:00Z")).toMatchObject({ inserted: 0, nextDueAt: null, awaitingOutbox: false });
 
-      // The exact Discord payloads, in order.
-      expect(sent).toEqual([
+      // The exact Discord payloads, in order. The last two retractions come
+      // from one sweep and share its transaction time, so their order is not
+      // meaningful and the pair is compared as a set.
+      expect([...sent.slice(0, 3), ...sent.slice(3).sort()]).toEqual([
         "[Needs you] Approve publishing the beta build · ~2 min · phone · waiting 4h (since 4:49 AM MST)\n"
           + "https://ethan-desktop.tail5192df.ts.net/STA/issues/STA-176\n\n"
           + "[Needs you] Finish the E2E test account setup · ~45 min · PC · waiting 1h (since 7:30 AM MST)\n"
@@ -260,8 +262,8 @@ const support = await getEmbeddedPostgresTestSupport();
         "[Needs you] Attach the approved .riv file · ~15 min · PC · waiting 20 min (since 9:40 AM MST)\n"
           + "https://ethan-desktop.tail5192df.ts.net/STA/issues/STA-198",
         "[Done] No action needed: Attach the approved .riv file (STA-198)",
-        "[Done] No action needed: Finish the E2E test account setup (STA-162)",
         "[Done] No action needed: Approve publishing the beta build (STA-176)",
+        "[Done] No action needed: Finish the E2E test account setup (STA-162)",
       ]);
       for (const message of sent) {
         expect(message).not.toMatch(/Master Builder|paused|available again|fallback|automatic|UTC/i);
