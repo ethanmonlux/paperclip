@@ -6,9 +6,11 @@ import {
   agentWakeupRequests,
   approvals,
   companies,
+  documents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueDocuments,
   issueExecutionDecisions,
   issueRelations,
   issues,
@@ -19,8 +21,12 @@ import {
   routineTriggers,
 } from "@paperclipai/db";
 import {
+  STAPLE_CONSOLE_CAPABILITY_MAP_KEY,
+  STAPLE_CONSOLE_LANES,
   buildStapleConsoleBoard,
   clipStapleConsoleText,
+  parseStapleConsoleCapabilityMap,
+  parseStapleConsolePrRef,
   extractStapleConsolePrRefs,
   isStapleConsoleReviewIssue,
   isStapleConsoleTerminal,
@@ -29,6 +35,7 @@ import {
   stapleConsoleDefaultRepo,
   stapleConsoleVerdictOfComment,
   type StapleConsoleBoard,
+  type StapleConsoleCapabilityMapDocumentInput,
   type StapleConsoleCiState,
   type StapleConsoleIssueInput,
   type StapleConsolePrState,
@@ -63,6 +70,12 @@ const MAX_RUNS = 4_000;
 const REVIEW_DECISION_LOOKBACK_MS = 30 * 24 * 60 * 60_000;
 const MAX_REVIEW_COMMENTS = 2_000;
 const MAX_GITHUB_PRS_PER_REFRESH = 25;
+/** Capability-claim proof PRs (Level 4), read after the cards' own PRs and cached for an hour once final. */
+const MAX_GITHUB_PROOF_PRS_PER_REFRESH = 30;
+/** Installed-build containment checks per refresh; a merge commit's answer for one build never changes. */
+const MAX_GITHUB_INSTALLED_CHECKS_PER_REFRESH = 20;
+const INSTALLED_CHECK_TTL_MS = 6 * 60 * 60_000;
+const STAPLE_REPO = STAPLE_CONSOLE_LANES.find((lane) => lane.key === "staple")?.defaultRepo ?? "ethanmonlux/paperclip";
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
 const GITHUB_TIMEOUT_MS = 8_000;
@@ -82,6 +95,7 @@ type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 interface PullRequestSnapshot {
   state: StapleConsolePrState;
   mergedAt: string | null;
+  mergeCommitSha: string | null;
   headSha: string | null;
   ci: StapleConsoleCiState;
   ciStartedAt: string | null;
@@ -234,6 +248,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     if (cached && cached.expiresAt > nowMs) return cached.value;
     const pr = asRecord(await githubJson(`/repos/${repo}/pulls/${number}`, token));
     const mergedAt = typeof pr?.merged_at === "string" ? pr.merged_at : null;
+    const mergeCommitSha = mergedAt && typeof pr?.merge_commit_sha === "string" ? pr.merge_commit_sha : null;
     const headSha = typeof asRecord(pr?.head)?.sha === "string" ? String(asRecord(pr?.head)!.sha) : null;
     const state: StapleConsolePrState = mergedAt ? "merged"
       : pr?.state === "closed" ? "closed"
@@ -243,6 +258,12 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     let ci: StapleConsoleCiState = "unknown";
     let ciStartedAt: string | null = null;
     let headCommittedAt: string | null = null;
+    // A merged PR's head checks are its CI proof (Level 4); unreadable leaves CI unknown.
+    if (headSha && state === "merged") {
+      ({ ci, ciStartedAt } = summarizeCheckRuns(
+        await githubJson(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, token).catch(() => null)));
+      if (ci === "none") ci = "unknown";
+    }
     if (headSha && (state === "open" || state === "draft")) {
       ({ ci, ciStartedAt } = summarizeCheckRuns(
         await githubJson(`/repos/${repo}/commits/${headSha}/check-runs?per_page=100`, token)));
@@ -254,13 +275,27 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         headCommittedAt = typeof date === "string" ? date : null;
       }
     }
-    const value = { state, mergedAt, headSha, ci, ciStartedAt, headCommittedAt };
+    const value = { state, mergedAt, mergeCommitSha, headSha, ci, ciStartedAt, headCommittedAt };
     prCache.set(key, { value, expiresAt: nowMs + (state === "open" || state === "draft" ? OPEN_PR_TTL_MS : FINAL_PR_TTL_MS) });
     if (prCache.size > 500) prCache.delete(prCache.keys().next().value!);
     return value;
   }
 
   /** Every task-derived row is limited to tasks `actor` may read (private projects and private ancestry). */
+  const installedCache = new Map<string, { value: boolean | null; expiresAt: number }>();
+  /** Whether `installedSha` contains `mergeSha` (GitHub compare); null when GitHub cannot say. */
+  async function installedContains(repo: string, mergeSha: string, installedSha: string, token: string, scope: string, nowMs: number) {
+    const key = `${scope}|${repo.toLowerCase()}|${mergeSha}|${installedSha}`;
+    const cached = installedCache.get(key);
+    if (cached && cached.expiresAt > nowMs) return cached.value;
+    const body = asRecord(await githubJson(`/repos/${repo}/compare/${mergeSha}...${installedSha}`, token));
+    const status = body?.status;
+    const value = status === "ahead" || status === "identical" ? true : status === "behind" || status === "diverged" ? false : null;
+    installedCache.set(key, { value, expiresAt: nowMs + INSTALLED_CHECK_TTL_MS });
+    if (installedCache.size > 500) installedCache.delete(installedCache.keys().next().value!);
+    return value;
+  }
+
   async function board(companyId: string, actor: AuthorizationActor): Promise<StapleConsoleBoard> {
     const now = opts.now?.() ?? new Date();
     const nowIso = now.toISOString();
@@ -363,7 +398,56 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       return false;
     }).map((row) => row.id);
 
-    const [agentRows, relationRows, runRows, wakeRows, interactionRows, approvalRows, workProductRows] = await Promise.all([
+    // ---- Capability map (Level 2): the newest readable `capability-map` issue document. Its claims'
+    // tasks and their descendants are the proof scope: their PRs and review verdicts load too.
+    const [mapRow] = await db
+      .select({
+        identifier: issues.identifier,
+        issueId: issues.id,
+        body: documents.latestBody,
+        revisionNumber: documents.latestRevisionNumber,
+        updatedAt: documents.updatedAt,
+      })
+      .from(issueDocuments)
+      .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+      .innerJoin(issues, eq(issueDocuments.issueId, issues.id))
+      .where(and(
+        eq(issueDocuments.companyId, companyId),
+        eq(issueDocuments.key, STAPLE_CONSOLE_CAPABILITY_MAP_KEY),
+        readableIssue,
+      ))
+      .orderBy(desc(documents.updatedAt))
+      .limit(1);
+    const capabilityMap: StapleConsoleCapabilityMapDocumentInput | null = mapRow
+      ? {
+        issueIdentifier: mapRow.identifier ?? mapRow.issueId.slice(0, 8),
+        revisionNumber: mapRow.revisionNumber,
+        updatedAt: iso(mapRow.updatedAt)!,
+        body: mapRow.body,
+      }
+      : null;
+    const parsedMap = capabilityMap ? parseStapleConsoleCapabilityMap(capabilityMap.body) : null;
+    const claims = parsedMap?.ok ? parsedMap.map.groups.flatMap((group) => group.capabilities.flatMap((capability) => capability.claims)) : [];
+    const rowByIdentifier = new Map(issueRows.map((row) => [row.identifier, row]));
+    const childIdsOf = new Map<string, string[]>();
+    for (const row of issueRows) if (row.parentId) childIdsOf.set(row.parentId, [...(childIdsOf.get(row.parentId) ?? []), row.id]);
+    const proofScope = new Set<string>();
+    for (const identifier of claims.flatMap((claim) => [...(claim.issues ?? []), ...(claim.defects ?? [])])) {
+      const start = rowByIdentifier.get(identifier);
+      if (!start) continue;
+      const queue = [start.id];
+      while (queue.length > 0 && proofScope.size < 2_000) {
+        const id = queue.shift()!;
+        if (proofScope.has(id)) continue;
+        proofScope.add(id);
+        queue.push(...(childIdsOf.get(id) ?? []));
+      }
+    }
+    const cardScopeSet = new Set(cardScopeIds);
+    const proofOnlyIds = [...proofScope].filter((id) => !cardScopeSet.has(id));
+    const evidenceScopeIds = [...cardScopeIds, ...proofOnlyIds];
+
+    const [agentRows, relationRows, runRows, wakeRows, interactionRows, approvalRows, workProductRows, commentRows] = await Promise.all([
       db.select({ id: agents.id, name: agents.name, role: agents.role }).from(agents).where(eq(agents.companyId, companyId)),
       allIds.length === 0 ? [] : db
         .select({ blockerIssueId: issueRelations.issueId, blockedIssueId: issueRelations.relatedIssueId })
@@ -437,7 +521,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           inArray(issueApprovals.issueId, liveIds),
           readableApproval,
         )),
-      cardScopeIds.length === 0 ? [] : db
+      evidenceScopeIds.length === 0 ? [] : db
         .select({
           issueId: issueWorkProducts.issueId,
           url: issueWorkProducts.url,
@@ -448,20 +532,37 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         .where(and(
           eq(issueWorkProducts.companyId, companyId),
           eq(issueWorkProducts.type, "pull_request"),
-          inArray(issueWorkProducts.issueId, cardScopeIds),
+          inArray(issueWorkProducts.issueId, evidenceScopeIds),
         )),
+      // The newest comment on each card task, for the expanded card.
+      cardScopeIds.length === 0 ? [] : db
+        .selectDistinctOn([issueComments.issueId], {
+          issueId: issueComments.issueId,
+          authorAgentId: issueComments.authorAgentId,
+          authorUserId: issueComments.authorUserId,
+          body: sql<string>`left(${issueComments.body}, 600)`,
+          createdAt: issueComments.createdAt,
+        })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.companyId, companyId),
+          inArray(issueComments.issueId, cardScopeIds),
+          isNull(issueComments.deletedAt),
+          eq(issueComments.origin, "comment"),
+        ))
+        .orderBy(issueComments.issueId, desc(issueComments.createdAt)),
     ]);
 
     // ---- Review verdicts (FAC-838): native execution-stage decisions, and the verdict a review
     // task's own reviewer states in a comment. Comments by anyone else (the builder asking for
     // re-review, the coordinator) never count.
     const agentById = new Map(agentRows.map((agent) => [agent.id, { id: agent.id, name: agent.name, role: agent.role ?? null }]));
-    const cardScopeIdSet = new Set(cardScopeIds);
+    const evidenceScopeIdSet = new Set(evidenceScopeIds);
     const reviewIssueRows = issueInputs.filter((row) =>
-      cardScopeIdSet.has(row.id) && isStapleConsoleReviewIssue(row, agentById.get(row.assigneeAgentId ?? "")));
+      evidenceScopeIdSet.has(row.id) && isStapleConsoleReviewIssue(row, agentById.get(row.assigneeAgentId ?? "")));
     const decisionSince = new Date(nowMs - REVIEW_DECISION_LOOKBACK_MS);
     const [executionDecisionRows, reviewCommentRows] = await Promise.all([
-      cardScopeIds.length === 0 ? [] : db
+      evidenceScopeIds.length === 0 ? [] : db
         .select({
           issueId: issueExecutionDecisions.issueId,
           outcome: issueExecutionDecisions.outcome,
@@ -473,7 +574,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           eq(issueExecutionDecisions.companyId, companyId),
           eq(issueExecutionDecisions.stageType, "review"),
           inArray(issueExecutionDecisions.outcome, ["approved", "changes_requested"]),
-          inArray(issueExecutionDecisions.issueId, cardScopeIds),
+          inArray(issueExecutionDecisions.issueId, evidenceScopeIds),
           gte(issueExecutionDecisions.createdAt, decisionSince),
         )),
       reviewIssueRows.length === 0 ? [] : db
@@ -542,13 +643,22 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         source: "work_product",
       });
     }
-    for (const id of cardScopeIds) {
+    for (const id of evidenceScopeIds) {
       const row = byId.get(id)!;
       for (const ref of extractStapleConsolePrRefs(row.title, row.description, stapleConsoleDefaultRepo(titleChain(id)))) {
         if (pullRequests.some((pr) => pr.issueId === id && pr.repo.toLowerCase() === ref.repo.toLowerCase() && pr.number === ref.number)) continue;
         pullRequests.push({ issueId: id, ...ref, state: "unknown", mergedAt: null, ci: "unknown", ciStartedAt: null, source: "reference" });
       }
     }
+
+    // PRs a claim names directly ("owner/repo#N"), not attached to any task.
+    const claimPullRequests: StapleConsolePullRequestInput[] = [];
+    for (const value of claims.flatMap((claim) => claim.prs ?? [])) {
+      const ref = parseStapleConsolePrRef(value);
+      if (!ref || claimPullRequests.some((pr) => pr.repo.toLowerCase() === ref.repo.toLowerCase() && pr.number === ref.number)) continue;
+      claimPullRequests.push({ issueId: "", ...ref, state: "unknown", mergedAt: null, ci: "unknown", ciStartedAt: null, source: "reference" });
+    }
+    const serverInfo = getServerInfoSnapshot();
 
     let github: StapleConsoleSourceStatus["github"];
     const missingOnGitHub = new Set<string>();
@@ -559,34 +669,72 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         detail: "No company GitHub secret, server token or connected GitHub account of yours is available, so PR state is Paperclip's recorded status (not live) and CI is unknown.",
       };
     } else {
+      // Card PRs first under their own limit; capability proof PRs after, under a separate one.
       const unique = new Map<string, { repo: string; number: number }>();
-      for (const pr of pullRequests) unique.set(`${pr.repo.toLowerCase()}#${pr.number}`, pr);
+      for (const pr of pullRequests) if (cardScopeSet.has(pr.issueId)) unique.set(`${pr.repo.toLowerCase()}#${pr.number}`, pr);
       const targets = [...unique.entries()].sort((a, b) => b[1].number - a[1].number).slice(0, MAX_GITHUB_PRS_PER_REFRESH);
+      const proofUnique = new Map<string, { repo: string; number: number }>();
+      for (const pr of [...pullRequests, ...claimPullRequests]) {
+        const key = `${pr.repo.toLowerCase()}#${pr.number}`;
+        if (!unique.has(key)) proofUnique.set(key, pr);
+      }
+      const proofTargets = [...proofUnique.entries()].sort((a, b) => b[1].number - a[1].number).slice(0, MAX_GITHUB_PROOF_PRS_PER_REFRESH);
       const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
       const tokenHash = createHash("sha256").update(credential.token).digest("hex");
       const scope = `${companyId}|${viewer}|${tokenHash}`;
       const resolved = new Map<string, PullRequestSnapshot>();
       let failures = 0;
-      await Promise.all(targets.map(async ([key, pr]) => {
-        try {
-          resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, scope, nowMs));
-        } catch (error) {
-          if ((error as { status?: unknown }).status === 404) missingOnGitHub.add(key);
-          else failures += 1;
-        }
-      }));
+      let proofFailures = 0;
+      await Promise.all([
+        ...targets.map(async ([key, pr]) => {
+          try {
+            resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, scope, nowMs));
+          } catch (error) {
+            if ((error as { status?: unknown }).status === 404) missingOnGitHub.add(key);
+            else failures += 1;
+          }
+        }),
+        ...proofTargets.map(async ([key, pr]) => {
+          try {
+            resolved.set(key, await resolvePullRequest(pr.repo, pr.number, credential.token, scope, nowMs));
+          } catch (error) {
+            if ((error as { status?: unknown }).status === 404) missingOnGitHub.add(key);
+            else proofFailures += 1;
+          }
+        }),
+      ]);
       const skipped = unique.size - targets.length;
-      for (const pr of pullRequests) {
+      const proofSkipped = proofUnique.size - proofTargets.length;
+      for (const pr of [...pullRequests, ...claimPullRequests]) {
         const snapshot = resolved.get(`${pr.repo.toLowerCase()}#${pr.number}`);
         if (!snapshot) continue;
         Object.assign(pr, {
-          state: snapshot.state, mergedAt: snapshot.mergedAt, ci: snapshot.ci, ciStartedAt: snapshot.ciStartedAt,
-          headSha: snapshot.headSha, headCommittedAt: snapshot.headCommittedAt, source: "github",
+          state: snapshot.state, mergedAt: snapshot.mergedAt, mergeCommitSha: snapshot.mergeCommitSha, ci: snapshot.ci,
+          ciStartedAt: snapshot.ciStartedAt, headSha: snapshot.headSha, headCommittedAt: snapshot.headCommittedAt, source: "github",
         });
+      }
+      // Level 4: does the installed Staple build contain each merged Staple PR?
+      const installedSha = serverInfo.git.available ? serverInfo.git.fullSha : null;
+      if (installedSha) {
+        const merges = new Map<string, string>();
+        for (const pr of [...pullRequests, ...claimPullRequests]) {
+          if (pr.state === "merged" && pr.mergeCommitSha && pr.repo.toLowerCase() === STAPLE_REPO.toLowerCase()) {
+            merges.set(pr.mergeCommitSha, pr.repo);
+          }
+        }
+        const answers = new Map<string, boolean | null>();
+        await Promise.all([...merges.entries()].slice(0, MAX_GITHUB_INSTALLED_CHECKS_PER_REFRESH).map(async ([sha, repo]) => {
+          answers.set(sha, await installedContains(repo, sha, installedSha, credential.token, scope, nowMs).catch(() => null));
+        }));
+        for (const pr of [...pullRequests, ...claimPullRequests]) {
+          if (pr.mergeCommitSha && answers.has(pr.mergeCommitSha)) pr.inInstalledBuild = answers.get(pr.mergeCommitSha)!;
+        }
       }
       const gaps = [
         failures > 0 ? `GitHub read failed for ${failures} of ${targets.length} PRs` : null,
         skipped > 0 ? `${skipped} older PRs are beyond the ${MAX_GITHUB_PRS_PER_REFRESH}-PR refresh limit` : null,
+        proofFailures > 0 ? `GitHub read failed for ${proofFailures} capability proof PRs` : null,
+        proofSkipped > 0 ? `${proofSkipped} capability proof PRs are beyond the ${MAX_GITHUB_PROOF_PRS_PER_REFRESH}-PR refresh limit` : null,
       ].filter(Boolean);
       github = {
         available: failures < targets.length || targets.length === 0,
@@ -631,7 +779,6 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         available: false,
       });
     }
-    const serverInfo = getServerInfoSnapshot();
     const lastSync = issueRows
       .filter((row) => /upstream sync/i.test(row.title))
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
@@ -726,7 +873,17 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         };
       }),
       pullRequests: confirmedPullRequests,
+      claimPullRequests: claimPullRequests.filter((pr) => !missingOnGitHub.has(`${pr.repo.toLowerCase()}#${pr.number}`)),
       reviewDecisions,
+      comments: commentRows.map((row) => ({
+        issueId: row.issueId,
+        authorAgentId: row.authorAgentId,
+        authorUserId: row.authorUserId,
+        body: row.body,
+        createdAt: iso(row.createdAt)!,
+      })),
+      capabilityMap,
+      installedBuild: serverInfo.git.available ? serverInfo.git.shortSha : null,
       scheduled,
       sources: { github },
     });

@@ -24,6 +24,7 @@ const suite = support.supported ? describe : describe.skip;
 
 const cards = (board: StapleConsoleBoard) => board.lanes.flatMap((lane) => lane.cards);
 const boardText = (board: StapleConsoleBoard) => JSON.stringify(board);
+const noProof = { mergedAt: null, mergeCommitSha: null, inInstalledBuild: null };
 
 suite("staple console service", () => {
   let db: ReturnType<typeof createDb>;
@@ -213,17 +214,17 @@ suite("staple console service", () => {
     expect(prsOf(guessTask!.id)).toEqual([]);
     // #26 hit a GitHub outage: link kept, state unknown.
     expect(prsOf(taskNumbered(26).id)).toEqual([
-      { label: "widgets#26", url: url(26), state: "unknown", ci: "unknown", source: "reference" },
+      { label: "widgets#26", url: url(26), state: "unknown", ci: "unknown", source: "reference", ...noProof },
     ]);
     // #1 and #2 are past the 25-PR refresh cap (900 and 26..3): never requested, links kept.
     for (const number of [1, 2]) {
       expect(requested.some((target) => target.endsWith(`/pulls/${number}`))).toBe(false);
       expect(prsOf(taskNumbered(number).id)).toEqual([
-        { label: `widgets#${number}`, url: url(number), state: "unknown", ci: "unknown", source: "reference" },
+        { label: `widgets#${number}`, url: url(number), state: "unknown", ci: "unknown", source: "reference", ...noProof },
       ]);
     }
     expect(prsOf(taskNumbered(3).id)).toEqual([
-      { label: "widgets#3", url: url(3), state: "open", ci: "none", source: "github" },
+      { label: "widgets#3", url: url(3), state: "open", ci: "none", source: "github", ...noProof },
     ]);
     // Zero check runs 20 min after the head commit: CI never started (FAC-840).
     expect(cards(board).find((card) => card.id === taskNumbered(3).id)!.stuck).toEqual([
