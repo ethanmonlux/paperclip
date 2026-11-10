@@ -11621,13 +11621,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ slackUserId: "UBOARD" });
   });
 
-  it("delivers a FAC-597 founder fallback notice through the native outbox and cancels a stale one before I/O", async () => {
+  it("delivers a FAC-597 founder ask and its retraction through the native outbox and cancels a stale one before I/O", async () => {
     await instanceSettingsService(db).updateExperimental({ enableChatConnectors: true });
     const fixture = await seedCompany();
     await db.update(companyMemberships).set({ membershipRole: "owner" })
       .where(and(eq(companyMemberships.companyId, fixture.companyId), eq(companyMemberships.principalId, "owner-user")));
     let now = new Date();
-    const notices = createFounderFallbackNotices(db, { enabled: true, boundMs: 20 * 60_000 }, () => now);
+    const notices = createFounderFallbackNotices(db, { enabled: true, boundMs: 20 * 60_000, quietHours: false }, () => now);
     const { callbacks, endpoint, runtime, service } = await configuredSlackEndpoint(fixture,
       { linkedBoardUser: true, allowUnlinkedPeople: false, founderFallbackNotices: notices });
     const thread = makeThread({ channelId: "D-FALLBACK", id: "slack:D-FALLBACK:7600.1", isDM: true });
@@ -11641,43 +11641,46 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     expect((await service.get(endpoint.id)).status).toBe("active");
     await service.processPendingPublications();
     const posts = () => (runtime.endpoints.get(endpoint.id)?.posts ?? [])
-      .filter(post => JSON.stringify(post).includes("Paperclip fallback notice"));
+      .filter(post => /\[(Needs you|Done)\]|Paperclip fallback notice/.test(JSON.stringify(post)));
     expect(posts()).toEqual([]);
 
-    const failedAt = new Date(now.getTime() - 21 * 60_000);
-    const [failed] = await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: fixture.assignedAgentId,
-      status: "failed", startedAt: failedAt, finishedAt: failedAt }).returning();
-    await db.update(agents).set({ status: "error", updatedAt: failedAt }).where(eq(agents.id, fixture.assignedAgentId));
+    // A founder decision on another task, past its bound: one ask, delivered once.
+    const [task] = await db.insert(issues).values({ companyId: fixture.companyId, title: "Publish the beta", status: "todo" }).returning();
+    const decide = async (title: string) => (await db.insert(issueThreadInteractions).values({ companyId: fixture.companyId,
+      issueId: task!.id, kind: "request_confirmation", payload: { version: 1, prompt: "Approve?" } as never, title,
+      addresseeUserId: "owner-user", createdAt: new Date(now.getTime() - 21 * 60_000) }).returning())[0]!;
+    const decision = await decide("Approve publishing the beta");
     expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
     await service.processPendingPublications();
-    const agentKey = founderFallbackKey({ endpointId: endpoint.id, kind: "agent", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
-    const [published] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, agentKey));
+    const askKey = founderFallbackKey({ endpointId: endpoint.id, kind: "asks", interactionIds: [decision.id] });
+    const [published] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, askKey));
     expect(published).toMatchObject({ state: "published", conversationId: conversation!.id, issueId: conversation!.issueId });
     expect(posts()).toHaveLength(1);
-    expect(JSON.stringify(posts()[0])).toContain("Paperclip fallback notice (automatic, not from ");
+    expect(JSON.stringify(posts()[0])).toContain("[Needs you] Approve publishing the beta");
+    expect(JSON.stringify(posts()[0])).not.toContain("Paperclip fallback notice");
 
-    // Recovery is queued, then the agent fails again before the transport
-    // claim: the claim re-proof cancels the row and nothing reaches Slack.
-    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
+    // A second card is answered before the transport claim: the claim
+    // re-proof cancels its queued ask and nothing reaches Slack.
+    const answered = await decide("Approve the canary");
     now = new Date(now.getTime() + 60_000);
     expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
-    await db.update(agents).set({ status: "paused", pausedAt: now }).where(eq(agents.id, fixture.assignedAgentId));
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, answered.id));
     await service.processPendingPublications();
-    const recoveredKey = founderFallbackKey({ endpointId: endpoint.id, kind: "recovered", agentId: fixture.assignedAgentId, anchor: `error.${failed!.id}` });
-    const [stale] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, recoveredKey));
+    const staleKey = founderFallbackKey({ endpointId: endpoint.id, kind: "asks", interactionIds: [answered.id] });
+    const [stale] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, staleKey));
     expect(stale?.state).toBe("cancelled");
     expect(posts()).toHaveLength(1);
 
-    // That cancellation was definitely before I/O, so once the agent is
-    // available again the recovery notice is re-armed and delivered once.
-    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.assignedAgentId));
+    // The delivered card resolves on its task: one retraction, then silence.
+    await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, decision.id));
     now = new Date(now.getTime() + 60_000);
     expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 1 });
     await service.processPendingPublications();
-    const [rearmed] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, `${recoveredKey}:a1`));
-    expect(rearmed).toMatchObject({ state: "published", conversationId: conversation!.id });
+    const doneKey = founderFallbackKey({ endpointId: endpoint.id, kind: "done", interactionId: decision.id });
+    const [done] = await db.select().from(chatPublications).where(eq(chatPublications.idempotencyKey, doneKey));
+    expect(done).toMatchObject({ state: "published", conversationId: conversation!.id });
     expect(posts()).toHaveLength(2);
-    expect(JSON.stringify(posts()[1])).toContain("is available again");
+    expect(JSON.stringify(posts()[1])).toContain("[Done] No action needed: Approve publishing the beta");
     expect(await notices.sweep()).toMatchObject({ targets: 1, inserted: 0 });
     await service.shutdown();
   });
