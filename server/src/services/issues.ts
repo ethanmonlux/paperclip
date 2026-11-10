@@ -225,6 +225,7 @@ import { getRunLogStore, isRunLogStoreType } from "./run-log-store.js";
 import { recoverSettledNativeRunLog } from "./native-runtime/native-run-log-recovery.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { assertCapabilityRouting } from "./capability-routing.js";
 import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   isExternalChatPresentationContext,
@@ -10274,6 +10275,11 @@ export function issueService(db: Db) {
         await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
           kind: "work",
         });
+        await assertCapabilityRouting(db, {
+          companyId,
+          assigneeAgentId: data.assigneeAgentId,
+          labels: { labelIds: inputLabelIds ?? [] },
+        });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
@@ -11516,6 +11522,14 @@ export function issueService(db: Db) {
           { kind: "work" },
         );
       }
+      // Route only a change of assignee, so existing work stays claimable.
+      if (nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId) {
+        await assertCapabilityRouting(dbOrTx as Db, {
+          companyId: existing.companyId,
+          assigneeAgentId: nextAssigneeAgentId,
+          labels: nextLabelIds !== undefined ? { labelIds: nextLabelIds } : { issueId: existing.id },
+        });
+      }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(
           existing.companyId,
@@ -12338,7 +12352,7 @@ export function issueService(db: Db) {
       checkoutRunId: string | null,
     ) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
@@ -12346,6 +12360,14 @@ export function issueService(db: Db) {
       await assertAssignableAgent(db, issueCompany.companyId, agentId, {
         kind: "work",
       });
+      // Checkout claims only unassigned work; route that claim like an assignment.
+      if (!issueCompany.assigneeAgentId) {
+        await assertCapabilityRouting(db, {
+          companyId: issueCompany.companyId,
+          assigneeAgentId: agentId,
+          labels: { issueId: id },
+        });
+      }
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
