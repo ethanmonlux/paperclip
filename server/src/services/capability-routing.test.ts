@@ -236,13 +236,20 @@ describeEmbeddedPostgres("issueService capability routing", () => {
     await expect(svc.checkout(issue.id, ids.portfolio, ["todo"], null))
       .resolves.toMatchObject({ assigneeAgentId: ids.portfolio });
   });
-  // Holds the task row lock while `start` runs, changes the row as a
-  // concurrent writer would, and commits once `start` waits on the lock.
-  async function raceWithLockedWrite<T>(issueId: string, write: Partial<typeof issues.$inferInsert>, start: () => Promise<T>) {
+  // Holds the task row lock while `start` runs, changes the row (and any
+  // `alsoWrite` rows) as a concurrent writer would, and commits once `start`
+  // waits on the lock.
+  async function raceWithLockedWrite<T>(
+    issueId: string,
+    write: Partial<typeof issues.$inferInsert>,
+    start: () => Promise<T>,
+    alsoWrite?: (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => Promise<unknown>,
+  ) {
     let operation!: Promise<T>;
     await db.transaction(async (tx) => {
       await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
       await tx.update(issues).set(write).where(eq(issues.id, issueId));
+      await alsoWrite?.(tx);
       const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`) as unknown as Array<{ pid: number }>;
       operation = start();
       operation.catch(() => undefined);
@@ -315,5 +322,37 @@ describeEmbeddedPostgres("issueService capability routing", () => {
       .resolves.toMatchObject({ reassignedIssueCount: 1 });
     const [transferred] = await db.select().from(issues).where(eq(issues.id, kaiaWork.id));
     expect(transferred?.assigneeAgentId).toBe(ids.kaia);
+  });
+
+  it("routes a task assigned to the member while the archive runs (FAC-884)", async () => {
+    const { companyId, ids, kaiaLabelId } = await seedLanes();
+    const access = accessService(db);
+    const principalId = `member-${randomUUID()}`;
+    const member = await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId, status: "active", membershipRole: "operator",
+    }).returning().then((rows) => rows[0]!);
+    const kaiaWork = await svc.create(companyId, {
+      title: "Kaia gear selector art", status: "in_progress", priority: "high", assigneeUserId: principalId, labelIds: [kaiaLabelId],
+    });
+    const general = await svc.create(companyId, { title: "Boss names", status: "todo", priority: "high" });
+
+    // The general task reaches the member only after the archive has started.
+    await expect(raceWithLockedWrite(
+      kaiaWork.id,
+      { updatedAt: new Date() },
+      () => access.archiveMember(companyId, member.id, { reassignment: { assigneeAgentId: ids.kaia } }),
+      (tx) => tx.update(issues).set({ assigneeUserId: principalId }).where(eq(issues.id, general.id)),
+    )).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({ code: "agent_capability_mismatch", reason: "exclusive_label_missing", issueId: general.id }),
+    });
+    const [unarchived] = await db.select().from(companyMemberships).where(eq(companyMemberships.id, member.id));
+    expect(unarchived?.status).toBe("active");
+    const held = await db.select({ id: issues.id, assigneeUserId: issues.assigneeUserId, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues).where(eq(issues.companyId, companyId));
+    expect(held).toEqual(expect.arrayContaining([
+      { id: kaiaWork.id, assigneeUserId: principalId, assigneeAgentId: null },
+      { id: general.id, assigneeUserId: principalId, assigneeAgentId: null },
+    ]));
   });
 });

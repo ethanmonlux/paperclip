@@ -750,19 +750,6 @@ export function accessService(db: Db) {
         eq(issues.assigneeUserId, existing.principalId),
         sql`${issues.status} not in ('done', 'cancelled')`,
       );
-      if (assignmentPatch.assigneeAgentId) {
-        // The transfer assigns each task to the agent, so route each by its labels.
-        const transferred = await tx
-          .select({ id: issues.id })
-          .from(issues)
-          .where(assignedOpenIssueWhere)
-          .for("update");
-        await assertCapabilityRoutingForIssues(tx as unknown as Db, {
-          companyId,
-          assigneeAgentId: assignmentPatch.assigneeAgentId,
-          issueIds: transferred.map((row) => row.id),
-        });
-      }
       await notifyNativeStatusReassessment(tx, { companyId });
       await notifyDeferredExecutionEligibility(tx, { companyId });
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
@@ -786,6 +773,14 @@ export function accessService(db: Db) {
         .set(assignmentPatch)
         .where(and(assignedOpenIssueWhere, ne(issues.status, "in_progress")))
         .returning({ id: issues.id });
+      // The transfer assigns each moved task to the agent, so route each by its
+      // labels. Check the rows the updates returned, so a task assigned to the
+      // member during the archive is routed too; a rejection rolls back.
+      await assertCapabilityRoutingForIssues(tx as unknown as Db, {
+        companyId,
+        assigneeAgentId: assignmentPatch.assigneeAgentId,
+        issueIds: [...resetInProgress, ...reassigned].map((row) => row.id),
+      });
 
       await tx
         .delete(principalPermissionGrants)
