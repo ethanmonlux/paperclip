@@ -375,6 +375,19 @@ describe("merged means a merged PR, not a Done task (FAC-837)", () => {
     expect(board.header.mergedToday).toBe(0);
   });
 
+  it("does not claim a recorded open PR is still open without a live GitHub read", () => {
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [root()],
+      pullRequests: [pr({ ci: "unknown", ciStartedAt: null, source: "work_product" })],
+    }));
+    const card = onlyCard(board);
+    expect(card.step).toBe("review");
+    expect(card.completion).toBe("task_done");
+    expect(card.completionNote).toBe("Task done; facette#77 recorded open, merge not confirmed");
+    expect(card.mergedToday).toBe(false);
+    expect(board.header.mergedToday).toBe(0);
+  });
+
   it("shows a Done task with no PR as task-only completion, not a merge", () => {
     const board = buildStapleConsoleBoard(boardInput({ issues: [root()] }));
     const card = onlyCard(board);
