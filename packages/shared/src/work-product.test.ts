@@ -12,6 +12,7 @@ describe("work product metadata with resource ref", () => {
     // current workspace binding; this reusable schema validates its shape.
     expect(createIssueWorkProductSchema.safeParse({ ...base, metadata: { deliveryCloseout: {
       kind: "no_code", workspaceId: base.executionWorkspaceId, lifecycleGeneration: 0,
+      reason: "Investigation completed with no deliverable file required.",
     } } }).success).toBe(true);
     expect(createIssueWorkProductSchema.safeParse({ ...base, metadata: { deliveryCloseout: {
       kind: "artifact", workspaceId: base.executionWorkspaceId, lifecycleGeneration: 0,

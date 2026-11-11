@@ -23,7 +23,7 @@ export const issueWorkProductTypeSchema = z.enum([
 export const issueDeliveryCloseoutSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("code"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative(), headSha: z.string().regex(/^[a-f0-9]{40}$/i), pullRequestUrl: z.string().url() }).strict(),
   z.object({ kind: z.literal("artifact"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative(), artifactWorkProductIds: z.array(z.string().guid()).min(1).max(100) }).strict(),
-  z.object({ kind: z.literal("no_code"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative() }).strict(),
+  z.object({ kind: z.literal("no_code"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative(), reason: z.string().trim().min(12).max(500) }).strict(),
 ]);
 export type IssueDeliveryCloseout = z.infer<typeof issueDeliveryCloseoutSchema>;
 

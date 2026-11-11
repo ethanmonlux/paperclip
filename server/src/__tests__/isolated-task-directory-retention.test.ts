@@ -104,7 +104,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
     await db.insert(issueWorkProducts).values({ companyId, issueId, executionWorkspaceId: workspaceId,
       type: "delivery_closeout", provider: "paperclip", title: "No-code task closeout", status: "active",
-      metadata: { deliveryCloseout: { kind: "no_code", workspaceId, lifecycleGeneration: 0 } } });
+      metadata: { deliveryCloseout: { kind: "no_code", workspaceId, lifecycleGeneration: 0,
+        reason: "Fixture task requires no published output." } } });
     const row = () => db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)).then(rows => rows[0]!);
     const ledger = () => db.select().from(executionWorkspaceRestorePoints).where(eq(executionWorkspaceRestorePoints.executionWorkspaceId, workspaceId));
     const service = (overrides: Parameters<typeof executionWorkspaceService>[1] = {}) => executionWorkspaceService(db, {

@@ -190,7 +190,8 @@ to `active`, `executionWorkspaceId` to the current execution workspace, and
 ```
 
 ```json
-{ "kind": "no_code", "workspaceId": "<execution-workspace-id>", "lifecycleGeneration": 0 }
+{ "kind": "no_code", "workspaceId": "<execution-workspace-id>", "lifecycleGeneration": 0,
+  "reason": "This task requires no code or published artifact output." }
 ```
 
 ```json
