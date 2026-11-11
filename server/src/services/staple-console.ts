@@ -957,7 +957,10 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
               originId: ATLAS_AUTHORED_REVISION,
               idempotencyKey: `system-atlas-refresh:${ATLAS_AUTHORED_REVISION}`,
             });
-            refreshIssueId = refresh.id;
+            const readableIssue = await issueReadSqlCondition(db, actor);
+            const [readableRefresh] = await db.select({ id: issues.id }).from(issues)
+              .where(and(eq(issues.id, refresh.id), eq(issues.companyId, companyId), readableIssue));
+            refreshIssueId = readableRefresh?.id ?? null;
           }
         } catch {
           // Comparison stays truthful. A later source read retries native routing.

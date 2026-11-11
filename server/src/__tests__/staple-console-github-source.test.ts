@@ -179,7 +179,7 @@ suite("staple console GitHub source", () => {
         ? Response.json({ sha: source })
         : Response.json({ status: "ahead", files: [{ filename: "server/src/services/native-runtime/example.ts" }] }),
     });
-    const actor = { type: "board" as const, userId: randomUUID(), authorizingUserId: randomUUID() };
+    const actor = { type: "agent" as const, agentId, companyId };
     const first = await svc.atlasSource(companyId, actor);
     expect(first).toMatchObject({ status: "changed", sourceRevision: source, refreshIssueId: expect.any(String) });
     source = "c".repeat(40);
