@@ -79,6 +79,7 @@ Use this index to open a recipe or copy its feature and full capability IDs.
 | `workspaces` | [Workspaces, services, and files](workspaces.md) | `workspaces/binding`, `workspaces/provisioning`, `workspaces/services`, `workspaces/files-git`, `workspaces/closure` |
 | `execution-environments` | [Execution environments](execution-environments.md) | `execution-environments/configuration`, `execution-environments/capabilities`, `execution-environments/probe`, `execution-environments/assignment`, `execution-environments/images` |
 | `recovery` | [Recovery](recovery.md) | `recovery/diagnosis`, `recovery/bounded-continuation`, `recovery/source-action`, `recovery/exhaustion`, `recovery/workspace`, `recovery/unknown-outcome`, `recovery/user-continuation`, `recovery/reconnect` |
+| `system-atlas` | [System Atlas](system-atlas.md) | `system-atlas/exploration`, `system-atlas/freshness` |
 
 ### Apps, channels, and extensions
 

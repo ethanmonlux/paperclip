@@ -118,4 +118,42 @@ suite("staple console GitHub source", () => {
     await svc.board(companyId, { type: "agent", agentId: randomUUID(), companyId });
     expect(credentials.resolveManagedGitHubCredential).not.toHaveBeenCalled();
   });
+
+  it("keeps source, installed revision and last-good comparison distinct across a failed refresh", async () => {
+    const installed = "a".repeat(40);
+    const source = "b".repeat(40);
+    let clock = new Date("2026-11-11T03:00:00Z");
+    let fail = false;
+    const fetch = async (target: string) => {
+      if (fail) return new Response(null, { status: 503 });
+      if (target.endsWith("/commits/master")) return Response.json({ sha: source });
+      if (target.includes("/compare/")) return Response.json({ status: "ahead", files: [
+        { filename: "server/src/services/native-runtime/example.ts" },
+      ] });
+      throw new Error(`Unexpected GitHub path: ${target}`);
+    };
+    const svc = stapleConsoleService(db, {
+      now: () => clock, installedRevision: () => installed, fetch,
+      credentialProvider: async () => ({ token: "atlas-grant", source: "managed_connection", secretName: null, login: "owner" }),
+    });
+    const actor = { type: "board" as const, userId: randomUUID(), authorizingUserId: randomUUID() };
+    const first = await svc.atlasSource(randomUUID(), actor);
+    expect(first).toMatchObject({ authoredRevision: installed, installedRevision: installed, sourceRevision: source,
+      status: "changed", changedPaths: ["server/src/services/native-runtime/example.ts"], observedAt: clock.toISOString() });
+    clock = new Date(clock.getTime() + 3 * 60_000);
+    fail = true;
+    const second = await svc.atlasSource(randomUUID(), actor);
+    expect(second.status).toBe("unknown");
+    expect(second.sourceRevision).toBeNull();
+    // A failed read for the same authorized scope preserves last-good evidence without calling it current.
+    const companyId = randomUUID();
+    fail = false;
+    clock = new Date("2026-11-11T04:00:00Z");
+    await svc.atlasSource(companyId, actor);
+    fail = true;
+    clock = new Date(clock.getTime() + 3 * 60_000);
+    const lastGood = await svc.atlasSource(companyId, actor);
+    expect(lastGood).toMatchObject({ status: "unknown", sourceRevision: source, changedPaths: first.changedPaths,
+      observedAt: "2026-11-11T04:00:00.000Z" });
+  });
 });

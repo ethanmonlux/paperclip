@@ -15,5 +15,12 @@ export function stapleConsoleRoutes(db: Db) {
     res.json(await svc.board(companyId, req.actor));
   });
 
+  router.get("/companies/:companyId/system-atlas/source", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.set("cache-control", "no-store");
+    res.json(await svc.atlasSource(companyId, req.actor));
+  });
+
   return router;
 }

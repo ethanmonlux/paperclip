@@ -44,6 +44,7 @@ import {
   type StapleConsoleScheduledEvent,
   type StapleConsoleSourceStatus,
   type StapleConsoleMaintenanceHold,
+  type StapleAtlasSource,
 } from "@paperclipai/shared/staple-console";
 import { maintenanceHoldService } from "./maintenance-hold.js";
 import { notFound } from "../errors.js";
@@ -78,6 +79,7 @@ const INSTALLED_CHECK_TTL_MS = 6 * 60 * 60_000;
 const STAPLE_REPO = STAPLE_CONSOLE_LANES.find((lane) => lane.key === "staple")?.defaultRepo ?? "ethanmonlux/paperclip";
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
+const ATLAS_SOURCE_TTL_MS = 2 * 60_000;
 const GITHUB_TIMEOUT_MS = 8_000;
 
 /**
@@ -111,6 +113,7 @@ export interface StapleConsoleServiceOptions {
   fetch?: FetchLike;
   credentialProvider?: (companyId: string, actor: AuthorizationActor) => Promise<StapleConsoleGitHubCredential | null>;
   now?: () => Date;
+  installedRevision?: () => string | null;
 }
 
 function iso(value: Date | string | null | undefined): string | null {
@@ -226,6 +229,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
 
   const credentialProvider = opts.credentialProvider ?? defaultCredential;
   const prCache = new Map<string, { value: PullRequestSnapshot; expiresAt: number }>();
+  const atlasSourceCache = new Map<string, { sourceRevision: string; changedPaths: string[]; observedAt: string; expiresAt: number }>();
   const holdService = maintenanceHoldService(db);
 
   async function githubJson(path: string, token: string) {
@@ -890,6 +894,46 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     return { ...built, maintenanceHold };
   }
 
+  async function atlasSource(companyId: string, actor: AuthorizationActor): Promise<StapleAtlasSource> {
+    const nowMs = (opts.now?.() ?? new Date()).getTime();
+    const installed = getServerInfoSnapshot().git;
+    const installedRevision = opts.installedRevision ? opts.installedRevision() : installed.available ? installed.fullSha : null;
+    const result: StapleAtlasSource = {
+      authoredRevision: installedRevision ?? "unknown", sourceRevision: null, installedRevision,
+      changedPaths: null, status: "unknown", observedAt: new Date(nowMs).toISOString(),
+    };
+    const credential = await credentialProvider(companyId, actor).catch(() => null);
+    if (!credential || !installedRevision) return result;
+    const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
+    const scope = `${companyId}|${viewer}|${createHash("sha256").update(credential.token).digest("hex")}|${installedRevision}`;
+    const cached = atlasSourceCache.get(scope);
+    try {
+      let source = cached;
+      if (!source || source.expiresAt <= nowMs) {
+        const head = asRecord(await githubJson(`/repos/${STAPLE_REPO}/commits/master`, credential.token));
+        const sourceRevision = typeof head?.sha === "string" ? head.sha : null;
+        if (!sourceRevision) throw new Error("GitHub source revision unavailable");
+        let changedPaths: string[] = [];
+        if (sourceRevision !== installedRevision) {
+          const comparison = asRecord(await githubJson(`/repos/${STAPLE_REPO}/compare/${installedRevision}...${sourceRevision}`, credential.token));
+          const files = Array.isArray(comparison?.files) ? comparison.files : null;
+          if (!files || files.length >= 300 || !["ahead", "identical"].includes(String(comparison?.status))) throw new Error("GitHub source comparison incomplete");
+          changedPaths = files.flatMap((file) => {
+            const name = asRecord(file)?.filename;
+            return typeof name === "string" ? [name] : [];
+          });
+        }
+        source = { sourceRevision, changedPaths, observedAt: new Date(nowMs).toISOString(), expiresAt: nowMs + ATLAS_SOURCE_TTL_MS };
+        atlasSourceCache.set(scope, source);
+        if (atlasSourceCache.size > 100) atlasSourceCache.delete(atlasSourceCache.keys().next().value!);
+      }
+      return { ...result, sourceRevision: source.sourceRevision, changedPaths: source.changedPaths, observedAt: source.observedAt, status: source.changedPaths.length ? "changed" : "current" };
+    } catch {
+      // Keep last-good source evidence but mark the current comparison unknown.
+      return cached ? { ...result, sourceRevision: cached.sourceRevision, changedPaths: cached.changedPaths, observedAt: cached.observedAt } : result;
+    }
+  }
+
   async function readMaintenanceHoldBanner(): Promise<StapleConsoleMaintenanceHold | null> {
     try {
       const status = await holdService.status();
@@ -907,5 +951,5 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     }
   }
 
-  return { board };
+  return { board, atlasSource };
 }

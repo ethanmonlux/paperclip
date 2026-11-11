@@ -800,7 +800,7 @@ export function StapleConsole() {
   return (
     <div className="mx-auto w-full max-w-3xl space-y-4 pb-10" data-testid="staple-console">
       <div className="flex items-baseline justify-between gap-2">
-        <h1 className="text-xl font-semibold text-foreground">Staple Console</h1>
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1"><h1 className="text-xl font-semibold text-foreground">Staple Console</h1><Link to="/system-atlas" className="text-sm font-medium underline underline-offset-2">System Atlas</Link></div>
         <span
           className={cn("text-xs tabular-nums", stale ? "font-semibold text-muted-foreground" : "text-muted-foreground")}
           data-testid="staple-console-freshness"

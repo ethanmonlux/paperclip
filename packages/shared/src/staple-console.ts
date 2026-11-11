@@ -436,6 +436,15 @@ export interface StapleConsoleMaintenanceHold {
   parkedRuns: number;
 }
 
+export interface StapleAtlasSource {
+  authoredRevision: string;
+  sourceRevision: string | null;
+  installedRevision: string | null;
+  changedPaths: string[] | null;
+  status: "current" | "changed" | "unknown";
+  observedAt: string;
+}
+
 export interface StapleConsoleBoard {
   generatedAt: string;
   /** Present while the nightly maintenance hold is active. */

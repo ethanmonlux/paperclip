@@ -74,6 +74,7 @@ const CaseDetail = lazy(() => import("./pages/CaseDetail").then((module) => ({ d
 const Dashboard = lazy(() => import("./pages/Dashboard").then((module) => ({ default: module.Dashboard })));
 const DashboardLive = lazy(() => import("./pages/DashboardLive").then((module) => ({ default: module.DashboardLive })));
 const StapleConsole = lazy(() => import("./pages/StapleConsole").then((module) => ({ default: module.StapleConsole })));
+const SystemAtlas = lazy(() => import("./pages/SystemAtlas").then((module) => ({ default: module.SystemAtlas })));
 const Timeline = lazy(() => import("./pages/Timeline").then((module) => ({ default: module.Timeline })));
 const Companies = lazy(() => import("./pages/Companies").then((module) => ({ default: module.Companies })));
 const AgentDetail = lazy(() => import("./pages/AgentDetailPage").then((module) => ({ default: module.AgentDetailPage })));
@@ -155,6 +156,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route path="dashboard" element={<Dashboard />} />
       <Route path="dashboard/live" element={<DashboardLive />} />
       <Route path="console" element={<StapleConsole />} />
+      <Route path="system-atlas" element={<SystemAtlas />} />
       <Route
         path="timeline"
         element={streamlinedUiEnabled ? <AuditCompatibilityRedirect to="/activity/timeline" /> : <Timeline />}

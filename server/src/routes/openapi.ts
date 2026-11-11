@@ -6397,6 +6397,15 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/system-atlas/source",
+  tags: ["dashboard"],
+  summary: "Compare the installed System Atlas explanation with current source",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/issues/{issueId}/merge-gate",
   tags: ["issues"],
