@@ -9,6 +9,21 @@ export interface AtlasNode {
 }
 export interface AtlasChapter { id: string; title: string; introduction: string; nodes: AtlasNode[] }
 
+/** An illustrative route through the existing native task and delivery records. */
+export const atlasOverviewStages = [
+  { title: "Request", detail: "Ethan asks for an Item artwork button that opens the explorer in one tap.", owner: "Ethan sets the outcome", node: "brief" },
+  { title: "Clear success criteria", detail: "The task says what must work: phone navigation, safe Back and Home, current artwork, and access checks.", owner: "Coordinator records acceptance", node: "assignment" },
+  { title: "Implementation", detail: "An assigned engineer changes the task branch and links a reviewable PR.", owner: "Engineer builds", node: "branch" },
+  { title: "Independent review and tests", detail: "CI checks the candidate; a separate reviewer checks behavior and sends corrections back to the engineer.", owner: "CI and reviewer check", node: "review" },
+  { title: "Delivered usable result", detail: "After merge and nightly activation, Ethan opens the real phone route and records what works.", owner: "Coordinator verifies delivery", node: "acceptance" },
+] as const;
+
+export const atlasOverviewPaths = [
+  { title: "Why trust the result?", summary: "Read the exact-head checks, independent review, phone evidence and remaining unknowns.", nodes: ["ci", "review", "acceptance"] },
+  { title: "What happens when something breaks?", summary: "A failed check or stalled run returns to its owner for a focused fix, retry or visible escalation.", nodes: ["correction", "retry", "notifications"] },
+  { title: "How does the system change safely?", summary: "Upstream changes use small local patches; the nightly watcher keeps backup and rollback evidence.", nodes: ["candidate", "backup", "rollback"] },
+] as const;
+
 const node = (id: string, title: string, summary: string, workings: string, evidence: string, paths: string[]): AtlasNode => ({ id, title, summary, workings, evidence, paths });
 const task = ["server/src/routes/issues", "server/src/services/issues", "server/src/services/issue", "packages/db/src/schema/issues"];
 const native = ["server/src/services/native-runtime/", "packages/paperclip-runner/"];

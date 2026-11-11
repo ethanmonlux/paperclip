@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { atlasAffectedNodes, atlasChapters, atlasWalkthroughs } from "./system-atlas-data";
+import { atlasAffectedNodes, atlasChapters, atlasOverviewStages, atlasWalkthroughs } from "./system-atlas-data";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-a", companies: [{ id: "company-a" }] }) }));
@@ -20,6 +20,7 @@ let container: HTMLDivElement;
 let client: QueryClient;
 beforeEach(() => {
   Object.defineProperty(window, "innerWidth", { configurable: true, value: 380 });
+  Element.prototype.scrollIntoView = vi.fn();
   container = document.createElement("div"); document.body.appendChild(container);
   root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -38,11 +39,28 @@ describe("System Atlas", () => {
     expect(atlasAffectedNodes(["server/src/services/native-runtime/example.ts"])).toContain("session");
     expect(atlasAffectedNodes(["server/src/services/native-runtime/example.ts"])).not.toContain("github");
   });
+  it("opens on the guided flow and keeps recovery and details optional", async () => {
+    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/STA/system-atlas"]}><SystemAtlas /></MemoryRouter></QueryClientProvider>));
+    expect(atlasOverviewStages).toHaveLength(5);
+    expect(container.querySelector('[data-testid="atlas-overview"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="atlas-chapters"]')).toBeNull();
+    expect(container.textContent).toContain("Correction loop");
+    expect(container.textContent).toContain("Recovery loop");
+    expect(container.textContent).toContain("Why trust the result?");
+    expect(container.textContent).toContain("Finish means observed use.");
+    const detail = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("How this stage works"))!;
+    await act(async () => detail.click());
+    expect(container.querySelector('[data-testid="atlas-chapters"]')).not.toBeNull();
+    const back = [...container.querySelectorAll("header button")].find((button) => button.textContent?.includes("Back"))!;
+    await act(async () => back.click());
+    expect(container.querySelector('[data-testid="atlas-overview"]')).not.toBeNull();
+  });
   it("navigates chapters and progressive detail at 380px with separate revision labels", async () => {
     await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/STA/system-atlas"]}><SystemAtlas /></MemoryRouter></QueryClientProvider>));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(container.textContent).toContain("Source revision");
     expect(container.textContent).toContain("Installed revision");
+    await act(async () => [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Open all seven detailed chapters"))!.click());
     const chapters = container.querySelector('nav[aria-label="Atlas chapters"]')!;
     expect(chapters.querySelectorAll("button")).toHaveLength(7);
     const work = [...chapters.querySelectorAll("button")].find((button) => button.textContent?.includes("Work execution"))!;
