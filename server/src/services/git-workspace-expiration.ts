@@ -51,7 +51,8 @@ export async function exclusiveAllocatedBytes(target: string, shouldContinue: ()
       bytes += allocated;
     }
     if (entry.isDirectory()) {
-      for (const name of await fs.readdir(entryPath)) await visit(path.join(entryPath, name));
+      const directory = await fs.opendir(entryPath);
+      for await (const child of directory) await visit(path.join(entryPath, child.name));
     }
   };
   await visit(target);

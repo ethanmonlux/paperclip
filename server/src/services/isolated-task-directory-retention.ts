@@ -562,16 +562,20 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       // An orphan has no bound workspace or issue closeout to prove that files
       // were delivered. Keep all nonempty contents until an authoritative
       // checkpoint or publication record qualifies them separately.
-      if ((await fs.readdir(folder)).length > 0) throw new Error("orphan_contents_unqualified");
+      const directory = await fs.opendir(folder);
+      let hasContents = false;
+      try { hasContents = (await directory.read()) !== null; }
+      finally { await directory.close(); }
+      if (hasContents) throw new Error("orphan_contents_unqualified");
       if (options.dryRun) {
         result.outcome = "dry_run";
         return;
       }
-      const trash = shortSiblingName(folder, ".expired-");
-      await fs.rename(folder, trash);
-      await removeTaskDirectoryTree(trash).catch(() => {
-        result.walkRetryAt = nowMs + TASK_DIRECTORY_RETRY_MS;
-        throw new Error("task_directory_trash_pending");
+      // rmdir is atomic with respect to newly published files. A recursive
+      // rename-and-remove would delete contents added after the empty check.
+      await fs.rmdir(folder).catch((error: NodeJS.ErrnoException) => {
+        if (["ENOTEMPTY", "EEXIST", "ENOENT"].includes(error.code ?? "")) throw new Error("task_directory_changed");
+        throw error;
       });
       result.outcome = "removed";
       result.reclaimedBytes = result.candidateBytes;
