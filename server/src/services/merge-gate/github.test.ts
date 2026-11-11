@@ -1,0 +1,20 @@
+import { describe, expect, it, vi } from "vitest";
+import { createMergeGateGitHub } from "./github.js";
+
+describe("merge gate GitHub candidate identity", () => {
+  it("retains exact source, workflow path and check-suite identity from GitHub", async () => {
+    const headSha = "a".repeat(40);
+    const fetchImpl = vi.fn(async (url: string) => new Response(JSON.stringify(url.includes("/check-runs")
+      ? { total_count: 1, check_runs: [{ id: 111, name: "candidate", status: "completed", conclusion: "success", head_sha: headSha, check_suite: { id: 91 } }] }
+      : { total_count: 1, workflow_runs: [{ id: 1234, name: "Internal Windows Candidate", status: "completed", conclusion: "success",
+        head_sha: headSha, check_suite_id: 91, path: ".github/workflows/internal-windows.yml@refs/heads/finished-candidate",
+        run_attempt: 2, created_at: "2026-11-11T12:00:00Z" }] })));
+    const github = createMergeGateGitHub({ repo: "ethanmonlux/facette", token: "test", fetchImpl });
+    expect(await github.checks(headSha)).toEqual({ complete: true, checks: [
+      { kind: "check_run", name: "candidate", status: "completed", conclusion: "success", headSha, checkSuiteId: 91, checkRunId: 111 },
+      { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success", headSha, checkSuiteId: 91,
+        runId: 1234, workflowPath: ".github/workflows/internal-windows.yml", runAttempt: 2, createdAt: "2026-11-11T12:00:00Z" },
+    ] });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});

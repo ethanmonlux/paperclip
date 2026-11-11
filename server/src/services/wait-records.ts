@@ -41,6 +41,7 @@ export const CI_QUEUED_REPORT_MS = 30 * 60_000;
 export const PR_MERGEABLE_DEFAULT_DEADLINE_MS = 24 * 60 * 60_000;
 const GITHUB_TIMEOUT_MS = 8_000;
 const GITHUB_PAGE_SIZE = 100;
+const MAX_WORKFLOW_JOB_PAGES = 10;
 
 const ACTIVE_WORKFLOW_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]);
@@ -66,8 +67,12 @@ export function prepareWaitRecordMonitor<T extends Pick<IssueExecutionMonitorPol
   if (!target) throw unprocessable(`A ${monitor.kind} wait needs target.repo`);
   if (monitor.kind === "ci") {
     if (!target.sha) throw unprocessable("A ci wait needs the exact pushed head in target.sha");
+    if (target.workflowRunId != null && (!Number.isSafeInteger(target.workflowRunId) || target.workflowRunId <= 0)) {
+      throw unprocessable("target.workflowRunId must be a positive safe integer");
+    }
     return { ...monitor, target: { ...target, pushedAt: target.pushedAt ?? now.toISOString() } };
   }
+  if (target.workflowRunId != null) throw unprocessable("target.workflowRunId applies only to kind ci");
   if (!target.pullNumber) throw unprocessable("A pr_mergeable wait needs target.pullNumber");
   if (monitor.timeoutAt) return monitor;
   const deadline = new Date(Math.max(now.getTime(), Date.parse(monitor.nextCheckAt)) + PR_MERGEABLE_DEFAULT_DEADLINE_MS);
@@ -88,6 +93,7 @@ export interface GitHubWorkflowRunReading {
   conclusion: string | null;
   checkSuiteId: number | null;
   createdAt: string | null;
+  headSha?: string | null;
 }
 
 export interface GitHubPullRequestReading {
@@ -169,6 +175,27 @@ export function classifyCiWait(input: {
   const gate = pullRequestGate(target, snapshot.pullRequest, now);
   if (gate) return { action: "wake", observation: gate };
 
+  if (target.workflowRunId != null) {
+    const run = snapshot.workflowRuns[0];
+    if (snapshot.workflowRuns.length !== 1 || run?.id !== target.workflowRunId || !run.headSha) {
+      return { action: "fallback", observation: observation("unobservable", now,
+        `Workflow run ${target.workflowRunId} could not be identified. Keep the candidate pending; do not dispatch a duplicate.`) };
+    }
+    if (run.headSha.toLowerCase() !== target.sha?.toLowerCase()) {
+      return { action: "wake", observation: observation("superseded", now,
+        `Workflow run ${run.id} belongs to ${shortSha(run.headSha)}, not ${sha}. It cannot prove this candidate; inspect the current head before dispatching.`) };
+    }
+    if (!snapshot.checkRunsComplete || run.checkSuiteId === null ||
+      snapshot.checkRuns.some(job => job.checkSuiteId !== run.checkSuiteId)) {
+      return { action: "fallback", observation: observation("unobservable", now,
+        `The complete jobs for workflow run ${run.id} could not be verified. Keep the candidate pending; inspect the existing run instead of dispatching again.`) };
+    }
+    if (run.status === "completed" && snapshot.checkRuns.length === 0) {
+      return { action: "wake", observation: observation("startup_failure", now,
+        `Workflow run ${run.id} on ${sha} completed with zero jobs. It is not candidate proof; fix the workflow before an explicit retry.`) };
+    }
+  }
+
   const suitesWithJobs = new Set(snapshot.checkRuns.map(run => run.checkSuiteId).filter((id): id is number => id !== null));
   const startupFailure = snapshot.workflowRuns.find(run =>
     run.conclusion === "startup_failure" || run.conclusion === "action_required" || run.status === "action_required" ||
@@ -206,6 +233,14 @@ export function classifyCiWait(input: {
 
   const completedRuns = snapshot.checkRuns.length + snapshot.workflowRuns.length;
   if (completedRuns > 0) {
+    if (target.workflowRunId != null) {
+      const allSucceeded = snapshot.workflowRuns.every(run => run.status === "completed" && run.conclusion === "success") &&
+        snapshot.checkRuns.length > 0 && snapshot.checkRuns.every(run => run.status === "completed" && run.conclusion === "success");
+      return { action: "wake", observation: observation(allSucceeded ? "passed" : "failed", now,
+        allSucceeded
+          ? `Workflow run ${target.workflowRunId} at ${sha} succeeded with ${snapshot.checkRuns.length} successful jobs. Recheck the merge gate before merging.`
+          : `Workflow run ${target.workflowRunId} at ${sha} did not succeed in every job. Keep the candidate blocked and investigate; do not automatically retry.`) };
+    }
     const failedChecks = snapshot.checkRuns.filter(run => run.conclusion && FAILED_CONCLUSIONS.has(run.conclusion));
     const failedWorkflows = snapshot.workflowRuns.filter(run => run.conclusion && FAILED_CONCLUSIONS.has(run.conclusion));
     if (failedChecks.length > 0 || failedWorkflows.length > 0) {
@@ -317,6 +352,40 @@ export async function readGitHubWaitSnapshot(input: {
     return { checkRuns: [], checkRunsComplete: true, workflowRuns: [], pullRequest };
   }
 
+  if (input.target.workflowRunId != null) {
+    const run = await github(`/actions/runs/${input.target.workflowRunId}`);
+    const workflow: GitHubWorkflowRunReading = {
+      id: readNumber(run?.id) ?? 0,
+      name: readString(run?.name) ?? "workflow",
+      status: readString(run?.status) ?? "queued",
+      conclusion: readString(run?.conclusion),
+      checkSuiteId: readNumber(run?.check_suite_id),
+      createdAt: readString(run?.created_at),
+      headSha: readString(run?.head_sha),
+    };
+    if (workflow.id !== input.target.workflowRunId || workflow.headSha?.toLowerCase() !== input.target.sha.toLowerCase()) {
+      return { checkRuns: [], checkRunsComplete: false, workflowRuns: [workflow], pullRequest };
+    }
+    const checkRuns: GitHubCheckRunReading[] = [];
+    let complete = false;
+    for (let page = 1; page <= MAX_WORKFLOW_JOB_PAGES; page++) {
+      const jobs = await github(`/actions/runs/${workflow.id}/jobs?filter=latest&per_page=${GITHUB_PAGE_SIZE}&page=${page}`);
+      const rows = Array.isArray(jobs?.jobs) ? jobs.jobs : [];
+      for (const raw of rows) {
+        const job = asRecord(raw);
+        if (readNumber(job?.run_id) !== workflow.id || readString(job?.head_sha)?.toLowerCase() !== input.target.sha.toLowerCase()) {
+          throw new Error(`GitHub returned a job outside workflow run ${workflow.id} at the target SHA`);
+        }
+        checkRuns.push({ name: readString(job?.name) ?? "job", status: readString(job?.status) ?? "queued",
+          conclusion: readString(job?.conclusion), checkSuiteId: workflow.checkSuiteId });
+      }
+      const total = readNumber(jobs?.total_count);
+      if (total !== null && checkRuns.length >= total) { complete = true; break; }
+      if (rows.length < GITHUB_PAGE_SIZE) { complete = total === null; break; }
+    }
+    return { checkRuns, checkRunsComplete: complete, workflowRuns: [workflow], pullRequest };
+  }
+
   const sha = encodeURIComponent(input.target.sha);
   const [checks, workflows] = await Promise.all([
     github(`/commits/${sha}/check-runs?per_page=${GITHUB_PAGE_SIZE}`),
@@ -377,3 +446,4 @@ export async function evaluateServerWait(input: {
       `GitHub could not be read for ${monitor.target.repo}${status ? ` (HTTP ${status})` : ""}; check the wait target yourself.`) };
   }
 }
+
