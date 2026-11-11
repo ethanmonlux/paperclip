@@ -377,16 +377,18 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       dryRun: false, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
       restorePoint: { storage: getStorageService(), keyDurable: true }, ...overrides });
 
-    async function orphan(options: { modifiedDaysAgo?: number } = {}) {
+    async function orphan(options: { modifiedDaysAgo?: number; withContents?: boolean } = {}) {
       const companyId = randomUUID(), issueId = randomUUID();
       const cwd = await materializeIsolatedTaskDirectory({ companyId, issueId });
-      await fs.writeFile(path.join(cwd, "left.txt"), "left behind\n");
-      await fs.symlink(outside, path.join(cwd, "outside-link"));
+      if (options.withContents) {
+        await fs.writeFile(path.join(cwd, "left.txt"), "left behind\n");
+        await fs.symlink(outside, path.join(cwd, "outside-link"));
+      }
       await age(cwd, new Date(Date.now() - (options.modifiedDaysAgo ?? 10) * DAY_MS));
       return { companyId, issueId, cwd };
     }
 
-    it("removes an orphan whose issue is gone after the grace period", async () => {
+    it("removes an empty orphan whose issue is gone after the grace period", async () => {
       const o = await orphan();
       const batch = await sweep();
       expect(batch.results).toMatchObject([{ issueId: o.issueId, outcome: "removed", reason: null }]);
@@ -410,13 +412,26 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await exists(o.cwd)).toBe(true);
     });
 
+    it("reports and retains unqualified orphan contents", async () => {
+      const o = await orphan({ withContents: true });
+      const batch = await sweep({ dryRun: true });
+      expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
+        outcome: "skipped", reason: "orphan_contents_unqualified" }]);
+      expect(batch.results[0]!.candidateBytes).toBeGreaterThan(0);
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId,
+        outcome: "skipped", reason: "orphan_contents_unqualified" }]);
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
     it("reports one physical folder when many workspace hints alias it", async () => {
-      const o = await orphan();
+      const o = await orphan({ withContents: true });
       const results = await inspectIsolatedTaskDirectoryFolders(db,
         Array.from({ length: 300 }, () => ({ companyId: o.companyId, issueId: o.issueId })),
         { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
-      expect(results).toMatchObject([{ companyId: o.companyId, issueId: o.issueId, outcome: "dry_run" }]);
+      expect(results).toMatchObject([{ companyId: o.companyId, issueId: o.issueId, allowedScope: o.cwd,
+        ownerStatus: null, outcome: "skipped", reason: "orphan_contents_unqualified" }]);
       expect(results).toHaveLength(1);
+      expect(results[0]!.physicalObject).toBe(`${(await fs.lstat(o.cwd)).dev}:${(await fs.lstat(o.cwd)).ino}`);
       expect(await exists(o.cwd)).toBe(true);
     });
 
@@ -425,8 +440,9 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await db.insert(companies).values({ id: o.companyId, name: "Live", issuePrefix: `LV${o.companyId.slice(0, 6)}` });
       await db.insert(executionWorkspaces).values({ companyId: o.companyId, mode: "shared_workspace", strategyType: "project_primary",
         name: "Live", status: "active", providerType: "local_fs", cwd: path.join(o.cwd, "sub") });
-      const batch = await sweep();
-      expect(batch.results).toEqual([]);
+      const batch = await sweep({ dryRun: true });
+      expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
+        outcome: "skipped", reason: "live_workspace" }]);
       expect(await exists(o.cwd)).toBe(true);
     });
 

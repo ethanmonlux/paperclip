@@ -10,7 +10,7 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { openRestorePoint, sealRestorePoint, verifyRestorePointPayloadCandidate } from "./git-restore-point.js";
 import { notifyGitRestorePointWork } from "./git-restore-point-ledger.js";
 import { abandonGitRestorePoint, activateGitRestorePoints, readRestorePointObject, storeSealedRestorePoint } from "./git-restore-point-storage.js";
-import { allocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
+import { exclusiveAllocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
 import { IsolatedRepositorySourceBusy, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
 import { logActivity } from "./activity-log.js";
 import {
@@ -249,7 +249,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         const present = await directoryState(cwd) === "present";
         if (!state) {
           if (!present) throw new Error("missing_task_directory");
-          result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
           // A preview needs the same bounded qualification, but must not retain
           // every file body in memory just to discard the encoded snapshot.
           if (options.dryRun) {
@@ -289,7 +289,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           }
         } else {
           result.candidate = true;
-          if (present) result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          if (present) result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
           if (options.dryRun) return result;
         }
         if (!workspace) throw new Error("workspace_changed");
@@ -320,7 +320,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           await fs.rename(cwd, state.trash);
         }
         if (await exists(state.trash)) {
-          const bytes = await allocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; }).catch(() => result.candidateBytes);
+          const bytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; }).catch(() => result.candidateBytes);
           await removeTaskDirectoryTree(state.trash);
           result.reclaimedBytes = bytes;
         }
@@ -406,6 +406,9 @@ export async function restoreIsolatedTaskDirectory(input: {
 export type TaskDirectoryFolderResult = {
   companyId: string;
   issueId: string;
+  physicalObject: string;
+  allowedScope: string;
+  ownerStatus: string | null;
   outcome: "removed" | "preserved_and_removed" | "dry_run" | "skipped";
   reason: string | null;
   candidateBytes: number;
@@ -492,7 +495,8 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   if (!root) return null;
   const companyDir = path.join(root, companyId);
   const folder = path.join(companyDir, name);
-  const result: TaskDirectoryFolderResult = { companyId, issueId: name, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
+  const result: TaskDirectoryFolderResult = { companyId, issueId: name, physicalObject: "unknown", allowedScope: folder,
+    ownerStatus: null, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
   const retry = (at: number) => { result.retryAt = result.retryAt === undefined ? at : Math.min(result.retryAt, at); };
   try {
     if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
@@ -502,11 +506,15 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     });
     if (!stat) return null;
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_task_directory");
+    result.physicalObject = `${stat.dev}:${stat.ino}`;
     const rows = await folderRows(db, folder);
-    if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) return null;
+    if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) {
+      throw new Error("live_workspace");
+    }
     if (rows.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
-    const [issue] = await db.select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+    const [issue] = await db.select({ id: issues.id, status: issues.status, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
+    result.ownerStatus = issue?.status ?? null;
     const tree = issue ? await issueTreeState(db, companyId, name) : { exists: false, open: false, closedAt: null };
     if (tree.exists && (tree.open || !tree.closedAt)) throw new Error("issue_open");
     const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
@@ -550,7 +558,11 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
         const latest = await issueTreeState(db, companyId, name);
         if (latest.open || !latest.closedAt || latest.closedAt.getTime() + options.orphanGraceMs > nowMs) throw new Error("issue_open");
       }
-      result.candidateBytes = await allocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
+      result.candidateBytes = await exclusiveAllocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; });
+      // An orphan has no bound workspace or issue closeout to prove that files
+      // were delivered. Keep all nonempty contents until an authoritative
+      // checkpoint or publication record qualifies them separately.
+      if ((await fs.readdir(folder)).length > 0) throw new Error("orphan_contents_unqualified");
       if (options.dryRun) {
         result.outcome = "dry_run";
         return;

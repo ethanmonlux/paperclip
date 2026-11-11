@@ -28,6 +28,36 @@ export async function allocatedBytes(target: string, shouldContinue: () => boole
   if (entry.isDirectory()) for (const name of await fs.readdir(target)) bytes += await allocatedBytes(path.join(target, name), shouldContinue);
   return bytes;
 }
+
+/** Estimate blocks released by removing exactly this tree. A hardlinked file
+ * only releases its blocks when every link is inside the tree. Keep entries
+ * with one link out of the map, so ordinary large trees use bounded state. */
+export async function exclusiveAllocatedBytes(target: string, shouldContinue: () => boolean): Promise<number> {
+  const links = new Map<string, { bytes: number; observed: number; total: number }>();
+  let bytes = 0;
+  let entries = 0;
+  const visit = async (entryPath: string): Promise<void> => {
+    if (!shouldContinue()) throw new Error("scan_stopped");
+    if (++entries > 100_000) throw new Error("exclusive_byte_scan_limit_exceeded");
+    const entry = await fs.lstat(entryPath);
+    if (!entry.isDirectory() && !entry.isFile() && !entry.isSymbolicLink()) throw new Error("unsupported_filesystem_entry");
+    const allocated = entry.blocks * 512;
+    if (!entry.isDirectory() && entry.nlink > 1) {
+      const key = `${entry.dev}:${entry.ino}`;
+      const current = links.get(key);
+      if (current) current.observed += 1;
+      else links.set(key, { bytes: allocated, observed: 1, total: entry.nlink });
+    } else {
+      bytes += allocated;
+    }
+    if (entry.isDirectory()) {
+      for (const name of await fs.readdir(entryPath)) await visit(path.join(entryPath, name));
+    }
+  };
+  await visit(target);
+  for (const link of links.values()) if (link.observed === link.total) bytes += link.bytes;
+  return bytes;
+}
 export function gitExpirationSkipReason(error: unknown) {
   if (error instanceof GitCacheRestorationFailure) return "upstream_commit_unverified";
   return error instanceof Error && /^[a-z][a-z_]+$/.test(error.message) ? error.message : "inspection_failed";
