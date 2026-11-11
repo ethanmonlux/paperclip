@@ -282,6 +282,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
   });
 
+  it("does not preview stale saved contents after an interrupted removal", async () => {
+    const f = await fixture();
+    await f.expire({ beforeDelete: async () => { throw new Error("simulated_crash"); } });
+    const saved = readTaskDirectoryRetention(await f.row());
+    expect(saved).toMatchObject({ removed: false });
+
+    await fs.writeFile(path.join(f.cwd, "late.txt"), "unpublished work\n");
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false,
+      skipReason: "task_directory_changed" });
+    expect(await exists(f.cwd)).toBe(true);
+    expect(readTaskDirectoryRetention(await f.row())).toEqual(saved);
+  });
+
   it("never follows a task directory that is a symbolic link", async () => {
     const f = await fixture();
     const moved = path.join(root, `moved-${f.issueId}`);

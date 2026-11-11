@@ -288,8 +288,19 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             });
           }
         } else {
+          if (present) {
+            result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+            if (options.dryRun) {
+              const current = await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
+              if (current.digest !== state.restorePoint.digest) throw new Error("task_directory_changed");
+            }
+          } else if (options.dryRun) {
+            // A saved intent can survive a crash after the rename. Preview the
+            // actual trash object, never the original folder's old estimate.
+            if (await directoryState(state.trash) !== "present") throw new Error("missing_task_directory");
+            result.candidateBytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; });
+          }
           result.candidate = true;
-          if (present) result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
           if (options.dryRun) return result;
         }
         if (!workspace) throw new Error("workspace_changed");
