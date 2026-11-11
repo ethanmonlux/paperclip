@@ -124,6 +124,49 @@ describe("ci wait record (FAC-840 incident replays)", () => {
     expect(failed.observation.detail).toContain("server");
   });
 
+  it("wakes on a terminal failed parent despite queued children and other active workflows", () => {
+    for (const conclusion of ["failure", "timed_out", "cancelled", "stale"]) {
+      const result = classifyCiWait({ target, now, snapshot: snapshot({
+        checkRuns: [{ name: "windows-fast", status: "queued", conclusion: null, checkSuiteId: 7 }],
+        workflowRuns: [
+          { id: 1, workflowId: 11, name: "CI", status: "completed", conclusion, checkSuiteId: 7, createdAt: minutesAgo(40) },
+          { id: 2, workflowId: 12, name: "Other", status: "in_progress", conclusion: null, checkSuiteId: 8, createdAt: minutesAgo(5) },
+        ],
+      }) });
+      expect(result).toMatchObject({ action: "wake", observation: { state: "failed" } });
+    }
+  });
+
+  it("uses a newer run of the same workflow without dropping another workflow's failure", () => {
+    const old = { id: 1, workflowId: 11, name: "CI", status: "completed", conclusion: "failure",
+      checkSuiteId: 7, createdAt: minutesAgo(40) };
+    const current = { ...old, id: 2, checkSuiteId: 8, createdAt: minutesAgo(5), status: "in_progress", conclusion: null };
+    const checks = [
+      { name: "old", status: "completed", conclusion: "failure", checkSuiteId: 7 },
+      { name: "current", status: "in_progress", conclusion: null, checkSuiteId: 8 },
+    ];
+    expect(classifyCiWait({ target, now, snapshot: snapshot({ checkRuns: checks, workflowRuns: [old, current] }) }))
+      .toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
+    expect(classifyCiWait({ target, now, snapshot: snapshot({
+      checkRuns: [checks[0], { ...checks[1], status: "completed", conclusion: "success" }],
+      workflowRuns: [old, { ...current, status: "completed", conclusion: "success" }],
+    }) })).toMatchObject({ action: "wake", observation: { state: "passed" } });
+    expect(classifyCiWait({ target, now, snapshot: snapshot({
+      checkRuns: checks, workflowRuns: [current, { ...old, workflowId: 12, name: "Other CI" }],
+    }) })).toMatchObject({ action: "wake", observation: { state: "failed" } });
+  });
+
+  it("keeps an active rerun of the same run ID waiting despite an earlier failed check", () => {
+    expect(classifyCiWait({ target, now, snapshot: snapshot({
+      checkRuns: [
+        { name: "old", status: "completed", conclusion: "failure", checkSuiteId: 7 },
+        { name: "retry", status: "queued", conclusion: null, checkSuiteId: 7 },
+      ],
+      workflowRuns: [{ id: 1, workflowId: 11, name: "CI", status: "queued", conclusion: null,
+        checkSuiteId: 7, createdAt: minutesAgo(45) }],
+    }) })).toMatchObject({ action: "keep_waiting", observation: { state: "queued_long" } });
+  });
+
   it("wakes when the PR head moved past the recorded SHA", () => {
     const result = classifyCiWait({ target, snapshot: snapshot({ pullRequest: { ...cleanPr, headSha: "f".repeat(40) } }), now });
     expect(result).toMatchObject({ action: "wake", observation: { state: "superseded" } });
@@ -159,6 +202,19 @@ describe("ci wait bound to a candidate run (FAC-151)", () => {
       expect(classify(candidate({ workflowRuns: [{ ...run, conclusion }] })))
         .toMatchObject({ action: "wake", observation: { state: "failed" } });
     }
+  });
+
+  it("wakes when the selected run completed but a child still says queued", () => {
+    for (const conclusion of ["failure", "cancelled", "success"]) {
+      expect(classify(candidate({
+        workflowRuns: [{ ...run, conclusion }],
+        checkRuns: jobs.map(job => job.name === "candidate" ? { ...job, status: "queued", conclusion: null } : job),
+      }))).toMatchObject({ action: "wake", observation: { state: "failed" } });
+    }
+    expect(classify(candidate({
+      workflowRuns: [{ ...run, status: "in_progress", conclusion: null }],
+      checkRuns: jobs.map(job => ({ ...job, status: "queued", conclusion: null })),
+    }))).toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
   });
 
   it("does not pass empty, incomplete or unrelated job evidence", () => {
@@ -268,11 +324,11 @@ describe("server wait evaluation through GitHub", () => {
     const fetchImpl = fakeGitHub({
       "/pulls/25": { state: "open", merged: false, mergeable: true, mergeable_state: "clean", head: { sha } },
       [`/commits/${sha}/check-runs`]: { total_count: 1, check_runs: [{ name: "server", status: "queued", conclusion: null, check_suite: { id: 7 } }] },
-      [`/actions/runs?head_sha=${sha}`]: { workflow_runs: [{ id: 1, name: "CI", status: "queued", conclusion: null, check_suite_id: 7, created_at: minutesAgo(3) }] },
+      [`/actions/runs?head_sha=${sha}`]: { workflow_runs: [{ id: 1, name: "CI", workflow_id: 11, status: "queued", conclusion: null, check_suite_id: 7, created_at: minutesAgo(3) }] },
     });
     const read = await readGitHubWaitSnapshot({ kind: "ci", target, token: "t", fetchImpl });
     expect(read.checkRuns).toEqual([{ name: "server", status: "queued", conclusion: null, checkSuiteId: 7 }]);
-    expect(read.workflowRuns[0]).toMatchObject({ status: "queued", checkSuiteId: 7 });
+    expect(read.workflowRuns[0]).toMatchObject({ status: "queued", checkSuiteId: 7, workflowId: 11 });
     expect(read.pullRequest).toMatchObject({ mergeableState: "clean", headSha: sha });
     const result = await evaluateServerWait({ monitor, now, resolveToken: async () => "t", fetchImpl });
     expect(result).toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
