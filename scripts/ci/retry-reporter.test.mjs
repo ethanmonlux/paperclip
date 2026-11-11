@@ -26,6 +26,8 @@ function testCase({ state = "passed", retryCount = 0, file = path.join(root, "se
 test("retry defaults to one only in the PR workflow on GitHub Actions", () => {
   assert.equal(vitestRetryCount({}), 0);
   assert.equal(vitestRetryCount(pr), 1);
+  // Staple certification runs the same pr-trusted.yml suite on master (STA-223).
+  assert.equal(vitestRetryCount({ GITHUB_ACTIONS: "true", GITHUB_WORKFLOW: "Staple certification" }), 1);
   for (const workflow of ["Release", "Release Verify", "Cloud readiness", "Release Smoke", "Trusted PR CI", "Incremental CI qualification"]) {
     assert.equal(vitestRetryCount({ GITHUB_ACTIONS: "true", GITHUB_WORKFLOW: workflow }), 0, workflow);
   }
