@@ -595,6 +595,13 @@ export type MigrationCompatGuardOptions = {
    * CONCURRENTLY must be in it.
    */
   readonly nonTransactionalMigrations?: ReadonlySet<string>;
+  /**
+   * Staple fork: file names of migrations that upstream already shipped before
+   * this guard existed, mapped to their upstream source. An upstream sync adds
+   * them under fork numbers. Their `unknown` result is a notice, not an error.
+   * The caller matches them by exact SQL bytes.
+   */
+  readonly shippedUpstreamMigrations?: ReadonlyMap<string, string>;
 };
 
 /**
@@ -622,8 +629,14 @@ export function checkNewMigrationCompatibility(
         "  Make every statement in the file idempotent (IF NOT EXISTS), because a failed run starts again from the first statement.",
       ].join("\n"));
     }
+    const shippedUpstream = options.shippedUpstreamMigrations?.get(baseName);
     if (result.overrideError) {
       errors.push(`${fileName}: ${result.overrideError}`);
+    } else if (result.compatibility === "unknown" && shippedUpstream) {
+      notices.push([
+        `${fileName}: unknown, but upstream shipped these exact bytes before this guard existed (${shippedUpstream}).`,
+        ...describeReasons(result, "unknown"),
+      ].join("\n"));
     } else if (result.compatibility === "unknown") {
       errors.push([
         `${fileName}: cannot tell whether this migration is safe to apply while the previous release is still running.`,

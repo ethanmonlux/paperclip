@@ -288,6 +288,15 @@ describe("checkNewMigrationCompatibility", () => {
     expect(error).toContain("doc/DATABASE.md");
   });
 
+  it("reports a shipped upstream migration as a notice and still judges every other one", () => {
+    const shippedUpstreamMigrations = new Map([["0501_unknown.sql", "upstream 0500_unknown.sql, #1"]]);
+    const result = checkNewMigrationCompatibility([unknown, { ...unknown, fileName: "0503_unknown.sql" }], { shippedUpstreamMigrations });
+    expect(result.passed).toBe(false);
+    expect(result.errors).toEqual([expect.stringMatching(/^0503_unknown\.sql: cannot tell/)]);
+    expect(result.notices).toEqual([expect.stringMatching(/^0501_unknown\.sql: unknown, but upstream shipped these exact bytes .*\(upstream 0500_unknown\.sql, #1\)/)]);
+    expect(result.notices[0]).toContain("lock_hazard_create_index (statement 1)");
+  });
+
   it("passes an unknown migration that carries a justified override, with a notice", () => {
     const result = checkNewMigrationCompatibility([{ ...unknown, sql: `-- paperclip:migration-compat online_compatible: issues is small and the update is idempotent\n${unknown.sql}` }]);
     expect(result).toMatchObject({ passed: true, errors: [] });

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -67,11 +68,28 @@ export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
 }
 
 /**
+ * Staple fork (STA-323): upstream migrations that shipped before upstream's
+ * running-release guard (#20913), keyed by the SHA-256 of their SQL. An
+ * upstream sync PR adds them under fork numbers, so the guard would judge
+ * shipped upstream history as new fork work. Only these exact bytes match;
+ * an edited copy is judged normally. Ordering is still enforced.
+ */
+export const SHIPPED_UPSTREAM_MIGRATION_SHA256 = new Map([
+  ['9f0e9e0cd7afe691282efb87b59685cb613f3c7233cbafccf694c16f90955cf8', 'upstream 0462_plugin_lifecycle_resource_cursors.sql, #20576'],
+  ['f3473c856e291203a92bbf3032b427c8d9df5890ef2967a56e20d02fe5a5a1db', 'upstream 0464_project_environment.sql, #20651'],
+  ['50ce0eb2567570b098bea1de92fe6a220d139e4ba83438195fbbad1be51e31a1', 'upstream 0467_fair_human_torch.sql, #20860'],
+]);
+
+/**
  * Judges whether the migrations a PR adds can be applied while the previous
  * release is still running. `unknown` without an in-file override fails;
  * `requires_staging` only produces a notice.
  */
-export async function checkMigrationCompatibility(migrations, { priorMigrationSql, executorSource } = {}) {
+export async function checkMigrationCompatibility(migrations, {
+  priorMigrationSql,
+  executorSource,
+  shippedUpstreamSha256 = SHIPPED_UPSTREAM_MIGRATION_SHA256,
+} = {}) {
   // Type-stripped by Node: the policy job runs before dependencies are installed.
   const { checkNewMigrationCompatibility, parseNonTransactionalMigrations } = await import(
     new URL('../../packages/db/src/migration-compatibility.ts', import.meta.url).href
@@ -88,9 +106,15 @@ export async function checkMigrationCompatibility(migrations, { priorMigrationSq
       notices: [],
     };
   }
+  const shippedUpstreamMigrations = new Map();
+  for (const { fileName, sql } of migrations) {
+    const source = shippedUpstreamSha256.get(createHash('sha256').update(sql).digest('hex'));
+    if (source) shippedUpstreamMigrations.set(fileName.split('/').pop() ?? fileName, source);
+  }
   const { passed, errors, notices } = checkNewMigrationCompatibility(migrations, {
     priorMigrationSql,
     nonTransactionalMigrations,
+    shippedUpstreamMigrations,
   });
   return { passed, errors, notices };
 }

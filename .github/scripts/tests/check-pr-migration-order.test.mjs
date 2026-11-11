@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { checkMigrationCompatibility, checkMigrationOrder } from '../check-pr-migration-order.mjs';
 
 const migration = (name) => `packages/db/src/migrations/${name}.sql`;
@@ -54,6 +55,25 @@ test('fails a new migration the classifier cannot prove safe under the running r
   assert.match(result.errors[0], /lock_hazard_create_index/);
   assert.match(result.errors[0], /-- paperclip:migration-compat online_compatible: </);
   assert.match(result.errors[0], /expand migration now and a contract migration in a later release/);
+});
+
+test('reports upstream migrations shipped before the guard as notices, matched by exact bytes', async () => {
+  const shipped = ['0463_plugin_lifecycle_resource_cursors', '0465_project_environment', '0468_fair_human_torch'].map((name) => ({
+    fileName: migration(name),
+    sql: readFileSync(new URL(`../../../${migration(name)}`, import.meta.url), 'utf8'),
+  }));
+  const result = await checkMigrationCompatibility(shipped);
+
+  assert.equal(result.passed, true);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.notices.length, 3);
+  assert.match(result.notices[0], /0463_plugin_lifecycle_resource_cursors\.sql: unknown, but upstream shipped these exact bytes .*#20576/);
+  assert.match(result.notices[1], /0465_project_environment\.sql: unknown, but upstream shipped these exact bytes .*#20651/);
+  assert.match(result.notices[2], /0468_fair_human_torch\.sql: unknown, but upstream shipped these exact bytes .*#20860/);
+
+  const edited = await checkMigrationCompatibility([{ ...shipped[2], sql: `${shipped[2].sql}\n` }]);
+  assert.equal(edited.passed, false);
+  assert.match(edited.errors[0], /0468_fair_human_torch\.sql: cannot tell whether this migration is safe/);
 });
 
 test('passes an unknown migration with a justified in-file override', async () => {
