@@ -245,7 +245,7 @@ async function evaluateLocked(
   const [headChecks, baseChecks] = await Promise.all([github.checks(headSha), github.checks(baseSha)]);
 
   // Main stays green: CI red on the base head, or an open owner issue.
-  const baseCi = evaluateBaseCi({ baseSha, checks: baseChecks.checks });
+  const baseCi = evaluateBaseCi({ baseSha, checks: baseChecks.checks, policy });
   const owner = await deps.ensureRedMainIssue({
     companyId: request.companyId, repo, baseRef: pr.baseRef, baseSha, failing: baseCi.failing,
     fallbackAssigneeAgentId: issue.assigneeAgentId, projectId: issue.projectId, evidence: null,
@@ -371,3 +371,4 @@ export async function reportRedMain(deps: MergeGateDependencies, input: {
   }
   return { issue: { id: owner.issue.id, identifier: owner.issue.identifier }, created: owner.created };
 }
+

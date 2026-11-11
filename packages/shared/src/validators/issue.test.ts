@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   paperclipQuestionSetPayloadSchema,
   issueCommentMetadataSchema,
+  issueWaitTargetSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
@@ -16,6 +17,14 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("round-trips an optional exact workflow run ID without accepting invalid identities", () => {
+    const target = { repo: "ethanmonlux/facette", sha: "a".repeat(40), workflowRunId: 1234 };
+    expect(issueWaitTargetSchema.parse(target).workflowRunId).toBe(1234);
+    expect(issueWaitTargetSchema.parse({ repo: target.repo }).workflowRunId).toBeNull();
+    for (const workflowRunId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1234"]) {
+      expect(issueWaitTargetSchema.safeParse({ ...target, workflowRunId }).success).toBe(false);
+    }
+  });
   it.each(["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"])("rejects task-owned managed shell selector %s", key => {
     for (const name of [key, key.toLowerCase()]) {
       const overrides = {adapterConfig:{env:{[name]:"/workspace/startup"}}};
@@ -774,3 +783,4 @@ describe("persisted canonical question initial text", () => {
     expect(paperclipQuestionSetPayloadSchema.safeParse(input({ answerMode: "single_select", options: [{ id: "a", label: "A" }], initialText: "a" })).success).toBe(false);
   });
 });
+
