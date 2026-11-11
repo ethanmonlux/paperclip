@@ -43,6 +43,8 @@ export function taskWorkspaceRoutes(db: Db) {
     const config = loadConfig();
     const [preview] = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: issue.companyId, issueId: issue.id }], {
       dryRun: true,
+      // One authorized task may pay for the read-only repository proof.
+      proveRepositoryDelivery: true,
       now: new Date(),
       terminalDelayMs: config.gitRestorePointTerminalDelayDays * 24 * 60 * 60 * 1000,
       orphanGraceMs: config.taskDirectoryOrphanGraceDays * 24 * 60 * 60 * 1000,

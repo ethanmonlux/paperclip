@@ -36,8 +36,13 @@ import {
 import { markGitRestorePointExpired } from "../services/git-restore-point-storage.js";
 import { gitRestorePointRetentionService } from "../services/git-restore-point-ledger.js";
 import { getStorageService } from "../storage/index.js";
+import type { GitRemoteAuthProvider } from "../services/git-credentials.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const DELIVERED_REMOTE = "https://github.com/example/delivered.git";
+const GIT_ENV = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.com",
+  GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.com", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull };
+const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
 const exists = (target: string) => fs.lstat(target).then(() => true, () => false);
 
 async function age(target: string, at: Date) {
@@ -295,6 +300,49 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
     expect(await f.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
     expect(await exists(repo)).toBe(true);
+    expect((await f.row()).status).toBe("active");
+    expect(await f.ledger()).toEqual([]);
+  });
+
+  it("previews a code-delivered folder from its published nested checkout and keeps it", async () => {
+    const f = await fixture();
+    const upstream = path.join(root, `upstream-${f.workspaceId}.git`);
+    const repo = path.join(f.cwd, "repo");
+    execFileSync("git", ["init", "-q", "--bare", upstream], { env: GIT_ENV });
+    execFileSync("git", ["clone", "-q", upstream, repo], { env: GIT_ENV, stdio: "ignore" });
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/main");
+    await fs.writeFile(path.join(repo, "README.md"), "delivered\n");
+    git(repo, "add", "README.md");
+    git(repo, "commit", "-q", "-m", "Deliver fixture");
+    git(repo, "push", "-q", "origin", "HEAD:main");
+    git(repo, "remote", "set-url", "origin", DELIVERED_REMOTE);
+    const head = git(repo, "rev-parse", "HEAD");
+    const resolveGitAuth: GitRemoteAuthProvider = async () => ({ env: {}, configArgs: ["-c", `url.${upstream}.insteadOf=${DELIVERED_REMOTE}`],
+      source: "managed_connection", secretName: null });
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+    await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "Code task closeout", status: "active",
+      metadata: { deliveryCloseout: { kind: "code", workspaceId: f.workspaceId, lifecycleGeneration: 0, headSha: head,
+        pullRequestUrl: "https://github.com/example/delivered/pull/7" } } });
+    const preview = (proveRepositoryDelivery = true) => inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }], {
+      dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
+      restorePoint: { storage: getStorageService(), keyDurable: true }, proveRepositoryDelivery, resolveGitAuth });
+
+    const proven = await preview();
+    expect(proven).toMatchObject([{ outcome: "skipped", reason: "repository_restore_unsupported",
+      requiredEvidence: ["nested repository restore support before live removal"],
+      verifiedEvidence: [expect.stringContaining(`repo/: github.com/example/delivered at ${head.slice(0, 12)} contains the delivered head`),
+        expect.stringContaining("outer task entries fit restore-point limits")] }]);
+    expect(proven[0]!.candidateBytes).toBeGreaterThan(0);
+    // A routine sweep does not contact the upstream and states both missing proofs.
+    expect(await preview(false)).toMatchObject([{ reason: "repository_restore_unsupported", verifiedEvidence: [],
+      requiredEvidence: ["verified repository publication and qualified outer artifacts", "nested repository restore support before live removal"] }]);
+
+    await fs.writeFile(path.join(repo, "scratch.txt"), "unpublished\n");
+    expect(await preview()).toMatchObject([{ outcome: "skipped", reason: "dirty_or_untracked_files", verifiedEvidence: [],
+      requiredEvidence: ["committed and published nested checkout changes", "nested repository restore support before live removal"] }]);
+    expect(await f.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "repository_restore_unsupported" });
+    expect(await fs.readFile(path.join(repo, "scratch.txt"), "utf8")).toBe("unpublished\n");
     expect((await f.row()).status).toBe("active");
     expect(await f.ledger()).toEqual([]);
   });
