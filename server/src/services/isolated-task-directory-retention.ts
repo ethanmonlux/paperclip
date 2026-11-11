@@ -474,6 +474,16 @@ async function orphanConsumer(db: Db, companyId: string, issueId: string, folder
   const rows = await db.execute<{ reason: string | null }>(sql`${expirationScope(scope)}
     SELECT CASE
       WHEN EXISTS (SELECT 1 FROM ${projectWorkspaces} WHERE cwd = ${folder} OR left(cwd, length(${folder}) + 1) = ${folder} || '/') THEN 'project_workspace'
+      WHEN EXISTS (SELECT 1 FROM ${issues} i JOIN ${executionWorkspaces} w
+        ON w.company_id = i.company_id AND (w.cwd = ${folder} OR w.provider_ref = ${folder}
+          OR left(w.cwd, length(${folder}) + 1) = ${folder} || '/'
+          OR left(w.provider_ref, length(${folder}) + 1) = ${folder} || '/')
+        WHERE i.company_id = ${companyId} AND i.status NOT IN ('done', 'cancelled')
+          AND (i.execution_workspace_id = w.id
+            OR (i.workspace_selection->'selection'->>'kind' = 'existing'
+              AND i.workspace_selection->'selection'->>'workspaceId' = w.id::text)
+            OR (i.workspace_pending_selection->'intent'->'selection'->>'kind' = 'existing'
+              AND i.workspace_pending_selection->'intent'->'selection'->>'workspaceId' = w.id::text))) THEN 'referenced_workspace'
       WHEN EXISTS (SELECT 1 FROM ${workspaceRuntimeServices} WHERE status <> 'stopped'
         AND (cwd = ${folder} OR left(cwd, length(${folder}) + 1) = ${folder} || '/')) THEN 'live_runtime_service'
       WHEN EXISTS (SELECT 1 FROM relevant_runs WHERE status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted')
@@ -509,7 +519,7 @@ type FolderSweepOptions = {
   beforeDelete?: (workspace: Workspace) => Promise<void>;
 };
 
-const CONSUMER_SKIPS = new Set(["live_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
+const CONSUMER_SKIPS = new Set(["live_workspace", "referenced_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
   "unsettled_finalization", "live_lease", "recovery_action"]);
 
 async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: string, options: FolderSweepOptions): Promise<TaskDirectoryFolderResult | null> {
@@ -540,7 +550,10 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
     // The bound workspace stays active until retention archives it. Other
     // active references to this physical folder still prevent cleanup.
-    if (rows.some(row => row.id !== bound?.id && (!["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null))) {
+    // Historical failed/archived aliases can lack closedAt even though their
+    // row is terminal. The issue tree and consumer check below still fence any
+    // live run, lease or finalization before an empty orphan is removed.
+    if (rows.some(row => row.id !== bound?.id && !["archived", "cleanup_failed"].includes(row.status))) {
       throw new Error("live_workspace");
     }
     if (bound) {
@@ -589,7 +602,7 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     await withIsolatedRepositorySourceLock(db, companyId, name, async () => {
       if (await directoryState(folder) !== "present") throw new Error("task_directory_changed");
       const current = await folderRows(db, folder);
-      if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
+      if (current.some(row => !["archived", "cleanup_failed"].includes(row.status))) throw new Error("live_workspace");
       if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
       const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
         .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
