@@ -19,14 +19,12 @@ let root: Root;
 let container: HTMLDivElement;
 let client: QueryClient;
 beforeEach(() => {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
-  vi.setSystemTime(new Date("2026-11-11T03:00:30Z"));
   Object.defineProperty(window, "innerWidth", { configurable: true, value: 380 });
   container = document.createElement("div"); document.body.appendChild(container);
   root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 });
-afterEach(async () => { await act(async () => root.unmount()); container.remove(); client.clear(); vi.useRealTimers(); });
+afterEach(async () => { await act(async () => root.unmount()); container.remove(); client.clear(); });
 
 describe("System Atlas", () => {
   it("keeps seven chapters, 45 linked nodes and 11 walkthroughs", () => {
@@ -42,7 +40,7 @@ describe("System Atlas", () => {
   });
   it("navigates chapters and progressive detail at 380px with separate revision labels", async () => {
     await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/STA/system-atlas"]}><SystemAtlas /></MemoryRouter></QueryClientProvider>));
-    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(container.textContent).toContain("Source revision");
     expect(container.textContent).toContain("Installed revision");
     const chapters = container.querySelector('nav[aria-label="Atlas chapters"]')!;
