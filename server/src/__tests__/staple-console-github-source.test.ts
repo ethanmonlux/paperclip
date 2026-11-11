@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { companies, createDb, issues, issueWorkProducts, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { agents, companies, createDb, issues, issueWorkProducts, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type { StapleConsoleBoard } from "@paperclipai/shared/staple-console";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -159,5 +160,34 @@ suite("staple console GitHub source", () => {
     const lastGood = await svc.atlasSource(companyId, actor);
     expect(lastGood).toMatchObject({ status: "unknown", sourceRevision: source, changedPaths: first.changedPaths,
       observedAt: "2026-11-11T04:00:00.000Z" });
+  });
+
+  it("routes relevant source drift to one native owner task across later commits", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Staple", issuePrefix: `A${companyId.slice(0, 6).toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Atlas owner", adapterType: "process" });
+    await db.insert(issues).values({
+      id: "c94e307b-8114-420b-bec5-5b6cdd555179", companyId, title: "System Atlas", status: "in_progress", assigneeAgentId: agentId,
+    });
+    let source = "b".repeat(40);
+    let clock = new Date("2026-11-11T03:00:00Z");
+    const svc = stapleConsoleService(db, {
+      now: () => clock,
+      credentialProvider: async () => ({ token: "atlas-grant", source: "managed_connection", secretName: null, login: "owner" }),
+      fetch: async (target) => target.endsWith("/commits/master")
+        ? Response.json({ sha: source })
+        : Response.json({ status: "ahead", files: [{ filename: "server/src/services/native-runtime/example.ts" }] }),
+    });
+    const actor = { type: "board" as const, userId: randomUUID(), authorizingUserId: randomUUID() };
+    const first = await svc.atlasSource(companyId, actor);
+    expect(first).toMatchObject({ status: "changed", sourceRevision: source, refreshIssueId: expect.any(String) });
+    source = "c".repeat(40);
+    clock = new Date(clock.getTime() + 3 * 60_000);
+    const second = await svc.atlasSource(companyId, actor);
+    expect(second).toMatchObject({ status: "changed", sourceRevision: source, refreshIssueId: first.refreshIssueId });
+    const children = await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.originKind, "system_atlas_refresh")));
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({ parentId: "c94e307b-8114-420b-bec5-5b6cdd555179", assigneeAgentId: agentId });
   });
 });

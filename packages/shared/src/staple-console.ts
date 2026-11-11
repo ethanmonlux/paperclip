@@ -443,6 +443,8 @@ export interface StapleAtlasSource {
   changedPaths: string[] | null;
   status: "current" | "changed" | "unknown";
   observedAt: string;
+  /** Native owner task created for a relevant source change, when routing is available. */
+  refreshIssueId?: string | null;
 }
 
 export interface StapleConsoleBoard {

@@ -55,6 +55,7 @@ import {
 } from "./git-credentials.js";
 import { ghFetch } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
+import { issueService } from "./issues.js";
 import { executionIssueCondition } from "./issue-visibility.js";
 import {
   approvalReadSqlCondition,
@@ -82,6 +83,12 @@ const FINAL_PR_TTL_MS = 60 * 60_000;
 const ATLAS_SOURCE_TTL_MS = 2 * 60_000;
 /** Commit that introduced the current authored Atlas nodes. Advance only when their prose is reviewed. */
 const ATLAS_AUTHORED_REVISION = "0135ef823d6216c3c9681050bcf31d2959ac3744";
+const ATLAS_OWNER_ISSUE_ID = "c94e307b-8114-420b-bec5-5b6cdd555179";
+const ATLAS_RELEVANT_PATHS = [
+  "server/src/", "ui/src/", "packages/shared/src/", "packages/db/src/",
+  "packages/paperclip-runner/", "packages/adapters/", "scripts/", "rules/",
+  "maps/", "doc/", ".github/workflows/", "AGENTS.md",
+] as const;
 const GITHUB_TIMEOUT_MS = 8_000;
 
 /**
@@ -929,7 +936,35 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         atlasSourceCache.set(scope, source);
         if (atlasSourceCache.size > 100) atlasSourceCache.delete(atlasSourceCache.keys().next().value!);
       }
-      return { ...result, sourceRevision: source.sourceRevision, changedPaths: source.changedPaths, observedAt: source.observedAt, status: source.changedPaths.length ? "changed" : "current" };
+      let refreshIssueId: string | null = null;
+      if (source.changedPaths.some((path) => ATLAS_RELEVANT_PATHS.some((prefix) => path.startsWith(prefix)))) {
+        try {
+          const [owner] = await db.select({ id: issues.id, companyId: issues.companyId, projectId: issues.projectId,
+            assigneeAgentId: issues.assigneeAgentId }).from(issues).where(eq(issues.id, ATLAS_OWNER_ISSUE_ID));
+          if (owner?.companyId === companyId && owner.assigneeAgentId) {
+            // The authored revision is the dedupe boundary. Later commits share this task;
+            // a reviewed explanation advances the revision and permits the next task.
+            const refresh = await issueService(db).create(companyId, {
+              parentId: owner.id,
+              parentDepthPolicy: "allow_nested",
+              projectId: owner.projectId,
+              title: "Refresh System Atlas explanations for changed source",
+              description: `Review the affected Atlas explanations against source ${source.sourceRevision}. Changed paths: ${source.changedPaths.join(", ")}. Keep source, installed and observed evidence distinct. Update the authored revision only after semantic review and verified source changes.`,
+              status: "todo",
+              priority: "medium",
+              assigneeAgentId: owner.assigneeAgentId,
+              originKind: "system_atlas_refresh",
+              originId: ATLAS_AUTHORED_REVISION,
+              idempotencyKey: `system-atlas-refresh:${ATLAS_AUTHORED_REVISION}`,
+            });
+            refreshIssueId = refresh.id;
+          }
+        } catch {
+          // Comparison stays truthful. A later source read retries native routing.
+        }
+      }
+      return { ...result, sourceRevision: source.sourceRevision, changedPaths: source.changedPaths,
+        observedAt: source.observedAt, status: source.changedPaths.length ? "changed" : "current", refreshIssueId };
     } catch {
       // Keep last-good source evidence but mark the current comparison unknown.
       return cached ? { ...result, sourceRevision: cached.sourceRevision, changedPaths: cached.changedPaths, observedAt: cached.observedAt } : result;
