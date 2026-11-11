@@ -129,8 +129,12 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
   }
 
   it("archives and removes a closed issue's task directory after the delay and restores it on reopen", async () => {
+    const service = executionWorkspaceService(db, { taskDirectoryRetention: settings, gitRestorePoints: restorePoints() });
+    // Prime the independent folder walk before creating the bound workspace so
+    // this test exercises the terminal workspace row path and its counters.
+    await service.sweepTerminalWorkspaces();
     const f = await fixture();
-    const result = await f.service().sweepTerminalWorkspaces();
+    const result = await service.sweepTerminalWorkspaces();
     expect(result).toMatchObject({ archived: 1 });
     expect(await exists(f.cwd)).toBe(false);
     expect(await fs.readFile(path.join(outside, "keep.txt"), "utf8")).toBe("outside\n");
@@ -417,11 +421,13 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
   });
 
   it("does not let skipped rows starve later rows of the per-sweep budget", async () => {
+    const service = executionWorkspaceService(db, { taskDirectoryRetention: { ...settings, perSweep: 1 },
+      gitRestorePoints: restorePoints() });
+    await service.sweepTerminalWorkspaces();
     const blocked = await fixture();
     execFileSync("mkfifo", [path.join(blocked.cwd, "pipe")]);
     const ready = await fixture();
     await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(executionWorkspaces.id, blocked.workspaceId));
-    const service = blocked.service({ taskDirectoryRetention: { ...settings, perSweep: 1 } });
     expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
     expect(await exists(ready.cwd)).toBe(true);
     expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
