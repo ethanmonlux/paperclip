@@ -133,8 +133,9 @@ describe("task directory repository recipes", () => {
     await fs.mkdir(path.join(target, "nested", "repo"), { recursive: true });
     const unavailable: GitRemoteAuthProvider = async () => ({ env: {}, source: "managed_connection", secretName: null,
       configArgs: ["-c", `url.${path.join(f.root, "missing.git")}.insteadOf=${REMOTE}`] });
-    const failure = await restoreTaskDirectoryRepositories(target, [recipe], { resolveGitAuth: unavailable }).catch(error => error as Error);
-    expect(failure.message).toBe("The task directory could not be restored: repository_restore_failed");
-    expect(failure.message).not.toContain(f.root);
+    const failure = await restoreTaskDirectoryRepositories(target, [recipe], { resolveGitAuth: unavailable })
+      .then(() => null, (error: unknown) => error as Error);
+    expect(failure?.message).toBe("The task directory could not be restored: repository_restore_failed");
+    expect(failure?.message).not.toContain(f.root);
   });
 });
