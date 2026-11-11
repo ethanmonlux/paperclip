@@ -97,6 +97,8 @@ export interface MergeGateDependencies {
   github: (repo: string, token: string) => MergeGateGitHub;
   resolveToken: (companyId: string, actor: MergeGateActor) => Promise<string | null>;
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
+  /** A recorded coordinator -> implementer -> coordinator handoff with an implementer run. */
+  loadLegacyDelegation: (companyId: string, issueId: string, coordinatorAgentId: string) => Promise<boolean>;
   /**
    * Who may have authored the task: every agent with a run on it and the
    * model families those runs recorded. Only the merging coordinator's runs
@@ -130,13 +132,14 @@ function normalizeRepo(repo: string) {
 
 /**
  * Coordinator-only: a board operator, or an agent that delegated the task
- * (its creator, or the assignee of an ancestor) and is not its implementer.
+ * (its creator, an ancestor's assignee, or a recorded legacy handoff).
  */
-export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, actor: MergeGateActor) {
+export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation">, issue: GateIssue, actor: MergeGateActor) {
   if (actor.type === "board") return;
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
   if (issue.assigneeAgentId === agentId) {
+    if (await deps.loadLegacyDelegation(issue.companyId, issue.id, agentId)) return;
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
   if (issue.createdByAgentId === agentId) return;

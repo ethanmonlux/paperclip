@@ -68,6 +68,7 @@ function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAtt
 function harness(input: {
   github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
   authorFamilies?: string[] | null; authorAgents?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
+  legacyCoordinator?: string;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
@@ -81,6 +82,7 @@ function harness(input: {
     github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
     loadIssue: async (_company, id) => issues.get(id) ?? null,
+    loadLegacyDelegation: async (_company, _issueId, agentId) => input.legacyCoordinator === agentId,
     loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
@@ -138,6 +140,26 @@ describe("merge gate service", () => {
     await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "lead-coordinator", runId: "r" } })))
       .resolves.toMatchObject({ outcome: "merged" });
     expect(merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows a recorded legacy coordinator handoff while rejecting its implementer and unrelated agents", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, legacyCoordinator: "coordinator", issues: [
+      issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null }),
+    ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "claude-engineer", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "someone-else", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
+    expect(merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat current assignment alone as a legacy handoff", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, issues: [issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null })] });
+    await expect(evaluateAndMerge(h.deps, request())).rejects.toThrow(/implementer cannot merge/);
+    expect(merge).not.toHaveBeenCalled();
   });
 
   it("needs only CI after a clean update from main since the review", async () => {

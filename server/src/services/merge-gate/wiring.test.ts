@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import {
-  agents, authUsers, companies, companyMemberships, createDb, documentRevisions, documents, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  activityLog, agents, authUsers, companies, companyMemberships, createDb, documentRevisions, documents, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   heartbeatRuns, issueDocuments, issues,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
@@ -114,6 +114,31 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
       createdByAgentId: implementer.id, createdByRunId: null });
     await expect(deps.loadReviews(f.company.id, { reviewIssueIds: [reviewIssue.id], repo: "ethanmonlux/facette", pullNumber: 704 }))
       .resolves.toMatchObject([{ reviewerAgentId: implementer.id, reviewerModelFamilies: [], writtenByReviewer: false }]);
+  });
+
+  it("recognizes the STA-293 legacy coordinator handoff only with a recorded engineer run", async () => {
+    const f = await fixture();
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const engineer = await f.agent("Engineer", "claude_local");
+    const task = await f.issue("Legacy task", coordinator.id);
+    const at = (minute: number) => new Date(Date.UTC(2026, 10, 11, 10, minute));
+    const event = async (action: string, actorType: string, actorId: string, details: Record<string, unknown>, minute: number) =>
+      db.insert(activityLog).values({ companyId: f.company.id, entityType: "issue", entityId: task.id,
+        action, actorType, actorId, details, createdAt: at(minute) });
+    await event("issue.created", "user", "gate-owner", { assigneeAgentId: coordinator.id }, 0);
+    await event("issue.updated", "agent", coordinator.id,
+      { changes: { assigneeAgentId: { from: coordinator.id, to: engineer.id } } }, 10);
+    const deps = createMergeGateDependencies(db);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
+    await db.insert(heartbeatRuns).values({ companyId: f.company.id, issueId: task.id, agentId: engineer.id,
+      status: "succeeded", invocationSource: "assignment", triggerDetail: "system", startedAt: at(15), finishedAt: at(18) });
+    await event("issue.updated", "agent", engineer.id,
+      { changes: { assigneeAgentId: { from: engineer.id, to: coordinator.id } } }, 20);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(true);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, engineer.id)).toBe(false);
+    await event("issue.updated", "agent", coordinator.id,
+      { changes: { assigneeAgentId: { from: coordinator.id, to: engineer.id } } }, 30);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
   });
 
   it("holds one merge lock per repository branch across connections", async () => {

@@ -1,6 +1,7 @@
 /** Database and GitHub wiring for the protected-main merge gate (FAC-840 B). */
-import { and, desc, eq, inArray, isNotNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, ne, notInArray, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   documentRevisions,
   documents,
@@ -65,6 +66,17 @@ async function pickUrgentCapableAgent(db: Db, companyId: string): Promise<string
 }
 
 const MAX_AUTHOR_RUNS = 500;
+const MAX_ASSIGNMENT_EVENTS = 500;
+
+function assignmentChange(details: Record<string, unknown> | null): { from: string | null; to: string | null } | null {
+  const change = (details?.changes as Record<string, unknown> | undefined)?.assigneeAgentId;
+  if (!change || typeof change !== "object") return null;
+  const fields = change as Record<string, unknown>;
+  return {
+    from: typeof fields.from === "string" ? fields.from : null,
+    to: typeof fields.to === "string" ? fields.to : null,
+  };
+}
 
 /** Hold a transaction-scoped advisory lock on its own connection for `action`. */
 async function withAdvisoryTryLock<T>(db: Db, key: string, action: () => Promise<T>): Promise<T | typeof MERGE_LOCK_BUSY> {
@@ -104,6 +116,37 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
       return (await resolveGitHubApiCredential(db, companyId))?.token ?? null;
     },
     loadIssue,
+    async loadLegacyDelegation(companyId, issueId, coordinatorAgentId) {
+      // Legacy tasks were sometimes created for a coordinator by a human,
+      // then reassigned to an engineer and returned after implementation.
+      // A current assignee alone is not evidence of coordinator authority.
+      const events = await db.select({ action: activityLog.action, actorType: activityLog.actorType,
+        actorId: activityLog.actorId, details: activityLog.details, createdAt: activityLog.createdAt })
+        .from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId), inArray(activityLog.action, ["issue.created", "issue.updated"])))
+        .orderBy(asc(activityLog.createdAt)).limit(MAX_ASSIGNMENT_EVENTS + 1);
+      if (events.length > MAX_ASSIGNMENT_EVENTS) return false;
+      const created = events.find(event => event.action === "issue.created");
+      if (created?.details?.assigneeAgentId !== coordinatorAgentId) return false;
+      const transfers = events.filter(event => event.action === "issue.updated")
+        .map(event => ({ ...event, change: assignmentChange(event.details) }))
+        .filter(event => event.change !== null);
+      const returned = transfers.at(-1);
+      const implementerAgentId = returned?.change?.from;
+      if (!returned || !implementerAgentId || implementerAgentId === coordinatorAgentId ||
+        returned.change?.to !== coordinatorAgentId || returned.actorType !== "agent" ||
+        returned.actorId !== implementerAgentId) return false;
+      const delegated = transfers.find(event => event.change?.from === coordinatorAgentId &&
+        event.change.to === implementerAgentId && event.actorType === "agent" &&
+        event.actorId === coordinatorAgentId && event.createdAt < returned.createdAt);
+      if (!delegated) return false;
+      const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId),
+          eq(heartbeatRuns.agentId, implementerAgentId), isNotNull(heartbeatRuns.startedAt),
+          gte(heartbeatRuns.startedAt, delegated.createdAt),
+          lte(heartbeatRuns.startedAt, returned.createdAt))).limit(1);
+      return Boolean(run);
+    },
     async loadTaskAuthorship(companyId, input) {
       // Every run that started on the task may have authored part of it,
       // whatever role its agent holds now.
