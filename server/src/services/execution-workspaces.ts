@@ -2093,6 +2093,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .select({
         id: issueWorkProducts.id,
         type: issueWorkProducts.type,
+        status: issueWorkProducts.status,
         url: issueWorkProducts.url,
         externalId: issueWorkProducts.externalId,
         title: issueWorkProducts.title,
@@ -2109,6 +2110,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .limit(100));
     return products.flatMap(product => {
       if (product.type === "delivery_closeout") {
+        if (product.status !== "active") return [];
         const parsed = issueDeliveryCloseoutSchema.safeParse(product.metadata?.deliveryCloseout);
         if (!parsed.success || parsed.data.kind !== "code" || parsed.data.workspaceId !== workspace.id
           || parsed.data.lifecycleGeneration !== readExecutionWorkspaceLifecycleGeneration(workspace.metadata)
