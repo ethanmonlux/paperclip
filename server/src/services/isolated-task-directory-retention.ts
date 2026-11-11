@@ -10,10 +10,13 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { openRestorePoint, sealRestorePoint, verifyRestorePointPayloadCandidate } from "./git-restore-point.js";
 import { notifyGitRestorePointWork } from "./git-restore-point-ledger.js";
 import { abandonGitRestorePoint, activateGitRestorePoints, readRestorePointObject, storeSealedRestorePoint } from "./git-restore-point-storage.js";
-import { exclusiveAllocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
+import { exclusiveAllocatedBytes, describeGitExpirationFailure, expirationGitAuth, expirationScope, isGitWorkspaceExpirationEligible,
+  type GitExpirationFailure } from "./git-workspace-expiration.js";
+import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { IsolatedRepositorySourceBusy, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
 import { logActivity } from "./activity-log.js";
 import { readTaskDeliveryCloseout } from "./task-delivery-closeout.js";
+import { codeDeliveryEvidence, describeCodeDeliveryQualification, qualifyCodeDeliveryTaskDirectory } from "./task-code-delivery-qualification.js";
 import {
   captureTaskDirectorySnapshot,
   createEmptyTaskDirectorySnapshot,
@@ -79,7 +82,12 @@ export type TaskDirectoryRetentionResult = {
   reclaimedBytes: number;
   skipReason: string | null;
   failure?: GitExpirationFailure;
+  /** Proof still needed, and proof that passed, for a code-delivered folder. */
+  requiredEvidence?: string[];
+  verifiedEvidence?: string[];
 };
+
+const REPOSITORY_RESTORE_EVIDENCE = "nested repository restore support before live removal";
 
 export function readTaskDirectoryRetention(workspace: { metadata?: Record<string, unknown> | null }): TaskDirectoryRetention | null {
   const state = workspace.metadata?.[TASK_DIRECTORY_RETENTION_KEY] as TaskDirectoryRetention | undefined;
@@ -221,6 +229,10 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
   restorePoint?: TaskDirectoryRestorePointOptions;
   signal?: AbortSignal;
   beforeDelete?: (workspace: Workspace) => Promise<void>;
+  /** Run the read-only repository publication proof for a code closeout.
+   * Only a targeted dry-run preview requests it; sweeps never contact remotes. */
+  proveRepositoryDelivery?: boolean;
+  resolveGitAuth?: GitRemoteAuthProvider;
 }): Promise<TaskDirectoryRetentionResult> {
   const result: TaskDirectoryRetentionResult = { candidate: false, expired: false, restorePoint: false, candidateBytes: 0, reclaimedBytes: 0, skipReason: null };
   let pending: string | null = null;
@@ -254,7 +266,25 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
             workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
           if (!closeout) throw new Error("delivery_closeout_missing");
-          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
+          if (closeout.kind === "code") {
+            // Removal would also need to rebuild the checkout on reopen. Until a
+            // restore recipe exists, a passed proof still keeps the folder.
+            if (!options.dryRun || !options.proveRepositoryDelivery) {
+              result.requiredEvidence = ["verified repository publication and qualified outer artifacts", REPOSITORY_RESTORE_EVIDENCE];
+              throw new Error("repository_restore_unsupported");
+            }
+            try {
+              const qualified = await qualifyCodeDeliveryTaskDirectory(cwd, closeout, { limits: options.restorePoint?.limits,
+                signal: options.signal, resolveGitAuth: options.resolveGitAuth ?? expirationGitAuth(db, workspace) });
+              result.verifiedEvidence = describeCodeDeliveryQualification(qualified);
+            } catch (error) {
+              options.signal?.throwIfAborted();
+              result.requiredEvidence = [codeDeliveryEvidence(skipReason(error)), REPOSITORY_RESTORE_EVIDENCE];
+              throw error;
+            }
+            result.requiredEvidence = [REPOSITORY_RESTORE_EVIDENCE];
+            throw new Error("repository_restore_unsupported");
+          }
           // A preview needs the same bounded qualification, but must not retain
           // every file body in memory just to discard the encoded snapshot.
           if (options.dryRun) {
@@ -298,7 +328,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
             workspaceId: workspace.id, lifecycleGeneration: state.generation - 1 });
           if (!closeout) throw new Error("delivery_closeout_missing");
-          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
+          if (closeout.kind === "code") throw new Error("repository_restore_unsupported");
           if (present) {
             result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
             if (options.dryRun) {
@@ -432,6 +462,7 @@ export type TaskDirectoryFolderResult = {
   allowedScope: string;
   ownerStatus: string | null;
   requiredEvidence: string[];
+  verifiedEvidence: string[];
   outcome: "removed" | "preserved_and_removed" | "dry_run" | "skipped";
   reason: string | null;
   candidateBytes: number;
@@ -517,6 +548,8 @@ type FolderSweepOptions = {
   restorePoint?: TaskDirectoryRestorePointOptions;
   signal?: AbortSignal;
   beforeDelete?: (workspace: Workspace) => Promise<void>;
+  proveRepositoryDelivery?: boolean;
+  resolveGitAuth?: GitRemoteAuthProvider;
 };
 
 const CONSUMER_SKIPS = new Set(["live_workspace", "referenced_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
@@ -529,7 +562,7 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   const companyDir = path.join(root, companyId);
   const folder = path.join(companyDir, name);
   const result: TaskDirectoryFolderResult = { companyId, issueId: name, physicalObject: "unknown", allowedScope: folder,
-    ownerStatus: null, requiredEvidence: [], outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
+    ownerStatus: null, requiredEvidence: [], verifiedEvidence: [], outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
   const retry = (at: number) => { result.retryAt = result.retryAt === undefined ? at : Math.min(result.retryAt, at); };
   try {
     if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
@@ -570,7 +603,8 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
         throw new Error("not_due");
       }
       const expiration = await expireIsolatedTaskDirectory(db, bound, { dryRun: options.dryRun, now: options.now,
-        notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete });
+        notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete,
+        proveRepositoryDelivery: options.proveRepositoryDelivery, resolveGitAuth: options.resolveGitAuth });
       result.candidateBytes = expiration.candidateBytes;
       result.reclaimedBytes = expiration.reclaimedBytes;
       result.reason = expiration.skipReason;
@@ -583,7 +617,8 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       if (expiration.skipReason === "restore_point_key_not_durable") result.requiredEvidence.push("durable restore-point key");
       if (expiration.skipReason === "nested_git_repository") result.requiredEvidence.push("published repository head and qualified outer artifacts");
       if (expiration.skipReason === "delivery_closeout_missing") result.requiredEvidence.push("typed artifact or no-code delivery closeout for this workspace lifecycle");
-      if (expiration.skipReason === "repository_delivery_requires_separate_qualification") result.requiredEvidence.push("verified repository publication and qualified outer artifacts");
+      result.requiredEvidence.push(...expiration.requiredEvidence ?? []);
+      result.verifiedEvidence.push(...expiration.verifiedEvidence ?? []);
       if (expiration.skipReason === "live_or_unresolved_consumer") result.requiredEvidence.push("settled task, run, lease, and workspace references");
       if (expiration.failure) result.failure = expiration.failure;
       result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";
