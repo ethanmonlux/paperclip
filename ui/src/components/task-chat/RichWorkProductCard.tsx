@@ -180,7 +180,7 @@ export function RichWorkProductCard({ workProduct, href, variant = "card" }: Ric
       break;
     case "delivery_closeout": {
       Icon = FileText;
-      const closeout = metadata.deliveryCloseout;
+      const closeout = metadata?.deliveryCloseout;
       const kind = closeout && typeof closeout === "object" && !Array.isArray(closeout)
         ? (closeout as Record<string, unknown>).kind : null;
       meta = [kind === "no_code" ? "No-code closeout" : kind === "artifact" ? "Artifact closeout" : "Code closeout"];
