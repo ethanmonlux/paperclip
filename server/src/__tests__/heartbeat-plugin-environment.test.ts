@@ -57,6 +57,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+// Runs complete asynchronously on shared CI runners; 5s proved too tight there.
+const RUN_SETTLE_TIMEOUT_MS = 30_000;
+const TEST_TIMEOUT_MS = 75_000;
+
 describeEmbeddedPostgres("heartbeat plugin environments", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
@@ -97,7 +101,9 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     const companyId = randomUUID(), projectId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sourceId = randomUUID();
     const environmentId = randomUUID(), pluginId = randomUUID(), pluginKey = `test.tasks.${pluginId}`;
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-task-heartbeat-")); tempRoots.push(root);
-    await db.insert(companies).values({ id: companyId, name: "Task fixture", issuePrefix: "TASK", defaultResponsibleUserId: "task-user" });
+    // Prefix, identifier and environment name are instance-unique; derive them so a CI retry can re-insert.
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({ id: companyId, name: "Task fixture", issuePrefix, defaultResponsibleUserId: "task-user" });
     await grantResponsibleUser(companyId, "task-user");
     await db.insert(projects).values({ id: projectId, companyId, name: "Task fixture", status: "active",
       executionWorkspacePolicy: { enabled: true, storageProviderPluginId: pluginId } });
@@ -113,13 +119,13 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         workspaceProvider: { modes: ["shared_workspace", "isolated_workspace", "operator_branch"], strategies: ["project_primary", "git_worktree"] },
         entrypoints: { worker: "worker.js" },
         environmentDrivers: [{ driverKey: "tasks", displayName: "Tasks", supportsTasks: true, warmTaskVersion: 1, configSchema: { type: "object" } }] } });
-    await db.insert(environments).values({ id: environmentId, name: "Tasks", driver: "plugin", status: "active",
+    await db.insert(environments).values({ id: environmentId, name: `Tasks ${environmentId}`, driver: "plugin", status: "active",
       config: { pluginKey, driverKey: "tasks", driverConfig: {} } });
     await db.insert(agents).values({ id: agentId, companyId, name: "Task agent", role: "engineer", status: "idle",
       adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-6.1-sol", lifecycleMode: "warm" }, runtimeConfig: {},
       defaultEnvironmentId: environmentId, permissions: {} });
     await db.insert(issues).values({ id: issueId, companyId, projectId, projectWorkspaceId: sourceId, title: "Task-only dispatch", status: "in_progress",
-      assigneeAgentId: agentId, issueNumber: 1, identifier: "TASK-1" });
+      assigneeAgentId: agentId, issueNumber: 1, identifier: `${issuePrefix}-1` });
     const call = vi.fn(async (_id: string, method: string) => { throw new Error(`Unexpected task provider call: ${method}`); });
     const workerManager = { isRunning: () => true, getWorker: () => ({ supportedMethods: ["workspaceOperation", "environmentTask", "environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }), call } as unknown as PluginWorkerManager;
     const entered = vi.fn(() => { throw new Error("synthetic_native_boundary_reached"); });
@@ -127,7 +133,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     heartbeats.push(heartbeat);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", contextSnapshot: { issueId, projectId } });
     expect(run).not.toBeNull();
-    await vi.waitFor(async () => { expect((await heartbeat.getRun(run!.id))?.status).toBe("failed"); }, { timeout: 10_000 });
+    await vi.waitFor(async () => { expect((await heartbeat.getRun(run!.id))?.status).toBe("failed"); }, { timeout: RUN_SETTLE_TIMEOUT_MS });
     await heartbeat.drainActiveRunExecutions();
     const failed = await heartbeat.getRun(run!.id);
     expect(failed).toMatchObject({ errorCode: "configuration_incomplete", error: expect.stringContaining("requires a managed AI connection"),
@@ -137,7 +143,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     expect(entered).not.toHaveBeenCalled();
     expect(adapterExecute).not.toHaveBeenCalled();
     await expect(stat(pluginOnlyCwd)).rejects.toMatchObject({ code: "ENOENT" });
-  }, 20_000);
+  }, TEST_TIMEOUT_MS);
 
   it("acquires plugin environment leases through the heartbeat execution path", async () => {
     const companyId = randomUUID();
@@ -226,7 +232,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     } as any);
     await db.insert(environments).values({
       id: environmentId,
-      name: "Plugin Sandbox",
+      name: `Plugin Sandbox ${environmentId}`,
       driver: "plugin",
       status: "active",
         config: {
@@ -266,7 +272,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     await vi.waitFor(async () => {
       const latest = await heartbeat.getRun(run!.id);
       expect(latest?.status).toBe("succeeded");
-    }, { timeout: 5_000 });
+    }, { timeout: RUN_SETTLE_TIMEOUT_MS });
 
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentAcquireLease", {
       creationOperationId: expect.any(String),
@@ -301,9 +307,9 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
           driverKey: "sandbox",
         }),
       });
-    }, { timeout: 5_000 });
+    }, { timeout: RUN_SETTLE_TIMEOUT_MS });
     expect(adapterExecute).toHaveBeenCalledTimes(1);
-  }, 15_000);
+  }, TEST_TIMEOUT_MS);
 
   it("inherits the instance default environment across companies while preserving explicit agent overrides", async () => {
     const sharedEnvironmentId = randomUUID();
@@ -371,7 +377,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     await db.insert(environments).values([
       {
         id: sharedEnvironmentId,
-        name: "Shared Plugin Sandbox",
+        name: `Shared Plugin Sandbox ${sharedEnvironmentId}`,
         driver: "plugin",
         status: "active",
         config: {
@@ -386,7 +392,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       },
       {
         id: overrideEnvironmentId,
-        name: "Override Plugin Sandbox",
+        name: `Override Plugin Sandbox ${overrideEnvironmentId}`,
         driver: "plugin",
         status: "active",
         config: {
@@ -517,7 +523,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       ]);
       expect(latestShared?.status).toBe("succeeded");
       expect(latestOverride?.status).toBe("succeeded");
-    }, { timeout: 5_000 });
+    }, { timeout: RUN_SETTLE_TIMEOUT_MS });
 
     const acquireCalls = vi.mocked(workerManager.call).mock.calls
       .filter(([, method]) => method === "environmentAcquireLease");
@@ -542,7 +548,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         adapterType: "codex_local",
       }),
     ]));
-  }, 15_000);
+  }, TEST_TIMEOUT_MS);
 
   it("ignores stale non-reused workspace environment config in favor of the assignee selection", async () => {
     const companyId = randomUUID();
@@ -639,7 +645,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     await db.insert(environments).values([
       {
         id: oldEnvironmentId,
-        name: "QA SSH",
+        name: `QA SSH ${oldEnvironmentId}`,
         driver: "plugin",
         status: "active",
         config: {
@@ -654,7 +660,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       },
       {
         id: newEnvironmentId,
-        name: "QA E2B",
+        name: `QA E2B ${newEnvironmentId}`,
         driver: "plugin",
         status: "active",
         config: {
@@ -732,7 +738,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
     await vi.waitFor(async () => {
       const latest = await heartbeat.getRun(run!.id);
       expect(latest?.status).toBe("succeeded");
-    }, { timeout: 5_000 });
+    }, { timeout: RUN_SETTLE_TIMEOUT_MS });
 
     expect(workerManager.call).toHaveBeenNthCalledWith(1, pluginId, "environmentAcquireLease", {
       creationOperationId: expect.any(String),
@@ -748,5 +754,5 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       workspaceMode: "shared_workspace",
       adapterType: "codex_local",
     });
-  }, 15_000);
+  }, TEST_TIMEOUT_MS);
 });
