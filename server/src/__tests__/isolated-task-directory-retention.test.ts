@@ -536,7 +536,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await db.insert(companies).values({ id: o.companyId, name: "Terminal aliases", issuePrefix: `TA${o.companyId.slice(0, 6)}` });
       await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
         completedAt: new Date(Date.now() - 10 * DAY_MS) });
-      await db.insert(executionWorkspaces).values(["archived", "cleanup_failed"].map(status => ({
+      await db.insert(executionWorkspaces).values((["archived", "cleanup_failed"] as const).map(status => ({
         companyId: o.companyId, sourceIssueId: o.issueId, mode: "shared_workspace", strategyType: "project_primary",
         name: "Terminal alias", status, providerType: "local_fs", cwd: o.cwd,
       })));
