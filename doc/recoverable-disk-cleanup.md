@@ -307,6 +307,14 @@ delay git restore points use. It registers that moment as its deadline, so a clo
 costs no checks before then. It removes the directory only when all of these hold, checked
 under the issue's source lock and the workspace lifecycle lock:
 
+An authorized task reader can call `GET /api/issues/:id/workspace/retention-preview`
+to inspect that task's current folder without enabling retention. The response names
+the exact folder, physical identity, owner status, exclusive byte estimate, skip
+reason and required evidence when a folder exists. It also reports whether the
+installed server has task-directory retention enabled and whether it is in dry-run
+mode. A preview does not save a restore point or remove files. It describes the
+installed server and its accessible filesystem, not a source branch or another host.
+
 - the source issue is still bound to the workspace (`issue_not_bound` otherwise), because
   reopening restores through that binding;
 - no run of the tree or the workspace is queued, running or unfinished, no native run

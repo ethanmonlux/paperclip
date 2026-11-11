@@ -4564,6 +4564,16 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/workspace/retention-preview",
+  tags: ["issues"],
+  summary: "Preview native retention for one task folder",
+  description: "Read-only inspection of the installed server's retention settings and one task folder's physical scope, owner, exclusive bytes, skip reason, and required evidence. It does not enable retention or delete files.",
+  request: { params: z.object({ id: z.string().uuid() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
   method: "put",
   path: "/api/issues/{id}/workspace",
   tags: ["issues"],

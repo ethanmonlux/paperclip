@@ -10,9 +10,10 @@ import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { openRestorePoint, sealRestorePoint, verifyRestorePointPayloadCandidate } from "./git-restore-point.js";
 import { notifyGitRestorePointWork } from "./git-restore-point-ledger.js";
 import { abandonGitRestorePoint, activateGitRestorePoints, readRestorePointObject, storeSealedRestorePoint } from "./git-restore-point-storage.js";
-import { allocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
+import { exclusiveAllocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
 import { IsolatedRepositorySourceBusy, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
 import { logActivity } from "./activity-log.js";
+import { readTaskDeliveryCloseout } from "./task-delivery-closeout.js";
 import {
   captureTaskDirectorySnapshot,
   createEmptyTaskDirectorySnapshot,
@@ -249,12 +250,23 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         const present = await directoryState(cwd) === "present";
         if (!state) {
           if (!present) throw new Error("missing_task_directory");
-          result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
+            workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
+          if (!closeout) throw new Error("delivery_closeout_missing");
+          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
+          // A preview needs the same bounded qualification, but must not retain
+          // every file body in memory just to discard the encoded snapshot.
+          if (options.dryRun) {
+            await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
+            result.candidate = true;
+            return result;
+          }
           const captured = await captureTaskDirectorySnapshot(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
           result.candidate = true;
-          if (options.dryRun) return result;
           const generation = Number(workspace.metadata?.lifecycleGeneration ?? 0) + 1;
-          const stored = await storeTaskDirectoryRestorePoint(db, options.restorePoint!.storage, workspace, generation, captured, options.signal);
+          const stored = await storeTaskDirectoryRestorePoint(db, options.restorePoint!.storage, workspace, generation,
+            captured, options.signal);
           pending = stored.ledgerId;
           result.restorePoint = true;
           state = { schema: TASK_DIRECTORY_RETENTION_SCHEMA, generation, removed: false,
@@ -281,8 +293,25 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             });
           }
         } else {
+          // The intent increments the workspace generation after validation.
+          // Continue to bind the declaration to the pre-archive lifecycle.
+          const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
+            workspaceId: workspace.id, lifecycleGeneration: state.generation - 1 });
+          if (!closeout) throw new Error("delivery_closeout_missing");
+          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
+          if (present) {
+            result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+            if (options.dryRun) {
+              const current = await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
+              if (current.digest !== state.restorePoint.digest) throw new Error("task_directory_changed");
+            }
+          } else if (options.dryRun) {
+            // A saved intent can survive a crash after the rename. Preview the
+            // actual trash object, never the original folder's old estimate.
+            if (await directoryState(state.trash) !== "present") throw new Error("missing_task_directory");
+            result.candidateBytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; });
+          }
           result.candidate = true;
-          if (present) result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
           if (options.dryRun) return result;
         }
         if (!workspace) throw new Error("workspace_changed");
@@ -313,7 +342,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           await fs.rename(cwd, state.trash);
         }
         if (await exists(state.trash)) {
-          const bytes = await allocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; }).catch(() => result.candidateBytes);
+          const bytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; }).catch(() => result.candidateBytes);
           await removeTaskDirectoryTree(state.trash);
           result.reclaimedBytes = bytes;
         }
@@ -376,7 +405,7 @@ export async function restoreIsolatedTaskDirectory(input: {
     if (!state.removed) return { restored: false, expired: false };
     if ((await fs.readdir(cwd)).length === 0) await fs.rmdir(cwd);
     else {
-      const current = await inspectTaskDirectory(cwd, { signal: input.signal }).catch(() => null);
+      const current = await inspectTaskDirectory(cwd, { signal: input.signal, restoreVerification: true }).catch(() => null);
       if (current?.digest === ref.digest) return { restored: false, expired: false };
       throw new TaskDirectoryRestoreFailure("task_directory_diverged");
     }
@@ -399,6 +428,10 @@ export async function restoreIsolatedTaskDirectory(input: {
 export type TaskDirectoryFolderResult = {
   companyId: string;
   issueId: string;
+  physicalObject: string;
+  allowedScope: string;
+  ownerStatus: string | null;
+  requiredEvidence: string[];
   outcome: "removed" | "preserved_and_removed" | "dry_run" | "skipped";
   reason: string | null;
   candidateBytes: number;
@@ -441,6 +474,16 @@ async function orphanConsumer(db: Db, companyId: string, issueId: string, folder
   const rows = await db.execute<{ reason: string | null }>(sql`${expirationScope(scope)}
     SELECT CASE
       WHEN EXISTS (SELECT 1 FROM ${projectWorkspaces} WHERE cwd = ${folder} OR left(cwd, length(${folder}) + 1) = ${folder} || '/') THEN 'project_workspace'
+      WHEN EXISTS (SELECT 1 FROM ${issues} i JOIN ${executionWorkspaces} w
+        ON w.company_id = i.company_id AND (w.cwd = ${folder} OR w.provider_ref = ${folder}
+          OR left(w.cwd, length(${folder}) + 1) = ${folder} || '/'
+          OR left(w.provider_ref, length(${folder}) + 1) = ${folder} || '/')
+        WHERE i.company_id = ${companyId} AND i.status NOT IN ('done', 'cancelled')
+          AND (i.execution_workspace_id = w.id
+            OR (i.workspace_selection->'selection'->>'kind' = 'existing'
+              AND i.workspace_selection->'selection'->>'workspaceId' = w.id::text)
+            OR (i.workspace_pending_selection->'intent'->'selection'->>'kind' = 'existing'
+              AND i.workspace_pending_selection->'intent'->'selection'->>'workspaceId' = w.id::text))) THEN 'referenced_workspace'
       WHEN EXISTS (SELECT 1 FROM ${workspaceRuntimeServices} WHERE status <> 'stopped'
         AND (cwd = ${folder} OR left(cwd, length(${folder}) + 1) = ${folder} || '/')) THEN 'live_runtime_service'
       WHEN EXISTS (SELECT 1 FROM relevant_runs WHERE status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted')
@@ -476,7 +519,7 @@ type FolderSweepOptions = {
   beforeDelete?: (workspace: Workspace) => Promise<void>;
 };
 
-const CONSUMER_SKIPS = new Set(["live_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
+const CONSUMER_SKIPS = new Set(["live_workspace", "referenced_workspace", "retention_pending", "project_workspace", "live_runtime_service", "live_run",
   "unsettled_finalization", "live_lease", "recovery_action"]);
 
 async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: string, options: FolderSweepOptions): Promise<TaskDirectoryFolderResult | null> {
@@ -485,7 +528,8 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   if (!root) return null;
   const companyDir = path.join(root, companyId);
   const folder = path.join(companyDir, name);
-  const result: TaskDirectoryFolderResult = { companyId, issueId: name, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
+  const result: TaskDirectoryFolderResult = { companyId, issueId: name, physicalObject: "unknown", allowedScope: folder,
+    ownerStatus: null, requiredEvidence: [], outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
   const retry = (at: number) => { result.retryAt = result.retryAt === undefined ? at : Math.min(result.retryAt, at); };
   try {
     if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
@@ -495,24 +539,52 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     });
     if (!stat) return null;
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_task_directory");
+    result.physicalObject = `${stat.dev}:${stat.ino}`;
     const rows = await folderRows(db, folder);
-    if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) return null;
     if (rows.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
-    const [issue] = await db.select({ id: issues.id, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
+    const [issue] = await db.select({ id: issues.id, status: issues.status, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
+    result.ownerStatus = issue?.status ?? null;
     const tree = issue ? await issueTreeState(db, companyId, name) : { exists: false, open: false, closedAt: null };
     if (tree.exists && (tree.open || !tree.closedAt)) throw new Error("issue_open");
     const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
+    // The bound workspace stays active until retention archives it. Other
+    // active references to this physical folder still prevent cleanup.
+    // Historical failed/archived aliases can lack closedAt even though their
+    // row is terminal. The issue tree and consumer check below still fence any
+    // live run, lease or finalization before an empty orphan is removed.
+    if (rows.some(row => row.id !== bound?.id && !["archived", "cleanup_failed"].includes(row.status))) {
+      throw new Error("live_workspace");
+    }
     if (bound) {
       if (bound.cwd !== folder || !await isIsolatedTaskDirectoryWorkspace(bound)) throw new Error("bound_workspace");
       result.executionWorkspaceId = bound.id;
       const dueAt = tree.closedAt!.getTime() + options.terminalDelayMs;
-      if (dueAt > nowMs) { retry(dueAt); throw new Error("not_due"); }
+      if (dueAt > nowMs) {
+        result.candidateBytes = await exclusiveAllocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; });
+        const closeout = await readTaskDeliveryCloseout(db, { companyId, issueId: name, workspaceId: bound.id,
+          lifecycleGeneration: Number(bound.metadata?.lifecycleGeneration ?? 0) });
+        if (!closeout) result.requiredEvidence.push("typed artifact or no-code delivery closeout for this workspace lifecycle");
+        if (closeout?.kind === "code") result.requiredEvidence.push("verified repository publication and qualified outer artifacts");
+        retry(dueAt);
+        throw new Error("not_due");
+      }
       const expiration = await expireIsolatedTaskDirectory(db, bound, { dryRun: options.dryRun, now: options.now,
         notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete });
       result.candidateBytes = expiration.candidateBytes;
       result.reclaimedBytes = expiration.reclaimedBytes;
       result.reason = expiration.skipReason;
+      if (options.dryRun && expiration.candidate && !options.restorePoint) {
+        result.requiredEvidence.push("configured durable restore-point storage");
+      } else if (options.dryRun && expiration.candidate && options.restorePoint?.keyDurable === false) {
+        result.requiredEvidence.push("durable restore-point key");
+      }
+      if (expiration.skipReason === "restore_points_disabled") result.requiredEvidence.push("configured durable restore-point storage");
+      if (expiration.skipReason === "restore_point_key_not_durable") result.requiredEvidence.push("durable restore-point key");
+      if (expiration.skipReason === "nested_git_repository") result.requiredEvidence.push("published repository head and qualified outer artifacts");
+      if (expiration.skipReason === "delivery_closeout_missing") result.requiredEvidence.push("typed artifact or no-code delivery closeout for this workspace lifecycle");
+      if (expiration.skipReason === "repository_delivery_requires_separate_qualification") result.requiredEvidence.push("verified repository publication and qualified outer artifacts");
+      if (expiration.skipReason === "live_or_unresolved_consumer") result.requiredEvidence.push("settled task, run, lease, and workspace references");
       if (expiration.failure) result.failure = expiration.failure;
       result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";
       if (isRetryableTaskDirectorySkip(expiration.skipReason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
@@ -530,7 +602,7 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     await withIsolatedRepositorySourceLock(db, companyId, name, async () => {
       if (await directoryState(folder) !== "present") throw new Error("task_directory_changed");
       const current = await folderRows(db, folder);
-      if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
+      if (current.some(row => !["archived", "cleanup_failed"].includes(row.status))) throw new Error("live_workspace");
       if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
       const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
         .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
@@ -543,16 +615,24 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
         const latest = await issueTreeState(db, companyId, name);
         if (latest.open || !latest.closedAt || latest.closedAt.getTime() + options.orphanGraceMs > nowMs) throw new Error("issue_open");
       }
-      result.candidateBytes = await allocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
+      result.candidateBytes = await exclusiveAllocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; });
+      // An orphan has no bound workspace or issue closeout to prove that files
+      // were delivered. Keep all nonempty contents until an authoritative
+      // checkpoint or publication record qualifies them separately.
+      const directory = await fs.opendir(folder);
+      let hasContents = false;
+      try { hasContents = (await directory.read()) !== null; }
+      finally { await directory.close(); }
+      if (hasContents) throw new Error("orphan_contents_unqualified");
       if (options.dryRun) {
         result.outcome = "dry_run";
         return;
       }
-      const trash = shortSiblingName(folder, ".expired-");
-      await fs.rename(folder, trash);
-      await removeTaskDirectoryTree(trash).catch(() => {
-        result.walkRetryAt = nowMs + TASK_DIRECTORY_RETRY_MS;
-        throw new Error("task_directory_trash_pending");
+      // rmdir is atomic with respect to newly published files. A recursive
+      // rename-and-remove would delete contents added after the empty check.
+      await fs.rmdir(folder).catch((error: NodeJS.ErrnoException) => {
+        if (["ENOTEMPTY", "EEXIST", "ENOENT"].includes(error.code ?? "")) throw new Error("task_directory_changed");
+        throw error;
       });
       result.outcome = "removed";
       result.reclaimedBytes = result.candidateBytes;
@@ -560,6 +640,11 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   } catch (error) {
     options.signal?.throwIfAborted();
     result.reason = skipReason(error);
+    if (result.reason === "orphan_contents_unqualified") {
+      result.requiredEvidence = ["authoritative publication or owned checkpoint for every retained file"];
+    } else if (CONSUMER_SKIPS.has(result.reason)) {
+      result.requiredEvidence = ["settled task, run, lease, and workspace references"];
+    }
     if (result.reason === "inspection_failed") result.failure = describeGitExpirationFailure(error);
     if (isRetryableTaskDirectorySkip(result.reason) || CONSUMER_SKIPS.has(result.reason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
   }
@@ -568,9 +653,14 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
 
 export async function inspectIsolatedTaskDirectoryFolders(db: Db, folders: Array<{ companyId: string; issueId: string }>, options: FolderSweepOptions) {
   const results: TaskDirectoryFolderResult[] = [];
+  const seen = new Set<string>();
   for (const folder of folders) {
     options.signal?.throwIfAborted();
     if (!IDENTITY.test(folder.companyId) || !IDENTITY.test(folder.issueId)) continue;
+    // Hints can contain many workspace aliases of one physical task folder.
+    const physicalKey = `${folder.companyId}/${folder.issueId}`;
+    if (seen.has(physicalKey)) continue;
+    seen.add(physicalKey);
     const result = await inspectTaskDirectoryFolder(db, folder.companyId, folder.issueId, options);
     if (result) results.push(result);
   }

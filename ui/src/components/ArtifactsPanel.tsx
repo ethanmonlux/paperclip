@@ -55,6 +55,7 @@ function matchesFilter(wp: IssueWorkProduct, filter: FilterValue): boolean {
 function typeIcon(type: string) {
   switch (type) {
     case "document": return FileText;
+    case "delivery_closeout": return FileText;
     case "pull_request": return GitBranch;
     case "branch": return GitBranch;
     case "commit": return GitCommit;
