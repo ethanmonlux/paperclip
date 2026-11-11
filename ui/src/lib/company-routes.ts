@@ -1,6 +1,8 @@
 const BOARD_ROUTE_ROOTS = new Set([
   "dashboard",
   "console",
+  "system-atlas",
+  "item-artwork",
   "companies",
   "company",
   "skills",

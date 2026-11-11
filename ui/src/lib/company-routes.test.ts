@@ -7,6 +7,14 @@ import {
 } from "./company-routes";
 
 describe("company routes", () => {
+  it("keeps Atlas and Item artwork in the active company", () => {
+    for (const route of ["/system-atlas", "/item-artwork"]) {
+      expect(isBoardPathWithoutPrefix(route)).toBe(true);
+      expect(extractCompanyPrefixFromPath(route)).toBeNull();
+      expect(applyCompanyPrefix(route, "STA")).toBe(`/STA${route}`);
+      expect(applyCompanyPrefix(`/STA${route}`, "STA")).toBe(`/STA${route}`);
+    }
+  });
   it("keeps public Dot consent outside company-prefixed routes", () => {
     const path = `/dot-connect/pcmcp_request_${"a".repeat(43)}`;
     expect(extractCompanyPrefixFromPath(path)).toBeNull();
