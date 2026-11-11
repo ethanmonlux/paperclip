@@ -52,7 +52,7 @@ describe("System Atlas", () => {
     await act(async () => detail.click());
     expect(container.querySelector('[data-testid="atlas-chapters"]')).not.toBeNull();
     const back = [...container.querySelectorAll("header button")].find((button) => button.textContent?.includes("Back"))!;
-    await act(async () => back.click());
+    await act(async () => (back as HTMLButtonElement).click());
     expect(container.querySelector('[data-testid="atlas-overview"]')).not.toBeNull();
   });
   it("navigates chapters and progressive detail at 380px with separate revision labels", async () => {
@@ -60,14 +60,14 @@ describe("System Atlas", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(container.textContent).toContain("Source revision");
     expect(container.textContent).toContain("Installed revision");
-    await act(async () => [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Open all seven detailed chapters"))!.click());
+    await act(async () => ([...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Open all seven detailed chapters")) as HTMLButtonElement).click());
     const chapters = container.querySelector('nav[aria-label="Atlas chapters"]')!;
     expect(chapters.querySelectorAll("button")).toHaveLength(7);
     const work = [...chapters.querySelectorAll("button")].find((button) => button.textContent?.includes("Work execution"))!;
-    await act(async () => work.click());
+    await act(async () => (work as HTMLButtonElement).click());
     expect(container.textContent).toContain("How approved work");
     const brief = [...container.querySelectorAll("article button")].find((button) => button.textContent?.includes("Useful brief"))!;
-    await act(async () => brief.click());
+    await act(async () => (brief as HTMLButtonElement).click());
     expect(container.querySelectorAll('[role="tab"]')).toHaveLength(3);
     await act(async () => (container.querySelector('[role="tab"]:nth-child(3)') as HTMLButtonElement).click());
     expect(container.textContent).toContain("Source paths:");

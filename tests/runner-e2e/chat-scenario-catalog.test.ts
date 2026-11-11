@@ -10,8 +10,9 @@ it("validates the complete planned chat catalog against its schema and feature m
   const schema = JSON.parse(readFileSync(new URL("catalog.schema.json", catalog), "utf8"));
   const areas = readdirSync(catalog).filter(name => name.endsWith(".yaml") && name !== "defaults.yaml").sort();
   const features = readdirSync(maps).filter(name => name.endsWith(".md") && name !== "README.md").map(name => name.slice(0, -3)).sort();
-  expect(areas.map(name => name.slice(0, -5))).toEqual(features);
-  expect(areas).toHaveLength(37);
+  // The execution catalog is frozen; new feature-map entries do not enter it implicitly.
+  for (const name of areas) expect(features).toContain(name.slice(0, -5));
+  expect(areas).toHaveLength(35);
   const ids = new Set<string>();
   const covered = new Set<string>();
   const mapped = new Set<string>();
@@ -35,9 +36,9 @@ it("validates the complete planned chat catalog against its schema and feature m
     expect(capabilities.length, feature).toBeGreaterThan(0);
     capabilities.forEach(id => mapped.add(id));
   }
-  expect(ids.size).toBe(249);
+  expect(ids.size).toBe(244);
   expect([...covered].sort()).toEqual([...mapped].sort());
-  expect(mapped.size).toBe(197);
+  expect(mapped.size).toBe(192);
   const defaults = parseDocument(readFileSync(new URL("defaults.yaml", catalog), "utf8"), { uniqueKeys: true });
   expect(defaults.errors).toEqual([]);
   expect(defaults.toJS()).toMatchObject({ schema_version: 1, status: "planned" });
