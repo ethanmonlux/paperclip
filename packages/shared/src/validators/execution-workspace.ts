@@ -15,6 +15,8 @@ export const executionWorkspaceStatusSchema = z.enum([
 export const executionWorkspaceDeliveryStateSchema = z.enum([
   "merged_via_pr",
   "merged_by_ancestry",
+  "artifact_delivered",
+  "no_code",
   "unmerged",
   "unknown",
 ]);

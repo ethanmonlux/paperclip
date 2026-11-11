@@ -46,6 +46,7 @@ const bySortKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 type WalkOptions = {
   limits: TaskDirectorySnapshotLimits;
   signal?: AbortSignal;
+  rejectNestedGit: boolean;
   readFile: (absolute: string, relative: string, size: number) => Promise<string>;
 };
 
@@ -61,6 +62,11 @@ async function walk(root: string, options: WalkOptions) {
     options.signal?.throwIfAborted();
     const absoluteDir = relativeDir ? path.join(root, relativeDir) : root;
     const names = (await fs.readdir(absoluteDir)).sort(bySortKey);
+    // A task directory can contain a checkout at repo/. A directory snapshot
+    // does not establish that checkout's HEAD or publication state, and its
+    // generated contents can exceed the restore-point limits. Leave the whole
+    // task directory intact until repository delivery is qualified separately.
+    if (options.rejectNestedGit && names.includes(".git")) throw new TaskDirectorySnapshotSkip("nested_git_repository");
     const hasPackageManifest = names.includes("package.json")
       && (await fs.lstat(path.join(absoluteDir, "package.json"))).isFile();
     for (const name of names) {
@@ -116,8 +122,10 @@ async function hashFile(absolute: string, size: number) {
   }
 }
 
-export async function inspectTaskDirectory(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal } = {}) {
+export async function inspectTaskDirectory(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal;
+  restoreVerification?: boolean } = {}) {
   const walked = await walk(root, { limits: options.limits ?? DEFAULT_TASK_DIRECTORY_SNAPSHOT_LIMITS, signal: options.signal,
+    rejectNestedGit: !options.restoreVerification,
     readFile: (absolute, _relative, size) => hashFile(absolute, size) });
   return { digest: taskDirectoryManifestDigest(walked), entries: walked.entries.length, excluded: walked.excluded.length,
     newestMtimeMs: walked.newestMtimeMs };
@@ -137,6 +145,7 @@ export async function newestTaskDirectoryMtime(root: string, signal?: AbortSigna
 export async function captureTaskDirectorySnapshot(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal } = {}) {
   const bodies: Buffer[] = [];
   const walked = await walk(root, { limits: options.limits ?? DEFAULT_TASK_DIRECTORY_SNAPSHOT_LIMITS, signal: options.signal,
+    rejectNestedGit: true,
     readFile: async (absolute, _relative, size) => {
       const handle = await fs.open(absolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
@@ -245,7 +254,7 @@ export async function materializeTaskDirectorySnapshot(input: { payload: Buffer;
     }
     for (const directory of directories.reverse()) await fs.chmod(directory.target, directory.mode);
     const restored = await inspectTaskDirectory(staging, { limits: { maxFiles: Number.MAX_SAFE_INTEGER, maxFileBytes: Number.MAX_SAFE_INTEGER,
-      maxTotalBytes: Number.MAX_SAFE_INTEGER }, signal: input.signal });
+      maxTotalBytes: Number.MAX_SAFE_INTEGER }, signal: input.signal, restoreVerification: true });
     if (restored.digest !== input.expectedDigest) throw new TaskDirectoryRestoreFailure("restored_contents_mismatch");
     return staging;
   } catch (error) {

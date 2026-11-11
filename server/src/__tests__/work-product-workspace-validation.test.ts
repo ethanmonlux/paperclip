@@ -38,6 +38,23 @@ describeDatabase("work product execution workspace validation", () => {
 
   const input = { type: "pull_request", provider: "github", title: "Test output", status: "active", isPrimary: true };
 
+  it("binds a typed closeout to the current source issue and workspace generation", async () => {
+    const f = await fixture();
+    await db.update(executionWorkspaces).set({ sourceIssueId: f.issueId, metadata: { lifecycleGeneration: 2 } })
+      .where(eq(executionWorkspaces.id, f.executionWorkspaceId));
+    const svc = workProductService(db);
+    const closeout = (generation: number) => ({ type: "delivery_closeout", provider: "paperclip", status: "active",
+      title: "No-code closeout", executionWorkspaceId: f.executionWorkspaceId,
+      metadata: { deliveryCloseout: { kind: "no_code", workspaceId: f.executionWorkspaceId,
+        lifecycleGeneration: generation, reason: "No deliverable output is required." } } });
+    await expect(svc.createForIssue(f.issueId, f.companyId, closeout(1))).rejects.toMatchObject({ status: 422 });
+    const saved = await svc.createForIssue(f.issueId, f.companyId, closeout(2));
+    expect(saved?.metadata?.deliveryCloseout).toMatchObject({ kind: "no_code", lifecycleGeneration: 2 });
+    await expect(svc.update(saved!.id, { metadata: { deliveryCloseout: { kind: "no_code",
+      workspaceId: f.executionWorkspaceId, lifecycleGeneration: 3,
+      reason: "No deliverable output is required." } } })).rejects.toMatchObject({ status: 422 });
+  });
+
   it.each(["missing", "project", "other company"])("rejects a %s workspace on create without replacing the primary", async (kind) => {
     const f = await fixture();
     const svc = workProductService(db);

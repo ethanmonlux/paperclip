@@ -16,6 +16,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issues,
+  issueWorkProducts,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -93,6 +94,10 @@ describe.skipIf(!support.supported)("heartbeat resume of a removed task director
       name: "Finished files", status: "active", providerType: "local_fs", cwd, metadata: { source: "task_session", createdByRuntime: false } });
     await db.update(issues).set({ executionWorkspaceId: workspaceId, executionWorkspacePreference: "reuse_existing",
       executionWorkspaceSettings: { mode } }).where(eq(issues.id, issueId));
+    await db.insert(issueWorkProducts).values({ companyId, issueId, executionWorkspaceId: workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "Saved task output", status: "active",
+      metadata: { deliveryCloseout: { kind: "no_code", workspaceId, lifecycleGeneration: 0,
+        reason: "The task output remains in the recoverable workspace snapshot." } } });
     const workspace = () => db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)).then(rows => rows[0]!);
     expect(await expireIsolatedTaskDirectory(db, await workspace(), { dryRun: false, now: new Date(), notBefore: new Date(Date.now() - DAY_MS),
       restorePoint: { storage: getStorageService(), keyDurable: true } })).toMatchObject({ expired: true });
