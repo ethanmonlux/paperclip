@@ -531,6 +531,43 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await exists(o.cwd)).toBe(false);
     });
 
+    it("reconciles terminal aliases without closedAt for an empty orphan", async () => {
+      const o = await orphan();
+      await db.insert(companies).values({ id: o.companyId, name: "Terminal aliases", issuePrefix: `TA${o.companyId.slice(0, 6)}` });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
+        completedAt: new Date(Date.now() - 10 * DAY_MS) });
+      await db.insert(executionWorkspaces).values((["archived", "cleanup_failed"] as const).map(status => ({
+        companyId: o.companyId, sourceIssueId: o.issueId, mode: "shared_workspace", strategyType: "project_primary",
+        name: "Terminal alias", status, providerType: "local_fs", cwd: o.cwd,
+      })));
+      const preview = await sweep({ dryRun: true });
+      expect(preview.results).toMatchObject([{ issueId: o.issueId, outcome: "dry_run", ownerStatus: "done" }]);
+      expect(preview.results).toHaveLength(1);
+      expect(preview.results[0]!.physicalObject).toBe(`${(await fs.lstat(o.cwd)).dev}:${(await fs.lstat(o.cwd)).ino}`);
+      expect(await exists(o.cwd)).toBe(true);
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId, outcome: "removed" }]);
+      expect(await exists(o.cwd)).toBe(false);
+    });
+
+    it("keeps an empty orphan while another open task selects a terminal alias", async () => {
+      const o = await orphan();
+      const workspaceId = randomUUID();
+      const consumerId = randomUUID();
+      await db.insert(companies).values({ id: o.companyId, name: "Selected alias", issuePrefix: `SA${o.companyId.slice(0, 6)}` });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
+        completedAt: new Date(Date.now() - 10 * DAY_MS) });
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: o.companyId, sourceIssueId: o.issueId,
+        mode: "shared_workspace", strategyType: "project_primary", name: "Terminal alias", status: "archived",
+        providerType: "local_fs", cwd: o.cwd });
+      await db.insert(issues).values({ id: consumerId, companyId: o.companyId, title: "Waiting consumer", status: "todo",
+        workspaceSelection: { version: 1, source: "explicit", selection: { kind: "existing", workspaceId } } });
+      expect((await sweep({ dryRun: true })).results).toMatchObject([{ issueId: o.issueId, outcome: "skipped",
+        reason: "referenced_workspace", requiredEvidence: ["settled task, run, lease, and workspace references"] }]);
+      expect(await exists(o.cwd)).toBe(true);
+      await db.update(issues).set({ status: "done", completedAt: new Date(Date.now() - 10 * DAY_MS) }).where(eq(issues.id, consumerId));
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId, outcome: "removed" }]);
+    });
+
     it("keeps an orphan whose issue is still open", async () => {
       const o = await orphan();
       await db.insert(companies).values({ id: o.companyId, name: "Open", issuePrefix: `OP${o.companyId.slice(0, 6)}` });
