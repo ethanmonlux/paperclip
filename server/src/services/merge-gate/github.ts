@@ -151,7 +151,8 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
         total = readNumber(result?.total_count) ?? total;
         for (const raw of rows) {
           const run = asRecord(raw);
-          checks.push({ kind: "check_run", name: readString(run?.name) ?? "check", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion) });
+          checks.push({ kind: "check_run", name: readString(run?.name) ?? "check", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion),
+            headSha: readString(run?.head_sha), checkSuiteId: readNumber(asRecord(run?.check_suite)?.id), checkRunId: readNumber(run?.id) });
         }
         if (rows.length < PAGE_SIZE) break;
         if (page >= MAX_CHECK_PAGES) { complete = false; break; }
@@ -162,7 +163,10 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
         const rows = Array.isArray(result?.workflow_runs) ? result.workflow_runs : [];
         for (const raw of rows) {
           const run = asRecord(raw);
-          checks.push({ kind: "workflow_run", name: readString(run?.name) ?? "workflow", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion) });
+          checks.push({ kind: "workflow_run", name: readString(run?.name) ?? "workflow", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion),
+            headSha: readString(run?.head_sha), checkSuiteId: readNumber(run?.check_suite_id),
+            workflowPath: readString(run?.path)?.split("@", 1)[0] ?? null, runId: readNumber(run?.id),
+            runAttempt: readNumber(run?.run_attempt), createdAt: readString(run?.created_at) });
         }
         if (rows.length < PAGE_SIZE) break;
         if (page >= MAX_CHECK_PAGES) { complete = false; break; }
@@ -179,3 +183,4 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
     },
   };
 }
+

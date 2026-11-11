@@ -119,6 +119,22 @@ const accountWebCi = [...facetteAlwaysCi,
   { kind: "check_run" as const, name: "windows-fast", status: "completed", conclusion: "skipped" }];
 
 describe("merge gate service", () => {
+  it("keeps a reviewed Facette shell change blocked until exact-head candidate proof exists", async () => {
+    const ordinary = [...facetteAlwaysCi, ok("windows-fast"), ok("windows-native")];
+    const proof: MergeGateCheck[] = [
+      ...["frontend", "candidate", "browser-evidence"].map(name => ({ ...ok(name), headSha: HEAD, checkSuiteId: 91 })),
+      { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
+        headSha: HEAD, checkSuiteId: 91, runId: 1234, workflowPath: ".github/workflows/internal-windows.yml" },
+    ];
+    for (const candidate of [[], proof]) {
+      const { github, merge } = fakeGitHub({ headChecks: [...ordinary, ...candidate] });
+      github.pullRequestFiles = async () => [{ filename: "shell/src/app.tsx", status: "modified", blobSha: "x", patch: "@@ -1 +1 @@\n-a\n+b" }];
+      const result = await evaluateAndMerge(harness({ github }).deps, request());
+      expect(result.outcome).toBe(candidate.length === 0 ? "refused" : "merged");
+      expect(merge).toHaveBeenCalledTimes(candidate.length === 0 ? 0 : 1);
+    }
+  });
+
   it("merges a current, green, reviewed head at that exact SHA", async () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
     const h = harness({ github });
@@ -269,3 +285,4 @@ describe("merge gate service", () => {
     await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_missing" }] });
   });
 });
+
