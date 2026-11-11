@@ -3,8 +3,8 @@ import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { notifyApprovalQueueWork } from "./approval-work-notifications.js";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, heartbeatRunEvents, issueWorkProducts, workspaceRuntimeServices } from "@paperclipai/db";
-import { issueDeliveryCloseoutSchema, type IssueWorkProduct } from "@paperclipai/shared";
+import { executionWorkspaces, heartbeatRunEvents, issueAttachments, issueWorkProducts, workspaceRuntimeServices } from "@paperclipai/db";
+import { attachmentArtifactWorkProductMetadataSchema, issueDeliveryCloseoutSchema, type IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
@@ -44,8 +44,12 @@ async function validateDeliveryCloseout(tx: WorkProductTransaction, companyId: s
       .where(and(eq(issueWorkProducts.companyId, companyId), eq(issueWorkProducts.issueId, issueId), inArray(issueWorkProducts.id, ids)));
     if (rows.length !== ids.length || rows.some(row => row.type !== "artifact" || row.provider !== "paperclip"
       || ["failed", "closed", "archived"].includes(row.status)
-      || typeof row.metadata?.attachmentId !== "string" || row.metadata?.resourceRef))
+      || !attachmentArtifactWorkProductMetadataSchema.safeParse(row.metadata).success || row.metadata?.resourceRef))
       throw unprocessable("Artifact closeout requires published Paperclip attachment work products");
+    const attachmentIds = rows.map(row => row.metadata!.attachmentId as string);
+    const attachments = await tx.select({ id: issueAttachments.id }).from(issueAttachments).where(and(
+      eq(issueAttachments.companyId, companyId), eq(issueAttachments.issueId, issueId), inArray(issueAttachments.id, attachmentIds)));
+    if (attachments.length !== ids.length) throw unprocessable("Artifact closeout references a missing task attachment");
   }
 }
 

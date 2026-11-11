@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
-import { issueWorkProducts, type Db } from "@paperclipai/db";
-import { issueDeliveryCloseoutSchema, type IssueDeliveryCloseout } from "@paperclipai/shared";
+import { issueAttachments, issueWorkProducts, type Db } from "@paperclipai/db";
+import { attachmentArtifactWorkProductMetadataSchema, issueDeliveryCloseoutSchema, type IssueDeliveryCloseout } from "@paperclipai/shared";
 
 type ReadDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -29,7 +29,12 @@ export async function readTaskDeliveryCloseout(db: ReadDb, input: { companyId: s
         eq(issueWorkProducts.issueId, input.issueId), inArray(issueWorkProducts.id, ids)));
     if (artifacts.length !== ids.length || artifacts.some(row => row.type !== "artifact" || row.provider !== "paperclip"
       || ["failed", "closed", "archived"].includes(row.status)
-      || typeof row.metadata?.attachmentId !== "string" || row.metadata?.resourceRef)) return null;
+      || !attachmentArtifactWorkProductMetadataSchema.safeParse(row.metadata).success || row.metadata?.resourceRef)) return null;
+    const attachmentIds = artifacts.map(row => row.metadata!.attachmentId as string);
+    const attachments = await db.select({ id: issueAttachments.id }).from(issueAttachments).where(and(
+      eq(issueAttachments.companyId, input.companyId), eq(issueAttachments.issueId, input.issueId),
+      inArray(issueAttachments.id, attachmentIds)));
+    if (attachments.length !== ids.length) return null;
     return closeout;
   }
   return null;

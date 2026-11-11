@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
+  assets,
   agents,
   companies,
   createDb,
@@ -15,6 +16,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueAttachments,
   issueWorkProducts,
   issueRecoveryActions,
   issues,
@@ -161,9 +163,16 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     const f = await fixture();
     await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
     const artifactId = randomUUID();
+    const attachmentId = randomUUID();
+    const contentPath = `/api/attachments/${attachmentId}/content`;
+    const assetId = randomUUID();
+    await db.insert(assets).values({ id: assetId, companyId: f.companyId, provider: "local", objectKey: randomUUID(),
+      contentType: "text/plain", byteSize: 6, sha256: "a".repeat(64) });
+    await db.insert(issueAttachments).values({ id: attachmentId, companyId: f.companyId, issueId: f.issueId, assetId });
     await db.insert(issueWorkProducts).values({ id: artifactId, companyId: f.companyId, issueId: f.issueId,
       type: "artifact", provider: "paperclip", title: "Published report", status: "active",
-      metadata: { attachmentId: randomUUID() } });
+      metadata: { attachmentId, contentType: "text/plain", byteSize: 6, contentPath, openPath: contentPath,
+        downloadPath: `${contentPath}?download=1` } });
     await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
       type: "delivery_closeout", provider: "paperclip", title: "Artifact closeout", status: "active",
       metadata: { deliveryCloseout: { kind: "artifact", workspaceId: f.workspaceId, lifecycleGeneration: 0,
