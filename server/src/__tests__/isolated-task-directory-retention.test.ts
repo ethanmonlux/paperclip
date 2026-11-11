@@ -464,6 +464,79 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await late.ledger()).toMatchObject([{ status: "superseded" }]);
     }, 60_000);
 
+    /** Leave the state a crash right after the rename into trash leaves. */
+    async function crashAfterRename(f: Awaited<ReturnType<typeof codeDeliveredFixture>>) {
+      await f.expire({ beforeDelete: async () => { throw new Error("simulated_crash"); } });
+      const state = readTaskDirectoryRetention(await f.row())!;
+      await fs.rename(f.cwd, state.trash);
+      return state;
+    }
+
+    it("checks a folder left renamed by a crash and keeps a commit made in it afterwards", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await crashAfterRename(f);
+      gitFixture.calls = 0;
+      expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(state.trash)).toBe(false);
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+
+      const late = await codeDeliveredFixture();
+      const lateState = await crashAfterRename(late);
+      // A process still inside the renamed folder keeps working.
+      const moved = path.join(lateState.trash, "repo");
+      await fs.writeFile(path.join(moved, "late.txt"), "late work\n");
+      git(moved, "add", "late.txt");
+      git(moved, "commit", "-q", "-m", "Late unpublished work");
+      gitFixture.calls = 0;
+      expect(await late.expire({ dryRun: true })).toMatchObject({ expired: false, skipReason: "task_directory_changed" });
+      expect(await exists(lateState.trash)).toBe(true);
+      expect(await late.expire()).toMatchObject({ expired: false, skipReason: "task_directory_changed" });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(lateState.trash)).toBe(false);
+      expect(git(late.delivered.checkout, "log", "-1", "--format=%s")).toBe("Late unpublished work");
+      const row = await late.row();
+      expect(row.status).toBe("active");
+      expect(readTaskDirectoryRetention(row)).toBeNull();
+      expect(await late.ledger()).toMatchObject([{ status: "superseded" }]);
+    }, 60_000);
+
+    it("reopens a folder left renamed by a crash as it is, with later work", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await crashAfterRename(f);
+      const moved = path.join(state.trash, "repo");
+      await fs.writeFile(path.join(moved, "late.txt"), "late work\n");
+      git(moved, "add", "late.txt");
+      git(moved, "commit", "-q", "-m", "Late unpublished work");
+      gitFixture.calls = 0;
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(state.trash)).toBe(false);
+      expect(git(f.delivered.checkout, "log", "-1", "--format=%s")).toBe("Late unpublished work");
+      expect(await exists(path.join(f.cwd, "node_modules", "dep", "index.js"))).toBe(true);
+      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
+    }, 60_000);
+
+    it("finishes a partly completed removal on restart and reopens from the restore point", async () => {
+      const f = await codeDeliveredFixture();
+      await expect(f.expire({ beforeRemove: async trash => {
+        await fs.rm(path.join(trash, "repo"), { recursive: true, force: true });
+        throw new Error("simulated_crash");
+      } })).resolves.toMatchObject({ expired: false, skipReason: "simulated_crash" });
+      const state = readTaskDirectoryRetention(await f.row())!;
+      expect(state).toMatchObject({ removed: false, removalStartedAt: expect.any(String) });
+      expect(await exists(state.trash)).toBe(true);
+      gitFixture.calls = 0;
+      expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, skipReason: null });
+      expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(state.trash)).toBe(false);
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+    }, 60_000);
+
     it("keeps the folder closed and whole when a reopen cannot fetch, then restores on retry", async () => {
       const f = await codeDeliveredFixture();
       expect(await f.expire()).toMatchObject({ expired: true });

@@ -375,7 +375,15 @@ the workspace is made active again, the restore point is dropped and the directo
 `.expired-<random>` name beside it, no longer than the original name, and deleted. The
 archive and the removal are recorded as `execution_workspace.task_directory_archived` and
 `execution_workspace.task_directory_removed` activity. A removal the
-server could not finish is finished by a later sweep.
+server could not finish is finished by a later sweep. A crash right after the rename
+leaves the folder under its `.expired-` name, where a process still inside it can keep
+working, so the later sweep checks that renamed folder the same way, locally, before
+deleting it. If it changed, it is renamed back, the workspace is made active again and the
+restore point is dropped (`task_directory_changed`). The intent records `removalStartedAt`
+once that check passed and deletion begins, so a sweep after a partly completed deletion
+finishes it instead of treating the remainder as a change. Reopening before that sweep
+renames the `.expired-` folder back as it is, keeping any later work; only a partly
+deleted one is removed and rebuilt from the restore point.
 
 Reopening the workspace restores the directory before anything uses it: a comment or an
 agent update on an issue bound to a closed `isolated_workspace`, or the next run of the
