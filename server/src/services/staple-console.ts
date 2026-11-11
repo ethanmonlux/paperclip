@@ -80,6 +80,8 @@ const STAPLE_REPO = STAPLE_CONSOLE_LANES.find((lane) => lane.key === "staple")?.
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
 const ATLAS_SOURCE_TTL_MS = 2 * 60_000;
+/** Commit that introduced the current authored Atlas nodes. Advance only when their prose is reviewed. */
+const ATLAS_AUTHORED_REVISION = "0135ef823d6216c3c9681050bcf31d2959ac3744";
 const GITHUB_TIMEOUT_MS = 8_000;
 
 /**
@@ -899,13 +901,13 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     const installed = getServerInfoSnapshot().git;
     const installedRevision = opts.installedRevision ? opts.installedRevision() : installed.available ? installed.fullSha : null;
     const result: StapleAtlasSource = {
-      authoredRevision: installedRevision ?? "unknown", sourceRevision: null, installedRevision,
+      authoredRevision: ATLAS_AUTHORED_REVISION, sourceRevision: null, installedRevision,
       changedPaths: null, status: "unknown", observedAt: new Date(nowMs).toISOString(),
     };
     const credential = await credentialProvider(companyId, actor).catch(() => null);
-    if (!credential || !installedRevision) return result;
+    if (!credential) return result;
     const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
-    const scope = `${companyId}|${viewer}|${createHash("sha256").update(credential.token).digest("hex")}|${installedRevision}`;
+    const scope = `${companyId}|${viewer}|${createHash("sha256").update(credential.token).digest("hex")}|${ATLAS_AUTHORED_REVISION}`;
     const cached = atlasSourceCache.get(scope);
     try {
       let source = cached;
@@ -914,8 +916,8 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         const sourceRevision = typeof head?.sha === "string" ? head.sha : null;
         if (!sourceRevision) throw new Error("GitHub source revision unavailable");
         let changedPaths: string[] = [];
-        if (sourceRevision !== installedRevision) {
-          const comparison = asRecord(await githubJson(`/repos/${STAPLE_REPO}/compare/${installedRevision}...${sourceRevision}`, credential.token));
+        if (sourceRevision !== ATLAS_AUTHORED_REVISION) {
+          const comparison = asRecord(await githubJson(`/repos/${STAPLE_REPO}/compare/${ATLAS_AUTHORED_REVISION}...${sourceRevision}`, credential.token));
           const files = Array.isArray(comparison?.files) ? comparison.files : null;
           if (!files || files.length >= 300 || !["ahead", "identical"].includes(String(comparison?.status))) throw new Error("GitHub source comparison incomplete");
           changedPaths = files.flatMap((file) => {

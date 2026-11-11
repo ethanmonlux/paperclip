@@ -120,7 +120,7 @@ suite("staple console GitHub source", () => {
   });
 
   it("keeps source, installed revision and last-good comparison distinct across a failed refresh", async () => {
-    const installed = "a".repeat(40);
+    let installed = "a".repeat(40);
     const source = "b".repeat(40);
     let clock = new Date("2026-11-11T03:00:00Z");
     let fail = false;
@@ -138,8 +138,12 @@ suite("staple console GitHub source", () => {
     });
     const actor = { type: "board" as const, userId: randomUUID(), authorizingUserId: randomUUID() };
     const first = await svc.atlasSource(randomUUID(), actor);
-    expect(first).toMatchObject({ authoredRevision: installed, installedRevision: installed, sourceRevision: source,
+    expect(first).toMatchObject({ installedRevision: installed, sourceRevision: source,
       status: "changed", changedPaths: ["server/src/services/native-runtime/example.ts"], observedAt: clock.toISOString() });
+    expect(first.authoredRevision).not.toBe(installed);
+    installed = source;
+    const afterInstall = await svc.atlasSource(randomUUID(), actor);
+    expect(afterInstall).toMatchObject({ installedRevision: source, status: "changed", authoredRevision: first.authoredRevision });
     clock = new Date(clock.getTime() + 3 * 60_000);
     fail = true;
     const second = await svc.atlasSource(randomUUID(), actor);
