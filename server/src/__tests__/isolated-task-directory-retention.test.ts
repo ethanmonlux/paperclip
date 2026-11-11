@@ -25,6 +25,7 @@ import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { materializeIsolatedTaskDirectory } from "../services/isolated-task-directory.js";
 import {
   expireIsolatedTaskDirectory,
+  inspectIsolatedTaskDirectoryFolders,
   readTaskDirectoryRetention,
   sweepIsolatedTaskDirectories,
   TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING,
@@ -406,6 +407,16 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       const o = await orphan();
       const batch = await sweep({ dryRun: true });
       expect(batch.results).toMatchObject([{ issueId: o.issueId, outcome: "dry_run" }]);
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
+    it("reports one physical folder when many workspace hints alias it", async () => {
+      const o = await orphan();
+      const results = await inspectIsolatedTaskDirectoryFolders(db,
+        Array.from({ length: 300 }, () => ({ companyId: o.companyId, issueId: o.issueId })),
+        { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
+      expect(results).toMatchObject([{ companyId: o.companyId, issueId: o.issueId, outcome: "dry_run" }]);
+      expect(results).toHaveLength(1);
       expect(await exists(o.cwd)).toBe(true);
     });
 

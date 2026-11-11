@@ -250,11 +250,18 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         if (!state) {
           if (!present) throw new Error("missing_task_directory");
           result.candidateBytes = await allocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          // A preview needs the same bounded qualification, but must not retain
+          // every file body in memory just to discard the encoded snapshot.
+          if (options.dryRun) {
+            await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
+            result.candidate = true;
+            return result;
+          }
           const captured = await captureTaskDirectorySnapshot(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
           result.candidate = true;
-          if (options.dryRun) return result;
           const generation = Number(workspace.metadata?.lifecycleGeneration ?? 0) + 1;
-          const stored = await storeTaskDirectoryRestorePoint(db, options.restorePoint!.storage, workspace, generation, captured, options.signal);
+          const stored = await storeTaskDirectoryRestorePoint(db, options.restorePoint!.storage, workspace, generation,
+            captured, options.signal);
           pending = stored.ledgerId;
           result.restorePoint = true;
           state = { schema: TASK_DIRECTORY_RETENTION_SCHEMA, generation, removed: false,
@@ -568,9 +575,14 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
 
 export async function inspectIsolatedTaskDirectoryFolders(db: Db, folders: Array<{ companyId: string; issueId: string }>, options: FolderSweepOptions) {
   const results: TaskDirectoryFolderResult[] = [];
+  const seen = new Set<string>();
   for (const folder of folders) {
     options.signal?.throwIfAborted();
     if (!IDENTITY.test(folder.companyId) || !IDENTITY.test(folder.issueId)) continue;
+    // Hints can contain many workspace aliases of one physical task folder.
+    const physicalKey = `${folder.companyId}/${folder.issueId}`;
+    if (seen.has(physicalKey)) continue;
+    seen.add(physicalKey);
     const result = await inspectTaskDirectoryFolder(db, folder.companyId, folder.issueId, options);
     if (result) results.push(result);
   }
