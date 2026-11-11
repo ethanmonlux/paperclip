@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { eq, sql } from "drizzle-orm";
 import {
   activityLog,
+  assets,
   agents,
   companies,
   createDb,
@@ -15,6 +16,8 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueAttachments,
+  issueWorkProducts,
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
@@ -25,6 +28,7 @@ import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { materializeIsolatedTaskDirectory } from "../services/isolated-task-directory.js";
 import {
   expireIsolatedTaskDirectory,
+  inspectIsolatedTaskDirectoryFolders,
   readTaskDirectoryRetention,
   sweepIsolatedTaskDirectories,
   TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING,
@@ -98,6 +102,10 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       closedAt: options.status === "archived" ? new Date(Date.now() - closedDaysAgo! * DAY_MS) : null,
       metadata: { source: "task_session", createdByRuntime: false } });
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+    await db.insert(issueWorkProducts).values({ companyId, issueId, executionWorkspaceId: workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "No-code task closeout", status: "active",
+      metadata: { deliveryCloseout: { kind: "no_code", workspaceId, lifecycleGeneration: 0,
+        reason: "Fixture task requires no published output." } } });
     const row = () => db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)).then(rows => rows[0]!);
     const ledger = () => db.select().from(executionWorkspaceRestorePoints).where(eq(executionWorkspaceRestorePoints.executionWorkspaceId, workspaceId));
     const service = (overrides: Parameters<typeof executionWorkspaceService>[1] = {}) => executionWorkspaceService(db, {
@@ -121,8 +129,12 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
   }
 
   it("archives and removes a closed issue's task directory after the delay and restores it on reopen", async () => {
+    const service = executionWorkspaceService(db, { taskDirectoryRetention: settings, gitRestorePoints: restorePoints() });
+    // Prime the independent folder walk before creating the bound workspace so
+    // this test exercises the terminal workspace row path and its counters.
+    await service.sweepTerminalWorkspaces();
     const f = await fixture();
-    const result = await f.service().sweepTerminalWorkspaces();
+    const result = await service.sweepTerminalWorkspaces();
     expect(result).toMatchObject({ archived: 1 });
     expect(await exists(f.cwd)).toBe(false);
     expect(await fs.readFile(path.join(outside, "keep.txt"), "utf8")).toBe("outside\n");
@@ -138,6 +150,42 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(reopened.status).toBe("active");
     expect(readTaskDirectoryRetention(reopened)).toBeNull();
     expect(await f.ledger()).toMatchObject([{ status: "superseded" }]);
+  });
+
+  it("retains a task folder with no typed closeout and explains the missing proof", async () => {
+    const f = await fixture();
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false,
+      skipReason: "delivery_closeout_missing" });
+    const preview = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }],
+      { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
+    expect(preview[0]).toMatchObject({ outcome: "skipped", reason: "delivery_closeout_missing",
+      requiredEvidence: ["typed artifact or no-code delivery closeout for this workspace lifecycle"] });
+    expect(preview[0]!.candidateBytes).toBeGreaterThan(0);
+    expect(await exists(f.cwd)).toBe(true);
+  });
+
+  it("requires every artifact named by a closeout to remain published", async () => {
+    const f = await fixture();
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+    const artifactId = randomUUID();
+    const attachmentId = randomUUID();
+    const contentPath = `/api/attachments/${attachmentId}/content`;
+    const assetId = randomUUID();
+    await db.insert(assets).values({ id: assetId, companyId: f.companyId, provider: "local", objectKey: randomUUID(),
+      contentType: "text/plain", byteSize: 6, sha256: "a".repeat(64) });
+    await db.insert(issueAttachments).values({ id: attachmentId, companyId: f.companyId, issueId: f.issueId, assetId });
+    await db.insert(issueWorkProducts).values({ id: artifactId, companyId: f.companyId, issueId: f.issueId,
+      type: "artifact", provider: "paperclip", title: "Published report", status: "active",
+      metadata: { attachmentId, contentType: "text/plain", byteSize: 6, contentPath, openPath: contentPath,
+        downloadPath: `${contentPath}?download=1` } });
+    await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "Artifact closeout", status: "active",
+      metadata: { deliveryCloseout: { kind: "artifact", workspaceId: f.workspaceId, lifecycleGeneration: 0,
+        artifactWorkProductIds: [artifactId] } } });
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, skipReason: null });
+    await db.update(issueWorkProducts).set({ status: "archived" }).where(eq(issueWorkProducts.id, artifactId));
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, skipReason: "delivery_closeout_missing" });
   });
 
   it("restores a shared-workspace task directory through reopen", async () => {
@@ -158,7 +206,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect((await f.row()).status).toBe("active");
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     const deadline = await service.nextTerminalWorkspaceSweepAt();
-    expect(deadline).toBe(issue.completedAt!.getTime() + 3 * DAY_MS);
+    expect(deadline).toBeGreaterThan(Date.now());
+    expect(deadline).toBeLessThanOrEqual(issue.completedAt!.getTime() + 3 * DAY_MS);
     expect(await f.ledger()).toEqual([]);
   });
 
@@ -237,6 +286,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.ledger()).toEqual([]);
   });
 
+  it("keeps a task directory containing an unpublished nested checkout", async () => {
+    const f = await fixture();
+    const repo = path.join(f.cwd, "repo");
+    await fs.mkdir(repo);
+    execFileSync("git", ["init", "-q", repo]);
+
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
+    expect(await f.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
+    expect(await exists(repo)).toBe(true);
+    expect((await f.row()).status).toBe("active");
+    expect(await f.ledger()).toEqual([]);
+  });
+
   it("reports candidates in dry run without changing anything", async () => {
     const f = await fixture();
     const result = await f.service({ taskDirectoryRetention: { ...settings, dryRun: true }, gitRestorePoints: undefined }).sweepTerminalWorkspaces();
@@ -266,6 +328,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
     expect(await exists(f.cwd)).toBe(false);
     expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+  });
+
+  it("does not preview stale saved contents after an interrupted removal", async () => {
+    const f = await fixture();
+    await f.expire({ beforeDelete: async () => { throw new Error("simulated_crash"); } });
+    const saved = readTaskDirectoryRetention(await f.row());
+    expect(saved).toMatchObject({ removed: false });
+
+    await fs.writeFile(path.join(f.cwd, "late.txt"), "unpublished work\n");
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false,
+      skipReason: "task_directory_changed" });
+    expect(await exists(f.cwd)).toBe(true);
+    expect(readTaskDirectoryRetention(await f.row())).toEqual(saved);
   });
 
   it("never follows a task directory that is a symbolic link", async () => {
@@ -346,11 +421,13 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
   });
 
   it("does not let skipped rows starve later rows of the per-sweep budget", async () => {
+    const service = executionWorkspaceService(db, { taskDirectoryRetention: { ...settings, perSweep: 1 },
+      gitRestorePoints: restorePoints() });
+    await service.sweepTerminalWorkspaces();
     const blocked = await fixture();
     execFileSync("mkfifo", [path.join(blocked.cwd, "pipe")]);
     const ready = await fixture();
     await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(executionWorkspaces.id, blocked.workspaceId));
-    const service = blocked.service({ taskDirectoryRetention: { ...settings, perSweep: 1 } });
     expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
     expect(await exists(ready.cwd)).toBe(true);
     expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
@@ -363,16 +440,28 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       dryRun: false, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
       restorePoint: { storage: getStorageService(), keyDurable: true }, ...overrides });
 
-    async function orphan(options: { modifiedDaysAgo?: number } = {}) {
+    it("reports the restore-point prerequisite for a bound directory in dry run", async () => {
+      const f = await fixture({ status: "archived" });
+      const results = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }], {
+        dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
+      });
+      expect(results).toMatchObject([{ issueId: f.issueId, outcome: "dry_run",
+        requiredEvidence: ["configured durable restore-point storage"] }]);
+      expect(await exists(f.cwd)).toBe(true);
+    });
+
+    async function orphan(options: { modifiedDaysAgo?: number; withContents?: boolean } = {}) {
       const companyId = randomUUID(), issueId = randomUUID();
       const cwd = await materializeIsolatedTaskDirectory({ companyId, issueId });
-      await fs.writeFile(path.join(cwd, "left.txt"), "left behind\n");
-      await fs.symlink(outside, path.join(cwd, "outside-link"));
+      if (options.withContents) {
+        await fs.writeFile(path.join(cwd, "left.txt"), "left behind\n");
+        await fs.symlink(outside, path.join(cwd, "outside-link"));
+      }
       await age(cwd, new Date(Date.now() - (options.modifiedDaysAgo ?? 10) * DAY_MS));
       return { companyId, issueId, cwd };
     }
 
-    it("removes an orphan whose issue is gone after the grace period", async () => {
+    it("removes an empty orphan whose issue is gone after the grace period", async () => {
       const o = await orphan();
       const batch = await sweep();
       expect(batch.results).toMatchObject([{ issueId: o.issueId, outcome: "removed", reason: null }]);
@@ -396,13 +485,39 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await exists(o.cwd)).toBe(true);
     });
 
+    it("reports and retains unqualified orphan contents", async () => {
+      const o = await orphan({ withContents: true });
+      const batch = await sweep({ dryRun: true });
+      expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
+        outcome: "skipped", reason: "orphan_contents_unqualified",
+        requiredEvidence: ["authoritative publication or owned checkpoint for every retained file"] }]);
+      expect(batch.results[0]!.candidateBytes).toBeGreaterThan(0);
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId,
+        outcome: "skipped", reason: "orphan_contents_unqualified" }]);
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
+    it("reports one physical folder when many workspace hints alias it", async () => {
+      const o = await orphan({ withContents: true });
+      const results = await inspectIsolatedTaskDirectoryFolders(db,
+        Array.from({ length: 300 }, () => ({ companyId: o.companyId, issueId: o.issueId })),
+        { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
+      expect(results).toMatchObject([{ companyId: o.companyId, issueId: o.issueId, allowedScope: o.cwd,
+        ownerStatus: null, outcome: "skipped", reason: "orphan_contents_unqualified" }]);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.physicalObject).toBe(`${(await fs.lstat(o.cwd)).dev}:${(await fs.lstat(o.cwd)).ino}`);
+      expect(await exists(o.cwd)).toBe(true);
+    });
+
     it("keeps a folder that a live workspace points into", async () => {
       const o = await orphan();
       await db.insert(companies).values({ id: o.companyId, name: "Live", issuePrefix: `LV${o.companyId.slice(0, 6)}` });
       await db.insert(executionWorkspaces).values({ companyId: o.companyId, mode: "shared_workspace", strategyType: "project_primary",
         name: "Live", status: "active", providerType: "local_fs", cwd: path.join(o.cwd, "sub") });
-      const batch = await sweep();
-      expect(batch.results).toEqual([]);
+      const batch = await sweep({ dryRun: true });
+      expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
+        outcome: "skipped", reason: "live_workspace",
+        requiredEvidence: ["settled task, run, lease, and workspace references"] }]);
       expect(await exists(o.cwd)).toBe(true);
     });
 
@@ -414,6 +529,43 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
         name: "Archived", status: "archived", closedAt: new Date(Date.now() - 10 * DAY_MS), providerType: "local_fs", cwd: o.cwd });
       expect((await sweep()).results).toMatchObject([{ outcome: "removed" }]);
       expect(await exists(o.cwd)).toBe(false);
+    });
+
+    it("reconciles terminal aliases without closedAt for an empty orphan", async () => {
+      const o = await orphan();
+      await db.insert(companies).values({ id: o.companyId, name: "Terminal aliases", issuePrefix: `TA${o.companyId.slice(0, 6)}` });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
+        completedAt: new Date(Date.now() - 10 * DAY_MS) });
+      await db.insert(executionWorkspaces).values((["archived", "cleanup_failed"] as const).map(status => ({
+        companyId: o.companyId, sourceIssueId: o.issueId, mode: "shared_workspace", strategyType: "project_primary",
+        name: "Terminal alias", status, providerType: "local_fs", cwd: o.cwd,
+      })));
+      const preview = await sweep({ dryRun: true });
+      expect(preview.results).toMatchObject([{ issueId: o.issueId, outcome: "dry_run", ownerStatus: "done" }]);
+      expect(preview.results).toHaveLength(1);
+      expect(preview.results[0]!.physicalObject).toBe(`${(await fs.lstat(o.cwd)).dev}:${(await fs.lstat(o.cwd)).ino}`);
+      expect(await exists(o.cwd)).toBe(true);
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId, outcome: "removed" }]);
+      expect(await exists(o.cwd)).toBe(false);
+    });
+
+    it("keeps an empty orphan while another open task selects a terminal alias", async () => {
+      const o = await orphan();
+      const workspaceId = randomUUID();
+      const consumerId = randomUUID();
+      await db.insert(companies).values({ id: o.companyId, name: "Selected alias", issuePrefix: `SA${o.companyId.slice(0, 6)}` });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
+        completedAt: new Date(Date.now() - 10 * DAY_MS) });
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: o.companyId, sourceIssueId: o.issueId,
+        mode: "shared_workspace", strategyType: "project_primary", name: "Terminal alias", status: "archived",
+        providerType: "local_fs", cwd: o.cwd });
+      await db.insert(issues).values({ id: consumerId, companyId: o.companyId, title: "Waiting consumer", status: "todo",
+        workspaceSelection: { version: 1, source: "explicit", selection: { kind: "existing", workspaceId } } });
+      expect((await sweep({ dryRun: true })).results).toMatchObject([{ issueId: o.issueId, outcome: "skipped",
+        reason: "referenced_workspace", requiredEvidence: ["settled task, run, lease, and workspace references"] }]);
+      expect(await exists(o.cwd)).toBe(true);
+      await db.update(issues).set({ status: "done", completedAt: new Date(Date.now() - 10 * DAY_MS) }).where(eq(issues.id, consumerId));
+      expect((await sweep()).results).toMatchObject([{ issueId: o.issueId, outcome: "removed" }]);
     });
 
     it("keeps an orphan whose issue is still open", async () => {

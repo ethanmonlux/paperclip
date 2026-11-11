@@ -581,6 +581,7 @@ export {
 export {
   createIssueWorkProductSchema,
   issueWorkProductMetadataSchema,
+  issueDeliveryCloseoutSchema,
   updateIssueWorkProductSchema,
   attachmentArtifactWorkProductMetadataSchema,
   issueWorkProductTypeSchema,
@@ -588,6 +589,7 @@ export {
   issueWorkProductReviewStateSchema,
   type CreateIssueWorkProduct,
   type IssueWorkProductMetadata,
+  type IssueDeliveryCloseout,
   type UpdateIssueWorkProduct,
 } from "./work-product.js";
 

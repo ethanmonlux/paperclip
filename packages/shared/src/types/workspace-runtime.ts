@@ -40,6 +40,8 @@ export type ExecutionWorkspaceStatus =
 export type ExecutionWorkspaceDeliveryState =
   | "merged_via_pr"
   | "merged_by_ancestry"
+  | "artifact_delivered"
+  | "no_code"
   | "unmerged"
   | "unknown";
 

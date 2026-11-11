@@ -5,6 +5,20 @@ import {
 } from "./validators/work-product.js";
 
 describe("work product metadata with resource ref", () => {
+  it("requires a typed, workspace-bound delivery closeout", () => {
+    const base = { type: "delivery_closeout", provider: "paperclip", title: "Task closeout",
+      executionWorkspaceId: "223e4567-e89b-42d3-a456-426614174001" };
+    // The route's work-product service validates the required declaration and
+    // current workspace binding; this reusable schema validates its shape.
+    expect(createIssueWorkProductSchema.safeParse({ ...base, metadata: { deliveryCloseout: {
+      kind: "no_code", workspaceId: base.executionWorkspaceId, lifecycleGeneration: 0,
+      reason: "Investigation completed with no deliverable file required.",
+    } } }).success).toBe(true);
+    expect(createIssueWorkProductSchema.safeParse({ ...base, metadata: { deliveryCloseout: {
+      kind: "artifact", workspaceId: base.executionWorkspaceId, lifecycleGeneration: 0,
+      artifactWorkProductIds: [],
+    } } }).success).toBe(false);
+  });
   it("accepts valid workspace file ref in metadata", () => {
     const result = issueWorkProductMetadataSchema.parse({
       resourceRef: {

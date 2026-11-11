@@ -2071,6 +2071,8 @@ export {
   createIssueAttachmentMetadataSchema,
   createIssueWorkProductSchema,
   issueWorkProductMetadataSchema,
+  issueDeliveryCloseoutSchema,
+  type IssueDeliveryCloseout,
   updateIssueWorkProductSchema,
   attachmentArtifactWorkProductMetadataSchema,
   issueWorkProductTypeSchema,
