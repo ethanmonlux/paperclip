@@ -245,16 +245,16 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, undefined, { closedSiblingsAllowed: true })) {
           throw new Error("live_or_unresolved_consumer");
         }
-        const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
-          workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
-        if (!closeout) throw new Error("delivery_closeout_missing");
-        if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
         const cwd = workspace.cwd!;
         let state = readTaskDirectoryRetention(workspace);
         const present = await directoryState(cwd) === "present";
         if (!state) {
           if (!present) throw new Error("missing_task_directory");
           result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
+          const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
+            workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
+          if (!closeout) throw new Error("delivery_closeout_missing");
+          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
           // A preview needs the same bounded qualification, but must not retain
           // every file body in memory just to discard the encoded snapshot.
           if (options.dryRun) {
@@ -293,6 +293,12 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             });
           }
         } else {
+          // The intent increments the workspace generation after validation.
+          // Continue to bind the declaration to the pre-archive lifecycle.
+          const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
+            workspaceId: workspace.id, lifecycleGeneration: state.generation - 1 });
+          if (!closeout) throw new Error("delivery_closeout_missing");
+          if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
           if (present) {
             result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
             if (options.dryRun) {

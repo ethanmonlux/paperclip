@@ -156,6 +156,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
     expect(preview[0]).toMatchObject({ outcome: "skipped", reason: "delivery_closeout_missing",
       requiredEvidence: ["typed artifact or no-code delivery closeout for this workspace lifecycle"] });
+    expect(preview[0]!.candidateBytes).toBeGreaterThan(0);
     expect(await exists(f.cwd)).toBe(true);
   });
 
