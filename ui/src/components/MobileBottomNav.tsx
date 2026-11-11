@@ -10,6 +10,7 @@ import {
   MessageCircle,
   Inbox,
   Gauge,
+  Images,
 } from "lucide-react";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -96,6 +97,8 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
     [openNewIssue, inboxBadge.inbox, agentChatEnabled, combinedInboxTasksEnabled, coordinatorWorkspaceEnabled, attentionCount],
   );
 
+  const navigationItems = [...items, { type: "link", to: "/item-artwork", label: "Item artwork", icon: Images } as MobileNavItem];
+
   return (
     <nav
       className={cn(
@@ -107,9 +110,9 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
     >
       <div
         className="grid h-16 px-1"
-        style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}
+        style={{ gridTemplateColumns: `repeat(${navigationItems.length}, minmax(0, 1fr))` }}
       >
-        {items.map((item) => {
+        {navigationItems.map((item) => {
           if (item.type === "action") {
             const Icon = item.icon;
             const active = /\/issues\/new(?:\/|$)/.test(location.pathname);
@@ -156,7 +159,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
                       </Badge>
                     )}
                   </span>
-                  <span className="truncate">{item.label}</span>
+                  <span className="max-w-full text-center leading-tight wrap-anywhere">{item.label}</span>
                 </>
               )}
             </NavLink>

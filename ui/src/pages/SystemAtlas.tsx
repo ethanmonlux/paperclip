@@ -90,11 +90,11 @@ export function SystemAtlas() {
       <div className="rounded-lg border p-2"><strong className="block text-lg">{board?.maintenanceHold ? "Active" : board ? "Clear" : "?"}</strong>maintenance hold</div>
     </section>
     {agents.error ? <p className="text-xs text-muted-foreground">Agent roster unavailable; last loaded roster remains visible when present.</p> : null}
-    <div className="grid gap-5 md:grid-cols-[14rem_minmax(0,1fr)]">
-      <nav aria-label="Atlas chapters" className="flex gap-2 overflow-x-auto pb-2 md:flex-col md:overflow-visible">
+    <div className="grid gap-5 md:grid-cols-4">
+      <nav aria-label="Atlas chapters" className="flex gap-2 overflow-x-auto pb-2 md:col-span-1 md:flex-col md:overflow-visible">
         {atlasChapters.map((item, index) => <button key={item.id} type="button" aria-current={chapter.id === item.id ? "page" : undefined} onClick={() => { setChapterId(item.id); setNodeId(null); setDepth("summary"); }} className={cn("min-w-36 shrink-0 rounded-lg border px-3 py-2 text-left text-sm md:min-w-0", chapter.id === item.id ? "border-primary bg-primary/10 font-semibold" : "bg-card hover:bg-accent")}><span className="mr-2 text-xs text-muted-foreground">{String(index + 1).padStart(2, "0")}</span>{item.title}</button>)}
       </nav>
-      <div className="min-w-0 space-y-5">
+      <div className="min-w-0 space-y-5 md:col-span-3">
         <section className="rounded-xl border bg-card p-4"><p className="text-xs uppercase tracking-wider text-muted-foreground">Chapter {atlasChapters.indexOf(chapter) + 1} of 7</p><h2 className="mt-1 text-xl font-semibold">{chapter.title}</h2><p className="mt-1 text-sm text-muted-foreground">{chapter.introduction}</p></section>
         <div className="space-y-2">{chapter.nodes.map((item) => {
           const open = nodeId === item.id;
@@ -103,7 +103,7 @@ export function SystemAtlas() {
             <button type="button" className="flex w-full items-start gap-2 p-4 text-left" aria-expanded={open} onClick={() => { setNodeId(open ? null : item.id); setDepth("summary"); }}>
               {open ? <ChevronDown className="mt-0.5 size-4 shrink-0" /> : <ChevronRight className="mt-0.5 size-4 shrink-0" />}
               <span className="min-w-0 flex-1"><span className="block font-semibold">{item.title}</span><span className="mt-1 block text-sm text-muted-foreground">{item.summary}</span></span>
-              <span className={cn("rounded px-1.5 py-0.5 text-[10px] uppercase", sourceState === "stale" ? "bg-amber-500/15 text-amber-700" : "bg-muted text-muted-foreground")}>{sourceState}</span>
+              <span className={cn("rounded px-1.5 py-0.5 text-(length:--text-nano) uppercase", sourceState === "stale" ? "bg-amber-500/15 text-amber-700" : "bg-muted text-muted-foreground")}>{sourceState}</span>
             </button>
             {open ? <div className="space-y-3 border-t p-4 pt-3 text-sm">
               <div className="flex flex-wrap gap-1" role="tablist" aria-label={`${item.title} detail`}>

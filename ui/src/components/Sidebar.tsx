@@ -25,6 +25,7 @@ import {
   LayoutGrid,
   Users,
   Gauge,
+  Images,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -192,6 +193,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
             />
           ) : null}
           <SidebarNavItem to="/console" label="Console" icon={Gauge} />
+          <SidebarNavItem to="/item-artwork" label="Item artwork" icon={Images} />
           {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} badge={unreadChatCount} badgeLabel="unread chats" /> : null}
           {showDecisions ? (
             <SidebarNavItem

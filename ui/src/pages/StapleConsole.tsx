@@ -40,7 +40,7 @@ const STEP_LABELS: Record<StapleConsoleCardStep, string> = {
   done: "Done",
 };
 
-const CORAL = "border-[#f0714f] bg-[#f0714f]/10";
+const CORAL = "border-destructive bg-destructive/10";
 
 const CLAIM_DOT: Record<StapleConsoleClaimState, string> = {
   green: "bg-emerald-500",
@@ -131,7 +131,7 @@ function StepBar({ steps }: { steps: StapleConsoleStepCell[] }) {
           key={cell.step}
           aria-current={cell.state === "current" ? "step" : undefined}
           className={cn(
-            "min-w-0 truncate rounded px-1 py-0.5 text-center text-[10px] leading-tight",
+            "min-w-0 truncate rounded px-1 py-0.5 text-center text-(length:--text-nano) leading-tight",
             cell.state === "done" && "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300",
             cell.state === "current" && "bg-sky-500 font-semibold text-white",
             cell.state === "todo" && "bg-muted text-muted-foreground",
@@ -161,7 +161,7 @@ function RuntimeLine({ card, now }: { card: StapleConsoleCard; now: number }) {
   const active = since(card.lastActivityAt, now);
   const inStep = since(card.stepSince, now);
   return (
-    <p className="mt-1 text-[11px] text-muted-foreground" data-testid="staple-console-runtime">
+    <p className="mt-1 text-xs text-muted-foreground" data-testid="staple-console-runtime">
       {running ? `Running ${running}` : active ? `Last activity ${active} ago` : "No run yet"}
       {" · in step "}
       {inStep ?? <Unknown />}
@@ -224,10 +224,10 @@ function ConsoleCard({
       <Disclosure open={open} onToggle={onToggle} label={`${card.name}, ${open ? "collapse" : "expand"}`} className="items-start">
         <div className="min-w-0">
           <h3 className="text-sm font-semibold leading-snug text-foreground [overflow-wrap:anywhere]">{card.name}</h3>
-          <p className="text-[11px] text-muted-foreground">{cardSecondary(card)}</p>
+          <p className="text-xs text-muted-foreground">{cardSecondary(card)}</p>
         </div>
         {card.betaTag ? (
-          <span className="ml-auto shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
+          <span className="ml-auto shrink-0 rounded border border-border px-1.5 py-0.5 text-(length:--text-nano) uppercase tracking-wide text-muted-foreground">
             {card.betaTag === "beta" ? "Beta" : card.betaTag === "beta_preview" ? "Beta preview" : "After beta"}
           </span>
         ) : null}
@@ -319,7 +319,7 @@ function ConsoleCard({
               <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{card.lastComment.excerpt}</p>
             </div>
           ) : null}
-          <p className="text-[10px] text-muted-foreground">Lane from {card.laneSource}</p>
+          <p className="text-(length:--text-nano) text-muted-foreground">Lane from {card.laneSource}</p>
         </div>
       ) : null}
     </article>
@@ -341,7 +341,7 @@ function HeaderTiles({ header }: { header: StapleConsoleBoard["header"] }) {
       {items.map((item) => (
         <div key={item.label} className={cn("rounded-md border border-border p-2", item.tone)}>
           <div className="text-xl font-semibold tabular-nums text-foreground">{item.value}</div>
-          <div className="text-[11px] leading-tight text-muted-foreground">{item.label}</div>
+          <div className="text-xs leading-tight text-muted-foreground">{item.label}</div>
         </div>
       ))}
     </div>
@@ -388,7 +388,7 @@ function AttentionList({ items, onJump }: { items: StapleConsoleAttentionItem[];
             </div>
             <p className="mt-0.5 text-foreground [overflow-wrap:anywhere]">{item.text}</p>
             <div className="mt-1 flex items-baseline justify-between gap-2">
-              <span className="text-[11px] text-muted-foreground">{item.identifier}</span>
+              <span className="text-xs text-muted-foreground">{item.identifier}</span>
               {/^https?:/.test(item.href) ? (
                 <a href={item.href} target="_blank" rel="noreferrer" className="font-medium underline">{item.linkLabel}</a>
               ) : (
@@ -421,7 +421,7 @@ function Counts({ counts }: { counts: StapleConsoleCapability["counts"] }) {
 function ClaimProof({ claim, installedBuild, now }: { claim: StapleConsoleClaim; installedBuild: string | null; now: number }) {
   const { pullRequests, reviews, acceptance } = claim.proof;
   return (
-    <div className="space-y-1 rounded-md bg-muted/50 p-2 text-[11px]" data-testid="staple-console-proof">
+    <div className="space-y-1 rounded-md bg-muted/50 p-2 text-xs" data-testid="staple-console-proof">
       <h5 className="font-medium text-foreground">Proof</h5>
       {pullRequests.length > 0 ? (
         <ul className="space-y-0.5">{pullRequests.map((pr) => <ProofPr key={pr.url} pr={pr} />)}</ul>
@@ -476,16 +476,16 @@ function ClaimRow({
         <span className="min-w-0">
           <span className="block text-xs font-medium text-foreground [overflow-wrap:anywhere]">{claim.text}</span>
           {claim.why ? (
-            <span className="block text-[11px] text-muted-foreground [overflow-wrap:anywhere]">Why: {claim.why}</span>
+            <span className="block text-xs text-muted-foreground [overflow-wrap:anywhere]">Why: {claim.why}</span>
           ) : null}
         </span>
       </Disclosure>
       {open ? (
         <div className="ml-4 mt-1 space-y-2">
-          <p className="text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{claim.stateReason}</p>
+          <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">{claim.stateReason}</p>
           {claim.cardIds.map((cardId) => <div key={cardId}>{renderCard(cardId)}</div>)}
           {claim.cardIds.length === 0 && claim.tasks.length > 0 ? (
-            <ul className="text-[11px] text-muted-foreground">
+            <ul className="text-xs text-muted-foreground">
               {claim.tasks.map((task) => (
                 <li key={task.identifier}>
                   <Link to={`/issues/${task.identifier}`} className="underline">{task.identifier}</Link>
@@ -518,7 +518,7 @@ function Capabilities({
   return (
     <section aria-label="Capabilities" className="space-y-2" data-testid="staple-console-capabilities">
       <h2 className="text-sm font-semibold text-foreground">What works now</h2>
-      <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground" data-testid="staple-console-legend">
+      <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground" data-testid="staple-console-legend">
         <span className="flex items-center gap-1"><Dot state="green" /> Works now, with proof</span>
         <span className="flex items-center gap-1"><Dot state="blue" /> Being fixed or built</span>
         <span className="flex items-center gap-1"><Dot state="red" /> Needs attention, nothing fixing it</span>
@@ -526,7 +526,7 @@ function Capabilities({
       {!capabilities?.source.available ? (
         <p className="text-xs text-muted-foreground">
           Capability map <Unknown />
-          {capabilities?.source.detail ? <span className="block text-[11px]">{capabilities.source.detail}</span> : null}
+          {capabilities?.source.detail ? <span className="block text-xs">{capabilities.source.detail}</span> : null}
         </p>
       ) : (
         capabilities.groups.map((group) => (
@@ -662,7 +662,7 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
       <section aria-label="Active work" className="space-y-3" data-testid="staple-console-active">
         <h2 className="text-sm font-semibold text-foreground">Active work</h2>
         {!board.sources.github.available ? (
-          <p className="text-[11px] text-muted-foreground">PR state from Paperclip records, not live GitHub</p>
+          <p className="text-xs text-muted-foreground">PR state from Paperclip records, not live GitHub</p>
         ) : null}
         {board.lanes.map((lane) => {
           const active = lane.cards.filter((target) => !target.shipped);
@@ -745,7 +745,7 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
         <h2 className="text-sm font-semibold text-foreground">Scheduled and waiting</h2>
         <div className="grid grid-cols-2 gap-2">
           {board.scheduled.map((event, index) => (
-            <div key={`${event.label}-${index}`} className="rounded-md border border-border p-2 text-[11px]" title={event.detail ?? undefined}>
+            <div key={`${event.label}-${index}`} className="rounded-md border border-border p-2 text-xs" title={event.detail ?? undefined}>
               <div className="font-medium text-foreground">{event.label}</div>
               <div className="text-muted-foreground">
                 {event.at ? clock(event.at) : event.available ? "not scheduled" : <Unknown />}
@@ -755,7 +755,7 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
         </div>
       </section>
 
-      <p className="text-[10px] text-muted-foreground">
+      <p className="text-(length:--text-nano) text-muted-foreground">
         Read-only. Built {clock(board.generatedAt) ?? "unknown"} from Paperclip tasks, runs, interactions, approvals and
         work products. GitHub: {board.sources.github.detail}
         {board.capabilities?.source.available ? ` Capabilities from ${board.capabilities.source.detail}.` : ""}

@@ -51,7 +51,7 @@ describe("Console navigation", () => {
     await render("/STA/issues");
     const primary = [...sidebar().querySelectorAll<HTMLElement>(".design-sidebar-primary a, .design-sidebar-primary > button[aria-label='More workspace pages']")];
     const labels = primary.map(item => item.textContent?.trim());
-    expect(labels).toEqual(["Chat", "Tasks", "Inbox", "Console", "More"]);
+    expect(labels).toEqual(["Chat", "Tasks", "Inbox", "Console", "Item artwork", "More"]);
     expect(consoleLink(sidebar())?.getAttribute("aria-current")).toBeNull();
   });
   it("highlights the sidebar item on /STA/console", async () => {
@@ -64,11 +64,19 @@ describe("Console navigation", () => {
   it("leads the phone bottom bar and marks it active on /STA/console", async () => {
     await render("/STA/console");
     const items = [...bottomBar().querySelectorAll("a, button")];
-    expect(items.map(item => item.textContent)).toEqual(["Console", "Chat", "Tasks", "Inbox", "New task"]);
+    expect(items.map(item => item.textContent)).toEqual(["Console", "Chat", "Tasks", "Inbox", "New task", "Item artwork"]);
     expect(consoleLink(bottomBar())?.getAttribute("aria-current")).toBe("page");
   });
   it("leaves the bottom-bar item inactive elsewhere", async () => {
     await render("/STA/issues");
     expect(consoleLink(bottomBar())?.getAttribute("aria-current")).toBeNull();
+  });
+  it("keeps Item artwork directly available in desktop and phone navigation", async () => {
+    await render("/STA/item-artwork");
+    for (const navigation of [sidebar(), bottomBar()]) {
+      const link = navigation.querySelector<HTMLAnchorElement>('a[href="/STA/item-artwork"]');
+      expect(link?.textContent).toContain("Item artwork");
+      expect(link?.getAttribute("aria-current")).toBe("page");
+    }
   });
 });
