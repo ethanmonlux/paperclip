@@ -69,6 +69,7 @@ function harness(input: {
   github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
   authorFamilies?: string[] | null; authorAgents?: string[]; coordinatorFamilies?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
   legacyCoordinator?: string;
+  routedCoordinator?: string;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
@@ -83,6 +84,7 @@ function harness(input: {
     resolveToken: async () => "token",
     loadIssue: async (_company, id) => issues.get(id) ?? null,
     loadLegacyDelegation: async (_company, _issueId, agentId) => input.legacyCoordinator === agentId,
+    loadAcceptedCoordinatorRouting: async (_company, _issueId, _implementerId, agentId) => input.routedCoordinator === agentId,
     loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
@@ -192,6 +194,32 @@ describe("merge gate service", () => {
     });
     expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
     expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("recognizes an accepted engineer-to-coordinator routing without allowing self merge or same-family review", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, routedCoordinator: "coordinator", coordinatorFamilies: ["openai"],
+      reviews: [review({ reviewerModelFamilies: ["openai"] })], issues: [
+        issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "claude-engineer", parentId: null }),
+      ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "claude-engineer", runId: "r" } })))
+      .rejects.toThrow(/implementer cannot merge/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({
+      outcome: "refused", reasons: [{ code: "review_not_independent" }],
+    });
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("lets the routed coordinator merge after independent review and exact-head CI", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, routedCoordinator: "coordinator", issues: [
+      issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "claude-engineer", parentId: null }),
+    ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "someone-else", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
+    expect(merge).toHaveBeenCalledTimes(1);
   });
 
   it("needs only CI after a clean update from main since the review", async () => {

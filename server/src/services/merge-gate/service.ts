@@ -99,6 +99,8 @@ export interface MergeGateDependencies {
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
   /** A recorded coordinator -> implementer -> coordinator handoff with an implementer run. */
   loadLegacyDelegation: (companyId: string, issueId: string, coordinatorAgentId: string) => Promise<boolean>;
+  /** An implementer's accepted, agent-addressed review-routing handoff to its coordinator. */
+  loadAcceptedCoordinatorRouting: (companyId: string, issueId: string, implementerAgentId: string, coordinatorAgentId: string) => Promise<boolean>;
   /**
    * Who may have authored the task: every agent with a run on it and the
    * model families those runs recorded. Only a non-legacy coordinator's runs
@@ -134,7 +136,7 @@ function normalizeRepo(repo: string) {
  * Coordinator-only: a board operator, or an agent that delegated the task
  * (its creator, an ancestor's assignee, or a recorded legacy handoff).
  */
-export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation">, issue: GateIssue, actor: MergeGateActor) {
+export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation" | "loadAcceptedCoordinatorRouting">, issue: GateIssue, actor: MergeGateActor) {
   if (actor.type === "board") return false;
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
@@ -150,6 +152,8 @@ export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssu
     if (parent.assigneeAgentId === agentId) return false;
     parentId = parent.parentId;
   }
+  if (issue.assigneeAgentId && issue.createdByAgentId === issue.assigneeAgentId &&
+    await deps.loadAcceptedCoordinatorRouting(issue.companyId, issue.id, issue.assigneeAgentId, agentId)) return true;
   throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
 }
 
@@ -195,7 +199,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
   if (!Number.isSafeInteger(request.pullNumber) || request.pullNumber <= 0) throw unprocessable("pullNumber must be a positive integer");
   const issue = await deps.loadIssue(request.companyId, request.issueId);
   if (!issue) throw notFound("Issue not found");
-  const legacyCoordinator = await assertMayMerge(deps, issue, request.actor);
+  const handoffCoordinator = await assertMayMerge(deps, issue, request.actor);
 
   const token = await deps.resolveToken(request.companyId, request.actor);
   if (!token) throw unprocessable("No GitHub credential is available to the merge gate for this actor");
@@ -211,7 +215,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
     }
   };
   const first = await readPullRequest();
-  const context = { repo, label, policy, github, issue, legacyCoordinator };
+  const context = { repo, label, policy, github, issue, handoffCoordinator };
   if (request.dryRun) return evaluateLocked(deps, request, context, first);
   // One check-and-merge at a time per repository branch, so two merges
   // cannot both pass against the same base and land one after the other.
@@ -234,10 +238,10 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
 async function evaluateLocked(
   deps: MergeGateDependencies,
   request: MergeGateRequest,
-  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue; legacyCoordinator: boolean },
+  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue; handoffCoordinator: boolean },
   pr: Awaited<ReturnType<MergeGateGitHub["pullRequest"]>>,
 ): Promise<MergeGateResult> {
-  const { repo, label, policy, github, issue, legacyCoordinator } = context;
+  const { repo, label, policy, github, issue, handoffCoordinator } = context;
   const headSha = pr.headSha.toLowerCase();
   const baseSha = (await github.branchHead(pr.baseRef)).toLowerCase();
   // Everything below compares against this one base SHA, not the moving ref.
@@ -279,7 +283,7 @@ async function evaluateLocked(
   // so its runs remain potential authorship.
   const authorship = await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentId: legacyCoordinator ? null : request.actor.agentId ?? null,
+    excludeAgentId: handoffCoordinator ? null : request.actor.agentId ?? null,
   });
   const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
   const author: MergeGateAuthor = {

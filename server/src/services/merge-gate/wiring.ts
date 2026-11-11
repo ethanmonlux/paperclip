@@ -8,6 +8,7 @@ import {
   heartbeatRuns,
   issueDocuments,
   issueRelations,
+  issueThreadInteractions,
   issues,
   withDedicatedDbConnection,
   type Db,
@@ -146,6 +147,24 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
           gte(heartbeatRuns.startedAt, delegated.createdAt),
           lte(heartbeatRuns.startedAt, returned.createdAt))).limit(1);
       return Boolean(run);
+    },
+    async loadAcceptedCoordinatorRouting(companyId, issueId, implementerAgentId, coordinatorAgentId) {
+      // STA-315: an engineer-created task can retain its engineer assignee while
+      // a separate coordinator accepts the addressed review-routing handoff.
+      // Bind the record to this issue and both actors; ordinary confirmations
+      // cannot grant merge authority.
+      const rows = await db.select({ idempotencyKey: issueThreadInteractions.idempotencyKey,
+        title: issueThreadInteractions.title, payload: issueThreadInteractions.payload })
+        .from(issueThreadInteractions)
+        .where(and(eq(issueThreadInteractions.companyId, companyId), eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.kind, "request_confirmation"), eq(issueThreadInteractions.status, "accepted"),
+          eq(issueThreadInteractions.createdByAgentId, implementerAgentId),
+          eq(issueThreadInteractions.addresseeAgentId, coordinatorAgentId),
+          eq(issueThreadInteractions.resolvedByAgentId, coordinatorAgentId)))
+        .orderBy(desc(issueThreadInteractions.createdAt)).limit(20);
+      return rows.some(row => row.idempotencyKey?.startsWith(`confirmation:${issueId}:route-review:`) &&
+        row.title?.startsWith("Route cross-model review:") &&
+        row.payload.target?.type === "issue_document" && row.payload.target.issueId === issueId);
     },
     async loadTaskAuthorship(companyId, input) {
       // Every run that started on the task may have authored part of it,

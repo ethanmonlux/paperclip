@@ -1,7 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import {
   activityLog, agents, authUsers, companies, companyMemberships, createDb, documentRevisions, documents, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  heartbeatRuns, issueDocuments, issues,
+  heartbeatRuns, issueDocuments, issueThreadInteractions, issues,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -139,6 +139,27 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     await event("issue.updated", "agent", coordinator.id,
       { changes: { assigneeAgentId: { from: coordinator.id, to: engineer.id } } }, 30);
     expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
+  });
+
+  it("recognizes only an accepted, addressed STA-315 review routing record", async () => {
+    const f = await fixture();
+    const engineer = await f.agent("Engineer", "claude_local");
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const outsider = await f.agent("Outsider", "codex_local");
+    const task = await f.issue("Engineer-created task", engineer.id);
+    const deps = createMergeGateDependencies(db);
+    const payload = { version: 1 as const, prompt: "Route independent review", target: {
+      type: "issue_document" as const, issueId: task.id, key: "handoff", revisionId: crypto.randomUUID(),
+    } };
+    await db.insert(issueThreadInteractions).values({ companyId: f.company.id, issueId: task.id,
+      kind: "request_confirmation", status: "accepted", createdByAgentId: engineer.id,
+      addresseeAgentId: coordinator.id, resolvedByAgentId: coordinator.id,
+      title: "Route cross-model review: task", idempotencyKey: `confirmation:${task.id}:route-review:head:round1`, payload });
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, coordinator.id)).toBe(true);
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, outsider.id)).toBe(false);
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, coordinator.id, engineer.id)).toBe(false);
+    await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.issueId, task.id));
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, coordinator.id)).toBe(false);
   });
 
   it("holds one merge lock per repository branch across connections", async () => {
