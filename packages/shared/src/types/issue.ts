@@ -775,6 +775,7 @@ export interface IssueWaitTarget {
   pullNumber?: number | null;
   /** When the SHA was pushed; starts the no-start deadline for `ci`. */
   pushedAt?: string | null;
+  workflowRunId?: number | null;
 }
 
 export type IssueWaitObservationState =
@@ -1922,3 +1923,4 @@ export interface IssueChatBootstrapItem<TRun = unknown, TLiveRun = unknown, TAct
 export interface IssueChatBootstrap<TRun = unknown, TLiveRun = unknown, TActiveRun = unknown> {
   items: IssueChatBootstrapItem<TRun, TLiveRun, TActiveRun>[];
 }
+

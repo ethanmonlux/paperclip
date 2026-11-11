@@ -263,6 +263,8 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 
 ### Monitors and Watchers (say only what you actually scheduled)
 
+For a separately dispatched candidate, use `kind: "ci"` and `target: { repo, sha, pullNumber, workflowRunId }` with the exact published SHA and observed GitHub run ID. This extends the existing issue monitor; it does not dispatch or retry a workflow. The server reads that run and its jobs, so ordinary CI on the same SHA cannot resolve the candidate wait. A bound wait passes only with a complete, nonempty set of successful jobs at that SHA; skipped, neutral, failed, cancelled, old-head or unobservable evidence needs the owner. Preserve the dispatch intent and run URL in the current task's versioned receipt. If a dispatch response is uncertain, find the existing run before considering another dispatch. A workflow disabled for maintenance must remain disabled until the current task's authorization permits activation.
+
 A "watcher" or "monitor" is not something that lives inside a run. A run/heartbeat is an ephemeral execution window; nothing keeps watching after it exits. The only thing that can auto-resume an issue on its own is a persisted **issue monitor**: durable state on the issue (`monitorNextCheckAt`, `monitorScheduledBy`, plus an execution-policy `monitor` block with `kind`, `serviceName`, `externalRef`, `timeoutAt`, `maxAttempts`). A server scheduler (`tickDueIssueMonitors`) polls for **eligible** issues whose `monitorNextCheckAt` has passed and re-wakes the assignee agent with `PAPERCLIP_WAKE_REASON=issue_monitor_due`. Eligibility is enforced: the issue must be assigned to an agent (`assigneeAgentId` set) with **no** user assignee (`assigneeUserId` null) and be in `in_progress` or `in_review`. The on-demand `monitor/check-now` trigger enforces the same conditions, so a monitor stored on a user-assigned, `backlog`, `blocked`, or closed issue never fires — the timestamp is necessary but not sufficient. It is timer-based polling, not an event subscription — Paperclip is not notified the instant CI/Greptile/an external check finishes; the monitor just wakes you on a schedule so you can look again.
 
 Because of that, follow these rules:
@@ -807,3 +809,4 @@ provider, and keep the agent assigned with `continuationPolicy: "wake_assignee"`
 so the answer resumes verification. A handoff comment asking the user to comment
 back or reassign the task is not a confirmation card. The card records the user's
 answer; verify the provider's gate and publish result before continuing.
+
