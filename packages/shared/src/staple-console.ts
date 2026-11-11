@@ -437,7 +437,7 @@ export interface StapleConsoleMaintenanceHold {
 }
 
 export interface StapleAtlasSource {
-  authoredRevision: string;
+  authoredRevision: string | null;
   sourceRevision: string | null;
   installedRevision: string | null;
   changedPaths: string[] | null;

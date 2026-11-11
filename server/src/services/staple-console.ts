@@ -81,8 +81,8 @@ const STAPLE_REPO = STAPLE_CONSOLE_LANES.find((lane) => lane.key === "staple")?.
 const OPEN_PR_TTL_MS = 2 * 60_000;
 const FINAL_PR_TTL_MS = 60 * 60_000;
 const ATLAS_SOURCE_TTL_MS = 2 * 60_000;
-/** Commit that introduced the current authored Atlas nodes. Advance only when their prose is reviewed. */
-const ATLAS_AUTHORED_REVISION = "0135ef823d6216c3c9681050bcf31d2959ac3744";
+/** The latest main-branch commit touching this file is the reviewed prose baseline. */
+const ATLAS_EXPLANATIONS_PATH = "ui/src/pages/system-atlas-data.ts";
 const ATLAS_OWNER_ISSUE_ID = "c94e307b-8114-420b-bec5-5b6cdd555179";
 const ATLAS_RELEVANT_PATHS = [
   "server/src/", "ui/src/", "packages/shared/src/", "packages/db/src/",
@@ -238,7 +238,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
 
   const credentialProvider = opts.credentialProvider ?? defaultCredential;
   const prCache = new Map<string, { value: PullRequestSnapshot; expiresAt: number }>();
-  const atlasSourceCache = new Map<string, { sourceRevision: string; changedPaths: string[]; observedAt: string; expiresAt: number }>();
+  const atlasSourceCache = new Map<string, { authoredRevision: string; sourceRevision: string; changedPaths: string[]; observedAt: string; expiresAt: number }>();
   const holdService = maintenanceHoldService(db);
 
   async function githubJson(path: string, token: string) {
@@ -908,13 +908,13 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
     const installed = getServerInfoSnapshot().git;
     const installedRevision = opts.installedRevision ? opts.installedRevision() : installed.available ? installed.fullSha : null;
     const result: StapleAtlasSource = {
-      authoredRevision: ATLAS_AUTHORED_REVISION, sourceRevision: null, installedRevision,
+      authoredRevision: null, sourceRevision: null, installedRevision,
       changedPaths: null, status: "unknown", observedAt: new Date(nowMs).toISOString(),
     };
     const credential = await credentialProvider(companyId, actor).catch(() => null);
     if (!credential) return result;
     const viewer = `${actor.type}:${actor.userId ?? ""}:${actor.agentId ?? ""}`;
-    const scope = `${companyId}|${viewer}|${createHash("sha256").update(credential.token).digest("hex")}|${ATLAS_AUTHORED_REVISION}`;
+    const scope = `${companyId}|${viewer}|${createHash("sha256").update(credential.token).digest("hex")}`;
     const cached = atlasSourceCache.get(scope);
     try {
       let source = cached;
@@ -922,9 +922,13 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         const head = asRecord(await githubJson(`/repos/${STAPLE_REPO}/commits/master`, credential.token));
         const sourceRevision = typeof head?.sha === "string" ? head.sha : null;
         if (!sourceRevision) throw new Error("GitHub source revision unavailable");
+        const proseCommits = await githubJson(`/repos/${STAPLE_REPO}/commits?path=${encodeURIComponent(ATLAS_EXPLANATIONS_PATH)}&per_page=1`, credential.token);
+        const authoredRevision = Array.isArray(proseCommits) && typeof asRecord(proseCommits[0])?.sha === "string"
+          ? asRecord(proseCommits[0])!.sha as string : null;
+        if (!authoredRevision) throw new Error("Atlas authored revision unavailable");
         let changedPaths: string[] = [];
-        if (sourceRevision !== ATLAS_AUTHORED_REVISION) {
-          const comparison = asRecord(await githubJson(`/repos/${STAPLE_REPO}/compare/${ATLAS_AUTHORED_REVISION}...${sourceRevision}`, credential.token));
+        if (sourceRevision !== authoredRevision) {
+          const comparison = asRecord(await githubJson(`/repos/${STAPLE_REPO}/compare/${authoredRevision}...${sourceRevision}`, credential.token));
           const files = Array.isArray(comparison?.files) ? comparison.files : null;
           if (!files || files.length >= 300 || !["ahead", "identical"].includes(String(comparison?.status))) throw new Error("GitHub source comparison incomplete");
           changedPaths = files.flatMap((file) => {
@@ -932,7 +936,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
             return typeof name === "string" ? [name] : [];
           });
         }
-        source = { sourceRevision, changedPaths, observedAt: new Date(nowMs).toISOString(), expiresAt: nowMs + ATLAS_SOURCE_TTL_MS };
+        source = { authoredRevision, sourceRevision, changedPaths, observedAt: new Date(nowMs).toISOString(), expiresAt: nowMs + ATLAS_SOURCE_TTL_MS };
         atlasSourceCache.set(scope, source);
         if (atlasSourceCache.size > 100) atlasSourceCache.delete(atlasSourceCache.keys().next().value!);
       }
@@ -954,8 +958,8 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
               priority: "medium",
               assigneeAgentId: owner.assigneeAgentId,
               originKind: "system_atlas_refresh",
-              originId: ATLAS_AUTHORED_REVISION,
-              idempotencyKey: `system-atlas-refresh:${ATLAS_AUTHORED_REVISION}`,
+              originId: source.authoredRevision,
+              idempotencyKey: `system-atlas-refresh:${source.authoredRevision}`,
             });
             const readableIssue = await issueReadSqlCondition(db, actor);
             const [readableRefresh] = await db.select({ id: issues.id }).from(issues)
@@ -966,11 +970,12 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
           // Comparison stays truthful. A later source read retries native routing.
         }
       }
-      return { ...result, sourceRevision: source.sourceRevision, changedPaths: source.changedPaths,
+      return { ...result, authoredRevision: source.authoredRevision, sourceRevision: source.sourceRevision, changedPaths: source.changedPaths,
         observedAt: source.observedAt, status: source.changedPaths.length ? "changed" : "current", refreshIssueId };
     } catch {
       // Keep last-good source evidence but mark the current comparison unknown.
-      return cached ? { ...result, sourceRevision: cached.sourceRevision, changedPaths: cached.changedPaths, observedAt: cached.observedAt } : result;
+      return cached ? { ...result, authoredRevision: cached.authoredRevision,
+        sourceRevision: cached.sourceRevision, changedPaths: cached.changedPaths, observedAt: cached.observedAt } : result;
     }
   }
 

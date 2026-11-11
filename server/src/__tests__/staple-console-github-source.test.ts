@@ -128,6 +128,7 @@ suite("staple console GitHub source", () => {
     const fetch = async (target: string) => {
       if (fail) return new Response(null, { status: 503 });
       if (target.endsWith("/commits/master")) return Response.json({ sha: source });
+      if (target.includes("/commits?path=")) return Response.json([{ sha: "d".repeat(40) }]);
       if (target.includes("/compare/")) return Response.json({ status: "ahead", files: [
         { filename: "server/src/services/native-runtime/example.ts" },
       ] });
@@ -177,6 +178,8 @@ suite("staple console GitHub source", () => {
       credentialProvider: async () => ({ token: "atlas-grant", source: "managed_connection", secretName: null, login: "owner" }),
       fetch: async (target) => target.endsWith("/commits/master")
         ? Response.json({ sha: source })
+        : target.includes("/commits?path=")
+          ? Response.json([{ sha: "a".repeat(40) }])
         : Response.json({ status: "ahead", files: [{ filename: "server/src/services/native-runtime/example.ts" }] }),
     });
     const actor = { type: "agent" as const, agentId, companyId };
