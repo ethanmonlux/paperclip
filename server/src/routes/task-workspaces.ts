@@ -10,6 +10,9 @@ import { logActivity } from "../services/activity-log.js";
 import { forbidden, notFound } from "../errors.js";
 import { assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { validate } from "../middleware/validate.js";
+import { loadConfig } from "../config.js";
+import { inspectIsolatedTaskDirectoryFolders } from "../services/isolated-task-directory-retention.js";
+import { getStorageService } from "../storage/index.js";
 
 export function taskWorkspaceRoutes(db: Db) {
   const router = Router();
@@ -34,6 +37,22 @@ export function taskWorkspaceRoutes(db: Db) {
     const issue = await task(req);
     const view = await workspaces.inspectTaskWorkspace(issue.companyId, issue.id, req.actor);
     res.json({ ...view, repositories: issue.executionWorkspaceId ? await workspaces.listTaskRepositories(issue.companyId, issue.executionWorkspaceId) : [], capabilities: { prepareRepository: view.workspace?.providerType === "adapter_managed" ? "unsupported" : "next_normal_admission", selectWorkspace: "next_normal_admission" }, fileLocations: { taskFiles: "workspace", personalInstructionsAndMemory: "AGENT_HOME", providerHome: "runtime_managed" } });
+  });
+  router.get("/issues/:id/workspace/retention-preview", async (req, res) => {
+    const issue = await task(req);
+    const config = loadConfig();
+    const [preview] = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: issue.companyId, issueId: issue.id }], {
+      dryRun: true,
+      now: new Date(),
+      terminalDelayMs: config.gitRestorePointTerminalDelayDays * 24 * 60 * 60 * 1000,
+      orphanGraceMs: config.taskDirectoryOrphanGraceDays * 24 * 60 * 60 * 1000,
+      restorePoint: config.gitRestorePointsEnabled ? {
+        storage: getStorageService(),
+        keyDurable: config.storageProvider !== "s3" || Boolean(process.env.PAPERCLIP_SECRETS_MASTER_KEY?.trim()),
+      } : undefined,
+    });
+    res.json({ issueId: issue.id, retentionEnabled: config.taskDirectoryRetentionEnabled,
+      retentionDryRun: config.taskDirectoryRetentionDryRun, preview: preview ?? null });
   });
   router.put("/issues/:id/workspace", validate(selectTaskWorkspaceSchema), async (req, res) => {
     const issue = await task(req, true);

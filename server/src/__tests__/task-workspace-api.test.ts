@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
@@ -9,6 +9,7 @@ import { startRunnerApiTestServer } from "./helpers/runner-api-server.js";
 import { getEmbeddedPostgresTestSupport } from "./helpers/embedded-postgres.js";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { materializeIsolatedTaskDirectory } from "../services/isolated-task-directory.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("task workspace API and native semantic authority", () => {
@@ -16,6 +17,34 @@ const support = await getEmbeddedPostgresTestSupport();
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   beforeAll(async () => { process.env.PAPERCLIP_AGENT_JWT_SECRET = randomUUID(); server = await startRunnerApiTestServer(); }, 60_000);
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
+  it("exposes only an authorized task's non-destructive folder preview", async () => {
+    const f = await server.fixture({ disableWakeOnDemand: true });
+    const previousHome = process.env.PAPERCLIP_HOME;
+    const previousInstance = process.env.PAPERCLIP_INSTANCE_ID;
+    const home = join(server.root, "retention-preview-home");
+    process.env.PAPERCLIP_HOME = home;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    try {
+      const cwd = await materializeIsolatedTaskDirectory({ companyId: f.companyId, issueId: f.issueId });
+      const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.userId);
+      const preview = await fetch(`${server.apiUrl}/api/issues/${f.issueId}/workspace/retention-preview`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(preview.status).toBe(200);
+      expect(await preview.json()).toMatchObject({ issueId: f.issueId, retentionEnabled: false,
+        retentionDryRun: true, preview: { allowedScope: cwd, ownerStatus: expect.any(String), outcome: "skipped",
+          reason: "issue_open" } });
+      const foreign = await server.fixture({ disableWakeOnDemand: true });
+      const denied = await fetch(`${server.apiUrl}/api/issues/${foreign.issueId}/workspace/retention-preview`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(denied.status).toBe(404);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+      if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
+    }
+  });
   it("prepares a repository through native JWT authority for the local board and rechecks revoked access", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });
     await server.db.insert(authUsers).values({ id: "local-board", name: "Local Board", email: "local-board@example.invalid",
