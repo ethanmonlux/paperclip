@@ -545,7 +545,15 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       if (bound.cwd !== folder || !await isIsolatedTaskDirectoryWorkspace(bound)) throw new Error("bound_workspace");
       result.executionWorkspaceId = bound.id;
       const dueAt = tree.closedAt!.getTime() + options.terminalDelayMs;
-      if (dueAt > nowMs) { retry(dueAt); throw new Error("not_due"); }
+      if (dueAt > nowMs) {
+        result.candidateBytes = await exclusiveAllocatedBytes(folder, () => { options.signal?.throwIfAborted(); return true; });
+        const closeout = await readTaskDeliveryCloseout(db, { companyId, issueId: name, workspaceId: bound.id,
+          lifecycleGeneration: Number(bound.metadata?.lifecycleGeneration ?? 0) });
+        if (!closeout) result.requiredEvidence.push("typed artifact or no-code delivery closeout for this workspace lifecycle");
+        if (closeout?.kind === "code") result.requiredEvidence.push("verified repository publication and qualified outer artifacts");
+        retry(dueAt);
+        throw new Error("not_due");
+      }
       const expiration = await expireIsolatedTaskDirectory(db, bound, { dryRun: options.dryRun, now: options.now,
         notBefore: new Date(dueAt), restorePoint: options.restorePoint, signal: options.signal, beforeDelete: options.beforeDelete });
       result.candidateBytes = expiration.candidateBytes;
