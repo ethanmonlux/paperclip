@@ -8,7 +8,7 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { isHtmlPreview } from "@/lib/html-preview";
 import { Link, useLocation, useNavigate } from "@/lib/router";
-import { normalizeCompanyPrefix } from "@/lib/company-routes";
+import { itemArtworkReturnPath } from "@/lib/item-artwork-navigation";
 import { loadAttachmentText, TEXT_PREVIEW_MAX_BYTES } from "@/lib/text-preview";
 
 const ISSUE_ID = "0359548d-7b70-4841-88fd-090afc96e1d7";
@@ -21,15 +21,7 @@ export function ItemArtwork() {
   const location = useLocation();
   const companyPrefix = selectedCompany?.issuePrefix;
   const returnTo = (location.state as { itemArtworkReturnTo?: unknown } | null)?.itemArtworkReturnTo;
-  const safeReturnTo = typeof returnTo === "string" && companyPrefix && (() => {
-    const prefix = normalizeCompanyPrefix(companyPrefix);
-    try {
-      const target = new URL(returnTo, window.location.origin);
-      return target.origin === window.location.origin
-        && target.pathname.startsWith(`/${prefix}/`)
-        && target.pathname !== `/${prefix}/item-artwork`;
-    } catch { return false; }
-  })() ? returnTo : null;
+  const safeReturnTo = itemArtworkReturnPath(returnTo, companyPrefix, window.location.origin);
   useEffect(() => setBreadcrumbs([{ label: "Item artwork" }]), [setBreadcrumbs]);
 
   const products = useQuery({

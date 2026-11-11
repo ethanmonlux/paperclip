@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CoordinatorSidebar } from "./CoordinatorSidebar";
@@ -28,6 +28,10 @@ vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => [] } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 
 let root: Root, container: HTMLDivElement, client: QueryClient;
+function ReturnStateProbe() {
+  const location = useLocation();
+  return <output data-testid="return-state">{(location.state as { itemArtworkReturnTo?: string } | null)?.itemArtworkReturnTo ?? ""}</output>;
+}
 beforeEach(() => {
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -37,7 +41,7 @@ afterEach(async () => { await act(async () => root.unmount()); container.remove(
 async function render(pathname: string) {
   await act(async () => root.render(<QueryClientProvider client={client}><TooltipProvider>
     <MemoryRouter initialEntries={[pathname]}><Routes><Route path="/:companyPrefix/*" element={<>
-      <CoordinatorSidebar /><MobileBottomNav visible />
+      <CoordinatorSidebar /><MobileBottomNav visible /><ReturnStateProbe />
     </>} /></Routes></MemoryRouter>
   </TooltipProvider></QueryClientProvider>));
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
@@ -78,5 +82,12 @@ describe("Console navigation", () => {
       expect(link?.textContent).toContain("Item artwork");
       expect(link?.getAttribute("aria-current")).toBe("page");
     }
+  });
+  it("records the current company view when opening Item artwork in-app", async () => {
+    await render("/STA/issues?q=items&status=open");
+    await act(async () => {
+      bottomBar().querySelector<HTMLAnchorElement>('a[href="/STA/item-artwork"]')!.click();
+    });
+    expect(container.querySelector('[data-testid="return-state"]')?.textContent).toBe("/STA/issues?q=items&status=open");
   });
 });

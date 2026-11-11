@@ -16,6 +16,7 @@ Agent access: [companion](../agent-access-map/item-artwork.md).
 
 - `navigation`: `item-artwork/navigation` — open the company-scoped explorer from desktop or phone navigation.
 - `snapshot`: `item-artwork/snapshot` — follow the stable STA-290 work product to its latest authorized HTML attachment.
+- `return`: `item-artwork/return` — visible Back returns to a known same-company app view or Console, and Home opens Console directly.
 
 ## How to get to it (user POV)
 
@@ -33,7 +34,7 @@ Preconditions: select a company with read access to STA-290 and its attachment.
 
 Automated: [navigation test](../../ui/src/components/ConsoleNav.test.tsx) checks the persistent entry and active route. The existing [HTML preview tests](../../ui/src/lib/html-preview.test.ts) cover the preview security policy.
 
-Manual: At 390 and 430 CSS px, open the route, reload, use Back, and exercise the explorer tabs, touch search and detail. Publish a replacement attachment on the stable work product and confirm the same route opens it. Check missing, failed and unauthorized attachment states.
+Manual: At 390 and 430 CSS px, open the route, reload, use Back and Home from loading, empty and failure states, and exercise the explorer tabs, touch search and detail. Publish a replacement attachment on the stable work product and confirm the same route opens it. Check missing, failed and unauthorized attachment states.
 
 ## Gotchas
 
