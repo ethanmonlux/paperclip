@@ -3356,8 +3356,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const blockingReasons: string[] = [];
       const remoteWorkspace = readRemoteWorkspaceAuthority(workspace.metadata);
       if (!statusInspectionSucceeded) {
-        blockingReasons.push(gitWarnings[0] ?? (remoteWorkspace ? "The remote workspace save is incomplete."
-          : "Paperclip could not verify the workspace git status. Retry before destructive cleanup."));
+        blockingReasons.push(gitWarnings[0]?.includes("Git repository is nested at") ? gitWarnings[0]
+          : remoteWorkspace ? gitWarnings[0] ?? "The remote workspace save is incomplete."
+          : "Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
       }
       const isSharedWorkspace = executionWorkspace.mode === "shared_workspace";
       const workspacePath = readNullableString(executionWorkspace.providerRef) ?? readNullableString(executionWorkspace.cwd);

@@ -774,7 +774,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
   describe("delivery reads after a pooled disconnect", () => {
     const issueTreeFields = "id,status,completedAt,cancelledAt,updatedAt";
-    const pullRequestProductFields = "id,url,externalId,title,summary,metadata";
+    const pullRequestProductFields = "id,type,status,url,externalId,title,summary,metadata";
 
     function disconnected() {
       return new Error("Failed query", {

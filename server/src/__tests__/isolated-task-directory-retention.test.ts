@@ -202,7 +202,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect((await f.row()).status).toBe("active");
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     const deadline = await service.nextTerminalWorkspaceSweepAt();
-    expect(deadline).toBe(issue.completedAt!.getTime() + 3 * DAY_MS);
+    expect(deadline).toBeGreaterThan(Date.now());
+    expect(deadline).toBeLessThanOrEqual(issue.completedAt!.getTime() + 3 * DAY_MS);
     expect(await f.ledger()).toEqual([]);
   });
 

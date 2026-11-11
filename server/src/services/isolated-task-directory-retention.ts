@@ -531,9 +531,6 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("unsafe_task_directory");
     result.physicalObject = `${stat.dev}:${stat.ino}`;
     const rows = await folderRows(db, folder);
-    if (rows.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) {
-      throw new Error("live_workspace");
-    }
     if (rows.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
     const [issue] = await db.select({ id: issues.id, status: issues.status, executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));
@@ -541,6 +538,11 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
     const tree = issue ? await issueTreeState(db, companyId, name) : { exists: false, open: false, closedAt: null };
     if (tree.exists && (tree.open || !tree.closedAt)) throw new Error("issue_open");
     const bound = issue ? rows.find(row => row.id === issue.executionWorkspaceId) : undefined;
+    // The bound workspace stays active until retention archives it. Other
+    // active references to this physical folder still prevent cleanup.
+    if (rows.some(row => row.id !== bound?.id && (!["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null))) {
+      throw new Error("live_workspace");
+    }
     if (bound) {
       if (bound.cwd !== folder || !await isIsolatedTaskDirectoryWorkspace(bound)) throw new Error("bound_workspace");
       result.executionWorkspaceId = bound.id;
