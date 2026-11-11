@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -10,7 +10,6 @@ import { createLocalDiskStorageProvider } from "../../storage/local-disk-provide
 import { createStorageService } from "../../storage/service.js";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "../../__tests__/helpers/native-restart.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
-import { defaultCapabilityRunnerdBinary } from "../../vendor/paperclip-runner/index.js";
 
 type ProviderTransport = ReturnType<NonNullable<NonNullable<Parameters<typeof import("../../vendor/paperclip-runner/index.js").createNativeSessionBackend>[1]>["codexTransportFactory"]>>;
 const { FakeCodexTransport } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.ts", import.meta.url).href) as { FakeCodexTransport: new () => ProviderTransport };
@@ -49,7 +48,23 @@ import { createReleaseIssueExecution } from "../../modules/wake-queue/applicatio
 describeEmbeddedPostgres("managed warm checkpoint ownership", () => {
   const environment = nativeRestartFixture();
   let root: string;
-  beforeAll(async () => { root = await mkdtemp(join(tmpdir(), "warm-checkpoint-owner-")); });
+  let runnerdStub: string;
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), "warm-checkpoint-owner-"));
+    // The remote target check reads only the executable header, and the fixture
+    // never launches the daemon, so a matching header stands in for the Rust
+    // build that general CI shards do not produce.
+    const header = Buffer.alloc(64);
+    if (process.platform === "darwin") {
+      header.writeUInt32LE(0xfeedfacf, 0);
+      header.writeUInt32LE(process.arch === "arm64" ? 0x0100000c : 0x01000007, 4);
+    } else {
+      header.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
+      header.writeUInt16LE(process.arch === "arm64" ? 183 : 62, 18);
+    }
+    runnerdStub = join(root, "paperclip-runnerd");
+    await writeFile(runnerdStub, header, { mode: 0o755 });
+  });
   afterAll(async () => { state.storage = null; await rm(root, { recursive: true, force: true }); });
 
   it.each(["normal", "delayed", "instruction_error", "fresh_successor", "wrong_boot", "superseded_owner", "detach_during_close", "detach_during_instruction_error", "detach_during_instruction_error_and_renewal_loss"])("keeps the producing coordinator claim until the managed failed-turn close joins: %s", async scenario => {
@@ -142,7 +157,7 @@ describeEmbeddedPostgres("managed warm checkpoint ownership", () => {
         .where(eq(heartbeatRuns.id, fixture.runId));
       return executePaperclipNativeSession({ db: fixture.db, execution, runnerInstanceId: fixture.native.runnerInstanceId,
         useRunnerd: true, runnerIngressAuthorized: true,
-        runnerRemoteBinaryPath: defaultCapabilityRunnerdBinary(), runnerRemoteCodexPath: defaultCapabilityRunnerdBinary(),
+        runnerRemoteBinaryPath: runnerdStub, runnerRemoteCodexPath: runnerdStub,
         runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: root, environmentId,
           leaseId: randomUUID(), providerKey: "fixture", effectiveCapabilities: { runnerWebSocketIngress: true },
           sandboxLeaseAcquisition: { outcome: acquisition, providerLeaseId },
