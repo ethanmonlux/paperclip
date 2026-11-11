@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExecutionWorkspace } from "@paperclipai/shared";
 import { inspectGitCloseReadiness } from "./execution-workspaces.js";
+import { inspectTaskDirectory } from "./isolated-task-directory-snapshot.js";
 
 const directories: string[] = [];
 
@@ -45,6 +46,7 @@ describe("nested task repository close readiness", () => {
       expect.stringContaining("repository is nested"),
       expect.stringContaining("1 outer task entry"),
     ]));
+    await expect(inspectTaskDirectory(outer)).rejects.toThrow("nested_git_repository");
   });
 
   it("keeps a plain task directory distinct from a nested repository", async () => {

@@ -237,6 +237,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.ledger()).toEqual([]);
   });
 
+  it("keeps a task directory containing an unpublished nested checkout", async () => {
+    const f = await fixture();
+    const repo = path.join(f.cwd, "repo");
+    await fs.mkdir(repo);
+    execFileSync("git", ["init", "-q", repo]);
+
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
+    expect(await f.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "nested_git_repository" });
+    expect(await exists(repo)).toBe(true);
+    expect((await f.row()).status).toBe("active");
+    expect(await f.ledger()).toEqual([]);
+  });
+
   it("reports candidates in dry run without changing anything", async () => {
     const f = await fixture();
     const result = await f.service({ taskDirectoryRetention: { ...settings, dryRun: true }, gitRestorePoints: undefined }).sweepTerminalWorkspaces();

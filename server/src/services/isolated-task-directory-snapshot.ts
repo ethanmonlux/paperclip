@@ -61,6 +61,11 @@ async function walk(root: string, options: WalkOptions) {
     options.signal?.throwIfAborted();
     const absoluteDir = relativeDir ? path.join(root, relativeDir) : root;
     const names = (await fs.readdir(absoluteDir)).sort(bySortKey);
+    // A task directory can contain a checkout at repo/. A directory snapshot
+    // does not establish that checkout's HEAD or publication state, and its
+    // generated contents can exceed the restore-point limits. Leave the whole
+    // task directory intact until repository delivery is qualified separately.
+    if (names.includes(".git")) throw new TaskDirectorySnapshotSkip("nested_git_repository");
     const hasPackageManifest = names.includes("package.json")
       && (await fs.lstat(path.join(absoluteDir, "package.json"))).isFile();
     for (const name of names) {
