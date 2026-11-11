@@ -409,6 +409,7 @@ export type TaskDirectoryFolderResult = {
   physicalObject: string;
   allowedScope: string;
   ownerStatus: string | null;
+  requiredEvidence: string[];
   outcome: "removed" | "preserved_and_removed" | "dry_run" | "skipped";
   reason: string | null;
   candidateBytes: number;
@@ -496,7 +497,7 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   const companyDir = path.join(root, companyId);
   const folder = path.join(companyDir, name);
   const result: TaskDirectoryFolderResult = { companyId, issueId: name, physicalObject: "unknown", allowedScope: folder,
-    ownerStatus: null, outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
+    ownerStatus: null, requiredEvidence: [], outcome: "skipped", reason: null, candidateBytes: 0, reclaimedBytes: 0 };
   const retry = (at: number) => { result.retryAt = result.retryAt === undefined ? at : Math.min(result.retryAt, at); };
   try {
     if (!UUID.test(name) || !UUID.test(companyId)) throw new Error("unrecognized_task_directory_name");
@@ -528,6 +529,10 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       result.candidateBytes = expiration.candidateBytes;
       result.reclaimedBytes = expiration.reclaimedBytes;
       result.reason = expiration.skipReason;
+      if (expiration.skipReason === "restore_points_disabled") result.requiredEvidence.push("configured durable restore-point storage");
+      if (expiration.skipReason === "restore_point_key_not_durable") result.requiredEvidence.push("durable restore-point key");
+      if (expiration.skipReason === "nested_git_repository") result.requiredEvidence.push("published repository head and qualified outer artifacts");
+      if (expiration.skipReason === "live_or_unresolved_consumer") result.requiredEvidence.push("settled task, run, lease, and workspace references");
       if (expiration.failure) result.failure = expiration.failure;
       result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";
       if (isRetryableTaskDirectorySkip(expiration.skipReason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
@@ -583,6 +588,11 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
   } catch (error) {
     options.signal?.throwIfAborted();
     result.reason = skipReason(error);
+    if (result.reason === "orphan_contents_unqualified") {
+      result.requiredEvidence = ["authoritative publication or owned checkpoint for every retained file"];
+    } else if (CONSUMER_SKIPS.has(result.reason)) {
+      result.requiredEvidence = ["settled task, run, lease, and workspace references"];
+    }
     if (result.reason === "inspection_failed") result.failure = describeGitExpirationFailure(error);
     if (isRetryableTaskDirectorySkip(result.reason) || CONSUMER_SKIPS.has(result.reason)) retry(nowMs + TASK_DIRECTORY_RETRY_MS);
   }

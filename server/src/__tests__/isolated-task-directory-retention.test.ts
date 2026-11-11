@@ -416,7 +416,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       const o = await orphan({ withContents: true });
       const batch = await sweep({ dryRun: true });
       expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
-        outcome: "skipped", reason: "orphan_contents_unqualified" }]);
+        outcome: "skipped", reason: "orphan_contents_unqualified",
+        requiredEvidence: ["authoritative publication or owned checkpoint for every retained file"] }]);
       expect(batch.results[0]!.candidateBytes).toBeGreaterThan(0);
       expect((await sweep()).results).toMatchObject([{ issueId: o.issueId,
         outcome: "skipped", reason: "orphan_contents_unqualified" }]);
@@ -442,7 +443,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
         name: "Live", status: "active", providerType: "local_fs", cwd: path.join(o.cwd, "sub") });
       const batch = await sweep({ dryRun: true });
       expect(batch.results).toMatchObject([{ issueId: o.issueId, allowedScope: o.cwd,
-        outcome: "skipped", reason: "live_workspace" }]);
+        outcome: "skipped", reason: "live_workspace",
+        requiredEvidence: ["settled task, run, lease, and workspace references"] }]);
       expect(await exists(o.cwd)).toBe(true);
     });
 
