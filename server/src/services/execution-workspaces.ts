@@ -956,7 +956,7 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   }
 }
 
-async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
+export async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<{
   git: ExecutionWorkspaceCloseGitReadiness | null;
   warnings: string[];
   statusInspectionSucceeded: boolean;
@@ -1005,6 +1005,31 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
   try {
     repoRoot = (await runGit(["rev-parse", "--show-toplevel"], workspacePath)).stdout.trim() || null;
   } catch (error) {
+    // A copied task checkout can have its repository under an outer task
+    // directory. Inspect the actual repository for the preview, but keep the
+    // outer directory ineligible until its source and artifacts are bound to
+    // a durable closeout. Git status inside repo/ cannot account for siblings.
+    if (workspace.providerType === "local_fs" && !(await hasGitMarkerInPathOrAncestors(workspacePath))) {
+      const nestedPath = path.join(workspacePath, "repo");
+      const nestedStat = await fs.lstat(nestedPath).catch(() => null);
+      if (nestedStat?.isDirectory() && !nestedStat.isSymbolicLink()) {
+        const nested = await inspectGitCloseReadiness({ ...workspace, providerRef: nestedPath, cwd: nestedPath });
+        if (nested.git?.repoRoot && path.resolve(nested.git.repoRoot) === path.resolve(nestedPath)) {
+          const siblings = (await fs.readdir(workspacePath).catch(() => [])).filter((name) => name !== "repo");
+          return {
+            git: nested.git,
+            warnings: [
+              `The Git repository is nested at "${nestedPath}"; the task workspace still points at "${workspacePath}".`,
+              ...(siblings.length ? [`${siblings.length} outer task ${siblings.length === 1 ? "entry" : "entries"} outside the repository require separate artifact or checkpoint review.`] : []),
+              ...nested.warnings,
+            ],
+            // This must stay false even for a clean, merged nested repository:
+            // the outer task directory has not been qualified for removal.
+            statusInspectionSucceeded: false,
+          };
+        }
+      }
+    }
     // A plain directory (e.g. a local_fs shared workspace) has no git state to
     // lose. Only treat it that way when no `.git` exists on the path, so a
     // broken or unreadable repository still fails closed.
@@ -3308,8 +3333,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const blockingReasons: string[] = [];
       const remoteWorkspace = readRemoteWorkspaceAuthority(workspace.metadata);
       if (!statusInspectionSucceeded) {
-        blockingReasons.push(remoteWorkspace ? gitWarnings[0] ?? "The remote workspace save is incomplete."
-          : "Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
+        blockingReasons.push(gitWarnings[0] ?? (remoteWorkspace ? "The remote workspace save is incomplete."
+          : "Paperclip could not verify the workspace git status. Retry before destructive cleanup."));
       }
       const isSharedWorkspace = executionWorkspace.mode === "shared_workspace";
       const workspacePath = readNullableString(executionWorkspace.providerRef) ?? readNullableString(executionWorkspace.cwd);
