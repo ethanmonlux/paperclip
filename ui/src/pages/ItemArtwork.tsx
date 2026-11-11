@@ -7,16 +7,29 @@ import { TextAttachmentPreview } from "@/components/task-side-panel/TaskAttachme
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { isHtmlPreview } from "@/lib/html-preview";
-import { Link, useNavigate } from "@/lib/router";
+import { Link, useLocation, useNavigate } from "@/lib/router";
+import { normalizeCompanyPrefix } from "@/lib/company-routes";
 import { loadAttachmentText, TEXT_PREVIEW_MAX_BYTES } from "@/lib/text-preview";
 
 const ISSUE_ID = "0359548d-7b70-4841-88fd-090afc96e1d7";
 const WORK_PRODUCT_ID = "2c02daef-04bf-4203-afc2-402b5fd331cc";
 
 export function ItemArtwork() {
-  const { selectedCompanyId, companies } = useCompany();
+  const { selectedCompanyId, selectedCompany, companies } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const navigate = useNavigate();
+  const location = useLocation();
+  const companyPrefix = selectedCompany?.issuePrefix;
+  const returnTo = (location.state as { itemArtworkReturnTo?: unknown } | null)?.itemArtworkReturnTo;
+  const safeReturnTo = typeof returnTo === "string" && companyPrefix && (() => {
+    const prefix = normalizeCompanyPrefix(companyPrefix);
+    try {
+      const target = new URL(returnTo, window.location.origin);
+      return target.origin === window.location.origin
+        && target.pathname.startsWith(`/${prefix}/`)
+        && target.pathname !== `/${prefix}/item-artwork`;
+    } catch { return false; }
+  })() ? returnTo : null;
   useEffect(() => setBreadcrumbs([{ label: "Item artwork" }]), [setBreadcrumbs]);
 
   const products = useQuery({
@@ -53,7 +66,10 @@ export function ItemArtwork() {
   return <main className="mx-auto flex w-full max-w-6xl min-w-0 flex-col gap-3 pb-6" data-testid="item-artwork">
     <header className="flex flex-wrap items-center justify-between gap-2">
       <div><p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">Staple · Item artwork</p><h1 className="text-2xl font-semibold">Item explorer</h1></div>
-      <button type="button" onClick={() => navigate(-1)} className="rounded-md border px-3 py-2 text-sm font-medium hover:bg-accent">Back</button>
+      <div className="flex flex-wrap gap-2">
+        <button type="button" onClick={() => navigate(safeReturnTo ?? "/console")} className="min-h-11 rounded-md border px-4 py-2 text-sm font-medium hover:bg-accent">Back</button>
+        <Link to="/console" className="inline-flex min-h-11 items-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-accent">Home</Link>
+      </div>
     </header>
     <p className="text-sm text-muted-foreground">Published snapshot from <Link to="/issues/STA-290" className="underline underline-offset-2">STA-290</Link>{product ? ` · pointer updated ${new Date(product.updatedAt).toLocaleString()}` : ""}. Artwork discovery and publication continue in that task.</p>
     {failed ? <div role="alert" className="rounded-lg border p-3 text-sm">Could not refresh the snapshot. {content.data ? "The last loaded preview is shown below and may be stale." : "The explorer is unavailable right now."} <button type="button" className="underline" onClick={() => { void products.refetch(); void attachments.refetch(); void content.refetch(); }}>Retry</button></div> : null}

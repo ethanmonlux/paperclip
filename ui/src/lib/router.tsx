@@ -27,6 +27,15 @@ function resolveTo(to: To, companyPrefix: string | null): To {
   return to;
 }
 
+function itemArtworkNavigationState(to: To, state: unknown, from: RouterDom.Location): unknown {
+  const pathname = typeof to === "string" ? to.split(/[?#]/, 1)[0] : to.pathname;
+  if (!pathname?.endsWith("/item-artwork") || from.pathname === pathname) return state;
+  return {
+    ...(state && typeof state === "object" && !Array.isArray(state) ? state : {}),
+    itemArtworkReturnTo: `${from.pathname}${from.search}${from.hash}`,
+  };
+}
+
 export function useActiveCompanyPrefix(): string | null {
   const { selectedCompany } = useCompany();
   const params = RouterDom.useParams<{ companyPrefix?: string }>();
@@ -74,6 +83,7 @@ export const Link = React.forwardRef<HTMLAnchorElement, CompanyLinkProps>(
     ...props
   }, ref) {
     const companyPrefix = useActiveCompanyPrefix();
+    const location = RouterDom.useLocation();
     const resolvedTo = resolveTo(to, companyPrefix);
     const issuePathId = parseIssuePathIdFromPath(typeof resolvedTo === "string" ? resolvedTo : resolvedTo.pathname);
 
@@ -92,14 +102,16 @@ export const Link = React.forwardRef<HTMLAnchorElement, CompanyLinkProps>(
       );
     }
 
-    return <RouterDom.Link ref={ref} to={resolvedTo} {...props} />;
+    return <RouterDom.Link ref={ref} to={resolvedTo} {...props} state={itemArtworkNavigationState(resolvedTo, props.state, location)} />;
   },
 );
 
 export const NavLink = React.forwardRef<HTMLAnchorElement, React.ComponentProps<typeof RouterDom.NavLink>>(
   function CompanyNavLink({ to, ...props }, ref) {
     const companyPrefix = useActiveCompanyPrefix();
-    return <RouterDom.NavLink ref={ref} to={resolveTo(to, companyPrefix)} {...props} />;
+    const location = RouterDom.useLocation();
+    const resolvedTo = resolveTo(to, companyPrefix);
+    return <RouterDom.NavLink ref={ref} to={resolvedTo} {...props} state={itemArtworkNavigationState(resolvedTo, props.state, location)} />;
   },
 );
 
