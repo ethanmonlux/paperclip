@@ -176,8 +176,10 @@ function brokerRequest(url, init, env) {
       const request = http.request({
         method: init.method, host: servername, port, path: target.pathname + target.search,
         headers: { ...init.headers, host: target.host, 'content-length': String(Buffer.byteLength(init.body)) },
+        // host is what the certificate is checked against; without it an IP
+        // broker was checked against 'localhost'. IPs get no SNI, as in fetch.
         createConnection: () => target.protocol === 'https:'
-          ? tls.connect({ socket, servername: net.isIP(servername) ? undefined : servername }) : socket,
+          ? tls.connect({ socket, host: servername, servername: net.isIP(servername) ? undefined : servername }) : socket,
       }, response => {
         const chunks = [];
         response.on('data', chunk => chunks.push(chunk));
