@@ -46,7 +46,7 @@ const bySortKey = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 type WalkOptions = {
   limits: TaskDirectorySnapshotLimits;
   signal?: AbortSignal;
-  rejectNestedGit: boolean;
+  nestedGit: "reject" | "allow" | "collect";
   readFile: (absolute: string, relative: string, size: number) => Promise<string>;
 };
 
@@ -55,6 +55,7 @@ async function walk(root: string, options: WalkOptions) {
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new TaskDirectorySnapshotSkip("unsafe_task_directory");
   const entries: TaskDirectoryEntry[] = [];
   const excluded: string[] = [];
+  const repositories: string[] = [];
   let files = 0;
   let total = 0;
   let newestMtimeMs = rootStat.mtimeMs;
@@ -66,7 +67,14 @@ async function walk(root: string, options: WalkOptions) {
     // does not establish that checkout's HEAD or publication state, and its
     // generated contents can exceed the restore-point limits. Leave the whole
     // task directory intact until repository delivery is qualified separately.
-    if (options.rejectNestedGit && names.includes(".git")) throw new TaskDirectorySnapshotSkip("nested_git_repository");
+    // A code-delivery preview instead records each nested checkout and leaves
+    // its contents to a separate repository proof; the root itself never
+    // qualifies as a nested checkout.
+    if (names.includes(".git") && options.nestedGit !== "allow") {
+      if (options.nestedGit === "reject" || !relativeDir) throw new TaskDirectorySnapshotSkip("nested_git_repository");
+      repositories.push(relativeDir);
+      return;
+    }
     const hasPackageManifest = names.includes("package.json")
       && (await fs.lstat(path.join(absoluteDir, "package.json"))).isFile();
     for (const name of names) {
@@ -99,7 +107,7 @@ async function walk(root: string, options: WalkOptions) {
     }
   };
   await visit("");
-  return { entries, excluded, newestMtimeMs };
+  return { entries, excluded, repositories, newestMtimeMs };
 }
 
 export function taskDirectoryManifestDigest(manifest: Pick<TaskDirectorySnapshotManifest, "entries">) {
@@ -123,11 +131,12 @@ async function hashFile(absolute: string, size: number) {
 }
 
 export async function inspectTaskDirectory(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal;
-  restoreVerification?: boolean } = {}) {
+  restoreVerification?: boolean; nestedRepositories?: boolean } = {}) {
   const walked = await walk(root, { limits: options.limits ?? DEFAULT_TASK_DIRECTORY_SNAPSHOT_LIMITS, signal: options.signal,
-    rejectNestedGit: !options.restoreVerification,
+    nestedGit: options.restoreVerification ? "allow" : options.nestedRepositories ? "collect" : "reject",
     readFile: (absolute, _relative, size) => hashFile(absolute, size) });
   return { digest: taskDirectoryManifestDigest(walked), entries: walked.entries.length, excluded: walked.excluded.length,
+    repositories: walked.repositories,
     newestMtimeMs: walked.newestMtimeMs };
 }
 
@@ -145,7 +154,7 @@ export async function newestTaskDirectoryMtime(root: string, signal?: AbortSigna
 export async function captureTaskDirectorySnapshot(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal } = {}) {
   const bodies: Buffer[] = [];
   const walked = await walk(root, { limits: options.limits ?? DEFAULT_TASK_DIRECTORY_SNAPSHOT_LIMITS, signal: options.signal,
-    rejectNestedGit: true,
+    nestedGit: "reject",
     readFile: async (absolute, _relative, size) => {
       const handle = await fs.open(absolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
