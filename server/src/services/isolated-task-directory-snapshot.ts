@@ -151,10 +151,13 @@ export async function newestTaskDirectoryMtime(root: string, signal?: AbortSigna
   return newest;
 }
 
-export async function captureTaskDirectorySnapshot(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal } = {}) {
+/** With `nestedRepositories`, each nested checkout is saved as an empty
+ * directory and listed in `repositories`; its recipe rebuilds the contents. */
+export async function captureTaskDirectorySnapshot(root: string, options: { limits?: TaskDirectorySnapshotLimits; signal?: AbortSignal;
+  nestedRepositories?: boolean } = {}) {
   const bodies: Buffer[] = [];
   const walked = await walk(root, { limits: options.limits ?? DEFAULT_TASK_DIRECTORY_SNAPSHOT_LIMITS, signal: options.signal,
-    nestedGit: "reject",
+    nestedGit: options.nestedRepositories ? "collect" : "reject",
     readFile: async (absolute, _relative, size) => {
       const handle = await fs.open(absolute, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
@@ -166,7 +169,8 @@ export async function captureTaskDirectorySnapshot(root: string, options: { limi
         await handle.close();
       }
     } });
-  return encodeTaskDirectorySnapshot({ schema: TASK_DIRECTORY_SNAPSHOT_SCHEMA, entries: walked.entries, excluded: walked.excluded }, bodies);
+  return { ...encodeTaskDirectorySnapshot({ schema: TASK_DIRECTORY_SNAPSHOT_SCHEMA, entries: walked.entries, excluded: walked.excluded }, bodies),
+    repositories: walked.repositories };
 }
 
 export function createEmptyTaskDirectorySnapshot() {

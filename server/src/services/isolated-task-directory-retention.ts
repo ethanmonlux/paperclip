@@ -18,6 +18,15 @@ import { logActivity } from "./activity-log.js";
 import { readTaskDeliveryCloseout } from "./task-delivery-closeout.js";
 import { codeDeliveryEvidence, describeCodeDeliveryQualification, qualifyCodeDeliveryTaskDirectory } from "./task-code-delivery-qualification.js";
 import {
+  MAX_TASK_DIRECTORY_REPOSITORIES,
+  readTaskDirectoryRepositoryRecipe,
+  restoreTaskDirectoryRepositories,
+  taskDirectoryRepositoriesUnchanged,
+  taskDirectoryRepositoryMatches,
+  validateTaskDirectoryRepositoryRecipes,
+  type TaskDirectoryRepositoryRecipe,
+} from "./task-directory-repositories.js";
+import {
   captureTaskDirectorySnapshot,
   createEmptyTaskDirectorySnapshot,
   inspectTaskDirectory,
@@ -34,6 +43,9 @@ import {
 export { TASK_DIRECTORY_RETENTION_KEY } from "./isolated-task-directory-snapshot.js";
 export const TASK_DIRECTORY_RETENTION_SCHEMA = "paperclip.task-directory-retention.v1";
 export const TASK_DIRECTORY_RESTORE_POINT_SCHEMA = "paperclip.task-directory-restore-point.v1";
+/** A restore point whose folder held nested checkouts. Older servers reject
+ * it instead of reopening the folder without its checkouts. */
+export const TASK_DIRECTORY_RESTORE_POINT_SCHEMA_V2 = "paperclip.task-directory-restore-point.v2";
 export const TASK_DIRECTORY_RETENTION_REASON = "isolated task directory retention";
 export const TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING = "The saved files of this task directory expired, so it was reopened as an empty directory. Files from before it was cleaned up are no longer available.";
 export const TASK_DIRECTORY_RETRY_MS = 60 * 60 * 1000;
@@ -45,12 +57,12 @@ const IDENTITY = /^[a-zA-Z0-9_-]+$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRASH = /^\.(expired|restoring)-[0-9a-f]{8,}$/;
 const RETRYABLE_SKIPS = new Set(["source_busy", "lifecycle_busy", "workspace_changed", "live_or_unresolved_consumer",
-  "task_directory_changed", "inspection_failed"]);
+  "task_directory_changed", "inspection_failed", "managed_checkout_upstream_unavailable"]);
 
 type Workspace = typeof executionWorkspaces.$inferSelect;
 
 export type TaskDirectoryRestorePointRef = {
-  schema: typeof TASK_DIRECTORY_RESTORE_POINT_SCHEMA;
+  schema: typeof TASK_DIRECTORY_RESTORE_POINT_SCHEMA | typeof TASK_DIRECTORY_RESTORE_POINT_SCHEMA_V2;
   id: string;
   objectKey: string;
   sha256: string;
@@ -61,6 +73,9 @@ export type TaskDirectoryRestorePointRef = {
   files: number;
   excluded: number;
   expiredAt?: string;
+  /** Present exactly for the v2 schema: how reopening rebuilds each nested
+   * checkout that the saved files leave as an empty directory. */
+  repositories?: TaskDirectoryRepositoryRecipe[];
 };
 
 export type TaskDirectoryRetention = {
@@ -87,7 +102,7 @@ export type TaskDirectoryRetentionResult = {
   verifiedEvidence?: string[];
 };
 
-const REPOSITORY_RESTORE_EVIDENCE = "nested repository restore support before live removal";
+const PUBLICATION_EVIDENCE = "verified repository publication and qualified outer artifacts";
 
 export function readTaskDirectoryRetention(workspace: { metadata?: Record<string, unknown> | null }): TaskDirectoryRetention | null {
   const state = workspace.metadata?.[TASK_DIRECTORY_RETENTION_KEY] as TaskDirectoryRetention | undefined;
@@ -135,14 +150,17 @@ function restorePointObjectKey(companyId: string, workspaceId: string, generatio
 }
 
 export function validateTaskDirectoryRestorePointRef(ref: TaskDirectoryRestorePointRef | null | undefined, workspace: { companyId: string; id: string }) {
-  if (!ref || ref.schema !== TASK_DIRECTORY_RESTORE_POINT_SCHEMA || typeof ref.id !== "string" || !UUID.test(ref.id)
+  const withRepositories = ref?.schema === TASK_DIRECTORY_RESTORE_POINT_SCHEMA_V2;
+  if (!ref || (ref.schema !== TASK_DIRECTORY_RESTORE_POINT_SCHEMA && !withRepositories) || typeof ref.id !== "string" || !UUID.test(ref.id)
     || !Number.isSafeInteger(ref.generation) || ref.generation < 1
     || ref.objectKey !== restorePointObjectKey(workspace.companyId, workspace.id, ref.generation, ref.id)
     || !/^[0-9a-f]{64}$/.test(ref.sha256) || !/^[0-9a-f]{64}$/.test(ref.digest)
     || !Number.isSafeInteger(ref.byteSize) || ref.byteSize <= 0 || ref.byteSize > MAX_RESTORE_POINT_BYTES
-    || !ref.key || typeof ref.key !== "object" || Array.isArray(ref.key)) {
+    || !ref.key || typeof ref.key !== "object" || Array.isArray(ref.key)
+    || (!withRepositories && ref.repositories !== undefined)) {
     throw new TaskDirectoryRestoreFailure("invalid_restore_point_reference");
   }
+  if (withRepositories) validateTaskDirectoryRepositoryRecipes(ref.repositories);
   return ref;
 }
 
@@ -211,14 +229,16 @@ async function issueBoundToWorkspace(db: Db | Parameters<Parameters<Db["transact
 }
 
 async function storeTaskDirectoryRestorePoint(db: Db, storage: StorageService, workspace: Workspace, generation: number,
-  captured: Awaited<ReturnType<typeof captureTaskDirectorySnapshot>>, signal?: AbortSignal) {
+  captured: Awaited<ReturnType<typeof captureTaskDirectorySnapshot>>, repositories: TaskDirectoryRepositoryRecipe[] | undefined,
+  signal?: AbortSignal) {
   const id = randomUUID();
   const sealed = await sealRestorePoint(captured.payload, { companyId: workspace.companyId, workspaceId: workspace.id, restorePointId: id, generation });
   const objectKey = restorePointObjectKey(workspace.companyId, workspace.id, generation, id);
   const ledgerId = await storeSealedRestorePoint({ db, storage, workspace: { companyId: workspace.companyId, id: workspace.id,
     sourceIssueId: workspace.sourceIssueId }, generation, checkoutName: "", objectKey, sealed, signal });
-  const ref: TaskDirectoryRestorePointRef = { schema: TASK_DIRECTORY_RESTORE_POINT_SCHEMA, id, objectKey, sha256: sealed.sha256,
-    byteSize: sealed.ciphertext.length, key: sealed.key, generation, digest: captured.digest, files: captured.files, excluded: captured.excluded };
+  const ref: TaskDirectoryRestorePointRef = { schema: repositories ? TASK_DIRECTORY_RESTORE_POINT_SCHEMA_V2 : TASK_DIRECTORY_RESTORE_POINT_SCHEMA,
+    id, objectKey, sha256: sealed.sha256, byteSize: sealed.ciphertext.length, key: sealed.key, generation, digest: captured.digest,
+    files: captured.files, excluded: captured.excluded, ...(repositories ? { repositories } : {}) };
   return { ledgerId, ref };
 }
 
@@ -229,8 +249,10 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
   restorePoint?: TaskDirectoryRestorePointOptions;
   signal?: AbortSignal;
   beforeDelete?: (workspace: Workspace) => Promise<void>;
-  /** Run the read-only repository publication proof for a code closeout.
-   * Only a targeted dry-run preview requests it; sweeps never contact remotes. */
+  /** Run the read-only repository publication proof in a dry run. A targeted
+   * preview requests it; dry-run sweeps never contact remotes. Live removal of
+   * a code-delivered folder always runs it, because reopening must fetch the
+   * checkout from the same publication. */
   proveRepositoryDelivery?: boolean;
   resolveGitAuth?: GitRemoteAuthProvider;
 }): Promise<TaskDirectoryRetentionResult> {
@@ -266,24 +288,33 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
             workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
           if (!closeout) throw new Error("delivery_closeout_missing");
+          let repositories: TaskDirectoryRepositoryRecipe[] | undefined;
           if (closeout.kind === "code") {
-            // Removal would also need to rebuild the checkout on reopen. Until a
-            // restore recipe exists, a passed proof still keeps the folder.
-            if (!options.dryRun || !options.proveRepositoryDelivery) {
-              result.requiredEvidence = ["verified repository publication and qualified outer artifacts", REPOSITORY_RESTORE_EVIDENCE];
-              throw new Error("repository_restore_unsupported");
+            if (options.dryRun && !options.proveRepositoryDelivery) {
+              result.requiredEvidence = [PUBLICATION_EVIDENCE];
+              throw new Error("repository_publication_unverified");
             }
             try {
+              const listed = (await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal,
+                nestedRepositories: true })).repositories;
+              if (listed.length > MAX_TASK_DIRECTORY_REPOSITORIES) throw new Error("too_many_nested_repositories");
+              const before = await Promise.all(listed.map(relative => readTaskDirectoryRepositoryRecipe(cwd, relative, options.signal)));
               const qualified = await qualifyCodeDeliveryTaskDirectory(cwd, closeout, { limits: options.restorePoint?.limits,
                 signal: options.signal, resolveGitAuth: options.resolveGitAuth ?? expirationGitAuth(db, workspace) });
+              repositories = await Promise.all(qualified.repositories.map(repository =>
+                readTaskDirectoryRepositoryRecipe(cwd, repository.path, options.signal)));
+              // A commit or edit made while the proof ran is not covered by it.
+              if (JSON.stringify(before) !== JSON.stringify(repositories)) throw new Error("task_directory_changed");
               result.verifiedEvidence = describeCodeDeliveryQualification(qualified);
             } catch (error) {
               options.signal?.throwIfAborted();
-              result.requiredEvidence = [codeDeliveryEvidence(skipReason(error)), REPOSITORY_RESTORE_EVIDENCE];
+              result.requiredEvidence = [codeDeliveryEvidence(skipReason(error))];
               throw error;
             }
-            result.requiredEvidence = [REPOSITORY_RESTORE_EVIDENCE];
-            throw new Error("repository_restore_unsupported");
+            if (options.dryRun) {
+              result.candidate = true;
+              return result;
+            }
           }
           // A preview needs the same bounded qualification, but must not retain
           // every file body in memory just to discard the encoded snapshot.
@@ -292,11 +323,13 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             result.candidate = true;
             return result;
           }
-          const captured = await captureTaskDirectorySnapshot(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
+          const captured = await captureTaskDirectorySnapshot(cwd, { limits: options.restorePoint?.limits, signal: options.signal,
+            nestedRepositories: Boolean(repositories) });
+          if (repositories && !samePaths(captured.repositories, repositories)) throw new Error("task_directory_changed");
           result.candidate = true;
           const generation = Number(workspace.metadata?.lifecycleGeneration ?? 0) + 1;
           const stored = await storeTaskDirectoryRestorePoint(db, options.restorePoint!.storage, workspace, generation,
-            captured, options.signal);
+            captured, repositories, options.signal);
           pending = stored.ledgerId;
           result.restorePoint = true;
           state = { schema: TASK_DIRECTORY_RETENTION_SCHEMA, generation, removed: false,
@@ -328,13 +361,12 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
             workspaceId: workspace.id, lifecycleGeneration: state.generation - 1 });
           if (!closeout) throw new Error("delivery_closeout_missing");
-          if (closeout.kind === "code") throw new Error("repository_restore_unsupported");
+          // A saved intent already holds the proven recipe; finishing it only
+          // compares local state and never contacts a remote.
+          if (closeout.kind === "code" && !state.restorePoint.repositories) throw new Error("repository_restore_unsupported");
           if (present) {
             result.candidateBytes = await exclusiveAllocatedBytes(cwd, () => { options.signal?.throwIfAborted(); return true; });
-            if (options.dryRun) {
-              const current = await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal });
-              if (current.digest !== state.restorePoint.digest) throw new Error("task_directory_changed");
-            }
+            if (options.dryRun && !await savedContentsUnchanged(cwd, state.restorePoint, options)) throw new Error("task_directory_changed");
           } else if (options.dryRun) {
             // A saved intent can survive a crash after the rename. Preview the
             // actual trash object, never the original folder's old estimate.
@@ -350,12 +382,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
           throw new Error("live_or_unresolved_consumer");
         }
         if (await directoryState(cwd) === "present") {
-          const current = await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal })
-            .catch((error: unknown) => {
-              if (error instanceof TaskDirectorySnapshotSkip) return null;
-              throw error;
-            });
-          if (!current || current.digest !== state.restorePoint.digest) {
+          if (!await savedContentsUnchanged(cwd, state.restorePoint, options)) {
             if (workspace.cleanupReason === TASK_DIRECTORY_RETENTION_REASON) {
               const metadata: Record<string, unknown> = { ...workspace.metadata, lifecycleGeneration: state.generation + 1 };
               delete metadata[TASK_DIRECTORY_RETENTION_KEY];
@@ -404,6 +431,25 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
   }
 }
 
+function samePaths(listed: string[], repositories: TaskDirectoryRepositoryRecipe[]) {
+  return JSON.stringify([...listed].sort()) === JSON.stringify(repositories.map(repository => repository.path).sort());
+}
+
+/** The folder still holds exactly what its restore point saved: the outer
+ * files, and for nested checkouts the local state their proof covered. */
+async function savedContentsUnchanged(cwd: string, ref: TaskDirectoryRestorePointRef,
+  options: { restorePoint?: TaskDirectoryRestorePointOptions; signal?: AbortSignal }) {
+  const repositories = ref.repositories;
+  const current = await inspectTaskDirectory(cwd, { limits: options.restorePoint?.limits, signal: options.signal,
+    nestedRepositories: Boolean(repositories) }).catch((error: unknown) => {
+    if (error instanceof TaskDirectorySnapshotSkip) return null;
+    throw error;
+  });
+  if (!current || current.digest !== ref.digest) return false;
+  if (!repositories) return true;
+  return samePaths(current.repositories, repositories) && await taskDirectoryRepositoriesUnchanged(cwd, repositories, options.signal);
+}
+
 async function abandonTaskDirectoryRestorePoint(db: Db | Parameters<Parameters<Db["transaction"]>[0]>[0], workspaceId: string, objectKey: string) {
   await db.transaction(async tx => {
     await notifyGitRestorePointWork(tx, `workspace:${workspaceId}`);
@@ -421,38 +467,51 @@ export async function supersedeTaskDirectoryRestorePoint(tx: Parameters<Paramete
 export async function restoreIsolatedTaskDirectory(input: {
   storage: StorageService;
   workspace: Pick<Workspace, "id" | "companyId" | "sourceIssueId" | "strategyType" | "providerType" | "repoUrl" | "branchName" | "cwd" | "providerRef" | "mode" | "metadata">;
+  /** Repository access for nested checkouts, which are fetched from origin. */
+  resolveGitAuth?: GitRemoteAuthProvider;
   signal?: AbortSignal;
-}): Promise<{ restored: boolean; expired: boolean }> {
+}): Promise<{ restored: boolean; expired: boolean; repositories: number }> {
   const state = readTaskDirectoryRetention(input.workspace);
-  if (!state) return { restored: false, expired: false };
+  if (!state) return { restored: false, expired: false, repositories: 0 };
   if (!await isIsolatedTaskDirectoryWorkspace(input.workspace)) throw new TaskDirectoryRestoreFailure("task_directory_identity_changed");
   const cwd = input.workspace.cwd!;
   const parent = path.dirname(cwd);
   await fs.mkdir(parent, { recursive: true, mode: 0o700 });
   if (await fs.realpath(parent) !== parent) throw new TaskDirectoryRestoreFailure("task_directory_identity_changed");
   const ref = validateTaskDirectoryRestorePointRef(state.restorePoint, input.workspace);
+  const repositories = ref.repositories ?? [];
   if (await directoryState(cwd) === "present") {
-    if (!state.removed) return { restored: false, expired: false };
+    if (!state.removed) return { restored: false, expired: false, repositories: 0 };
     if ((await fs.readdir(cwd)).length === 0) await fs.rmdir(cwd);
     else {
-      const current = await inspectTaskDirectory(cwd, { signal: input.signal, restoreVerification: true }).catch(() => null);
-      if (current?.digest === ref.digest) return { restored: false, expired: false };
+      // A crash after the rename into place leaves an already restored folder.
+      const current = await inspectTaskDirectory(cwd, { signal: input.signal, restoreVerification: repositories.length === 0,
+        nestedRepositories: repositories.length > 0 }).catch(() => null);
+      let matches = current?.digest === ref.digest && samePaths(current.repositories, repositories);
+      for (const repository of repositories) matches &&= await taskDirectoryRepositoryMatches(cwd, repository, input.signal);
+      if (matches) return { restored: false, expired: false, repositories: 0 };
       throw new TaskDirectoryRestoreFailure("task_directory_diverged");
     }
   }
   if (ref.expiredAt) {
     await fs.mkdir(cwd, { mode: 0o700 });
-    return { restored: false, expired: true };
+    return { restored: false, expired: true, repositories: 0 };
   }
+  if (repositories.length > 0 && !input.resolveGitAuth) throw new TaskDirectoryRestoreFailure("repository_access_unavailable");
   const payload = await loadTaskDirectoryRestorePoint({ ...input, ref });
   const staging = await materializeTaskDirectorySnapshot({ payload, target: cwd, expectedDigest: ref.digest, signal: input.signal });
   try {
+    // Checkouts are rebuilt in staging, so a failed fetch never leaves a
+    // partial folder in place and the reopen can be retried.
+    if (repositories.length > 0) {
+      await restoreTaskDirectoryRepositories(staging, repositories, { resolveGitAuth: input.resolveGitAuth!, signal: input.signal });
+    }
     await fs.rename(staging, cwd);
   } catch (error) {
     await removeTaskDirectoryTree(staging).catch(() => undefined);
     throw error;
   }
-  return { restored: true, expired: false };
+  return { restored: true, expired: false, repositories: repositories.length };
 }
 
 export type TaskDirectoryFolderResult = {

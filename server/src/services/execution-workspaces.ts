@@ -4693,7 +4693,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         const taskDirectoryState = readTaskDirectoryRetention(row);
         try {
           if (taskDirectoryState) {
-            const restored = await restoreIsolatedTaskDirectory({ storage: opts.gitRestorePoints?.storage ?? getStorageService(), workspace: row });
+            const restored = await restoreIsolatedTaskDirectory({ storage: opts.gitRestorePoints?.storage ?? getStorageService(), workspace: row,
+              resolveGitAuth: gitAuth });
             if (restored.expired) taskDirectoryWarning = TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING;
             logger.info({ event: "execution_workspace.task_directory_restore", executionWorkspaceId: row.id, companyId: row.companyId,
               issueId: issue.id, ...restored }, "Isolated task directory restored for reopen");

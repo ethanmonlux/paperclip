@@ -319,9 +319,25 @@ For a folder closed with a `code` delivery closeout, the preview also runs a rea
 repository proof. Each nested checkout must have one GitHub `origin`, the checkout of
 the pull request's repository must contain the delivered head, and every checkout must
 be clean with all local commits published upstream. Files outside the checkouts must
-fit the restore-point limits. Passed checks appear as `verifiedEvidence`. Routine
-sweeps skip this network proof. A code-delivered folder is always kept, reason
-`repository_restore_unsupported`, until reopening can rebuild its checkout.
+fit the restore-point limits. Passed checks appear as `verifiedEvidence`, and a folder
+that passes is a `dry_run` candidate. Dry-run sweeps never contact a remote and report
+such a folder as `repository_publication_unverified`.
+
+Live removal of a code-delivered folder runs the same proof first, because reopening
+fetches its checkouts from the same publication; a failed proof keeps the folder and
+names the missing evidence (`dirty_or_untracked_files`, `unpushed_managed_checkout`, and
+so on). An unreachable upstream (`managed_checkout_upstream_unavailable`) is retried an
+hour later. At most 16 nested checkouts are supported. For each checkout the restore point
+records a recipe: its path, GitHub repository, `origin` URL without any inline
+credentials, head commit, checked-out branch (or a detached head), the branch's upstream,
+and a digest of its local refs, reflogs, config and status. The saved files leave each
+checkout as an empty directory, and the restore point uses schema
+`paperclip.task-directory-restore-point.v2`, which older servers reject instead of
+reopening the folder without its checkouts. The proof's local state must be the same
+before and after the proof, again right before the folder is renamed for deletion, and
+when a later sweep finishes an interrupted removal. Finishing an interrupted removal
+compares that local state only and never contacts a remote; any change, such as a new
+commit, rolls the removal back like any other change.
 
 - the source issue is still bound to the workspace (`issue_not_bound` otherwise), because
   reopening restores through that binding;
@@ -368,7 +384,22 @@ beside it, whose name is no longer than the original, verified against the saved
 and renamed into place. An empty directory in the way is replaced; a non-empty
 one that does not match keeps the workspace closed and fails the reopen instead of
 overwriting it. After a successful reopen the restore point is superseded and removed; the
-next retention saves a new one. When the restore point has already expired, the reopen
+next retention saves a new one.
+
+For a code-delivered folder, reopening also rebuilds each checkout inside the staging
+directory before it is renamed into place: it initializes the repository, adds the saved
+`origin`, fetches the remote's branches and tags plus the saved head commit with the
+task's current repository access, and checks out the saved branch at that commit (with
+its upstream) or the detached head. Each checkout must then have the saved head, branch,
+upstream and `origin` and a clean working tree. Other local branches and reflogs are not
+recreated; the proof showed their commits are upstream. Ignored files such as
+`node_modules` are not saved and are regenerated. A fetch that fails, for example because
+access was revoked or the disk is full, removes the staging directory, keeps the
+workspace closed with its restore point, and the reopen can be retried. A folder found
+already restored after a crash is accepted only when its outer files and every checkout
+still match. When the restore point has expired, the reopen starts with an empty directory
+as below, without the checkouts. A retained folder with checkouts cannot be migrated to a
+remote environment (`nested_repository_restore_unsupported`); reopen it locally first. When the restore point has already expired, the reopen
 starts with an empty directory and posts a system comment on the issue saying the earlier
 files are no longer available.
 

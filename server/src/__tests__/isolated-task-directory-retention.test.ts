@@ -38,6 +38,18 @@ import { gitRestorePointRetentionService } from "../services/git-restore-point-l
 import { getStorageService } from "../storage/index.js";
 import type { GitRemoteAuthProvider } from "../services/git-credentials.js";
 
+// Reopen and live sweeps resolve repository access through the task's
+// provider; route every fixture GitHub origin to its local upstream instead.
+const gitFixture = vi.hoisted(() => ({ upstreams: new Map<string, string>(), calls: 0 }));
+vi.mock("../services/git-credentials.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/git-credentials.js")>(),
+  createIssueGitRemoteAuthProvider: () => async () => {
+    gitFixture.calls += 1;
+    return { env: {}, source: "managed_connection" as const, secretName: null,
+      configArgs: [...gitFixture.upstreams].flatMap(([remote, upstream]) => ["-c", `url.${upstream}.insteadOf=${remote}`]) };
+  },
+}));
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DELIVERED_REMOTE = "https://github.com/example/delivered.git";
 const GIT_ENV = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.com",
@@ -304,47 +316,229 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(await f.ledger()).toEqual([]);
   });
 
-  it("previews a code-delivered folder from its published nested checkout and keeps it", async () => {
-    const f = await fixture();
-    const upstream = path.join(root, `upstream-${f.workspaceId}.git`);
-    const repo = path.join(f.cwd, "repo");
+  /** A nested checkout whose commits are all on a local upstream standing in
+   * for its GitHub origin, recorded by a code closeout when `delivered`. */
+  async function publishedCheckout(f: Awaited<ReturnType<typeof fixture>>, relative: string, repository: string,
+    options: { delivered?: boolean; origin?: string; detached?: boolean } = {}) {
+    const remote = `https://github.com/${repository}.git`;
+    const upstream = path.join(root, `upstream-${randomUUID()}.git`);
+    const checkout = path.join(f.cwd, relative);
+    await fs.mkdir(path.dirname(checkout), { recursive: true });
     execFileSync("git", ["init", "-q", "--bare", upstream], { env: GIT_ENV });
-    execFileSync("git", ["clone", "-q", upstream, repo], { env: GIT_ENV, stdio: "ignore" });
-    git(repo, "symbolic-ref", "HEAD", "refs/heads/main");
-    await fs.writeFile(path.join(repo, "README.md"), "delivered\n");
-    git(repo, "add", "README.md");
-    git(repo, "commit", "-q", "-m", "Deliver fixture");
-    git(repo, "push", "-q", "origin", "HEAD:main");
-    git(repo, "remote", "set-url", "origin", DELIVERED_REMOTE);
-    const head = git(repo, "rev-parse", "HEAD");
-    const resolveGitAuth: GitRemoteAuthProvider = async () => ({ env: {}, configArgs: ["-c", `url.${upstream}.insteadOf=${DELIVERED_REMOTE}`],
-      source: "managed_connection", secretName: null });
-    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
-    await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
-      type: "delivery_closeout", provider: "paperclip", title: "Code task closeout", status: "active",
-      metadata: { deliveryCloseout: { kind: "code", workspaceId: f.workspaceId, lifecycleGeneration: 0, headSha: head,
-        pullRequestUrl: "https://github.com/example/delivered/pull/7" } } });
-    const preview = (proveRepositoryDelivery = true) => inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }], {
-      dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
-      restorePoint: { storage: getStorageService(), keyDurable: true }, proveRepositoryDelivery, resolveGitAuth });
+    execFileSync("git", ["clone", "-q", upstream, checkout], { env: GIT_ENV, stdio: "ignore" });
+    git(checkout, "symbolic-ref", "HEAD", "refs/heads/main");
+    await fs.writeFile(path.join(checkout, "README.md"), `${repository}\n`);
+    git(checkout, "add", "README.md");
+    git(checkout, "commit", "-q", "-m", "Deliver fixture");
+    git(checkout, "push", "-q", "-u", "origin", "HEAD:main");
+    git(checkout, "remote", "set-url", "origin", options.origin ?? remote);
+    if (options.detached) git(checkout, "checkout", "-q", "--detach");
+    gitFixture.upstreams.set(remote, upstream);
+    if (options.origin) gitFixture.upstreams.set(options.origin, upstream);
+    const head = git(checkout, "rev-parse", "HEAD");
+    if (options.delivered) {
+      await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+      await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
+        type: "delivery_closeout", provider: "paperclip", title: "Code task closeout", status: "active",
+        metadata: { deliveryCloseout: { kind: "code", workspaceId: f.workspaceId, lifecycleGeneration: 0, headSha: head,
+          pullRequestUrl: `https://github.com/${repository}/pull/7` } } });
+    }
+    return { checkout, head, remote, upstream };
+  }
 
-    const proven = await preview();
-    expect(proven).toMatchObject([{ outcome: "skipped", reason: "repository_restore_unsupported",
-      requiredEvidence: ["nested repository restore support before live removal"],
-      verifiedEvidence: [expect.stringContaining(`repo/: github.com/example/delivered at ${head.slice(0, 12)} contains the delivered head`),
-        expect.stringContaining("outer task entries fit restore-point limits")] }]);
-    expect(proven[0]!.candidateBytes).toBeGreaterThan(0);
-    // A routine sweep does not contact the upstream and states both missing proofs.
-    expect(await preview(false)).toMatchObject([{ reason: "repository_restore_unsupported", verifiedEvidence: [],
-      requiredEvidence: ["verified repository publication and qualified outer artifacts", "nested repository restore support before live removal"] }]);
+  /** A folder with outer files, the delivered checkout at repo/ (pushed with
+   * an inline token in its origin) and a detached library checkout. */
+  async function codeDeliveredFixture() {
+    const f = await fixture();
+    const delivered = await publishedCheckout(f, "repo", "example/delivered", { delivered: true,
+      origin: "https://x-access-token:fixture-secret@github.com/example/delivered.git" });
+    const library = await publishedCheckout(f, "vendor/lib", "example/library", { detached: true });
+    return { ...f, delivered, library };
+  }
 
-    await fs.writeFile(path.join(repo, "scratch.txt"), "unpublished\n");
-    expect(await preview()).toMatchObject([{ outcome: "skipped", reason: "dirty_or_untracked_files", verifiedEvidence: [],
-      requiredEvidence: ["committed and published nested checkout changes", "nested repository restore support before live removal"] }]);
-    expect(await f.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "repository_restore_unsupported" });
-    expect(await fs.readFile(path.join(repo, "scratch.txt"), "utf8")).toBe("unpublished\n");
-    expect((await f.row()).status).toBe("active");
-    expect(await f.ledger()).toEqual([]);
+  async function expectExactCheckouts(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, options: { restored?: boolean } = {}) {
+    if (options.restored === false) expect(await exists(path.join(f.cwd, "node_modules", "dep", "index.js"))).toBe(true);
+    else await expectRestored(f.cwd);
+    expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(f.delivered.head);
+    expect(git(f.delivered.checkout, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+    expect(git(f.delivered.checkout, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+    // A restored origin never carries the token the original clone embedded.
+    expect(git(f.delivered.checkout, "remote", "get-url", "origin")).toBe(options.restored === false
+      ? "https://x-access-token:fixture-secret@github.com/example/delivered.git" : DELIVERED_REMOTE);
+    expect(git(f.delivered.checkout, "status", "--porcelain")).toBe("");
+    expect(await fs.readFile(path.join(f.delivered.checkout, "README.md"), "utf8")).toBe("example/delivered\n");
+    expect(git(f.library.checkout, "rev-parse", "HEAD")).toBe(f.library.head);
+    expect(() => git(f.library.checkout, "symbolic-ref", "-q", "HEAD")).toThrow();
+    expect(git(f.library.checkout, "status", "--porcelain")).toBe("");
+  }
+
+  describe("code-delivered task folders", () => {
+    afterEach(() => { gitFixture.upstreams.clear(); gitFixture.calls = 0; });
+
+    it("previews a proven folder as a candidate while routine dry runs stay remote-free", async () => {
+      const f = await codeDeliveredFixture();
+      const preview = (proveRepositoryDelivery: boolean) => inspectIsolatedTaskDirectoryFolders(db,
+        [{ companyId: f.companyId, issueId: f.issueId }], { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS,
+          terminalDelayMs: 3 * DAY_MS, restorePoint: { storage: getStorageService(), keyDurable: true }, proveRepositoryDelivery });
+      const proven = await preview(true);
+      expect(proven).toMatchObject([{ outcome: "dry_run", reason: null, requiredEvidence: [],
+        verifiedEvidence: [
+          expect.stringContaining(`repo/: github.com/example/delivered at ${f.delivered.head.slice(0, 12)} contains the delivered head`),
+          expect.stringContaining(`vendor/lib/: github.com/example/library at ${f.library.head.slice(0, 12)}`),
+          expect.stringContaining("outer task entries fit restore-point limits")] }]);
+      expect(proven[0]!.candidateBytes).toBeGreaterThan(0);
+      gitFixture.calls = 0;
+      expect(await preview(false)).toMatchObject([{ outcome: "skipped", reason: "repository_publication_unverified", verifiedEvidence: [],
+        requiredEvidence: ["verified repository publication and qualified outer artifacts"] }]);
+      expect(gitFixture.calls).toBe(0);
+      expect((await f.row()).status).toBe("active");
+      expect(await f.ledger()).toEqual([]);
+    });
+
+    it("retires the folder after its publication proof and reopens the exact checkouts and outputs", async () => {
+      const service = executionWorkspaceService(db, { taskDirectoryRetention: settings, gitRestorePoints: restorePoints() });
+      // Prime the folder walk so the terminal workspace row path retires it.
+      await service.sweepTerminalWorkspaces();
+      const f = await codeDeliveredFixture();
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(await exists(f.cwd)).toBe(false);
+      const archived = await f.row();
+      const state = readTaskDirectoryRetention(archived)!;
+      expect(state).toMatchObject({ removed: true, restorePoint: { schema: "paperclip.task-directory-restore-point.v2", files: 4, excluded: 1,
+        repositories: [
+          { path: "repo", repository: "example/delivered", remoteUrl: DELIVERED_REMOTE, head: f.delivered.head, branch: "main",
+            upstream: "refs/heads/main" },
+          { path: "vendor/lib", repository: "example/library", remoteUrl: "https://github.com/example/library.git", head: f.library.head,
+            branch: null, upstream: null },
+        ] } });
+      expect(JSON.stringify(archived.metadata)).not.toContain("fixture-secret");
+      expect(await f.ledger()).toMatchObject([{ status: "active", objectKey: state.restorePoint.objectKey }]);
+
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
+      expect(await f.ledger()).toMatchObject([{ status: "superseded" }]);
+    });
+
+    it("keeps dirty and unpublished checkout work", async () => {
+      const dirty = await codeDeliveredFixture();
+      await fs.writeFile(path.join(dirty.library.checkout, "scratch.txt"), "unpublished\n");
+      expect(await dirty.expire()).toMatchObject({ candidate: false, expired: false, skipReason: "dirty_or_untracked_files",
+        requiredEvidence: ["committed and published nested checkout changes"] });
+      expect(await fs.readFile(path.join(dirty.library.checkout, "scratch.txt"), "utf8")).toBe("unpublished\n");
+      expect((await dirty.row()).status).toBe("active");
+      expect(await dirty.ledger()).toEqual([]);
+
+      const unpushed = await codeDeliveredFixture();
+      await fs.writeFile(path.join(unpushed.delivered.checkout, "later.txt"), "local only\n");
+      git(unpushed.delivered.checkout, "add", "later.txt");
+      git(unpushed.delivered.checkout, "commit", "-q", "-m", "Local follow-up");
+      expect(await unpushed.expire()).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout" });
+      expect(await exists(path.join(unpushed.delivered.checkout, "later.txt"))).toBe(true);
+      expect(await unpushed.ledger()).toEqual([]);
+    }, 60_000);
+
+    it("finishes an interrupted retirement from local state alone and rolls back a later commit", async () => {
+      const f = await codeDeliveredFixture();
+      await expect(f.expire({ beforeDelete: async () => { throw new Error("simulated_crash"); } }))
+        .resolves.toMatchObject({ expired: false, skipReason: "simulated_crash" });
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: false });
+      gitFixture.calls = 0;
+      expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(f.cwd)).toBe(false);
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+
+      const late = await codeDeliveredFixture();
+      await late.expire({ beforeDelete: async () => { throw new Error("simulated_crash"); } });
+      await fs.writeFile(path.join(late.delivered.checkout, "late.txt"), "late work\n");
+      git(late.delivered.checkout, "add", "late.txt");
+      git(late.delivered.checkout, "commit", "-q", "-m", "Late unpublished work");
+      expect(await late.expire({ dryRun: true })).toMatchObject({ expired: false, skipReason: "task_directory_changed" });
+      expect(await late.expire()).toMatchObject({ expired: false, skipReason: "task_directory_changed" });
+      expect(await exists(path.join(late.delivered.checkout, "late.txt"))).toBe(true);
+      const row = await late.row();
+      expect(row.status).toBe("active");
+      expect(readTaskDirectoryRetention(row)).toBeNull();
+      expect(await late.ledger()).toMatchObject([{ status: "superseded" }]);
+    }, 60_000);
+
+    it("keeps the folder closed and whole when a reopen cannot fetch, then restores on retry", async () => {
+      const f = await codeDeliveredFixture();
+      expect(await f.expire()).toMatchObject({ expired: true });
+      const upstream = gitFixture.upstreams.get(DELIVERED_REMOTE)!;
+      gitFixture.upstreams.set(DELIVERED_REMOTE, path.join(root, "missing-upstream.git"));
+      expect(await f.reopen()).toMatchObject({ ok: false, code: "rebuild_failed" });
+      expect(await exists(f.cwd)).toBe(false);
+      expect((await fs.readdir(path.dirname(f.cwd))).filter(name => name.startsWith(".restoring-"))).toEqual([]);
+      expect((await f.row()).status).toBe("archived");
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+
+      gitFixture.upstreams.set(DELIVERED_REMOTE, upstream);
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+    }, 60_000);
+
+    it("accepts a folder already restored before a crash and refuses one that diverged", async () => {
+      const f = await codeDeliveredFixture();
+      expect(await f.expire()).toMatchObject({ expired: true });
+      const archived = await f.row();
+      const { restoreIsolatedTaskDirectory } = await import("../services/isolated-task-directory-retention.js");
+      const { createIssueGitRemoteAuthProvider } = await import("../services/git-credentials.js");
+      const resolveGitAuth = createIssueGitRemoteAuthProvider(db, f.companyId, f.issueId);
+      expect(await restoreIsolatedTaskDirectory({ storage: getStorageService(), workspace: archived, resolveGitAuth }))
+        .toMatchObject({ restored: true, repositories: 2 });
+      // The process stopped before the reopen recorded it; the next reopen
+      // recognizes the exact folder instead of failing or overwriting it.
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+
+      const diverged = await codeDeliveredFixture();
+      expect(await diverged.expire()).toMatchObject({ expired: true });
+      await restoreIsolatedTaskDirectory({ storage: getStorageService(), workspace: await diverged.row(), resolveGitAuth });
+      await fs.writeFile(path.join(diverged.delivered.checkout, "README.md"), "edited after restore\n");
+      expect(await diverged.reopen()).toMatchObject({ ok: false, code: "rebuild_failed" });
+      expect(await fs.readFile(path.join(diverged.delivered.checkout, "README.md"), "utf8")).toBe("edited after restore\n");
+    }, 60_000);
+
+    it("keeps the folder when its restore point cannot be stored", async () => {
+      const f = await codeDeliveredFixture();
+      const storage = getStorageService();
+      const full = { ...storage, putFile: async () => {
+        throw Object.assign(new Error("Disk quota exceeded"), { code: "EDQUOT" });
+      } } as typeof storage;
+      const result = await f.expire({ restorePoint: { storage: full, keyDurable: true } });
+      expect(result).toMatchObject({ expired: false, restorePoint: false });
+      expect(result.skipReason).not.toBeNull();
+      await expectExactCheckouts(f, { restored: false });
+      expect((await f.row()).status).toBe("active");
+      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
+      expect((await f.ledger()).filter(entry => entry.status === "active")).toEqual([]);
+    });
+
+    it("retires one physical folder through duplicate aliases and keeps one shared with a live workspace", async () => {
+      const f = await codeDeliveredFixture();
+      await db.insert(executionWorkspaces).values({ companyId: f.companyId, sourceIssueId: f.issueId, mode: "isolated_workspace",
+        strategyType: "project_primary", name: "Old alias", status: "archived", closedAt: new Date(Date.now() - 10 * DAY_MS),
+        providerType: "local_fs", cwd: f.cwd });
+      const sweep = () => inspectIsolatedTaskDirectoryFolders(db, Array.from({ length: 3 }, () => ({ companyId: f.companyId, issueId: f.issueId })),
+        { ...settings, now: new Date(), restorePoint: { storage: getStorageService(), keyDurable: true } });
+      const results = await sweep();
+      expect(results).toMatchObject([{ outcome: "preserved_and_removed", executionWorkspaceId: f.workspaceId }]);
+      expect(await exists(f.cwd)).toBe(false);
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      await expectExactCheckouts(f);
+
+      const shared = await codeDeliveredFixture();
+      await db.insert(executionWorkspaces).values({ companyId: shared.companyId, mode: "shared_workspace", strategyType: "project_primary",
+        name: "Shared root", status: "active", providerType: "local_fs", cwd: shared.delivered.checkout });
+      expect(await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: shared.companyId, issueId: shared.issueId }],
+        { ...settings, now: new Date(), restorePoint: { storage: getStorageService(), keyDurable: true } }))
+        .toMatchObject([{ outcome: "skipped", reason: "live_workspace" }]);
+      await expectExactCheckouts(shared, { restored: false });
+      expect(await shared.ledger()).toEqual([]);
+    }, 60_000);
   });
 
   it("reports candidates in dry run without changing anything", async () => {

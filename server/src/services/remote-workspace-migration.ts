@@ -141,6 +141,9 @@ async function inspect(db: ReadDb, input: { companyId: string; workspaceId: stri
       const retained = readTaskDirectoryRetention(workspace);
       if (retained?.removed === true && retained.restorePoint && retained.generation === retained.restorePoint.generation) {
         if (retained.restorePoint.expiredAt) reasons.push("restore_point_expired");
+        // The restore point leaves nested checkouts as empty directories;
+        // only a local reopen fetches them from origin.
+        else if (retained.restorePoint.repositories) reasons.push("nested_repository_restore_unsupported");
         else {
           try { validateTaskDirectoryRestorePointRef(retained.restorePoint, workspace); retainedDirectory = retained; }
           catch { reasons.push("restore_point_invalid"); }
