@@ -10,6 +10,9 @@ export function githubLauncherSource(options: { brokerFile?: boolean; interprete
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const http = require('node:http');
+const net = require('node:net');
+const tls = require('node:tls');
 const { spawn } = require('node:child_process');
 // A PATH shim can capture this launcher's absolute path and call it again.
 // Reject that cycle before resolving another executable or capturing authority.
@@ -116,6 +119,83 @@ function inspectGhCommand(args) {
   } catch { state.merge = 'gh api graphql (unreadable request body)'; }
   return state;
 }
+// A network sandbox reaches the broker only through its HTTP(S)_PROXY, which
+// Node fetch ignores unless NODE_USE_ENV_PROXY is set. Without that flag the
+// broker host was resolved directly and failed (EAI_AGAIN) inside the sandbox,
+// so that case tunnels through the configured proxy with CONNECT instead.
+function brokerProxy(target, env) {
+  if (env.NODE_USE_ENV_PROXY === '1') return null;
+  const value = target.protocol === 'https:' ? env.HTTPS_PROXY || env.https_proxy : env.HTTP_PROXY || env.http_proxy;
+  if (!value) return null;
+  const port = target.port || (target.protocol === 'https:' ? '443' : '80');
+  const host = target.hostname.toLowerCase();
+  const bypassed = String(env.NO_PROXY || env.no_proxy || '').split(/[\s,]+/).filter(Boolean).some(entry => {
+    if (entry === '*') return true;
+    const match = /^(.+?)(?::(\d+))?$/.exec(entry.toLowerCase());
+    if (!match || (match[2] && match[2] !== port)) return false;
+    const name = match[1].replace(/^\*?\./, '');
+    return host === name || host.endsWith('.' + name);
+  });
+  if (bypassed) return null;
+  try {
+    const proxy = new URL(value.includes('://') ? value : 'http://' + value);
+    return proxy.protocol === 'http:' ? proxy : null;
+  } catch { return null; }
+}
+function brokerRequest(url, init, env) {
+  const target = new URL(url);
+  const proxy = brokerProxy(target, env);
+  if (!proxy) return fetch(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(10000) });
+  return new Promise((resolve, reject) => {
+    const port = target.port || (target.protocol === 'https:' ? '443' : '80');
+    const owned = [];
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      for (const resource of owned) resource.destroy();
+      if (error) reject(error); else resolve(value);
+    };
+    // Same shapes as fetch failures, so the diagnostic below stays one code.
+    const transportError = cause => finish(Object.assign(new Error('broker transport failed'), { cause }));
+    const timer = setTimeout(() => finish(Object.assign(new Error('broker request timed out'), { name: 'TimeoutError' })), 10000);
+    const connectHeaders = { host: target.hostname + ':' + port };
+    if (proxy.username || proxy.password) {
+      connectHeaders['proxy-authorization'] = 'Basic ' + Buffer.from(decodeURIComponent(proxy.username) + ':' + decodeURIComponent(proxy.password)).toString('base64');
+    }
+    const connect = http.request({ host: proxy.hostname.replace(/^\[|\]$/g, ''), port: proxy.port || 80, method: 'CONNECT',
+      path: target.hostname + ':' + port, headers: connectHeaders, agent: false });
+    owned.push(connect);
+    connect.on('error', transportError);
+    connect.once('connect', (proxyResponse, socket) => {
+      owned.push(socket);
+      socket.on('error', transportError);
+      if (proxyResponse.statusCode !== 200) { transportError({ code: 'proxy_tunnel_rejected' }); return; }
+      const servername = target.hostname.replace(/^\[|\]$/g, '');
+      const request = http.request({
+        method: init.method, host: servername, port, path: target.pathname + target.search,
+        headers: { ...init.headers, host: target.host, 'content-length': String(Buffer.byteLength(init.body)) },
+        createConnection: () => target.protocol === 'https:'
+          ? tls.connect({ socket, servername: net.isIP(servername) ? undefined : servername }) : socket,
+      }, response => {
+        const chunks = [];
+        response.on('data', chunk => chunks.push(chunk));
+        response.on('error', transportError);
+        response.once('end', () => {
+          const body = Buffer.concat(chunks);
+          // Redirects are not followed, matching fetch's redirect: 'error'.
+          finish(null, { status: response.statusCode, ok: response.statusCode >= 200 && response.statusCode < 300,
+            arrayBuffer: async () => body, json: async () => JSON.parse(body.toString('utf8')) });
+        });
+      });
+      owned.push(request);
+      request.on('error', transportError);
+      request.end(init.body);
+    });
+    connect.end();
+  });
+}
 async function main() {
   const inspected = inspectGhCommand(process.argv.slice(2));
   const directMerge = inspected.merge;
@@ -185,12 +265,12 @@ ${options.brokerFile ? String.raw`
       let transportFailures = 0, conflicts = 0, result;
       for (;;) {
         try {
-          response = await fetch(url, {
-            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+          response = await brokerRequest(url, {
+            method: 'POST',
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
               'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
             body: '{}',
-          });
+          }, env);
           if (response.status === 409 && conflicts < 29) {
             conflicts += 1;
             await response.arrayBuffer();
@@ -235,7 +315,7 @@ ${options.brokerFile ? String.raw`
       const viaEnvironmentProxy = env.NODE_USE_ENV_PROXY === '1'
         && Boolean(env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy)
         && !env.NO_PROXY && !env.no_proxy;
-      const code = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(rawCode)
+      const code = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'proxy_tunnel_rejected'].includes(rawCode)
         ? rawCode : error && typeof error === 'object' && error.name === 'TimeoutError' ? 'request_timeout'
           : rawCode === 0 && viaEnvironmentProxy ? 'proxy_transport_unclassified' : 'unknown';
       diagnostic('broker_transport_unavailable (' + code + ')');
