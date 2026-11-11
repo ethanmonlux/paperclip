@@ -405,7 +405,7 @@ export async function restoreIsolatedTaskDirectory(input: {
     if (!state.removed) return { restored: false, expired: false };
     if ((await fs.readdir(cwd)).length === 0) await fs.rmdir(cwd);
     else {
-      const current = await inspectTaskDirectory(cwd, { signal: input.signal }).catch(() => null);
+      const current = await inspectTaskDirectory(cwd, { signal: input.signal, restoreVerification: true }).catch(() => null);
       if (current?.digest === ref.digest) return { restored: false, expired: false };
       throw new TaskDirectoryRestoreFailure("task_directory_diverged");
     }
