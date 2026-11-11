@@ -377,6 +377,16 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       dryRun: false, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
       restorePoint: { storage: getStorageService(), keyDurable: true }, ...overrides });
 
+    it("reports the restore-point prerequisite for a bound directory in dry run", async () => {
+      const f = await fixture({ status: "archived" });
+      const results = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }], {
+        dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS,
+      });
+      expect(results).toMatchObject([{ issueId: f.issueId, outcome: "dry_run",
+        requiredEvidence: ["configured durable restore-point storage"] }]);
+      expect(await exists(f.cwd)).toBe(true);
+    });
+
     async function orphan(options: { modifiedDaysAgo?: number; withContents?: boolean } = {}) {
       const companyId = randomUUID(), issueId = randomUUID();
       const cwd = await materializeIsolatedTaskDirectory({ companyId, issueId });

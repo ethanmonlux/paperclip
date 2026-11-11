@@ -529,6 +529,11 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       result.candidateBytes = expiration.candidateBytes;
       result.reclaimedBytes = expiration.reclaimedBytes;
       result.reason = expiration.skipReason;
+      if (options.dryRun && expiration.candidate && !options.restorePoint) {
+        result.requiredEvidence.push("configured durable restore-point storage");
+      } else if (options.dryRun && expiration.candidate && options.restorePoint?.keyDurable === false) {
+        result.requiredEvidence.push("durable restore-point key");
+      }
       if (expiration.skipReason === "restore_points_disabled") result.requiredEvidence.push("configured durable restore-point storage");
       if (expiration.skipReason === "restore_point_key_not_durable") result.requiredEvidence.push("durable restore-point key");
       if (expiration.skipReason === "nested_git_repository") result.requiredEvidence.push("published repository head and qualified outer artifacts");
