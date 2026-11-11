@@ -554,6 +554,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       const workspaceId = randomUUID();
       const consumerId = randomUUID();
       await db.insert(companies).values({ id: o.companyId, name: "Selected alias", issuePrefix: `SA${o.companyId.slice(0, 6)}` });
+      await db.insert(issues).values({ id: o.issueId, companyId: o.companyId, title: "Old", status: "done",
+        completedAt: new Date(Date.now() - 10 * DAY_MS) });
       await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: o.companyId, sourceIssueId: o.issueId,
         mode: "shared_workspace", strategyType: "project_primary", name: "Terminal alias", status: "archived",
         providerType: "local_fs", cwd: o.cwd });
