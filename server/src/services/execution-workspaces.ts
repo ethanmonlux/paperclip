@@ -1,6 +1,6 @@
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { effectiveProjectWorkspacePolicy } from "./project-workspace-provider.js";
-import { readRemoteWorkspaceAuthority, readWorkspaceProviderBinding } from "@paperclipai/shared";
+import { readRemoteWorkspaceAuthority, readWorkspaceProviderBinding, issueDeliveryCloseoutSchema } from "@paperclipai/shared";
 import { cleanupRemoteWorkspaceAllocation, inspectRemoteWorkspacePersistence, type DestroyRemoteWorkspaceLease } from "./remote-workspace-lifecycle.js";
 import { inspectPluginWorkspace, removePluginWorkspace, restorePluginWorkspace, pluginWorkspaceSupportsMergeAncestry, type WorkspaceWorkers } from "./plugin-workspaces.js";
 import { acquireExecutionWorkspaceLifecycleLock, withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
@@ -40,6 +40,7 @@ import type { SQL } from "drizzle-orm";
 import { nativeSessionProviderEvidence } from "./native-runtime/native-session-resume.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
+import { readTaskDeliveryCloseout } from "./task-delivery-closeout.js";
 import {
   clearTerminalWorkspaceRetry, readTerminalWorkspaceRetry, recordTerminalWorkspaceFailure, terminalWorkspaceFailure,
   TERMINAL_WORKSPACE_RETRY_KEY, type TerminalWorkspaceFailure,
@@ -2082,6 +2083,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   async function listDeliveryPullRequestReferences(
     workspace: ExecutionWorkspaceRow,
+    expectedHeadSha?: string | null,
   ) {
     const sourceIssueId = workspace.sourceIssueId;
     if (!sourceIssueId) return [];
@@ -2090,6 +2092,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const products = await retryIdempotentDatabaseOperation(() => db
       .select({
         id: issueWorkProducts.id,
+        type: issueWorkProducts.type,
         url: issueWorkProducts.url,
         externalId: issueWorkProducts.externalId,
         title: issueWorkProducts.title,
@@ -2099,15 +2102,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .from(issueWorkProducts)
       .where(and(
         eq(issueWorkProducts.companyId, workspace.companyId),
-        eq(issueWorkProducts.type, "pull_request"),
+        inArray(issueWorkProducts.type, ["pull_request", "delivery_closeout"]),
         eq(issueWorkProducts.issueId, sourceIssueId),
       ))
       .orderBy(desc(issueWorkProducts.updatedAt))
       .limit(100));
-    return products.flatMap(product => extractGitHubPullRequestReferences([
-      product.url, product.externalId, product.title, product.summary,
-      product.metadata ? JSON.stringify(product.metadata) : null,
-    ])).filter(reference => pullRequestMatchesWorkspaceRepository(reference, workspace));
+    return products.flatMap(product => {
+      if (product.type === "delivery_closeout") {
+        const parsed = issueDeliveryCloseoutSchema.safeParse(product.metadata?.deliveryCloseout);
+        if (!parsed.success || parsed.data.kind !== "code" || parsed.data.workspaceId !== workspace.id
+          || parsed.data.lifecycleGeneration !== readExecutionWorkspaceLifecycleGeneration(workspace.metadata)
+          || !expectedHeadSha || parsed.data.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()) return [];
+        return extractGitHubPullRequestReferences([parsed.data.pullRequestUrl]);
+      }
+      return extractGitHubPullRequestReferences([
+        product.url, product.externalId, product.title, product.summary,
+        product.metadata ? JSON.stringify(product.metadata) : null,
+      ]);
+    }).filter(reference => pullRequestMatchesWorkspaceRepository(reference, workspace));
   }
 
   async function cachedDeliveryPullRequestDetails(workspace: ExecutionWorkspaceRow, reference: GitHubPullRequestReference) {
@@ -2174,7 +2186,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (deliveryProof) {
       mergedPullRequest = deliveryProof.evidence.kind === "merged_pr" && deliveryProof.headSha === workspaceHeadSha;
     } else if (sourceIssueTerminal) {
-      for (const reference of await listDeliveryPullRequestReferences(workspace)) {
+      for (const reference of await listDeliveryPullRequestReferences(workspace, workspaceHeadSha)) {
         const details = await cachedDeliveryPullRequestDetails(workspace, reference);
         if (
           details.state === "merged"
@@ -2194,15 +2206,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
     }
 
-    return {
-      deliveryState: deriveExecutionWorkspaceDeliveryState({
+    let deliveryState = deriveExecutionWorkspaceDeliveryState({
         sourceIssueTerminal,
         mergedPullRequest,
         pullRequestStateUnknown,
         isMergedIntoBase: deliveryProof
           ? deliveryProof.evidence.kind === "ancestry" && deliveryProof.headSha === workspaceHeadSha
           : git?.isMergedIntoBase ?? null,
-      }),
+      });
+    if (sourceIssueTerminal && workspace.sourceIssueId && workspace.providerType === "local_fs"
+      && !git?.repoRoot && !workspace.repoUrl && !workspace.branchName
+      && await isIsolatedTaskDirectoryWorkspace(workspace)) {
+      const closeout = await readTaskDeliveryCloseout(db, { companyId: workspace.companyId, issueId: workspace.sourceIssueId,
+        workspaceId: workspace.id, lifecycleGeneration: readExecutionWorkspaceLifecycleGeneration(workspace.metadata) });
+      if (closeout?.kind === "artifact") deliveryState = "artifact_delivered";
+      if (closeout?.kind === "no_code") deliveryState = "no_code";
+    }
+    return {
+      deliveryState,
       sourceIssueTerminal,
       subtreeTerminal,
       cooldownAnchor,
@@ -3979,7 +4000,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           try {
             const proof = await resolveWorkspaceDelivery({ companyId: workspace.companyId, repoUrl: workspace.repoUrl,
               headSha: deliveryCandidate.headSha, destinationRef: deliveryCandidate.destinationRef, projectSource: deliveryCandidate.projectSource,
-              pullRequests: await listDeliveryPullRequestReferences(workspace) });
+              pullRequests: await listDeliveryPullRequestReferences(workspace, deliveryCandidate.headSha) });
             if (proof.status !== "delivered" || proof.headSha !== deliveryCandidate.headSha) {
               result.skippedUndelivered += 1;
               if (proof.status === "unknown" && ["unsupported_source_or_destination", "unsupported_destination_ref"].includes(proof.reason)) {
@@ -4013,7 +4034,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             throw conflict("Workspace changed after delivery was verified");
           const freshProof = await resolveWorkspaceDelivery({ companyId: current.companyId, repoUrl: current.repoUrl,
             headSha: currentCandidate.headSha, destinationRef: currentCandidate.destinationRef, projectSource: currentCandidate.projectSource,
-            pullRequests: await listDeliveryPullRequestReferences(current) });
+            pullRequests: await listDeliveryPullRequestReferences(current, currentCandidate.headSha) });
           if (freshProof.status !== "delivered" || freshProof.headSha !== expectedDeliveryProof.headSha
             || freshProof.destinationRef !== expectedDeliveryProof.destinationRef || freshProof.evidence.kind !== expectedDeliveryProof.evidence.kind
             || (recoveryPullRequest && (freshProof.evidence.kind !== "merged_pr" || freshProof.evidence.number !== recoveryPullRequest.number)))

@@ -15,6 +15,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueWorkProducts,
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
@@ -99,6 +100,9 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       closedAt: options.status === "archived" ? new Date(Date.now() - closedDaysAgo! * DAY_MS) : null,
       metadata: { source: "task_session", createdByRuntime: false } });
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+    await db.insert(issueWorkProducts).values({ companyId, issueId, executionWorkspaceId: workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "No-code task closeout", status: "active",
+      metadata: { deliveryCloseout: { kind: "no_code", workspaceId, lifecycleGeneration: 0 } } });
     const row = () => db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)).then(rows => rows[0]!);
     const ledger = () => db.select().from(executionWorkspaceRestorePoints).where(eq(executionWorkspaceRestorePoints.executionWorkspaceId, workspaceId));
     const service = (overrides: Parameters<typeof executionWorkspaceService>[1] = {}) => executionWorkspaceService(db, {
@@ -139,6 +143,34 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     expect(reopened.status).toBe("active");
     expect(readTaskDirectoryRetention(reopened)).toBeNull();
     expect(await f.ledger()).toMatchObject([{ status: "superseded" }]);
+  });
+
+  it("retains a task folder with no typed closeout and explains the missing proof", async () => {
+    const f = await fixture();
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, expired: false,
+      skipReason: "delivery_closeout_missing" });
+    const preview = await inspectIsolatedTaskDirectoryFolders(db, [{ companyId: f.companyId, issueId: f.issueId }],
+      { dryRun: true, now: new Date(), orphanGraceMs: 7 * DAY_MS, terminalDelayMs: 3 * DAY_MS });
+    expect(preview[0]).toMatchObject({ outcome: "skipped", reason: "delivery_closeout_missing",
+      requiredEvidence: ["typed artifact or no-code delivery closeout for this workspace lifecycle"] });
+    expect(await exists(f.cwd)).toBe(true);
+  });
+
+  it("requires every artifact named by a closeout to remain published", async () => {
+    const f = await fixture();
+    await db.delete(issueWorkProducts).where(eq(issueWorkProducts.issueId, f.issueId));
+    const artifactId = randomUUID();
+    await db.insert(issueWorkProducts).values({ id: artifactId, companyId: f.companyId, issueId: f.issueId,
+      type: "artifact", provider: "paperclip", title: "Published report", status: "active",
+      metadata: { attachmentId: randomUUID() } });
+    await db.insert(issueWorkProducts).values({ companyId: f.companyId, issueId: f.issueId, executionWorkspaceId: f.workspaceId,
+      type: "delivery_closeout", provider: "paperclip", title: "Artifact closeout", status: "active",
+      metadata: { deliveryCloseout: { kind: "artifact", workspaceId: f.workspaceId, lifecycleGeneration: 0,
+        artifactWorkProductIds: [artifactId] } } });
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, skipReason: null });
+    await db.update(issueWorkProducts).set({ status: "archived" }).where(eq(issueWorkProducts.id, artifactId));
+    expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: false, skipReason: "delivery_closeout_missing" });
   });
 
   it("restores a shared-workspace task directory through reopen", async () => {

@@ -14,7 +14,18 @@ export const issueWorkProductTypeSchema = z.enum([
   "commit",
   "artifact",
   "document",
+  "delivery_closeout",
 ]);
+
+/** A task delivery declaration is scoped to one workspace lifecycle. It is a
+ * durable assertion in the ordinary work-product flow, not proof that a remote
+ * PR merged or that a local file was uploaded. Consumers verify those facts. */
+export const issueDeliveryCloseoutSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("code"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative(), headSha: z.string().regex(/^[a-f0-9]{40}$/i), pullRequestUrl: z.string().url() }).strict(),
+  z.object({ kind: z.literal("artifact"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative(), artifactWorkProductIds: z.array(z.string().guid()).min(1).max(100) }).strict(),
+  z.object({ kind: z.literal("no_code"), workspaceId: z.string().guid(), lifecycleGeneration: z.number().int().nonnegative() }).strict(),
+]);
+export type IssueDeliveryCloseout = z.infer<typeof issueDeliveryCloseoutSchema>;
 
 export const issueWorkProductStatusSchema = z.enum([
   "active",
@@ -73,12 +84,13 @@ export type AttachmentArtifactWorkProductMetadata = z.infer<typeof attachmentArt
 export const issueWorkProductMetadataSchema = z
   .object({
     resourceRef: workspaceFileRefSchema.optional().nullable(),
+    deliveryCloseout: issueDeliveryCloseoutSchema.optional(),
   })
   .passthrough();
 
 export type IssueWorkProductMetadata = z.infer<typeof issueWorkProductMetadataSchema>;
 
-export const createIssueWorkProductSchema = z.object({
+const issueWorkProductBaseSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   executionWorkspaceId: z.string().guid().optional().nullable(),
   runtimeServiceId: z.string().guid().optional().nullable(),
@@ -96,10 +108,12 @@ export const createIssueWorkProductSchema = z.object({
   createdByRunId: z.string().guid().optional().nullable(),
 });
 
+export const createIssueWorkProductSchema = issueWorkProductBaseSchema;
+
 export type CreateIssueWorkProduct = z.infer<typeof createIssueWorkProductSchema>;
 
 export const updateIssueWorkProductSchema = objectWithoutDefaults(
-  createIssueWorkProductSchema,
+  issueWorkProductBaseSchema,
 ).partial();
 
 export type UpdateIssueWorkProduct = z.infer<typeof updateIssueWorkProductSchema>;

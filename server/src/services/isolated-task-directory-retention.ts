@@ -13,6 +13,7 @@ import { abandonGitRestorePoint, activateGitRestorePoints, readRestorePointObjec
 import { exclusiveAllocatedBytes, describeGitExpirationFailure, expirationScope, isGitWorkspaceExpirationEligible, type GitExpirationFailure } from "./git-workspace-expiration.js";
 import { IsolatedRepositorySourceBusy, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
 import { logActivity } from "./activity-log.js";
+import { readTaskDeliveryCloseout } from "./task-delivery-closeout.js";
 import {
   captureTaskDirectorySnapshot,
   createEmptyTaskDirectorySnapshot,
@@ -244,6 +245,10 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, undefined, { closedSiblingsAllowed: true })) {
           throw new Error("live_or_unresolved_consumer");
         }
+        const closeout = await readTaskDeliveryCloseout(tx, { companyId: workspace.companyId, issueId: workspace.sourceIssueId!,
+          workspaceId: workspace.id, lifecycleGeneration: Number(workspace.metadata?.lifecycleGeneration ?? 0) });
+        if (!closeout) throw new Error("delivery_closeout_missing");
+        if (closeout.kind === "code") throw new Error("repository_delivery_requires_separate_qualification");
         const cwd = workspace.cwd!;
         let state = readTaskDirectoryRetention(workspace);
         const present = await directoryState(cwd) === "present";
@@ -548,6 +553,8 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       if (expiration.skipReason === "restore_points_disabled") result.requiredEvidence.push("configured durable restore-point storage");
       if (expiration.skipReason === "restore_point_key_not_durable") result.requiredEvidence.push("durable restore-point key");
       if (expiration.skipReason === "nested_git_repository") result.requiredEvidence.push("published repository head and qualified outer artifacts");
+      if (expiration.skipReason === "delivery_closeout_missing") result.requiredEvidence.push("typed artifact or no-code delivery closeout for this workspace lifecycle");
+      if (expiration.skipReason === "repository_delivery_requires_separate_qualification") result.requiredEvidence.push("verified repository publication and qualified outer artifacts");
       if (expiration.skipReason === "live_or_unresolved_consumer") result.requiredEvidence.push("settled task, run, lease, and workspace references");
       if (expiration.failure) result.failure = expiration.failure;
       result.outcome = expiration.expired ? "preserved_and_removed" : options.dryRun && expiration.candidate ? "dry_run" : "skipped";

@@ -178,6 +178,14 @@ export function RichWorkProductCard({ workProduct, href, variant = "card" }: Ric
       meta = ["Document", stringMeta(metadata, "revision", "revisionNumber") ? `rev ${stringMeta(metadata, "revision", "revisionNumber")}` : null];
       action = "Open document";
       break;
+    case "delivery_closeout": {
+      Icon = FileText;
+      const closeout = metadata.deliveryCloseout;
+      const kind = closeout && typeof closeout === "object" && !Array.isArray(closeout)
+        ? (closeout as Record<string, unknown>).kind : null;
+      meta = [kind === "no_code" ? "No-code closeout" : kind === "artifact" ? "Artifact closeout" : "Code closeout"];
+      break;
+    }
     case "preview_url":
       Icon = Globe;
       meta = [urlLabel(workProduct.url)];

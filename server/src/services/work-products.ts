@@ -4,7 +4,7 @@ import { notifyApprovalQueueWork } from "./approval-work-notifications.js";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, heartbeatRunEvents, issueWorkProducts, workspaceRuntimeServices } from "@paperclipai/db";
-import type { IssueWorkProduct } from "@paperclipai/shared";
+import { issueDeliveryCloseoutSchema, type IssueWorkProduct } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { insertRowsInChunks } from "./batch-insert.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
@@ -22,6 +22,32 @@ import type { ImportIssueWorkProductRow } from "./import-write-types.js";
 
 type IssueWorkProductRow = typeof issueWorkProducts.$inferSelect;
 type WorkProductTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
+async function validateDeliveryCloseout(tx: WorkProductTransaction, companyId: string, issueId: string,
+  data: Pick<IssueWorkProductRow, "type" | "provider" | "status" | "url" | "metadata" | "executionWorkspaceId">) {
+  if (data.type !== "delivery_closeout") return;
+  const parsed = issueDeliveryCloseoutSchema.safeParse(data.metadata?.deliveryCloseout);
+  if (!parsed.success || data.provider !== "paperclip" || data.status !== "active" || data.url
+    || data.executionWorkspaceId !== parsed.data.workspaceId) throw unprocessable("Invalid task delivery closeout");
+  const closeout = parsed.data;
+  const [workspace] = await tx.select({ sourceIssueId: executionWorkspaces.sourceIssueId, metadata: executionWorkspaces.metadata })
+    .from(executionWorkspaces).where(and(eq(executionWorkspaces.companyId, companyId), eq(executionWorkspaces.id, closeout.workspaceId)))
+    .for("key share");
+  const generation = workspace?.metadata?.lifecycleGeneration;
+  if (workspace?.sourceIssueId !== issueId || (typeof generation === "number" ? generation : 0) !== closeout.lifecycleGeneration)
+    throw unprocessable("Delivery closeout is not bound to the current task workspace generation");
+  if (closeout.kind === "artifact") {
+    const ids = [...new Set(closeout.artifactWorkProductIds)];
+    if (ids.length !== closeout.artifactWorkProductIds.length) throw unprocessable("Duplicate artifact references in delivery closeout");
+    const rows = await tx.select({ id: issueWorkProducts.id, type: issueWorkProducts.type, provider: issueWorkProducts.provider,
+      status: issueWorkProducts.status, metadata: issueWorkProducts.metadata }).from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.companyId, companyId), eq(issueWorkProducts.issueId, issueId), inArray(issueWorkProducts.id, ids)));
+    if (rows.length !== ids.length || rows.some(row => row.type !== "artifact" || row.provider !== "paperclip"
+      || ["failed", "closed", "archived"].includes(row.status)
+      || typeof row.metadata?.attachmentId !== "string" || row.metadata?.resourceRef))
+      throw unprocessable("Artifact closeout requires published Paperclip attachment work products");
+  }
+}
 
 async function validateExecutionWorkspace(
   tx: WorkProductTransaction,
@@ -279,11 +305,12 @@ export function workProductService(
         await assertAgentInteraction(tx, { companyId, actorAgentId, operation: "edit", issueId,
           texts: [data.title, data.summary ?? ""], lock: true });
         await notifyNativeStatusReassessment(tx, { companyId, issueId });
-        if (data.type === "pull_request") {
+        if (data.type === "pull_request" || data.type === "delivery_closeout") {
           await notifyTerminalWorkspaceWork(tx, `issue:${issueId}`);
           await notifyApprovalQueueWork(tx, companyId);
         }
         await validateExecutionWorkspace(tx, companyId, data.executionWorkspaceId);
+        await validateDeliveryCloseout(tx, companyId, issueId, data as IssueWorkProductRow);
         if (data.isPrimary) {
           await tx
             .update(issueWorkProducts)
@@ -317,6 +344,8 @@ export function workProductService(
           .where(eq(issueWorkProducts.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
+        if (existing.type === "delivery_closeout" || patch.type === "delivery_closeout")
+          throw unprocessable("Delivery closeouts are immutable; publish a new bound closeout after a correction");
         await assertAgentInteraction(tx, { companyId: existing.companyId, actorAgentId, operation: "edit", issueId: existing.issueId,
           texts: [
             ...(patch.title !== undefined && patch.title !== existing.title ? [patch.title] : []),

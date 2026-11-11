@@ -177,6 +177,36 @@ diagnostic context, but they cannot be the only access path. Browse/search is a
 fallback for recovering workspace files when the issue link or chip is not
 available, not the preferred way to deliver files to users.
 
+## Task delivery closeout for isolated folders
+
+After publishing the task's outputs, register a `delivery_closeout` work product
+through the normal task work-product API. Set `provider` to `paperclip`, `status`
+to `active`, `executionWorkspaceId` to the current execution workspace, and
+`metadata.deliveryCloseout` to one of:
+
+```json
+{ "kind": "artifact", "workspaceId": "<execution-workspace-id>", "lifecycleGeneration": 0,
+  "artifactWorkProductIds": ["<published-artifact-work-product-id>"] }
+```
+
+```json
+{ "kind": "no_code", "workspaceId": "<execution-workspace-id>", "lifecycleGeneration": 0 }
+```
+
+```json
+{ "kind": "code", "workspaceId": "<execution-workspace-id>", "lifecycleGeneration": 0,
+  "headSha": "<exact-40-character-commit-sha>", "pullRequestUrl": "https://github.com/<owner>/<repo>/pull/<number>" }
+```
+
+Use the workspace's current `metadata.lifecycleGeneration` (zero if absent).
+Artifact IDs must identify uploaded Paperclip attachment work products on this
+task. A workspace file reference is not an uploaded artifact. A no-code record
+means the task has no code or artifact to publish; it does not declare product
+acceptance. Code closeout records the exact proposed source, while cleanup still
+verifies the remote PR/head separately. A new workspace lifecycle or corrected
+delivery needs a new closeout record. Isolated task-folder retention also keeps
+the folder until its normal consumer and durable restore-point checks pass.
+
 ## Video Examples
 
 Upload an `.mp4` render:
