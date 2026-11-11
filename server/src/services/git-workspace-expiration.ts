@@ -69,7 +69,7 @@ export function withAnonymousGitFallback(provider: GitRemoteAuthProvider): GitRe
   return async (remoteUrl) => provider(remoteUrl).catch(() => null);
 }
 
-function expirationGitAuth(db: Db, workspace: Workspace) {
+export function expirationGitAuth(db: Db, workspace: Pick<Workspace, "companyId" | "sourceIssueId">) {
   return withAnonymousGitFallback(createIssueGitRemoteAuthProvider(db, workspace.companyId, workspace.sourceIssueId!));
 }
 

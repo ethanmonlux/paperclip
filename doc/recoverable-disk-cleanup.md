@@ -315,6 +315,14 @@ installed server has task-directory retention enabled and whether it is in dry-r
 mode. A preview does not save a restore point or remove files. It describes the
 installed server and its accessible filesystem, not a source branch or another host.
 
+For a folder closed with a `code` delivery closeout, the preview also runs a read-only
+repository proof. Each nested checkout must have one GitHub `origin`, the checkout of
+the pull request's repository must contain the delivered head, and every checkout must
+be clean with all local commits published upstream. Files outside the checkouts must
+fit the restore-point limits. Passed checks appear as `verifiedEvidence`. Routine
+sweeps skip this network proof. A code-delivered folder is always kept, reason
+`repository_restore_unsupported`, until reopening can rebuild its checkout.
+
 - the source issue is still bound to the workspace (`issue_not_bound` otherwise), because
   reopening restores through that binding;
 - no run of the tree or the workspace is queued, running or unfinished, no native run
