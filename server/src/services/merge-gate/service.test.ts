@@ -67,7 +67,7 @@ function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAtt
 
 function harness(input: {
   github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
-  authorFamilies?: string[] | null; authorAgents?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
+  authorFamilies?: string[] | null; authorAgents?: string[]; coordinatorFamilies?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
   legacyCoordinator?: string;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
@@ -86,7 +86,10 @@ function harness(input: {
     loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
-      return families === null ? null : { agentIds: input.authorAgents ?? ["claude-engineer"], modelFamilies: families };
+      return families === null ? null : {
+        agentIds: [...(input.authorAgents ?? ["claude-engineer"]), ...(query.excludeAgentId ? [] : ["coordinator"])],
+        modelFamilies: [...families, ...(query.excludeAgentId ? [] : input.coordinatorFamilies ?? [])],
+      };
     },
     // The database lock is a try-lock shared across server instances.
     withMergeLock: async (key, action) => {
@@ -159,6 +162,19 @@ describe("merge gate service", () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
     const h = harness({ github, issues: [issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null })] });
     await expect(evaluateAndMerge(h.deps, request())).rejects.toThrow(/implementer cannot merge/);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("counts a legacy coordinator's Codex runs as authorship before or after handoff", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, legacyCoordinator: "coordinator", coordinatorFamilies: ["openai"],
+      reviews: [review({ reviewerModelFamilies: ["openai"] })], issues: [
+        issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null }),
+      ] });
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({
+      outcome: "refused", reasons: [{ code: "review_not_independent" }],
+    });
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
     expect(merge).not.toHaveBeenCalled();
   });
 
