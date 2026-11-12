@@ -50,7 +50,7 @@ import { confirmNativeControllerStopped, NATIVE_CONTROLLER_HOST_UNVERIFIED } fro
 import { confirmOwnerGone, OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
 import { OWNABLE_KINDS } from "../services/recovery/ownership-registry.js";
 import { retryNativeWorkspaceExport } from "../services/native-runtime/native-workspace-export-retry.js";
-import { deferredWakeJoinsFirstTurn, firstTurnClaimedCommentIds, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
+import { deferredWakeJoinsFirstTurn, firstTurnClaimedCommentIds, firstTurnQueuedCommentIds, firstTurnTakesAllQueuedComments, firstTurnWakeColumns, firstTurnWakeContextFields, firstTurnWakePayloadFields, runAcceptsFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
@@ -315,7 +315,6 @@ import { retainBacklogHumanAssignment } from "../services/human-directed-work.js
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
-import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
 import {
   renderOnboardingGreeting,
   ONBOARDING_GREETING_AUTHORIZATION_REASON,
@@ -5555,11 +5554,7 @@ export function issueRoutes(
       })
       .from(issueRows)
       .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, uniqueIds)));
-    const decisions = await Promise.all(rows.map(async (row) => ({
-      id: row.id,
-      allowed: (await decideIssueAccess(req, row, "issue:read")).allowed,
-    })));
-    return new Set(decisions.filter((decision) => decision.allowed).map((decision) => decision.id));
+    return new Set((await filterIssuesForActor(req, rows)).map((row) => row.id));
   }
 
   function lockedIssueStub(issue: Pick<IssueRelationIssueSummary, "id" | "identifier">): IssueLockedStub {
@@ -5755,12 +5750,24 @@ export function issueRoutes(
     return decision !== true && decision.reason === "allow_visible_issue_write";
   }
 
+  /**
+   * Keeps the tasks the actor may read. One batched authorization read decides
+   * all of them, so the number of statements does not grow with the number of
+   * tasks.
+   */
   async function filterIssuesForActor<
     T extends Parameters<typeof decideIssueAccess>[1],
   >(req: Request, rows: T[]) {
-    const decisions = await Promise.all(
-      rows.map((issue) => decideIssueAccess(req, issue, "issue:read")),
-    );
+    const decisions = await access.decideReads(req.actor, rows.map((issue) => ({
+      type: "issue" as const,
+      companyId: issue.companyId,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      parentIssueId: issue.parentId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      status: issue.status,
+    })));
     return rows.filter((_, index) => decisions[index]?.allowed);
   }
 
@@ -5827,7 +5834,7 @@ export function issueRoutes(
     // watched subtree. This must be evaluated before the base assignee-ownership
     // boundary below: that boundary denies an agent mutating an issue owned by a
     // different agent, which is exactly the watchdog's primary job
-    // (SPEC-implementation §9.9 — comment, transition, reassign within the
+    // (`doc/TASK-WATCHDOG.md`, "Authority contract" — comment, transition, reassign within the
     // watched subtree). The watchdog scope can only widen access to the watched
     // subtree; downstream status-transition, assignment, recovery, and budget
     // guards in the route handlers still apply.
@@ -6252,9 +6259,10 @@ export function issueRoutes(
       });
     }
     // Resolving an interaction on another run's issue is a cross-issue mutation
-    // like a comment or a PATCH, so it consumes the same per-run budget (§9.3,
-    // §9.8.1). This runs last: company/resource access, run attribution,
-    // containment, and the audience decision have all already passed, and the
+    // like a comment or a PATCH, so it consumes the same per-run budget (see
+    // `doc/agent-permission-defaults.md`). This runs last: company/resource
+    // access, run attribution, containment, and the audience decision have all
+    // already passed, and the
     // terminal interaction mutation plus every child-task, continuation,
     // activity, tool, and wake side effect is still downstream. Same-issue
     // resolutions short-circuit inside the counter transaction and are not
@@ -7545,7 +7553,8 @@ export function issueRoutes(
   type IssueQueueWake = typeof agentWakeupRequests.$inferSelect;
   type IssueQueueRun = typeof heartbeatRuns.$inferSelect;
   type IssueQueueState = {
-    wake: Pick<IssueQueueWake, "id" | "companyId" | "payload" | "status" | "runId">;
+    wake: Pick<IssueQueueWake, "id" | "companyId" | "payload" | "status" | "runId" | "agentId" | "reason"
+      | "requestedByActorType" | "requestedByActorId">;
     state: "deferred" | "queued";
     queueRun: Pick<IssueQueueRun, "runtimeMode"> | null;
     /** The receipt already read for an interaction wake, reused by the queue builder. */
@@ -7561,16 +7570,18 @@ export function issueRoutes(
       .select({
         id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
         status: agentWakeupRequests.status, runId: agentWakeupRequests.runId,
+        ...firstTurnWakeColumns,
         payload: sql<Record<string, unknown>>`jsonb_build_object(
+          ${firstTurnWakePayloadFields(agentWakeupRequests.payload)},
           'issueId', ${agentWakeupRequests.payload}->'issueId',
           'mutation', ${agentWakeupRequests.payload}->'mutation',
-          'interactionId', ${agentWakeupRequests.payload}->'interactionId',
           'interactionStatus', ${agentWakeupRequests.payload}->'interactionStatus',
           'externalChatContinuation', ${agentWakeupRequests.payload}->'externalChatContinuation',
           'executionWait', jsonb_build_object(
             'reason', ${agentWakeupRequests.payload}->'executionWait'->'reason',
             'message', ${agentWakeupRequests.payload}->'executionWait'->'message'),
           '_paperclipWakeContext', jsonb_build_object(
+            ${firstTurnWakeContextFields(agentWakeupRequests.payload)},
             'wakeCommentIds', ${agentWakeupRequests.payload}->'_paperclipWakeContext'->'wakeCommentIds',
             'forceFreshSession', ${agentWakeupRequests.payload}->'_paperclipWakeContext'->'forceFreshSession')
         )`,
@@ -7606,7 +7617,8 @@ export function issueRoutes(
       if (wake.status === "deferred_issue_execution") {
         if (isReceipt) {
           const response = await readReceipt();
-          if (response) receipt = { wake, state: "deferred", queueRun: null, response };
+          // A tool action's outcome is delivered, never listed (approve = run).
+          if (response && !response.toolActionOutcome) receipt = { wake, state: "deferred", queueRun: null, response };
           continue;
         }
         return { wake, state: "deferred", queueRun: null };
@@ -7628,7 +7640,7 @@ export function issueRoutes(
         .then((runRows) => runRows[0] ?? null);
       if (queueRun && isReceipt) {
         const response = await readReceipt();
-        if (response) receipt = { wake, state: "queued", queueRun, response };
+        if (response && !response.toolActionOutcome) receipt = { wake, state: "queued", queueRun, response };
       }
       else if (queueRun) return { wake, state: "queued", queueRun };
     }
@@ -7728,6 +7740,13 @@ export function issueRoutes(
     if (wake && queuedInteractionId(wake.payload)) {
       if (response?.source.requiresFreshSession) queue.steeringDisposition = "unsupported";
       queue.entries = response ? [{ comment: response.comment, source: response.source, position: 0, canEdit: false, canDiscard: false }] : [];
+    } else if (wake && queueState?.state === "deferred" && input.activeRun?.status === "running") {
+      // A starting run (a booting sandbox, say) cannot be steered yet, but its
+      // first turn takes these messages. The view shows them as sent.
+      const firstTurnCommentIds = await firstTurnQueuedCommentIds(input.executor, {
+        companyId: input.issue.companyId, issueId: input.issue.id, runId: input.activeRun.id, wake,
+      });
+      if (firstTurnCommentIds.length > 0) queue.firstTurnCommentIds = firstTurnCommentIds;
     }
     return queue;
   }
@@ -7794,7 +7813,11 @@ export function issueRoutes(
     if (
       !wake ||
       readObject(wake.payload).issueId !== input.issue.id ||
-      (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload))
+      (queuedCommentIdsFromWakePayload(wake.payload).length === 0 && !queuedInteractionId(wake.payload)) ||
+      // A tool action's outcome is never a message to steer, interrupt or discard.
+      (queuedInteractionId(wake.payload) &&
+        (await readQueuedInteractionResponse(input.tx as unknown as Db, input.issue.companyId, input.issue.id, wake.payload))
+          ?.toolActionOutcome)
     ) {
       throw conflict("The queued message is no longer pending", {
         code: "queued_comment_not_pending",
@@ -10247,7 +10270,14 @@ export function issueRoutes(
     // The receipt commits before dispatch. Maintenance redelivers it after a
     // crash or a lost response; this nudge only reduces perceived latency.
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
-    if (chatActionId) void opts.chatRunRetries?.processFailedChatRunRetry(chatActionId).catch(err =>
+    const finalizeRunId = "finalizeRunId" in receipt ? receipt.finalizeRunId : undefined;
+    if (finalizeRunId) {
+      // The saved result is applied again; no provider run starts. The
+      // result-commit worker repeats this if the process stops first.
+      const { refinalizeSavedNativeResult } = await import("../services/native-runtime/exhausted-finalization-retry.js");
+      void refinalizeSavedNativeResult(db, { companyId: issue.companyId, runId: finalizeRunId }).catch(err =>
+        logger.warn({ err, issueId: issue.id, runId: finalizeRunId }, "Saved result finalization remains queued"));
+    } else if (chatActionId) void opts.chatRunRetries?.processFailedChatRunRetry(chatActionId).catch(err =>
       logger.warn({ err, issueId: issue.id }, "Connected task Retry remains queued"));
     else if (receipt.accepted && receipt.requestId) void heartbeat.resumeTaskRetry(issue.companyId, receipt.requestId).catch(err =>
       logger.warn({ err, issueId: issue.id }, "Task Retry remains queued"));
@@ -18524,13 +18554,6 @@ export function issueRoutes(
                   companyId: issue.companyId,
                   proposal: lockedProposal,
                 }),
-            });
-            await notifySecretProposalResolution({
-              proposal,
-              status: "approved",
-              userId: resolvedByUserId,
-              issues: svc,
-              heartbeat,
             });
           }
           continuationInteraction =

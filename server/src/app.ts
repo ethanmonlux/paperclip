@@ -121,6 +121,7 @@ import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
+import { linkPreviewRoutes } from "./routes/link-previews.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { caseRoutes } from "./routes/cases.js";
 import { caseHandoffRoutes } from "./routes/case-handoffs.js";
@@ -128,6 +129,7 @@ import { workflowRoutes } from "./routes/workflows.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
 import { createRemoteWorkspaceFiles } from "./services/remote-workspace-files.js";
 import { createSavedWorkspaceLoader } from "./services/remote-workspaces.js";
+import { createSavedWorkspaceArchiveOpener } from "./services/saved-workspace-archive.js";
 import { routineRoutes } from "./routes/routines.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
@@ -758,6 +760,7 @@ export async function createApp(
   // start route drives a live login instead of the fixed 503.
   const setupTokenLoginTransport = buildSetupTokenLoginTransport({
     sandbox: createProductionSetupTokenSandboxProvider({
+      db,
       environments: environmentService(db),
       environmentRuntime: environmentRuntimeService(db, {
         pluginWorkerManager: workerManager,
@@ -813,6 +816,7 @@ export async function createApp(
   api.use(fileResourceRoutes(db, { remoteFiles: createRemoteWorkspaceFiles(db, {
     environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }),
     loadSavedWorkspace: createSavedWorkspaceLoader(db, opts.storageService),
+    openSavedWorkspaceArchive: createSavedWorkspaceArchiveOpener(db, opts.storageService),
   }) }));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(
@@ -922,6 +926,7 @@ export async function createApp(
   api.use(decisionModelRoutes(db));
   api.use(agentObservabilityRoutes(db, { deploymentMode: opts.deploymentMode, deploymentExposure: opts.deploymentExposure }));
   api.use(fastResponseRoutes(db));
+  api.use(linkPreviewRoutes(db));
   api.use(promptInjectionPreventionRoutes(db));
   api.use(aiConnectionRoutes(db, { deploymentMode: opts.deploymentMode, deploymentExposure: opts.deploymentExposure, trustedLocalStdioRuntimeHost, pluginWorkerManager: workerManager }));
   api.use(

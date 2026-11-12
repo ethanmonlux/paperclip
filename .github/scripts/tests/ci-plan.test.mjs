@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { comparisonPaths, planTasks } from "../ci-plan.mjs";
 import { mergeDiff } from "../ci-diff.mjs";
+import { changedDigest } from "../staple-ci-scope.mjs";
 
 const root = new URL("../../../", import.meta.url);
 const config = JSON.parse(readFileSync(new URL("turbo.json", root), "utf8"));
@@ -422,7 +423,11 @@ process.stdout.write(fs.readFileSync(path.join(process.env.TEST_TRUSTED_ROOT, fi
     const ui = run("ui");
     routine(ui, "ui");
     assert.equal(ui.diff.base, merges.ui.base);
-    assert.deepEqual(ui.changed, ["ui/src/components/Sidebar.tsx"]);
+    // The published plan carries the changed list as its digest and count; test selection
+    // verifies its own diff of the same merge parents against them.
+    assert.equal(ui.changed, undefined);
+    assert.equal(ui.changedCount, 1);
+    assert.equal(ui.changedSha256, changedDigest(["ui/src/components/Sidebar.tsx"]));
     assert.deepEqual(ui.staple.affected, { run: true, all: null, packages: ["ui"] });
     assert.deepEqual(jobsRun(ui), { typecheck_release_registry: 0, general_tests: 2, docker_context_integrity: 0,
       sandbox_provider_tests: 0, verify_paperclip_runner: 0, build: 0, verify_serialized_server: 0, canary_dry_run: 0,

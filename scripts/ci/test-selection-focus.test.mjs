@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { budgetCandidates, focusGraph } from "./select-tests.mjs";
+import { budgetCandidates, focusGraph, publishedSelectionPlan, trustedChanged } from "./select-tests.mjs";
+import { changedDigest, publishedPlan } from "../../.github/scripts/staple-ci-scope.mjs";
 import { refineTestPlan } from "./test-selection-plan.mjs";
 import { typecheckArguments } from "./affected-packages.mjs";
 
@@ -86,4 +87,36 @@ test("budget pruning keeps the nearest tests and never prunes a project that a s
     assert.deepEqual(candidate.graphs[2].selected, shared.selected, `${candidate.label}: a shared-worker project runs whole`);
   }
   assert.equal(candidates.at(-1).label, "no test");
+});
+
+test("selection verifies its own diff against a published digest and republishes no per-file list", () => {
+  const files = Array.from({ length: 300 }, (_, i) => `server/src/services/sync-${i}.ts`);
+  const routed = publishedPlan({ version: 1, mode: "enabled", forceReason: null, changed: files, documentation: [], reasons: {},
+    jobs: {}, staple: { focused: true, unplanned: [], policyOnly: [] } });
+  const local = [...files].sort();
+  assert.deepEqual(trustedChanged(routed, local), local);
+  assert.throws(() => trustedChanged(routed, local.slice(1)), /disagrees with the trusted routing diff/);
+  assert.throws(() => trustedChanged(routed, [...local.slice(1), "server/src/other.ts"]), /disagrees with the trusted routing diff/);
+  assert.throws(() => trustedChanged({ ...routed, changedSha256: changedDigest(["x.ts"]) }, local), /disagrees/);
+  // An upstream plan still carries the list itself.
+  assert.deepEqual(trustedChanged({ changed: ["b.ts", "a.ts"] }, ["a.ts", "b.ts"]), ["b.ts", "a.ts"]);
+  assert.throws(() => trustedChanged({ changed: ["a.ts"] }, ["a.ts", "b.ts"]), /disagrees/);
+
+  const focus = { changed: 300, ungraphed: files.slice(0, 50), uncovered: files.slice(50, 120), unrouted: [], deferred: {}, wholeProjects: [],
+    budget: { maxJobs: 6, jobs: 2, exceeded: null } };
+  const selected = { ...routed, changed: files, jobs: { general_tests: { run: true } }, testSelection: { version: 1, hash: "h", stats: [], focus } };
+  const published = publishedSelectionPlan(selected, routed);
+  assert.equal(published.changed, undefined);
+  assert.deepEqual(published.jobs, selected.jobs);
+  assert.equal(published.testSelection.hash, "h");
+  assert.equal(published.testSelection.focus.ungraphed.length, 21);
+  assert.match(published.testSelection.focus.ungraphed.at(-1), /^\.\.\. and 30 more$/);
+  assert.match(published.testSelection.focus.uncovered.at(-1), /^\.\.\. and 50 more$/);
+  assert.deepEqual(published.testSelection.focus.unrouted, []);
+  assert.equal(published.testSelection.focus.changed, 300);
+  // A fallback keeps the routing plan's compact form; an upstream plan is republished unchanged.
+  assert.equal(publishedSelectionPlan({ ...routed, testSelectionFallback: "x" }, routed).changed, undefined);
+  const upstream = { changed: files, testSelection: { focus } };
+  assert.equal(publishedSelectionPlan(upstream, upstream), upstream);
+  assert.equal(publishedSelectionPlan({ testSelectionFallback: "Missing plan" }, null).testSelectionFallback, "Missing plan");
 });
