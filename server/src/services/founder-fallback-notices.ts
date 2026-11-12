@@ -18,7 +18,7 @@ import { authorizationService } from "./authorization.js";
 import { OPERATOR_UNCONFIRMED_DELIVERY_CANCELLATION } from "./chat-publication-errors.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
-import { publicChatTaskUrl } from "./chat-task-url.js";
+import { publicChatTaskUrl, safeChatTaskUrl } from "./chat-task-url.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "./delivery-work-notifications.js";
 import { subscribeAllCompanyLiveEvents } from "./live-events.js";
@@ -390,9 +390,20 @@ function askLine(interaction: Interaction, reason: ItemReason) {
   return reason.kind === "awaiting_founder" ? ask : `Stuck, needs a board action: ${ask}`;
 }
 
+/**
+ * The board URL of the card. A private install in `auto` base-URL mode (the
+ * Tailscale Serve box) sets no public URL, only its own https API origin, which
+ * also serves the board. These alerts reach only that install's owner, so they
+ * may link through it; shared chat links keep the stricter public-URL rule.
+ */
+function cardUrl(interaction: Interaction, ref: IssueRef | null) {
+  const taskRef = { prefix: ref?.prefix ?? null, identifier: ref?.identifier ?? null };
+  return publicChatTaskUrl(interaction.issueId, taskRef)
+    ?? safeChatTaskUrl(process.env.PAPERCLIP_API_URL?.trim(), interaction.issueId, taskRef);
+}
+
 function cardLink(interaction: Interaction, ref: IssueRef | null) {
-  return publicChatTaskUrl(interaction.issueId, { prefix: ref?.prefix ?? null, identifier: ref?.identifier ?? null })
-    ?? ref?.identifier ?? null;
+  return cardUrl(interaction, ref) ?? ref?.identifier ?? null;
 }
 
 type Ask = { interaction: Interaction; reason: ItemReason; ref: IssueRef | null; reminder: boolean; sequence: number };
@@ -523,20 +534,28 @@ export function createFounderFallbackNotices(db: Db, settings: FounderFallbackSe
       nextAttemptAt: chatPublications.nextAttemptAt,
       createdAt: chatPublications.createdAt,
       publishedAt: chatPublications.publishedAt,
+      payload: chatPublications.payload,
     }).from(chatPublications).where(and(
       eq(chatPublications.companyId, companyId),
       like(chatPublications.idempotencyKey, `${FOUNDER_FALLBACK_KEY_PREFIX}%`),
       like(chatPublications.idempotencyKey, `%${interactionId}%`),
     )).orderBy(asc(chatPublications.createdAt), asc(chatPublications.idempotencyKey));
+    const url = cardUrl(interaction, await issueRef(db, interaction));
     return {
       configured: settings.enabled,
       boundMs: settings.boundMs,
       interactionStatus: interaction.status,
       targets,
+      /** The card link these alerts carry now; null means the ask goes out without one. */
+      cardUrl: url,
       publications: rows.filter(row => {
         const key = parseFounderFallbackKey(row.idempotencyKey);
         if (!key || key.endpointId !== row.endpointId) return false;
         return key.kind === "done" ? key.interactionId === interactionId : alertedInteractionIds(key).includes(interactionId);
+      }).map(({ payload, ...row }) => {
+        const text = String((payload as { text?: unknown } | null)?.text ?? "");
+        // Whether the stored payload carries a tappable https link to this card.
+        return { ...row, linked: url !== null && text.includes(url) };
       }),
     };
   }
