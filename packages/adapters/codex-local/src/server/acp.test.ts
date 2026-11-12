@@ -72,7 +72,12 @@ type FakeRuntimeHandle = {
   backendSessionId: string;
   agentSessionId: string;
 };
-type FakeRuntimeTurnResult = { status: "completed" | "failed" | "cancelled"; stopReason?: string };
+type FakeRuntimeTurnResult = {
+  status: "completed" | "failed" | "cancelled";
+  stopReason?: string;
+  _meta?: Record<string, unknown>;
+};
+type FakeTerminalSessionFailure = { category: string; title?: string; details?: string };
 type FakeRuntimeTurn = {
   requestId: string;
   events: AsyncIterable<FakeRuntimeEvent>;
@@ -80,6 +85,16 @@ type FakeRuntimeTurn = {
   cancel: () => Promise<void>;
   closeStream: () => Promise<void>;
 };
+
+// A typed provider session failure arrives on the turn result `_meta` of a
+// normally stopped turn; the engine turns it into the failed outcome.
+function typedFailureTurn(failure: FakeTerminalSessionFailure): FakeRuntimeTurnResult {
+  return {
+    status: "completed",
+    stopReason: "end_turn",
+    _meta: { jetbrains: { air: { version: 1, sessionFailure: { severity: "error", ...failure } } } },
+  };
+}
 
 const tempRoots: string[] = [];
 const originalNodeVersion = process.version;
@@ -161,7 +176,6 @@ class FakeRuntime {
       { type: "text_delta", text: "hello", stream: "output", tag: "agent_message_chunk" },
     ],
     readonly terminal: FakeRuntimeTurnResult = { status: "completed", stopReason: "end_turn" },
-    readonly terminalSessionFailure?: { category: string; title?: string; details?: string },
   ) {}
 
   async ensureSession(input: {
@@ -189,10 +203,8 @@ class FakeRuntime {
     text: string;
     requestId: string;
     timeoutMs?: number;
-    onTerminalSessionFailure?: (failure: { category: string; title?: string; details?: string }) => void;
   }): FakeRuntimeTurn {
     this.startInputs.push(input);
-    if (this.terminalSessionFailure) input.onTerminalSessionFailure?.(this.terminalSessionFailure);
     const events = this.events;
     const terminal = this.terminal;
     return {
@@ -1390,11 +1402,7 @@ describe("codex_local ACP lane", () => {
       createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
         options,
         [],
-        {
-          status: "failed",
-          error: { message: "ACP turn failed." },
-        } as unknown as FakeRuntimeTurnResult,
-        { category: "access", title: "OAuth failed: refresh_token_invalidated" },
+        typedFailureTurn({ category: "access", title: "OAuth failed: refresh_token_invalidated" }),
       ) as never,
     });
 
@@ -1424,7 +1432,7 @@ describe("codex_local ACP lane", () => {
     const root = await makeTempRoot("paperclip-codex-acp-typed-provenance-");
     const execute = createCodexAcpExecutor({
       createRuntime: (options: FakeRuntimeOptions) =>
-        new FakeRuntime(options, quotedAuth, failedTurn("ACP turn failed."), { category, title }) as never,
+        new FakeRuntime(options, quotedAuth, typedFailureTurn({ category, title })) as never,
     });
 
     const result = await execute(buildContext(root));
@@ -1458,8 +1466,7 @@ describe("codex_local ACP lane", () => {
       createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
         options,
         [{ type: "text_delta", text: "Working on the task.", stream: "output", tag: "agent_message_chunk" }],
-        failedTurn("ACP turn failed."),
-        { category: "access", title: "OAuth failed: refresh token has expired" },
+        typedFailureTurn({ category: "access", title: "OAuth failed: refresh token has expired" }),
       ) as never,
     });
 
@@ -1536,7 +1543,7 @@ describe("codex_local ACP lane", () => {
     ["rejected turn", (options: FakeRuntimeOptions) =>
       new RejectingTurnRuntime(options, agentRpcError("Internal error", { message: refreshTokenReused }))],
     ["typed terminal session", (options: FakeRuntimeOptions) =>
-      new FakeRuntime(options, quotedAuth, failedTurn("ACP turn failed."), { category: "access", title: refreshTokenReused })],
+      new FakeRuntime(options, quotedAuth, typedFailureTurn({ category: "access", title: refreshTokenReused }))],
   ])("classifies a genuine %s provider auth failure", async (_label, createRuntime) => {
     const root = await makeTempRoot("paperclip-codex-acp-provider-auth-");
     const execute = createCodexAcpExecutor({ createRuntime: createRuntime as never });

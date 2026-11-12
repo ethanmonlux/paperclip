@@ -743,7 +743,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         available: failures < targets.length || targets.length === 0,
         detail: gaps.length === 0
           ? `Live GitHub read with ${credential.source === "managed_connection"
-            ? `your connected GitHub account${credential.login ? ` (${credential.login})` : ""}`
+            ? `your connected GitHub account${"login" in credential && credential.login ? ` (${credential.login})` : ""}`
             : `the server's existing ${credential.source === "server_env" ? "environment" : "company"} credential`} (cached up to 2 min).`
           : `${gaps.join("; ")}; those show Paperclip's recorded status (not live) with CI unknown.`,
       };
