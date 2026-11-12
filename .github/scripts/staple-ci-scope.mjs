@@ -18,6 +18,15 @@ const matchesAny = (file, globs) => globs.some((glob) => matchesGlob(file, glob)
 const RULES = ["plan", "certification"];
 // The lanes that scripts/ci/select-tests.mjs narrows to the focused tests.
 const TEST_LANES = ["general_tests", "verify_serialized_server"];
+// Reasons are display-only, but the plan is a job output and GitHub caps job outputs at 1 MiB.
+// Without upstream's global inputs every owned file is a reason for each task it reaches, so a
+// large upstream sync listed each of ~2,000 files under every task. `changed` stays complete.
+export const MAX_TASK_REASONS = 20;
+
+function boundedReasons(reasons) {
+  return Object.fromEntries(Object.entries(reasons).map(([task, list]) => [task, list.length <= MAX_TASK_REASONS ? list
+    : [...list.slice(0, MAX_TASK_REASONS), `... and ${list.length - MAX_TASK_REASONS} more changed inputs`]]));
+}
 
 export function validateScope(scope, lanes) {
   if (scope?.version !== 2) throw new Error("Unsupported Staple CI scope");
@@ -118,7 +127,7 @@ export function scopePlan({ plan, scope, config, lanes, forceReason = null }) {
   return {
     ...plan,
     forceReason: null,
-    reasons: replanned?.reasons ?? Object.fromEntries(Object.keys(plan.reasons ?? {}).map((task) => [task, []])),
+    reasons: replanned ? boundedReasons(replanned.reasons) : Object.fromEntries(Object.keys(plan.reasons ?? {}).map((task) => [task, []])),
     jobs,
     staple: { version: 2, scope: "routine", vitestSelection: true, focused: true, maxTestJobs: scope.routine.maxTestJobs,
       policyOnly, gates, deferred, unplanned, ...(testConfig ? { testConfig } : {}), affected: { run: Boolean(all) || packages.length > 0, all, packages },

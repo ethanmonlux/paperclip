@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { matchesGlob } from "node:path";
 import test from "node:test";
 import { planTasks } from "../ci-plan.mjs";
-import { scopePlan, scopeSummary, validateScope } from "../staple-ci-scope.mjs";
+import { MAX_TASK_REASONS, scopePlan, scopeSummary, validateScope } from "../staple-ci-scope.mjs";
 
 // STA-223: holds the Staple CI scope map. Every workspace package must be classified, every task
 // matrix job must have a rule, a routine push plans only light checks, and a complete suite is
@@ -165,6 +165,23 @@ test("broad, configuration and upstream-sync changes stay light and say what the
   assert.equal(plan.jobs.docker_context_integrity.selected, 1);
   assert.ok(plan.jobs.verify_paperclip_runner.selected > 0);
   assert.equal(scope.fullSuiteBranches, undefined);
+});
+
+test("a large upstream sync stays within GitHub's 1 MiB job output with every changed file kept", () => {
+  // PR #58 (STA-323) changed 2,103 files; listing each under every task made a 976 KB plan.
+  const files = Array.from({ length: 2500 }, (_, i) => [`server/src/services/sync-${i}.ts`, `ui/src/components/Sync${i}.tsx`,
+    `packages/shared/src/sync-${i}.ts`][i % 3]);
+  const plan = scoped(files);
+  assert.equal(plan.staple.scope, "routine");
+  assert.deepEqual(plan.changed, files);
+  for (const [task, reasons] of Object.entries(plan.reasons)) {
+    assert.ok(reasons.length <= MAX_TASK_REASONS + 1, task);
+    if (reasons.length > MAX_TASK_REASONS) assert.match(reasons.at(-1), /^\.\.\. and \d+ more changed inputs$/, task);
+  }
+  assert.ok(Object.values(plan.reasons).some((reasons) => reasons.length > MAX_TASK_REASONS));
+  // Bounding the display list selects exactly the lanes the complete list selects.
+  assert.deepEqual(counts(plan), counts(scoped(files.slice(0, 3))));
+  assert.ok(Buffer.byteLength(`plan=${JSON.stringify(plan)}\n`) < 512 * 1024);
 });
 
 test("package-owned suites run only with their own paths", () => {
