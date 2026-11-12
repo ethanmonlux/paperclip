@@ -16,6 +16,8 @@ import { planTasks } from "./ci-plan.mjs";
 
 const matchesAny = (file, globs) => globs.some((glob) => matchesGlob(file, glob));
 const RULES = ["plan", "certification"];
+// The lanes that scripts/ci/select-tests.mjs narrows to the focused tests.
+const TEST_LANES = ["general_tests", "verify_serialized_server"];
 
 export function validateScope(scope, lanes) {
   if (scope?.version !== 2) throw new Error("Unsupported Staple CI scope");
@@ -24,6 +26,7 @@ export function validateScope(scope, lanes) {
   const routine = scope.routine ?? {};
   if (!Number.isInteger(routine.maxTestJobs) || routine.maxTestJobs < 1) throw new Error("Invalid routine.maxTestJobs");
   if (!globs(routine.typecheckAllPaths) || !routine.typecheckAllPaths.length) throw new Error("Invalid routine.typecheckAllPaths");
+  if (!globs(routine.testConfigPaths) || !routine.testConfigPaths.length) throw new Error("Invalid routine.testConfigPaths");
   const sets = scope.pathSets ?? {};
   for (const [name, value] of Object.entries(sets)) {
     if (!globs(value) || !value.length) throw new Error(`Invalid path set: ${name}`);
@@ -80,11 +83,15 @@ export function scopePlan({ plan, scope, config, lanes, forceReason = null }) {
   const unplanned = scoped.filter((file) => !owned.includes(file));
   const replanned = owned.length ? planTasks({ config: laneConfig, lanes, paths: owned, mode: "enabled" }) : null;
 
+  // The root Vitest configuration is an input of every test project, and no lane names it. Offer
+  // every plan-ruled test lane to file selection, which then finds the projects it invalidates.
+  const testConfig = scoped.find((file) => matchesAny(file, scope.routine.testConfigPaths)) ?? null;
   const touched = (names) => names.some((name) => scoped.some((file) => matchesAny(file, scope.pathSets[name])));
   const jobs = {}, gates = {}, deferred = [];
   for (const [job, rule] of Object.entries(scope.jobs)) {
     const entries = lanes[job];
     let selected = replanned?.jobs[job].run ? replanned.jobs[job].matrix.include : [];
+    if (testConfig && TEST_LANES.includes(job)) selected = entries;
     if (rule === "certification") {
       gates[job] = "nightly certification";
       deferred.push(job);
@@ -98,7 +105,7 @@ export function scopePlan({ plan, scope, config, lanes, forceReason = null }) {
       } else if (!selected.length) selected = entries;
     } else if (rule.groups) {
       const before = selected.length;
-      selected = selected.filter((entry) => !rule.groups[entry.group] || touched(rule.groups[entry.group]));
+      selected = selected.filter((entry) => !rule.groups[entry.group] || testConfig || touched(rule.groups[entry.group]));
       if (selected.length < before) {
         gates[job] = Object.entries(rule.groups).filter(([, names]) => !touched(names))
           .map(([group, names]) => `${group}: no change under ${names.join(", ")}`).join("; ");
@@ -114,7 +121,7 @@ export function scopePlan({ plan, scope, config, lanes, forceReason = null }) {
     reasons: replanned?.reasons ?? Object.fromEntries(Object.keys(plan.reasons ?? {}).map((task) => [task, []])),
     jobs,
     staple: { version: 2, scope: "routine", vitestSelection: true, focused: true, maxTestJobs: scope.routine.maxTestJobs,
-      policyOnly, gates, deferred, unplanned, affected: { run: Boolean(all) || packages.length > 0, all, packages },
+      policyOnly, gates, deferred, unplanned, ...(testConfig ? { testConfig } : {}), affected: { run: Boolean(all) || packages.length > 0, all, packages },
       ...(plan.forceReason ? { upstreamForceReason: plan.forceReason } : {}) },
   };
 }

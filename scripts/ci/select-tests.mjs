@@ -48,11 +48,36 @@ const graphable = (file, root) => /^(?:ui\/src|server\/src|cli\/src|packages\/.+
 // a changed file as an input. A changed setup or configuration dependency still selects its whole
 // project. The opaque remainder is counted, named in the audit and left to the certification.
 export function focusGraph(graph, changed) {
-  if (graph.setupChanged || !graph.isolated) return { ...graph, deferred: [] };
+  if (wholeProject(graph)) return { ...graph, deferred: [] };
   const direct = new Set([...graph.related, ...graph.inputRelated, ...graph.inventory.filter((file) => changed.includes(file))]);
   const deferred = graph.alwaysRun.filter((file) => graph.retentionReasons[file] && !direct.has(file));
   const skip = new Set(deferred);
   return { ...graph, selected: graph.selected.filter((file) => !skip.has(file)), deferred };
+}
+
+// A changed setup or configuration dependency, or a shared worker, affects every test of a project.
+const wholeProject = (graph) => graph.setupChanged || !graph.isolated;
+
+// The selections a routine push tries, nearest tests first, when the affected tests exceed its
+// budget. A whole project is in every candidate unchanged.
+export function budgetCandidates(graphs, changed, sources) {
+  // heartbeat.ts has 209 direct importers; heartbeat-*.test.ts and its directory's tests are the nearest.
+  const stems = sources.map((file) => path.posix.basename(file).replace(/(?:\.test)?\.[cm]?[jt]sx?$/, ""));
+  const directories = new Set(sources.map((file) => path.posix.dirname(file)));
+  const near = (file) => directories.has(path.posix.dirname(file)) || stems.some((stem) => path.posix.basename(file).startsWith(stem));
+  const narrowed = (keep) => graphs.map((graph) => {
+    if (wholeProject(graph)) return graph;
+    const kept = keep(graph);
+    return { ...graph, selected: graph.selected.filter((file) => kept.has(file)) };
+  });
+  return [
+    ["the changed tests and the tests that import a changed source directly",
+      (graph) => new Set([...graph.direct, ...graph.inputRelated, ...changed])],
+    ["the changed tests and the direct importers named after or beside a changed source",
+      (graph) => new Set([...graph.direct.filter(near), ...changed])],
+    ["the changed tests", () => new Set(changed)],
+    ["no test", () => new Set()],
+  ].map(([label, keep]) => ({ label, graphs: narrowed(keep) }));
 }
 
 export async function createTestSelection(plan, head, root = process.cwd()) {
@@ -64,10 +89,13 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
     if (plan.jobs[job].run) for (const entry of plan.jobs[job].matrix.include) groups.add(entry.group ?? "serialized");
   }
   groups.delete("general-chat"); // Keep its line sharding and DB ownership intact.
-  const inputs = productInputs(plan.changed);
-  const changed = focused ? inputs.filter((file) => graphable(file, root)) : inputs;
-  const focus = focused ? { changed: changed.length, ungraphed: inputs.filter((file) => !changed.includes(file)),
-    uncovered: [], unrouted: [], deferred: {}, budget: { maxJobs: plan.staple.maxTestJobs, jobs: 0, exceeded: null } } : null;
+  // Every changed input goes to the graphs, not only the sources: a changed setup file, Vitest
+  // configuration or declared fixture is how a graph learns that a whole project or an
+  // input-reading test is affected.
+  const changed = productInputs(plan.changed);
+  const sources = focused ? changed.filter((file) => graphable(file, root)) : changed;
+  const focus = focused ? { changed: changed.length, ungraphed: changed.filter((file) => !sources.includes(file)),
+    uncovered: [], unrouted: [], deferred: {}, wholeProjects: [], budget: { maxJobs: plan.staple.maxTestJobs, jobs: 0, exceeded: null } } : null;
   if (focused && (!changed.length || !groups.size)) {
     return { ...refineTestPlan({ plan, head, owners: {}, graphs: [], empty: true, focus }), graphs: [] };
   }
@@ -100,7 +128,11 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
   for (const file of changed) {
     if (covered.has(file)) continue;
     assert.ok(focused, `Change outside the resolved test graphs: ${file}`);
-    focus.uncovered.push(file);
+  }
+  if (focused) {
+    focus.ungraphed = changed.filter((file) => !covered.has(file) && !sources.includes(file));
+    focus.uncovered = sources.filter((file) => !covered.has(file));
+    focus.wholeProjects = graphs.filter(wholeProject).map((graph) => graph.project);
   }
   const server = graphs.find((graph) => graph.project === "@paperclipai/server");
   if (server) {
@@ -123,29 +155,26 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
     // More affected tests than a routine push runs (a widely re-exported source reaches most of
     // the suite). Keep the nearest tests that fit: the changed tests with the tests that import a
     // changed source directly, then only those named after or beside it, then the changed tests
-    // alone. The rest is left to the
-    // certification. Never present a near-complete run as light.
+    // alone. The rest is left to the certification. Never present a near-complete run as light.
+    // A project that a setup or configuration change invalidates is never pruned: it runs whole,
+    // over the budget if it must.
     const files = graphs.reduce((total, graph) => total + graph.selected.length, 0);
-    // heartbeat.ts has 209 direct importers; heartbeat-*.test.ts and its directory's tests are the nearest.
-    const stems = changed.map((file) => path.posix.basename(file).replace(/(?:\.test)?\.[cm]?[jt]sx?$/, ""));
-    const directories = new Set(changed.map((file) => path.posix.dirname(file)));
-    const near = (file) => directories.has(path.posix.dirname(file)) || stems.some((stem) => path.posix.basename(file).startsWith(stem));
-    const narrowed = (keep) => graphs.map((graph) => ({ ...graph, selected: graph.selected.filter((file) => keep(graph).has(file)) }));
-    const tiers = [
-      ["the changed tests and the tests that import a changed source directly",
-        () => refine(narrowed((graph) => new Set([...graph.direct, ...graph.inputRelated, ...changed])))],
-      ["the changed tests and the direct importers named after or beside a changed source",
-        () => refine(narrowed((graph) => new Set([...graph.direct.filter(near), ...changed])))],
-      ["the changed tests", () => refine(narrowed(() => new Set(changed)))],
-      ["no test", () => refineTestPlan({ plan, head, owners: {}, graphs: [], empty: true, focus })],
-    ];
+    const complete = graphs;
     let kept;
-    for (const [label, attempt] of tiers) {
-      result = attempt();
-      kept = label;
+    for (const candidate of budgetCandidates(graphs, changed, sources)) {
+      graphs = candidate.graphs;
+      result = refine(graphs);
+      kept = candidate.label;
       if (jobs(result) <= focus.budget.maxJobs) break;
     }
-    focus.budget.exceeded = { files, jobs: focus.budget.jobs, kept: jobs(result) ? kept : "no test" };
+    // The audit names every affected test the budget left to the certification.
+    graphs = graphs.map((graph, index) => {
+      const selected = new Set(graph.selected);
+      return { ...graph, budgetDeferred: complete[index].selected.filter((file) => !selected.has(file)) };
+    });
+    if (focus.wholeProjects.length) kept = `every test of ${focus.wholeProjects.join(", ")}, and ${kept} of the other projects`;
+    focus.budget.exceeded = { files, jobs: focus.budget.jobs, kept,
+      left: graphs.reduce((total, graph) => total + graph.budgetDeferred.length, 0) };
     focus.budget.jobs = jobs(result);
   }
   return { ...result, graphs };
@@ -155,9 +184,10 @@ function focusSummary(focus) {
   const list = (files) => `${files.slice(0, 8).join(", ")}${files.length > 8 ? ` and ${files.length - 8} more` : ""}`;
   const deferred = Object.values(focus.deferred).reduce((total, count) => total + count, 0);
   return ["Focused regression for a routine push: the changed tests, the tests whose import graph reaches a changed source, and the tests that declare a changed file as an input.", "",
-    `- Graphed source changes: ${focus.changed}`,
+    `- Changed inputs given to the test graphs: ${focus.changed}`,
     ...(deferred ? [`- Tests kept only because their imports reach an opaque module (filesystem, process, network): ${deferred}. Not known to be affected; they run in the nightly certification.`] : []),
-    ...(focus.budget.exceeded ? [`- ${focus.budget.exceeded.files} affected test files need ${focus.budget.exceeded.jobs} jobs, over the routine budget of ${focus.budget.maxJobs}. This run keeps ${focus.budget.exceeded.kept}. The complete suite runs in the nightly certification, or on this pull request with the \`full-ci\` label.`] : []),
+    ...(focus.wholeProjects.length ? [`- A setup or configuration change selects every test of: ${list(focus.wholeProjects)}. These projects are never pruned.`] : []),
+    ...(focus.budget.exceeded ? [`- ${focus.budget.exceeded.files} affected test files need ${focus.budget.exceeded.jobs} jobs, over the routine budget of ${focus.budget.maxJobs}. This run keeps ${focus.budget.exceeded.kept} (${focus.budget.jobs} jobs). The ${focus.budget.exceeded.left} affected files it leaves out are listed as \`budgetDeferred\` in audit.json. The complete suite runs in the nightly certification, or on this pull request with the \`full-ci\` label.`] : []),
     ...(focus.ungraphed.length ? [`- Changes outside the test import graphs (left to policy, typecheck and the certification): ${list(focus.ungraphed)}`] : []),
     ...(focus.uncovered.length ? [`- Changed sources no selected test imports: ${list(focus.uncovered)}`] : []),
     ...(focus.unrouted.length ? [`- Affected tests owned by the chat or native Runner lanes, which run when their own paths change and in the certification: ${list(focus.unrouted)}`] : []),

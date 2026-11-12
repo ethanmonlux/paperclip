@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { focusGraph } from "./select-tests.mjs";
+import { budgetCandidates, focusGraph } from "./select-tests.mjs";
 import { refineTestPlan } from "./test-selection-plan.mjs";
 import { typecheckArguments } from "./affected-packages.mjs";
 
@@ -64,4 +64,26 @@ test("the affected-package typecheck names the changed packages with their depen
   for (const directory of ["../outside", "server}{..", "a b", "$(id)"]) {
     assert.throws(() => typecheckArguments({ run: true, all: null, packages: [directory] }), /Invalid package directory/);
   }
+});
+
+test("budget pruning keeps the nearest tests and never prunes a project that a setup change invalidates", () => {
+  const server = { project: "@paperclipai/server", isolated: true, setupChanged: false, inputRelated: ["fixture.test.ts"],
+    direct: ["heartbeat.test.ts", "heartbeat-queue.test.ts", "routes/issues.test.ts"],
+    selected: ["far.test.ts", "fixture.test.ts", "heartbeat-queue.test.ts", "heartbeat.test.ts", "routes/issues.test.ts", "services/edited.test.ts"] };
+  const ui = { project: "@paperclipai/ui", isolated: true, setupChanged: true, inputRelated: [], direct: [],
+    selected: ["a.test.tsx", "b.test.tsx", "c.test.tsx"] };
+  const shared = { ...ui, project: "@paperclipai/shared", setupChanged: false, isolated: false };
+  const changed = ["services/heartbeat.ts", "services/edited.test.ts", "ui/vitest.setup.ts"];
+  const candidates = budgetCandidates([server, ui, shared], changed, ["services/heartbeat.ts", "services/edited.test.ts"]);
+  assert.deepEqual(candidates.map((candidate) => candidate.graphs[0].selected), [
+    ["fixture.test.ts", "heartbeat-queue.test.ts", "heartbeat.test.ts", "routes/issues.test.ts", "services/edited.test.ts"],
+    ["heartbeat-queue.test.ts", "heartbeat.test.ts", "services/edited.test.ts"],
+    ["services/edited.test.ts"],
+    [],
+  ]);
+  for (const candidate of candidates) {
+    assert.deepEqual(candidate.graphs[1].selected, ui.selected, `${candidate.label}: a setup-invalidated project runs whole`);
+    assert.deepEqual(candidate.graphs[2].selected, shared.selected, `${candidate.label}: a shared-worker project runs whole`);
+  }
+  assert.equal(candidates.at(-1).label, "no test");
 });

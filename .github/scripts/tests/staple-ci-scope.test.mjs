@@ -181,6 +181,20 @@ test("package-owned suites run only with their own paths", () => {
   assert.match(scoped(["server/src/services/heartbeat/queue.ts"]).staple.gates.general_tests, /general-chat: no change under chat/);
 });
 
+test("setup and Vitest configuration changes reach file selection with their test lanes", () => {
+  // A project's own setup or configuration file is an input of its lanes.
+  assert.ok(scoped(["ui/vitest.setup.ts"]).jobs.general_tests.run);
+  const server = scoped(["server/vitest.config.ts"]);
+  assert.ok(server.jobs.general_tests.run && server.jobs.verify_serialized_server.run);
+  // The root configuration is an input of every project, and no lane names it.
+  const root = scoped(["vitest.config.ts"]);
+  assert.equal(root.staple.testConfig, "vitest.config.ts");
+  assert.deepEqual(root.jobs.general_tests.matrix.include, lanes.general_tests);
+  assert.deepEqual(root.jobs.verify_serialized_server.matrix.include, lanes.verify_serialized_server);
+  assert.equal(root.jobs.build.run, false);
+  assert.throws(() => validateScope({ ...scope, routine: { ...scope.routine, testConfigPaths: [] } }, lanes), /testConfigPaths/);
+});
+
 test("a complete suite selects every lane: labels, stacks, other modes and a missing diff", () => {
   const complete = (plan, reason) => {
     assert.equal(plan.staple.scope, "full");

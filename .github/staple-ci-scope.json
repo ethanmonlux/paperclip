@@ -13,6 +13,7 @@
   ],
   "routine": {
     "maxTestJobs": 6,
+    "testConfigPaths": ["vitest.config.*", "vitest.workspace.*"],
     "typecheckAllPaths": [
       "package.json",
       "pnpm-lock.yaml",

@@ -83,7 +83,9 @@ job's summary and its `audit.json` artifact name what was left out and why:
 When the affected tests need more than `routine.maxTestJobs` jobs (a widely re-exported source
 reaches most of the suite), the push runs the nearest tests that fit: the changed tests with the
 direct importers of the changed sources, or only the direct importers named after or beside a
-changed source, or the changed tests alone. The summary says which. It never runs a near-complete suite and calls it light.
+changed source, or the changed tests alone. The summary says which. `audit.json` lists each affected
+test it left out as `budgetDeferred`. A changed setup file or Vitest configuration selects every
+test of its project, and the budget never prunes that project. It never runs a near-complete suite and calls it light.
 
 A new push cancels the superseded checks of the same pull request only (`pr.yml`). It never cancels
 another pull request's checks or a certification. No workflow runs the same checks on both `push`
