@@ -53,8 +53,13 @@ vi.mock("../adapters/index.ts", async () => {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+// A run finishes in a few seconds locally, but a loaded CI shard can take
+// several times longer, so bound the poll by wall time rather than attempts.
+const RUN_SETTLE_TIMEOUT_MS = 30_000;
+
 async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
+  const deadline = Date.now() + RUN_SETTLE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
     const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
     if (run && run.status !== "queued" && run.status !== "running") return run;
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -83,7 +88,8 @@ async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
   }
 }
 
-describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
+// Several cases wait on more than one full run in sequence.
+describeEmbeddedPostgres("heartbeat responsible-user invariant", { timeout: 120_000 }, () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
