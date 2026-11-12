@@ -141,15 +141,28 @@ function readMs(value: string | null | undefined) {
   return Number.isNaN(ms) ? null : ms;
 }
 
-function latestWorkflowRuns(runs: GitHubWorkflowRunReading[]) {
+// A completed run whose jobs were all skipped (e.g. a `pull_request: labeled` run whose
+// `if:` excluded every job) executed no CI, so it must not supersede real evidence.
+function skippedOnly(run: GitHubWorkflowRunReading, checkRuns: GitHubCheckRunReading[]) {
+  if (run.status !== "completed") return false;
+  if (run.conclusion === "skipped") return true;
+  if (run.checkSuiteId === null) return false;
+  const jobs = checkRuns.filter(job => job.checkSuiteId === run.checkSuiteId);
+  return jobs.length > 0 && jobs.every(job => job.conclusion === "skipped");
+}
+
+function latestWorkflowRuns(runs: GitHubWorkflowRunReading[], checkRuns: GitHubCheckRunReading[]) {
   const latest = new Map<string, GitHubWorkflowRunReading>();
   for (const run of runs) {
     const key = run.workflowId == null ? `run:${run.id}` : `workflow:${run.workflowId}`;
     const previous = latest.get(key);
+    const skipped = skippedOnly(run, checkRuns);
+    const previousSkipped = previous ? skippedOnly(previous, checkRuns) : false;
     const time = readMs(run.createdAt);
     const previousTime = readMs(previous?.createdAt);
-    if (!previous || (time !== null && previousTime !== null && time !== previousTime
-      ? time > previousTime : run.id > previous.id)) latest.set(key, run);
+    const newer = previous && (time !== null && previousTime !== null && time !== previousTime
+      ? time > previousTime : run.id > previous.id);
+    if (!previous || (skipped === previousSkipped ? newer : previousSkipped)) latest.set(key, run);
   }
   return [...latest.values()];
 }
@@ -218,7 +231,7 @@ export function classifyCiWait(input: {
     }
   }
 
-  const workflowRuns = latestWorkflowRuns(snapshot.workflowRuns);
+  const workflowRuns = latestWorkflowRuns(snapshot.workflowRuns, snapshot.checkRuns);
   const currentSuites = new Set(workflowRuns.map(run => run.checkSuiteId));
   const supersededSuites = new Set(snapshot.workflowRuns
     .filter(run => !workflowRuns.includes(run) && run.checkSuiteId !== null && !currentSuites.has(run.checkSuiteId))

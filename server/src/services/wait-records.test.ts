@@ -156,6 +156,43 @@ describe("ci wait record (FAC-840 incident replays)", () => {
     }) })).toMatchObject({ action: "wake", observation: { state: "failed" } });
   });
 
+  describe("a newer skipped-only labeled run does not hide real CI (STA-336)", () => {
+    const real = { id: 1, workflowId: 11, name: "PR", status: "in_progress", conclusion: null,
+      checkSuiteId: 7, createdAt: minutesAgo(10) };
+    const realCheck = { name: "verify", status: "in_progress", conclusion: null, checkSuiteId: 7 };
+    const skippedCheck = { name: "ci", status: "completed", conclusion: "skipped", checkSuiteId: 8 };
+    const labeledRuns = ["success", "skipped"].map(conclusion =>
+      ({ ...real, id: 2, checkSuiteId: 8, createdAt: minutesAgo(2), status: "completed", conclusion }));
+    const finished = (conclusion: string) => ({
+      checkRuns: [{ ...realCheck, status: "completed", conclusion }, skippedCheck],
+      workflowRun: { ...real, status: "completed", conclusion },
+    });
+
+    it("keeps waiting on real CI still in progress", () => {
+      for (const labeled of labeledRuns) {
+        expect(classifyCiWait({ target, now, snapshot: snapshot({
+          checkRuns: [realCheck, skippedCheck], workflowRuns: [real, labeled],
+        }) })).toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
+      }
+    });
+
+    it("wakes failed on real CI that failed", () => {
+      const { checkRuns, workflowRun } = finished("failure");
+      for (const labeled of labeledRuns) {
+        expect(classifyCiWait({ target, now, snapshot: snapshot({ checkRuns, workflowRuns: [workflowRun, labeled] }) }))
+          .toMatchObject({ action: "wake", observation: { state: "failed" } });
+      }
+    });
+
+    it("still passes when the real CI succeeded", () => {
+      const { checkRuns, workflowRun } = finished("success");
+      for (const labeled of labeledRuns) {
+        expect(classifyCiWait({ target, now, snapshot: snapshot({ checkRuns, workflowRuns: [workflowRun, labeled] }) }))
+          .toMatchObject({ action: "wake", observation: { state: "passed" } });
+      }
+    });
+  });
+
   it("keeps an active rerun of the same run ID waiting despite an earlier failed check", () => {
     expect(classifyCiWait({ target, now, snapshot: snapshot({
       checkRuns: [
