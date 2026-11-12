@@ -250,3 +250,75 @@ test("the 02:30 hold is placed when a newer certified commit is waiting", async 
   assert.equal(holds.length, 1);
   assert.equal(holds[0].reason, "nightly maintenance window");
 });
+
+// Gate 2 (STA-223): `paperclipai db:backup --json` prints its banner and progress, the metadata as
+// pretty-printed JSON, then an outro, all on stdout. Reading only the last line found nothing, so a
+// good backup was reported as failed and the certified upgrade stopped at the backup gate.
+const esc = (code, text) => `\x1b[${code}m${text}\x1b[39m`;
+function dbBackupStdout(meta) {
+  return [
+    "", esc(36, "██████╗  █████╗ ██████╗ ███████╗██████╗  ██████╗██╗     ██╗██████╗ "),
+    esc(34, "  ───────────────────────────────────────────────────────"), "",
+    `┌   ${esc(46, " paperclip db:backup ")}`, "│", `│  ${esc(2, "Config: /home/u/.paperclip/instances/default/config.json")}`,
+    `│  ${esc(2, "Connection source: embedded-postgres@54329 {pid 4242}")}`, "│",
+    "◒  Creating database backup...", `◇  Backup saved: ${meta?.backupFile} (907.9 MB)`, "│",
+    ...(meta === undefined ? [] : [JSON.stringify(meta, null, 2)]),
+    "│", `└  ${esc(32, "Backup completed.")}`, "", "",
+  ].join("\n");
+}
+
+/** Saves db:backup stdout (and optionally a backup file) and asks the installer for the Gate 2 result. */
+function backupResult({ stdout, rc = 0, bytes, meta = (file) => ({ backupFile: file, sizeBytes: 12, prunedCount: 0 }) }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-backup-"));
+  try {
+    const file = path.join(dir, "staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+    if (bytes !== undefined) writeFileSync(file, Buffer.alloc(bytes, 1));
+    writeFileSync(path.join(dir, "out"), stdout ?? dbBackupStdout(meta(file)));
+    const result = spawnSync("bash", [script, "backup-result", path.join(dir, "out"), String(rc)], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim().replace(dir, "<dir>");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("Gate 2 reads backupFile from the real db:backup output, not its last line", () => {
+  const stdout = dbBackupStdout({ backupFile: "/b/x.sql.gz", sizeBytes: 12 });
+  // The old gate: `tail -1` of this output, grepped for "path or "file, never matched.
+  assert.doesNotMatch(stdout.trimEnd().split("\n").at(-1), /"path|"file/);
+  assert.equal(backupResult({ bytes: 12 }), "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+});
+
+test("Gate 2 accepts compact metadata and a backup without a reported size", () => {
+  assert.match(backupResult({ bytes: 5, stdout: undefined, meta: (file) => ({ backupFile: file }) }), /^file:/);
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-backup-"));
+  try {
+    const file = path.join(dir, "b.sql.gz"); writeFileSync(file, "x");
+    assert.match(backupResult({ stdout: `noise {not json}\n${JSON.stringify({ backupFile: file, sizeBytes: 1 })}\n` }), /^file:/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Gate 2 fails closed on a nonzero exit even when the metadata looks good", () => {
+  assert.equal(backupResult({ bytes: 12, rc: 1 }), "error:db:backup exited 1");
+});
+
+test("Gate 2 fails closed without readable metadata", () => {
+  assert.equal(backupResult({ bytes: 12, stdout: "" }), "error:no backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 12, stdout: dbBackupStdout(undefined) }), "error:no backup metadata in db:backup output");
+  // Truncated JSON: the output stopped mid-object.
+  assert.equal(backupResult({ bytes: 12, stdout: '{\n  "backupFile": "/b/x.sql.gz",\n  "sizeBytes": 1' }),
+    "error:no backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: "relative/x.sql.gz" }) }),
+    "error:backupFile is not an absolute path ('relative/x.sql.gz')");
+  assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: null }) }), "error:backupFile is not an absolute path (None)");
+});
+
+test("Gate 2 fails closed when the named backup file is missing, empty or the wrong size", () => {
+  assert.equal(backupResult({}), "error:backup file missing (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+  assert.equal(backupResult({ bytes: 0, meta: (file) => ({ backupFile: file }) }),
+    "error:backup file empty (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+  assert.equal(backupResult({ bytes: 7 }),
+    "error:backup file is 7 bytes, db:backup reported 12 (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+});
