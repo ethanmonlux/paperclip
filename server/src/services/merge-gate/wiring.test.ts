@@ -1,7 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import {
-  agents, authUsers, companies, companyMemberships, createDb, documentRevisions, documents, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  heartbeatRuns, issueDocuments, issues,
+  activityLog, agents, authUsers, companies, companyMemberships, createDb, documentRevisions, documents, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  heartbeatRuns, issueDocuments, issueThreadInteractions, issues,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -84,7 +84,7 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     // The implementer is reconfigured after authoring; history is unchanged.
     await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, implementer.id));
     const reviewRun = await f.run(reviewer.id, reviewIssue.id, { model: "gpt-6.1-sol", provider: "openai" });
-    const body = `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\nscope: full\np0: 0\np1: 0\np2: none`;
+    const body = `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\nscope: full\np0: 0\np1: 0\np2: none\nsourceAuthorAgentIds: ${implementer.id}`;
     const [document] = await db.insert(documents).values({ companyId: f.company.id, latestBody: body, updatedByAgentId: reviewer.id }).returning();
     await db.insert(documentRevisions).values({ companyId: f.company.id, documentId: document!.id, revisionNumber: 1, body,
       createdByAgentId: reviewer.id, createdByRunId: reviewRun.id });
@@ -101,6 +101,20 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     const coordinator = await f.agent("Coordinator", "codex_local");
     await f.run(coordinator.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
     await f.run(reviewer.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id] }))
+      .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: ["00000000-0000-4000-8000-000000000000"] })).resolves.toBeNull();
+    // The attestation never narrows away its own reviewer's runs on the task;
+    // an attester with no run there adds nothing and is not required to.
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id], attesterAgentId: reviewer.id }))
+      .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
+    const outsider = await f.agent("Outside reviewer", "codex_local");
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id], attesterAgentId: outsider.id }))
+      .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
     await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: coordinator.id }))
       .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
 
@@ -114,6 +128,77 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
       createdByAgentId: implementer.id, createdByRunId: null });
     await expect(deps.loadReviews(f.company.id, { reviewIssueIds: [reviewIssue.id], repo: "ethanmonlux/facette", pullNumber: 704 }))
       .resolves.toMatchObject([{ reviewerAgentId: implementer.id, reviewerModelFamilies: [], writtenByReviewer: false }]);
+  });
+
+  it("recognizes the STA-293 legacy coordinator handoff only with a recorded engineer run", async () => {
+    const f = await fixture();
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const engineer = await f.agent("Engineer", "claude_local");
+    const task = await f.issue("Legacy task", coordinator.id);
+    const at = (minute: number) => new Date(Date.UTC(2026, 10, 11, 10, minute));
+    const event = async (action: string, actorType: string, actorId: string, details: Record<string, unknown>, minute: number) =>
+      db.insert(activityLog).values({ companyId: f.company.id, entityType: "issue", entityId: task.id,
+        action, actorType, actorId, details, createdAt: at(minute) });
+    await event("issue.created", "user", "gate-owner", { assigneeAgentId: coordinator.id }, 0);
+    await event("issue.updated", "agent", coordinator.id,
+      { changes: { assigneeAgentId: { from: coordinator.id, to: engineer.id } } }, 10);
+    const deps = createMergeGateDependencies(db);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
+    await db.insert(heartbeatRuns).values({ companyId: f.company.id, issueId: task.id, agentId: engineer.id,
+      status: "succeeded", invocationSource: "assignment", triggerDetail: "system", startedAt: at(15), finishedAt: at(18) });
+    await event("issue.updated", "agent", engineer.id,
+      { changes: { assigneeAgentId: { from: engineer.id, to: coordinator.id } } }, 20);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(true);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, engineer.id)).toBe(false);
+    await event("issue.updated", "agent", coordinator.id,
+      { changes: { assigneeAgentId: { from: coordinator.id, to: engineer.id } } }, 30);
+    expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
+  });
+
+  it("names every creator, assignee and checkout holder of a task as a custodian, not a commenting reviewer", async () => {
+    const f = await fixture();
+    const engineer = await f.agent("Engineer", "claude_local");
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const helper = await f.agent("Helper", "codex_local");
+    const reviewer = await f.agent("Reviewer", "codex_local");
+    // STA-315 shape: the engineer holds it, a helper held it briefly, and the
+    // coordinator holds it now. The reviewer only ran on it to comment.
+    const task = await f.issue("Engineer task", coordinator.id);
+    await db.update(issues).set({ createdByAgentId: engineer.id }).where(eq(issues.id, task.id));
+    const event = async (action: string, agentId: string, details: Record<string, unknown>) =>
+      db.insert(activityLog).values({ companyId: f.company.id, entityType: "issue", entityId: task.id,
+        action, actorType: "agent", actorId: agentId, agentId, details });
+    await event("issue.created", engineer.id, { assigneeAgentId: engineer.id });
+    await event("issue.updated", engineer.id, { changes: { assigneeAgentId: { from: engineer.id, to: helper.id } } });
+    await event("issue.updated", helper.id, { changes: { status: { from: "todo", to: "in_progress" } } });
+    await event("issue.updated", coordinator.id, { changes: { assigneeAgentId: { from: helper.id, to: coordinator.id } } });
+    await event("issue.comment_added", reviewer.id, { bodySnippet: "review attached" });
+    await f.run(reviewer.id, task.id, { model: "gpt-6.1-sol" });
+    const deps = createMergeGateDependencies(db);
+    expect(await deps.loadTaskCustodians(f.company.id, task.id))
+      .toEqual([engineer.id, coordinator.id, helper.id].sort());
+    expect(await deps.loadTaskCustodians(f.company.id, crypto.randomUUID())).toBeNull();
+  });
+
+  it("recognizes only an accepted, addressed STA-315 review routing record", async () => {
+    const f = await fixture();
+    const engineer = await f.agent("Engineer", "claude_local");
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const outsider = await f.agent("Outsider", "codex_local");
+    const task = await f.issue("Engineer-created task", engineer.id);
+    const deps = createMergeGateDependencies(db);
+    const payload = { version: 1 as const, prompt: "Route independent review", target: {
+      type: "issue_document" as const, issueId: task.id, key: "handoff", revisionId: crypto.randomUUID(),
+    } };
+    await db.insert(issueThreadInteractions).values({ companyId: f.company.id, issueId: task.id,
+      kind: "request_confirmation", status: "accepted", createdByAgentId: engineer.id,
+      addresseeAgentId: coordinator.id, resolvedByAgentId: coordinator.id,
+      title: "Route cross-model review: task", idempotencyKey: `confirmation:${task.id}:route-review:head:round1`, payload });
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, coordinator.id)).toBe(true);
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, outsider.id)).toBe(false);
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, coordinator.id, engineer.id)).toBe(false);
+    await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.issueId, task.id));
+    expect(await deps.loadAcceptedCoordinatorRouting(f.company.id, task.id, engineer.id, coordinator.id)).toBe(false);
   });
 
   it("holds one merge lock per repository branch across connections", async () => {
