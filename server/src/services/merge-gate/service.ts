@@ -99,8 +99,9 @@ export interface MergeGateDependencies {
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
   /**
    * Who may have authored the task: every agent with a run on it and the
-   * model families those runs recorded. Only the merging coordinator's runs
-   * are left out (`excludeAgentId`). Reviewers are not: a reviewer with a run
+   * model families those runs recorded. The merging coordinator's runs may
+   * be left out (`excludeAgentId`) only after its creator authority is checked.
+   * Reviewers are not: a reviewer with a run
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
    */
@@ -132,14 +133,22 @@ function normalizeRepo(repo: string) {
  * Coordinator-only: a board operator, or an agent that delegated the task
  * (its creator, or the assignee of an ancestor) and is not its implementer.
  */
-export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, actor: MergeGateActor) {
+export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue" | "loadTaskAuthorship">, issue: GateIssue, actor: MergeGateActor) {
   if (actor.type === "board") return;
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
   if (issue.assigneeAgentId === agentId) {
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
-  if (issue.createdByAgentId === agentId) return;
+  if (issue.createdByAgentId === agentId) {
+    // A creator that ran on this task may also be its implementer. Its runs
+    // cannot be excluded from authorship merely because it created the task.
+    const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
+    if (!authorship || authorship.agentIds.includes(agentId)) {
+      throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
+    }
+    return;
+  }
   let parentId = issue.parentId;
   for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
     const parent = await deps.loadIssue(issue.companyId, parentId);
