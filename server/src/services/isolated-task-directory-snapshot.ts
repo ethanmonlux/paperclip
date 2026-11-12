@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { DEFAULT_RESTORE_POINT_LIMITS } from "./git-restore-point.js";
 
 export const TASK_DIRECTORY_RETENTION_KEY = "isolatedTaskDirectoryRetention";
@@ -273,6 +274,85 @@ export async function materializeTaskDirectorySnapshot(input: { payload: Buffer;
   } catch (error) {
     await removeTaskDirectoryTree(staging).catch(() => undefined);
     throw error;
+  }
+}
+
+const MAX_CHANGED_SCAN_ENTRIES = 200_000;
+
+function missing<T>(fallback: T) {
+  return (error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return fallback;
+    throw error;
+  };
+}
+
+/** Regular files and symlinks under `root` whose status-change time is at or
+ * after `sinceMs`. Every write, rename or link advances that time and no
+ * process can set it back, so this lists work done since then. Directories
+ * are skipped, because removing their entries advances their own times, and
+ * so is a regenerable node_modules beside a package.json, which snapshots
+ * never save. Returns null when the folder is too large to scan. */
+export async function taskDirectoryFilesChangedSince(root: string, sinceMs: number,
+  options: { signal?: AbortSignal; maxEntries?: number } = {}): Promise<string[] | null> {
+  const maxEntries = options.maxEntries ?? MAX_CHANGED_SCAN_ENTRIES;
+  const changed: string[] = [];
+  let scanned = 0;
+  const visit = async (relativeDir: string): Promise<boolean> => {
+    options.signal?.throwIfAborted();
+    const names = (await fs.readdir(relativeDir ? path.join(root, relativeDir) : root).catch(missing<string[]>([]))).sort(bySortKey);
+    const manifest = names.includes("package.json")
+      ? await fs.lstat(path.join(root, relativeDir, "package.json")).catch(missing(null)) : null;
+    for (const name of names) {
+      if (++scanned > maxEntries) return false;
+      const relative = relativeDir ? `${relativeDir}/${name}` : name;
+      const stat = await fs.lstat(path.join(root, relative)).catch(missing(null));
+      if (!stat) continue;
+      if (stat.isDirectory()) {
+        if (name === "node_modules" && manifest?.isFile()) continue;
+        if (!await visit(relative)) return false;
+      } else if ((stat.isFile() || stat.isSymbolicLink()) && Math.max(stat.ctimeMs, stat.mtimeMs) >= sinceMs) {
+        changed.push(relative);
+      }
+    }
+    return true;
+  };
+  return await visit("") ? changed : null;
+}
+
+/** Copy the listed files and symlinks from `source` over the same paths in
+ * `target`, replacing whatever is there, so later work wins. */
+export async function overlayTaskDirectoryFiles(source: string, target: string, relatives: string[], signal?: AbortSignal) {
+  const writableDirectory = async (directory: string) => {
+    const stat = await fs.lstat(directory).catch(missing(null));
+    if (stat && !stat.isDirectory()) await fs.rm(directory, { force: true });
+    if (!stat?.isDirectory()) await fs.mkdir(directory, { mode: 0o755 });
+    else if ((stat.mode & 0o700) !== 0o700) await fs.chmod(directory, (stat.mode & 0o777) | 0o700);
+  };
+  for (const relative of relatives) {
+    signal?.throwIfAborted();
+    const parts = relative.split("/");
+    let directory = target;
+    for (const part of parts.slice(0, -1)) {
+      directory = path.join(directory, part);
+      await writableDirectory(directory);
+    }
+    const from = path.join(source, ...parts);
+    const to = path.join(target, ...parts);
+    const stat = await fs.lstat(from).catch(missing(null));
+    if (!stat || !(stat.isFile() || stat.isSymbolicLink())) continue;
+    await fs.rm(to, { recursive: true, force: true });
+    if (stat.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(from), to);
+      continue;
+    }
+    const input = await fs.open(from, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const output = await fs.open(to, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      stat.mode & 0o777).catch(async (error: unknown) => {
+      await input.close();
+      throw error;
+    });
+    // The streams own and close both handles, also when the copy fails.
+    await pipeline(input.createReadStream(), output.createWriteStream(), signal ? { signal } : {});
   }
 }
 

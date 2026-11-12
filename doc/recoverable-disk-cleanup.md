@@ -379,11 +379,18 @@ server could not finish is finished by a later sweep. A crash right after the re
 leaves the folder under its `.expired-` name, where a process still inside it can keep
 working, so the later sweep checks that renamed folder the same way, locally, before
 deleting it. If it changed, it is renamed back, the workspace is made active again and the
-restore point is dropped (`task_directory_changed`). The intent records `removalStartedAt`
-once that check passed and deletion begins, so a sweep after a partly completed deletion
-finishes it instead of treating the remainder as a change. Reopening before that sweep
-renames the `.expired-` folder back as it is, keeping any later work; only a partly
-deleted one is removed and rebuilt from the restore point.
+restore point is dropped (`task_directory_changed`). When deletion begins, the intent
+records `removalCheckedAt`: the time the check before it started. A sweep after a stop at
+any point from there no longer compares the remainder with the saved files, because part
+of it may be gone. It finishes the deletion only if no file or symlink left in the folder
+changed since `removalCheckedAt`. A file's change time advances on every write, rename or
+link and cannot be set back. Anything newer is later work by a process still inside the
+folder, so the sweep keeps the folder and the intent (`task_directory_later_work`), and the
+trash sweep never deletes a pending intent's `.expired-` folder. Reopening renames an
+`.expired-` folder whose deletion never began back as it is. A partly deleted one is
+rebuilt from the restore point in staging, the files written since `removalCheckedAt` are
+copied over it, and only then is the remainder deleted, so the later commit or edit is
+kept.
 
 Reopening the workspace restores the directory before anything uses it: a comment or an
 agent update on an issue bound to a closed `isolated_workspace`, or the next run of the

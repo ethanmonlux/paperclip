@@ -32,8 +32,10 @@ import {
   inspectTaskDirectory,
   materializeTaskDirectorySnapshot,
   newestTaskDirectoryMtime,
+  overlayTaskDirectoryFiles,
   removeTaskDirectoryTree,
   shortSiblingName,
+  taskDirectoryFilesChangedSince,
   TASK_DIRECTORY_RETENTION_KEY,
   TaskDirectoryRestoreFailure,
   TaskDirectorySnapshotSkip,
@@ -51,6 +53,8 @@ export const TASK_DIRECTORY_RESTORE_POINT_EXPIRED_WARNING = "The saved files of 
 export const TASK_DIRECTORY_RETRY_MS = 60 * 60 * 1000;
 export const TASK_DIRECTORY_RECHECK_MS = 24 * 60 * 60 * 1000;
 const TRASH_GRACE_MS = 60 * 60 * 1000;
+/** File times come from a coarse kernel clock that can trail Date.now(). */
+const FILE_CLOCK_SLACK_MS = 50;
 const NAMESPACE = "git-restore-points";
 const MAX_RESTORE_POINT_BYTES = 512 * 1024 * 1024;
 const IDENTITY = /^[a-zA-Z0-9_-]+$/;
@@ -84,9 +88,10 @@ export type TaskDirectoryRetention = {
   removed: boolean;
   trash: string;
   restorePoint: TaskDirectoryRestorePointRef;
-  /** Set once the trash folder was checked and its deletion began, so a
-   * restart finishes a partial removal instead of checking what is left. */
-  removalStartedAt?: string;
+  /** Set when deletion of the trash folder begins, to the time the check
+   * before it started. A restart finishes a partial removal only if nothing
+   * in what is left changed since then; later work is kept. */
+  removalCheckedAt?: string;
   removedAt?: string;
 };
 
@@ -376,9 +381,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
             // A saved intent can survive a crash after the rename. Preview the
             // actual trash object, never the original folder's old estimate.
             if (await directoryState(state.trash) !== "present") throw new Error("missing_task_directory");
-            if (!state.removalStartedAt && !await savedContentsUnchanged(state.trash, state.restorePoint, options)) {
-              throw new Error("task_directory_changed");
-            }
+            await checkTaskDirectoryTrash(state, options);
             result.candidateBytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; });
           }
           result.candidate = true;
@@ -389,15 +392,21 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, undefined, { closedSiblingsAllowed: true })) {
           throw new Error("live_or_unresolved_consumer");
         }
-        if (!state.removalStartedAt && await directoryState(state.trash) === "present") {
+        // Anything changed in the folder after this time is not covered by the
+        // check below.
+        const checkedAt = new Date(Date.now() - FILE_CLOCK_SLACK_MS).toISOString();
+        if (await directoryState(state.trash) === "present") {
           // A crash after the rename leaves the folder at its trash path, where
           // a process still inside it can keep working. Check what is actually
           // there, locally, before deleting it.
           if (await directoryState(cwd) === "present") throw new Error("unknown_task_directory_trash");
-          if (!await savedContentsUnchanged(state.trash, state.restorePoint, options)) {
+          try {
+            await checkTaskDirectoryTrash(state, options);
+          } catch (error) {
+            if (!(error instanceof Error && error.message === "task_directory_changed")) throw error;
             await fs.rename(state.trash, cwd);
             await releaseChangedTaskDirectory(db, workspace, state);
-            throw new Error("task_directory_changed");
+            throw error;
           }
         } else if (await directoryState(cwd) === "present") {
           if (await exists(state.trash)) throw new Error("unknown_task_directory_trash");
@@ -409,10 +418,10 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         }
         if (await exists(state.trash)) {
           const bytes = await exclusiveAllocatedBytes(state.trash, () => { options.signal?.throwIfAborted(); return true; }).catch(() => result.candidateBytes);
-          if (!state.removalStartedAt) {
+          if (!state.removalCheckedAt) {
             await db.update(executionWorkspaces).set({
-              metadata: sql`jsonb_set(${executionWorkspaces.metadata}, ${`{${TASK_DIRECTORY_RETENTION_KEY},removalStartedAt}`}::text[],
-                ${JSON.stringify(new Date().toISOString())}::jsonb)`,
+              metadata: sql`jsonb_set(${executionWorkspaces.metadata}, ${`{${TASK_DIRECTORY_RETENTION_KEY},removalCheckedAt}`}::text[],
+                ${JSON.stringify(checkedAt)}::jsonb)`,
               updatedAt: new Date(),
             }).where(and(eq(executionWorkspaces.id, workspace.id),
               sql`${executionWorkspaces.metadata}->${TASK_DIRECTORY_RETENTION_KEY}->'restorePoint'->>'objectKey' = ${state.restorePoint.objectKey}`));
@@ -467,6 +476,21 @@ async function releaseChangedTaskDirectory(db: Db, workspace: Workspace, state: 
 
 function samePaths(listed: string[], repositories: TaskDirectoryRepositoryRecipe[]) {
   return JSON.stringify([...listed].sort()) === JSON.stringify(repositories.map(repository => repository.path).sort());
+}
+
+/** Check a folder left at its trash path before deleting it. Before deletion
+ * began it must still hold exactly what was saved. After that, part of it may
+ * already be gone, so nothing in what is left may have changed since the
+ * check that preceded the deletion: a process still inside the folder can
+ * keep working there, and that work is kept rather than trusting the marker. */
+async function checkTaskDirectoryTrash(state: TaskDirectoryRetention,
+  options: { restorePoint?: TaskDirectoryRestorePointOptions; signal?: AbortSignal }) {
+  if (!state.removalCheckedAt) {
+    if (!await savedContentsUnchanged(state.trash, state.restorePoint, options)) throw new Error("task_directory_changed");
+    return;
+  }
+  const later = await taskDirectoryFilesChangedSince(state.trash, Date.parse(state.removalCheckedAt), { signal: options.signal });
+  if (later === null || later.length > 0) throw new Error("task_directory_later_work");
 }
 
 /** The folder still holds exactly what its restore point saved: the outer
@@ -527,33 +551,45 @@ export async function restoreIsolatedTaskDirectory(input: {
       throw new TaskDirectoryRestoreFailure("task_directory_diverged");
     }
   }
-  if (!state.removed && path.dirname(state.trash) === parent && await directoryState(state.trash) === "present") {
+  // Files written after the check that preceded a partial removal.
+  let later: string[] = [];
+  const trash = !state.removed && path.dirname(state.trash) === parent && await directoryState(state.trash) === "present";
+  if (trash) {
     // A crash after the rename leaves the folder itself, possibly with later
-    // work. Reopen it as it is; a partly removed one is rebuilt instead.
-    if (!state.removalStartedAt) {
+    // work. Reopen it as it is. A partly removed one is rebuilt from the
+    // restore point, carrying over whatever was written in it since.
+    if (!state.removalCheckedAt) {
       await fs.rename(state.trash, cwd);
       return { restored: true, expired: false, repositories: 0 };
     }
-    await removeTaskDirectoryTree(state.trash);
+    const changed = await taskDirectoryFilesChangedSince(state.trash, Date.parse(state.removalCheckedAt), { signal: input.signal });
+    if (changed === null) throw new TaskDirectoryRestoreFailure("task_directory_later_work_too_large");
+    later = changed;
   }
+  let staging: string;
   if (ref.expiredAt) {
-    await fs.mkdir(cwd, { mode: 0o700 });
-    return { restored: false, expired: true, repositories: 0 };
+    staging = shortSiblingName(cwd, ".restoring-");
+    await fs.mkdir(staging, { mode: 0o700 });
+  } else {
+    if (repositories.length > 0 && !input.resolveGitAuth) throw new TaskDirectoryRestoreFailure("repository_access_unavailable");
+    const payload = await loadTaskDirectoryRestorePoint({ ...input, ref });
+    staging = await materializeTaskDirectorySnapshot({ payload, target: cwd, expectedDigest: ref.digest, signal: input.signal });
   }
-  if (repositories.length > 0 && !input.resolveGitAuth) throw new TaskDirectoryRestoreFailure("repository_access_unavailable");
-  const payload = await loadTaskDirectoryRestorePoint({ ...input, ref });
-  const staging = await materializeTaskDirectorySnapshot({ payload, target: cwd, expectedDigest: ref.digest, signal: input.signal });
   try {
     // Checkouts are rebuilt in staging, so a failed fetch never leaves a
     // partial folder in place and the reopen can be retried.
-    if (repositories.length > 0) {
+    if (!ref.expiredAt && repositories.length > 0) {
       await restoreTaskDirectoryRepositories(staging, repositories, { resolveGitAuth: input.resolveGitAuth!, signal: input.signal });
     }
+    await overlayTaskDirectoryFiles(state.trash, staging, later, input.signal);
     await fs.rename(staging, cwd);
   } catch (error) {
     await removeTaskDirectoryTree(staging).catch(() => undefined);
     throw error;
   }
+  // Only now that its later work is in place may the partly removed folder go.
+  if (trash) await removeTaskDirectoryTree(state.trash);
+  if (ref.expiredAt) return { restored: false, expired: true, repositories: 0 };
   return { restored: true, expired: false, repositories: repositories.length };
 }
 
@@ -831,6 +867,11 @@ export async function sweepIsolatedTaskDirectories(db: Db, options: FolderSweepO
         const folder = path.join(companyDir, name);
         const stat = await fs.lstat(folder).catch(() => null);
         if (!stat || options.dryRun) continue;
+        // A pending intent's trash may hold later work; its own check decides.
+        const [owner] = await db.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(and(
+          sql`${executionWorkspaces.metadata}->${TASK_DIRECTORY_RETENTION_KEY}->>'trash' = ${folder}`,
+          sql`${executionWorkspaces.metadata}->${TASK_DIRECTORY_RETENTION_KEY}->>'removed' = 'false'`)).limit(1);
+        if (owner) continue;
         const touched = Math.max(stat.mtimeMs, stat.ctimeMs);
         if (touched + TRASH_GRACE_MS > nowMs) { retry(touched + TRASH_GRACE_MS); continue; }
         await removeTaskDirectoryTree(folder).catch(() => retry(nowMs + TASK_DIRECTORY_RETRY_MS));

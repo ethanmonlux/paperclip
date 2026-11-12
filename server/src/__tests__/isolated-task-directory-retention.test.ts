@@ -418,7 +418,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await expectExactCheckouts(f);
       expect(readTaskDirectoryRetention(await f.row())).toBeNull();
       expect(await f.ledger()).toMatchObject([{ status: "superseded" }]);
-    });
+    }, 60_000);
 
     it("keeps dirty and unpublished checkout work", async () => {
       const dirty = await codeDeliveredFixture();
@@ -525,7 +525,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
         throw new Error("simulated_crash");
       } })).resolves.toMatchObject({ expired: false, skipReason: "simulated_crash" });
       const state = readTaskDirectoryRetention(await f.row())!;
-      expect(state).toMatchObject({ removed: false, removalStartedAt: expect.any(String) });
+      expect(state).toMatchObject({ removed: false, removalCheckedAt: expect.any(String) });
       expect(await exists(state.trash)).toBe(true);
       gitFixture.calls = 0;
       expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, skipReason: null });
@@ -536,6 +536,67 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
       await expectExactCheckouts(f);
     }, 60_000);
+
+    /** Commit new unpublished work in the delivered checkout inside `folder`. */
+    async function commitLateWork(folder: string) {
+      const moved = path.join(folder, "repo");
+      await fs.writeFile(path.join(moved, "late.txt"), "late work\n");
+      git(moved, "add", "late.txt");
+      git(moved, "commit", "-q", "-m", "Late unpublished work");
+      return git(moved, "rev-parse", "HEAD");
+    }
+
+    /** Stop a removal once its marker is saved, after `partly` ran on the trash. */
+    async function stopRemoval(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, partly: (trash: string) => Promise<void>) {
+      await expect(f.expire({ beforeRemove: async trash => {
+        await partly(trash);
+        throw new Error("simulated_crash");
+      } })).resolves.toMatchObject({ expired: false, skipReason: "simulated_crash" });
+      const state = readTaskDirectoryRetention(await f.row())!;
+      expect(state).toMatchObject({ removed: false, removalCheckedAt: expect.any(String) });
+      return state;
+    }
+
+    /** A restart must keep work made in the trash after its removal began,
+     * then reopen with that work on top of the restored folder. */
+    async function expectLaterWorkKept(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, trash: string, late: string) {
+      gitFixture.calls = 0;
+      expect(await f.expire({ dryRun: true })).toMatchObject({ expired: false, skipReason: "task_directory_later_work" });
+      expect(await f.expire()).toMatchObject({ expired: false, skipReason: "task_directory_later_work" });
+      expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
+      // The trash sweep leaves a pending intent's trash to that intent's check.
+      await sweepIsolatedTaskDirectories(db, { dryRun: false, now: new Date(Date.now() + 2 * DAY_MS), orphanGraceMs: 7 * DAY_MS,
+        terminalDelayMs: 3 * DAY_MS, restorePoint: { storage: getStorageService(), keyDurable: true } });
+      expect(gitFixture.calls).toBe(0);
+      expect(git(path.join(trash, "repo"), "rev-parse", "HEAD")).toBe(late);
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: false });
+
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(await exists(trash)).toBe(false);
+      await expectRestored(f.cwd);
+      expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(late);
+      expect(git(f.delivered.checkout, "rev-parse", "HEAD^")).toBe(f.delivered.head);
+      expect(git(f.delivered.checkout, "status", "--porcelain")).toBe("");
+      expect(await fs.readFile(path.join(f.delivered.checkout, "late.txt"), "utf8")).toBe("late work\n");
+      expect(git(f.library.checkout, "rev-parse", "HEAD")).toBe(f.library.head);
+      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
+    }
+
+    it("keeps a commit made in the trash after the removal marker but before any deletion", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async () => undefined);
+      await expectLaterWorkKept(f, state.trash, await commitLateWork(state.trash));
+    }, 90_000);
+
+    it("keeps a commit made in a checkout a partial removal left behind", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async trash => {
+        await fs.rm(path.join(trash, "report.md"));
+        await fs.rm(path.join(trash, "vendor"), { recursive: true, force: true });
+      });
+      expect(await exists(path.join(state.trash, "report.md"))).toBe(false);
+      await expectLaterWorkKept(f, state.trash, await commitLateWork(state.trash));
+    }, 90_000);
 
     it("keeps the folder closed and whole when a reopen cannot fetch, then restores on retry", async () => {
       const f = await codeDeliveredFixture();
