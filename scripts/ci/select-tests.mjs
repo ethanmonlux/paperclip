@@ -115,7 +115,12 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
       for (const project of inventory.workspaceProjects) projects.add(project);
     }
   }
-  let graphs = await selectProjects({ projects: [...projects], changed });
+  // Vitest reruns every test for any changed package.json. A manifest is not a test input: the
+  // affected-package typecheck owns it, and it is named below as left to the certification.
+  const graphInputs = focused ? changed.filter((file) => path.posix.basename(file) !== "package.json") : changed;
+  let graphs = await selectProjects({ projects: [...projects], changed: graphInputs });
+  // The root Vitest configuration is every project's configuration, so it invalidates them all.
+  if (focused && plan.staple.testConfig) graphs = graphs.map((graph) => ({ ...graph, setupChanged: true, selected: graph.inventory }));
   if (focused) graphs = graphs.map((graph) => focusGraph(graph, changed));
   for (const graph of graphs) {
     const { project } = graph;
@@ -130,6 +135,7 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
     assert.ok(focused, `Change outside the resolved test graphs: ${file}`);
   }
   if (focused) {
+    if (plan.staple.testConfig) covered.add(plan.staple.testConfig);
     focus.ungraphed = changed.filter((file) => !covered.has(file) && !sources.includes(file));
     focus.uncovered = sources.filter((file) => !covered.has(file));
     focus.wholeProjects = graphs.filter(wholeProject).map((graph) => graph.project);
@@ -172,7 +178,8 @@ export async function createTestSelection(plan, head, root = process.cwd()) {
       const selected = new Set(graph.selected);
       return { ...graph, budgetDeferred: complete[index].selected.filter((file) => !selected.has(file)) };
     });
-    if (focus.wholeProjects.length) kept = `every test of ${focus.wholeProjects.join(", ")}, and ${kept} of the other projects`;
+    if (focus.wholeProjects.length === graphs.length) kept = "every test of every project";
+    else if (focus.wholeProjects.length) kept = `every test of ${focus.wholeProjects.join(", ")}, and ${kept} of the other projects`;
     focus.budget.exceeded = { files, jobs: focus.budget.jobs, kept,
       left: graphs.reduce((total, graph) => total + graph.budgetDeferred.length, 0) };
     focus.budget.jobs = jobs(result);
