@@ -70,6 +70,8 @@ function harness(input: {
   authorFamilies?: string[] | null; authorAgents?: string[]; coordinatorFamilies?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
   legacyCoordinator?: string;
   routedCoordinator?: string;
+  /** The task's recorded creator/assignee/checkout history; defaults to its creator and assignee. */
+  custodians?: string[] | null;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
@@ -79,6 +81,7 @@ function harness(input: {
   const logs: Array<{ action: string; details: Record<string, unknown> }> = [];
   const locks = input.locks ?? new Set<string>();
   const authorQueries: Array<{ issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[] }> = [];
+  const custodianQueries: string[] = [];
   const deps: MergeGateDependencies = {
     github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
@@ -94,6 +97,12 @@ function harness(input: {
         agentIds: query.sourceAuthorAgentIds ?? [...(input.authorAgents ?? ["claude-engineer"]), ...(coordinatorRuns ? ["coordinator"] : [])],
         modelFamilies: query.sourceAuthorAgentIds ? families : [...families, ...(coordinatorRuns ? input.coordinatorFamilies ?? [] : [])],
       };
+    },
+    loadTaskCustodians: async (_company, issueId) => {
+      custodianQueries.push(issueId);
+      if (input.custodians !== undefined) return input.custodians;
+      const task = issues.get(issueId);
+      return [task?.createdByAgentId, task?.assigneeAgentId].filter((id): id is string => Boolean(id));
     },
     // The database lock is a try-lock shared across server instances.
     withMergeLock: async (key, action) => {
@@ -116,7 +125,7 @@ function harness(input: {
     parkOnIssue: async request => { parked.push({ issueId: request.issueId, blockerIssueId: request.blockerIssueId }); },
     log: async entry => { logs.push({ action: entry.action, details: entry.details }); },
   };
-  return { deps, issues, owners, parked, logs, authorQueries };
+  return { deps, issues, owners, parked, logs, authorQueries, custodianQueries };
 }
 
 const coordinator = { type: "agent" as const, agentId: "coordinator", runId: "run-1" };
@@ -240,14 +249,50 @@ describe("merge gate service", () => {
 
   it("uses the completed reviewer's attested source authors for the live STA-315 board shape", async () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
-    const h = harness({ github, coordinatorFamilies: ["openai"], reviews: [review({
+    // The STA-326 reviewer ran on STA-315 only to comment; it never created,
+    // held or checked out the task.
+    const h = harness({ github, coordinatorFamilies: ["openai"], custodians: ["claude-engineer", "coordinator"], reviews: [review({
       reviewIssueIdentifier: "STA-326", sourceAuthorAgentIds: ["claude-engineer"],
     })], issues: [issue({ id: "task", status: "blocked", assigneeAgentId: "coordinator",
       createdByAgentId: "claude-engineer", parentId: null })] });
     await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
       .resolves.toMatchObject({ outcome: "mergeable", reasons: [] });
+    expect(h.custodianQueries).toEqual(["task"]);
     expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null,
       sourceAuthorAgentIds: ["claude-engineer"] }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("does not let an implementer attest itself out of the source authors", async () => {
+    // Codex held and implemented the task before it went to Claude. Codex then
+    // reviews it and lists only Claude as the source author. No commit trailer
+    // names Codex.
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const selfAttested = review({ reviewIssueIdentifier: "STA-SELF", reviewerAgentId: "codex-implementer",
+      sourceAuthorAgentIds: ["claude-engineer"] });
+    const refusedSelfReview = { outcome: "refused", reasons: [{ code: "review_not_independent",
+      detail: expect.stringContaining("worked on this task") }] };
+    const h = harness({ github, reviews: [selfAttested], authorAgents: ["codex-implementer", "claude-engineer"],
+      authorFamilies: ["anthropic", "openai"], custodians: ["claude-engineer", "codex-implementer", "coordinator"] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "lead-coordinator", runId: "r" } })))
+      .resolves.toMatchObject(refusedSelfReview);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    // The attestation never narrowed authorship: every run on the task counted.
+    expect(h.authorQueries.filter(query => query.sourceAuthorAgentIds)).toEqual([]);
+    // Unreadable task history cannot establish the attester's independence either.
+    const unknownHistory = harness({ github, reviews: [selfAttested], authorAgents: ["codex-implementer", "claude-engineer"],
+      authorFamilies: ["anthropic", "openai"], custodians: null });
+    await expect(evaluateAndMerge(unknownHistory.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    expect(unknownHistory.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    // A reviewer that lists itself as a source author is not attesting independence.
+    const listsItself = harness({ github, reviews: [review({ sourceAuthorAgentIds: ["codex-reviewer"] })],
+      authorAgents: ["codex-reviewer", "claude-engineer"], authorFamilies: ["anthropic", "openai"] });
+    await expect(evaluateAndMerge(listsItself.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    expect(listsItself.custodianQueries).toEqual([]);
     expect(merge).not.toHaveBeenCalled();
   });
 

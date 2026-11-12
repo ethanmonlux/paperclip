@@ -113,6 +113,13 @@ export interface MergeGateDependencies {
   loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[] }) =>
     Promise<{ agentIds: string[]; modelFamilies: string[] } | null>;
   /**
+   * Agents the task's own record ties to it as a possible implementer: its
+   * creator, every agent ever assigned it or that checked it out, and its
+   * current assignee. Read from the issue and its activity log, never from a
+   * review document. Null when that history cannot be read.
+   */
+  loadTaskCustodians: (companyId: string, issueId: string) => Promise<string[] | null>;
+  /**
    * Run `action` holding the merge lock for one repository branch, across
    * server instances. Returns `MERGE_LOCK_BUSY` when another merge holds it.
    */
@@ -305,13 +312,22 @@ async function evaluateLocked(
   // already shown to have no runs on the task, is excluded. A handoff
   // coordinator (legacy return or accepted routing) may have authored code,
   // so its runs remain potential authorship.
-  // A completed review can attest the exhaustive source author set. Validate
-  // those identities against started task runs in the database; coordination
-  // and review runs on the source task are not source authors by default.
-  const sourceReview = [...independentOfMerger].reverse().find(review =>
+  // A completed review can attest the exhaustive source author set, so
+  // coordination and review runs on the task stop counting as authorship.
+  // The attesting reviewer must be independent of the implementation by the
+  // task's own history (never its creator, assignee or checkout holder),
+  // which the attestation cannot narrow; otherwise an implementer could list
+  // only another agent and pass its own review. The attested agents must
+  // still have started runs on the task.
+  const attestations = independentOfMerger.filter(review =>
     review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
-    review.pullRequest?.toLowerCase() === label.toLowerCase() && review.reviewedSha === headSha &&
-    review.sourceAuthorAgentIds?.length);
+    review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
+    review.reviewedSha === headSha && review.sourceAuthorAgentIds?.length &&
+    !review.sourceAuthorAgentIds.includes(review.reviewerAgentId));
+  const custodians = attestations.length > 0 ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
+  const sourceReview = custodians
+    ? attestations.reverse().find(review => !custodians.includes(review.reviewerAgentId!))
+    : undefined;
   const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
   const authorship = await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,

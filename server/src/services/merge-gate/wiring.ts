@@ -1,5 +1,5 @@
 /** Database and GitHub wiring for the protected-main merge gate (FAC-840 B). */
-import { and, asc, desc, eq, gte, inArray, isNotNull, lte, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -166,6 +166,38 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         row.title?.startsWith("Route cross-model review:") &&
         "target" in row.payload && row.payload.target?.type === "issue_document" &&
         row.payload.target.issueId === issueId);
+    },
+    async loadTaskCustodians(companyId, issueId) {
+      // Only an assignee can check a task out, and every reassignment is
+      // logged with both sides, so the creator, the current assignee and these
+      // events name every agent that could have executed it.
+      const [issue] = await db.select({ createdByAgentId: issues.createdByAgentId, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).limit(1);
+      if (!issue) return null;
+      const events = await db.select({ action: activityLog.action, agentId: activityLog.agentId, details: activityLog.details })
+        .from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId), or(
+            inArray(activityLog.action, ["issue.created", "issue.child_created", "issue.checked_out"]),
+            and(eq(activityLog.action, "issue.updated"),
+              sql`${activityLog.details} -> 'changes' -> 'assigneeAgentId' is not null`),
+          )))
+        .limit(MAX_ASSIGNMENT_EVENTS + 1);
+      if (events.length > MAX_ASSIGNMENT_EVENTS) return null;
+      const custodians = new Set<string>();
+      const add = (value: unknown) => { if (typeof value === "string" && value) custodians.add(value); };
+      add(issue.createdByAgentId);
+      add(issue.assigneeAgentId);
+      for (const event of events) {
+        add(event.details?.assigneeAgentId);
+        if (event.action === "issue.checked_out") {
+          add(event.agentId);
+          add(event.details?.agentId);
+        }
+        const change = assignmentChange(event.details);
+        add(change?.from);
+        add(change?.to);
+      }
+      return [...custodians].sort();
     },
     async loadTaskAuthorship(companyId, input) {
       // Without a reviewer-attested source author set, every task run remains

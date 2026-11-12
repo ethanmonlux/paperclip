@@ -146,6 +146,31 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     expect(await deps.loadLegacyDelegation(f.company.id, task.id, coordinator.id)).toBe(false);
   });
 
+  it("names every creator, assignee and checkout holder of a task as a custodian, not a commenting reviewer", async () => {
+    const f = await fixture();
+    const engineer = await f.agent("Engineer", "claude_local");
+    const coordinator = await f.agent("Coordinator", "codex_local");
+    const helper = await f.agent("Helper", "codex_local");
+    const reviewer = await f.agent("Reviewer", "codex_local");
+    // STA-315 shape: the engineer holds it, a helper held it briefly, and the
+    // coordinator holds it now. The reviewer only ran on it to comment.
+    const task = await f.issue("Engineer task", coordinator.id);
+    await db.update(issues).set({ createdByAgentId: engineer.id }).where(eq(issues.id, task.id));
+    const event = async (action: string, agentId: string, details: Record<string, unknown>) =>
+      db.insert(activityLog).values({ companyId: f.company.id, entityType: "issue", entityId: task.id,
+        action, actorType: "agent", actorId: agentId, agentId, details });
+    await event("issue.created", engineer.id, { assigneeAgentId: engineer.id });
+    await event("issue.updated", engineer.id, { changes: { assigneeAgentId: { from: engineer.id, to: helper.id } } });
+    await event("issue.updated", helper.id, { changes: { status: { from: "todo", to: "in_progress" } } });
+    await event("issue.updated", coordinator.id, { changes: { assigneeAgentId: { from: helper.id, to: coordinator.id } } });
+    await event("issue.comment_added", reviewer.id, { bodySnippet: "review attached" });
+    await f.run(reviewer.id, task.id, { model: "gpt-6.1-sol" });
+    const deps = createMergeGateDependencies(db);
+    expect(await deps.loadTaskCustodians(f.company.id, task.id))
+      .toEqual([engineer.id, coordinator.id, helper.id].sort());
+    expect(await deps.loadTaskCustodians(f.company.id, crypto.randomUUID())).toBeNull();
+  });
+
   it("recognizes only an accepted, addressed STA-315 review routing record", async () => {
     const f = await fixture();
     const engineer = await f.agent("Engineer", "claude_local");
