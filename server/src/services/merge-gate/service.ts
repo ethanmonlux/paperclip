@@ -100,7 +100,7 @@ export interface MergeGateDependencies {
   /**
    * Who may have authored the task: every agent with a run on it and the
    * model families those runs recorded. The merging coordinator's runs may
-   * be left out (`excludeAgentId`) only after its creator authority is checked.
+   * be left out (`excludeAgentId`) only after its coordinator authority is checked.
    * Reviewers are not: a reviewer with a run
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
@@ -140,23 +140,29 @@ export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssu
   if (issue.assigneeAgentId === agentId) {
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
-  if (issue.createdByAgentId === agentId) {
-    // A creator that ran on this task may also be its implementer. Its runs
-    // cannot be excluded from authorship merely because it created the task.
-    const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
-    if (!authorship || authorship.agentIds.includes(agentId)) {
-      throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
+  let coordinatesTask = issue.createdByAgentId === agentId;
+  if (!coordinatesTask) {
+    let parentId = issue.parentId;
+    for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const parent = await deps.loadIssue(issue.companyId, parentId);
+      if (!parent) break;
+      if (parent.assigneeAgentId === agentId) {
+        coordinatesTask = true;
+        break;
+      }
+      parentId = parent.parentId;
     }
-    return;
   }
-  let parentId = issue.parentId;
-  for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
-    const parent = await deps.loadIssue(issue.companyId, parentId);
-    if (!parent) break;
-    if (parent.assigneeAgentId === agentId) return;
-    parentId = parent.parentId;
+  if (!coordinatesTask) {
+    throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
   }
-  throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
+  // Either authority path can belong to a former implementer. Never exclude
+  // the coordinator's task runs without first checking the full run history.
+  const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
+  if (!authorship) throw forbidden("Task authorship could not be established; the merge gate cannot authorize this agent");
+  if (authorship.agentIds.includes(agentId)) {
+    throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
+  }
 }
 
 async function isRedMainExempt(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, ownerIssueId: string) {

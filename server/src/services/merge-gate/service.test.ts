@@ -170,11 +170,24 @@ describe("merge gate service", () => {
     expect(merge).not.toHaveBeenCalled();
   });
 
+  it("refuses an ancestor coordinator that implemented before handing the task to another agent", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const h = harness({ github, issues: [
+      issue({ id: "task", parentId: "parent", createdByAgentId: null, assigneeAgentId: "claude-engineer" }),
+      issue({ id: "parent", assigneeAgentId: "codex-engineer" }),
+    ], authorAgents: ["codex-engineer", "claude-engineer"], authorFamilies: ["anthropic"] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "codex-engineer", runId: "ancestor-run" } })))
+      .rejects.toThrow(/implementer cannot merge/);
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
   it("fails closed when a creator's run history cannot be established", async () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
     const h = harness({ github, authorFamilies: null });
     await expect(evaluateAndMerge(h.deps, request()))
-      .rejects.toThrow(/implementer cannot merge/);
+      .rejects.toThrow(/authorship could not be established/);
     expect(merge).not.toHaveBeenCalled();
   });
 
@@ -289,7 +302,7 @@ describe("merge gate service", () => {
       issue({ id: "parent", assigneeAgentId: "coordinator" }),
     ] });
     await expect(evaluateAndMerge(missing.deps, request()))
-      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }] });
+      .rejects.toThrow(/authorship could not be established/);
     expect(coAuthorModelFamilies(["fix\n\nCo-authored-by: Codex <codex@openai.com>", null])).toEqual(["openai"]);
   });
 
