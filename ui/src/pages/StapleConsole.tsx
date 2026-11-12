@@ -269,60 +269,65 @@ function ConsoleCard({
         </div>
       ) : null}
 
-      {open ? (
-        <div className="mt-3 space-y-2 border-t border-border pt-2 text-xs" data-testid="staple-console-card-detail">
-          {card.stuck.map((flag, index) => (
-            <p key={`${flag.rule}-${flag.issueIdentifier}-${index}`} className="text-destructive" data-rule={flag.rule}>
-              Stuck · {flag.issueIdentifier}: {flag.reason}
-            </p>
-          ))}
-          {card.completionNote ? <p className="text-muted-foreground [overflow-wrap:anywhere]">{card.completionNote}</p> : null}
-          <div>
-            <h4 className="font-medium text-foreground">PR and CI</h4>
-            {card.pullRequests.length > 0 ? (
-              <ul className="mt-0.5 space-y-0.5">{card.pullRequests.map((pr) => <ProofPr key={pr.url} pr={pr} />)}</ul>
-            ) : (
-              <p className="text-muted-foreground">No PR linked</p>
-            )}
-          </div>
-          <p>
-            <span className="font-medium text-foreground">Review </span>
-            {card.review ? (
-              <span className="text-muted-foreground">
-                {card.review.outcome === "approved" ? "approved" : "changes requested"} by {card.review.reviewerName ?? "unknown"}, {since(card.review.at, now) ?? "unknown"} ago
+      {open ? <CardDetail card={card} now={now} /> : null}
+    </article>
+  );
+}
+
+/** Level 4 proof for one card: shared by the lane card and the compact Shipped today row. */
+function CardDetail({ card, now }: { card: StapleConsoleCard; now: number }) {
+  return (
+    <div className="mt-3 space-y-2 border-t border-border pt-2 text-xs" data-testid="staple-console-card-detail">
+      {card.stuck.map((flag, index) => (
+        <p key={`${flag.rule}-${flag.issueIdentifier}-${index}`} className="text-destructive" data-rule={flag.rule}>
+          Stuck · {flag.issueIdentifier}: {flag.reason}
+        </p>
+      ))}
+      {card.completionNote ? <p className="text-muted-foreground [overflow-wrap:anywhere]">{card.completionNote}</p> : null}
+      <div>
+        <h4 className="font-medium text-foreground">PR and CI</h4>
+        {card.pullRequests.length > 0 ? (
+          <ul className="mt-0.5 space-y-0.5">{card.pullRequests.map((pr) => <ProofPr key={pr.url} pr={pr} />)}</ul>
+        ) : (
+          <p className="text-muted-foreground">No PR linked</p>
+        )}
+      </div>
+      <p>
+        <span className="font-medium text-foreground">Review </span>
+        {card.review ? (
+          <span className="text-muted-foreground">
+            {card.review.outcome === "approved" ? "approved" : "changes requested"} by {card.review.reviewerName ?? "unknown"}, {since(card.review.at, now) ?? "unknown"} ago
+          </span>
+        ) : (
+          <span className="text-muted-foreground">none recorded</span>
+        )}
+      </p>
+      <div>
+        <h4 className="font-medium text-foreground">Tasks</h4>
+        <ul className="mt-0.5 space-y-0.5">
+          {card.members.map((member) => (
+            <li key={member.identifier} className="flex gap-1">
+              <Link to={`/issues/${member.identifier}`} className="shrink-0 underline">{member.identifier}</Link>
+              <span className="min-w-0 truncate text-muted-foreground">
+                {member.role} · {member.status.replace(/_/g, " ")}
+                {member.assigneeName ? ` · ${member.assigneeName}` : ""}
               </span>
-            ) : (
-              <span className="text-muted-foreground">none recorded</span>
-            )}
-          </p>
-          <div>
-            <h4 className="font-medium text-foreground">Tasks</h4>
-            <ul className="mt-0.5 space-y-0.5">
-              {card.members.map((member) => (
-                <li key={member.identifier} className="flex gap-1">
-                  <Link to={`/issues/${member.identifier}`} className="shrink-0 underline">{member.identifier}</Link>
-                  <span className="min-w-0 truncate text-muted-foreground">
-                    {member.role} · {member.status.replace(/_/g, " ")}
-                    {member.assigneeName ? ` · ${member.assigneeName}` : ""}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-          {card.lastComment ? (
-            <div>
-              <h4 className="font-medium text-foreground">
-                Last comment <span className="font-normal text-muted-foreground">
-                  · {card.lastComment.issueIdentifier} · {card.lastComment.authorName ?? "unknown"} · {since(card.lastComment.at, now) ?? "unknown"} ago
-                </span>
-              </h4>
-              <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{card.lastComment.excerpt}</p>
-            </div>
-          ) : null}
-          <p className="text-[10px] text-muted-foreground">Lane from {card.laneSource}</p>
+            </li>
+          ))}
+        </ul>
+      </div>
+      {card.lastComment ? (
+        <div>
+          <h4 className="font-medium text-foreground">
+            Last comment <span className="font-normal text-muted-foreground">
+              · {card.lastComment.issueIdentifier} · {card.lastComment.authorName ?? "unknown"} · {since(card.lastComment.at, now) ?? "unknown"} ago
+            </span>
+          </h4>
+          <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{card.lastComment.excerpt}</p>
         </div>
       ) : null}
-    </article>
+      <p className="text-[10px] text-muted-foreground">Lane from {card.laneSource}</p>
+    </div>
   );
 }
 
@@ -692,17 +697,35 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
           <ul className="divide-y divide-border rounded-md border border-border text-xs">
             {shipped.map((target) => {
               const merged = target.pullRequests.find((pr) => pr.state === "merged");
+              const open = isOpen(`card:${target.id}`);
               return (
-                <li key={target.id} className="flex items-baseline gap-2 px-2 py-1.5">
-                  <Dot state={target.completion === "merged" ? "green" : "blue"} />
-                  <span className="min-w-0 flex-1 truncate text-foreground">{target.name}</span>
-                  {merged ? (
-                    <a href={merged.url} target="_blank" rel="noreferrer" className="shrink-0 text-muted-foreground underline">
-                      {target.identifier} · #{merged.label.split("#").pop()}
-                    </a>
-                  ) : (
-                    <Link to={`/issues/${target.identifier}`} className="shrink-0 text-muted-foreground underline">{target.identifier}</Link>
-                  )}
+                <li
+                  key={target.id}
+                  id={`console-card-${target.id}`}
+                  data-testid="staple-console-shipped-row"
+                  data-card-id={target.id}
+                  data-expanded={open ? "true" : "false"}
+                  className={cn("scroll-mt-20 px-2 py-1.5", highlighted === target.id && "ring-2 ring-sky-500")}
+                >
+                  <div className="flex items-baseline gap-2">
+                    <Disclosure
+                      open={open}
+                      onToggle={() => toggle(`card:${target.id}`)}
+                      label={`${target.name}, ${open ? "collapse" : "expand"}`}
+                      className="min-w-0 flex-1 items-baseline"
+                    >
+                      <Dot state={target.completion === "merged" ? "green" : "blue"} />
+                      <span className="min-w-0 flex-1 truncate text-foreground">{target.name}</span>
+                    </Disclosure>
+                    {merged ? (
+                      <a href={merged.url} target="_blank" rel="noreferrer" className="shrink-0 text-muted-foreground underline">
+                        {target.identifier} · #{merged.label.split("#").pop()}
+                      </a>
+                    ) : (
+                      <Link to={`/issues/${target.identifier}`} className="shrink-0 text-muted-foreground underline">{target.identifier}</Link>
+                    )}
+                  </div>
+                  {open ? <CardDetail card={target} now={now} /> : null}
                 </li>
               );
             })}
