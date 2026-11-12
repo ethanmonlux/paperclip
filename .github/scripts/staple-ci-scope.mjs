@@ -9,6 +9,7 @@
 // and the installer installs only a commit it certified, so a regression outside a push's routine
 // checks is caught there and never installed. The full-ci and profile-ci labels, stacks and a
 // missing diff run the complete suite on the pull request: every lane, not the path-scoped plan.
+import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { matchesGlob } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,14 +19,31 @@ const matchesAny = (file, globs) => globs.some((glob) => matchesGlob(file, glob)
 const RULES = ["plan", "certification"];
 // The lanes that scripts/ci/select-tests.mjs narrows to the focused tests.
 const TEST_LANES = ["general_tests", "verify_serialized_server"];
-// Reasons are display-only, but the plan is a job output and GitHub caps job outputs at 1 MiB.
-// Without upstream's global inputs every owned file is a reason for each task it reaches, so a
-// large upstream sync listed each of ~2,000 files under every task. `changed` stays complete.
-export const MAX_TASK_REASONS = 20;
+// The published plan is a job output that later jobs receive as the CI_PLAN environment variable.
+// GitHub caps job outputs at 1 MiB and Linux caps one environment string at 128 KiB, so it carries
+// decisions, not per-file lists that grow with the diff: a 2,103-file upstream sync made a 976 KB
+// plan. The complete lists stay in the step summary and in the plan scopePlan returns.
+export const MAX_LISTED = 20;
 
-function boundedReasons(reasons) {
-  return Object.fromEntries(Object.entries(reasons).map(([task, list]) => [task, list.length <= MAX_TASK_REASONS ? list
-    : [...list.slice(0, MAX_TASK_REASONS), `... and ${list.length - MAX_TASK_REASONS} more changed inputs`]]));
+export function boundedList(list) {
+  return list.length <= MAX_LISTED ? list : [...list.slice(0, MAX_LISTED), `... and ${list.length - MAX_LISTED} more`];
+}
+
+/** Digest of a changed-file list, so a later job can verify its own diff against the trusted one. */
+export function changedDigest(files) {
+  return createHash("sha256").update([...new Set(files)].sort().join("\0")).digest("hex");
+}
+
+/** The plan as published: `changed` becomes its digest and count; display lists are bounded. */
+export function publishedPlan(plan) {
+  if (!plan) return plan;
+  const { changed, ...rest } = plan;
+  const staple = plan.staple && Object.fromEntries(Object.entries(plan.staple).map(([key, value]) =>
+    [key, ["unplanned", "policyOnly"].includes(key) && Array.isArray(value) ? boundedList(value) : value]));
+  return { ...rest, changedCount: new Set(changed).size, changedSha256: changedDigest(changed),
+    documentation: boundedList(plan.documentation ?? []),
+    reasons: Object.fromEntries(Object.entries(plan.reasons ?? {}).map(([task, list]) => [task, boundedList(list)])),
+    ...(staple ? { staple } : {}) };
 }
 
 export function validateScope(scope, lanes) {
@@ -127,7 +145,7 @@ export function scopePlan({ plan, scope, config, lanes, forceReason = null }) {
   return {
     ...plan,
     forceReason: null,
-    reasons: replanned ? boundedReasons(replanned.reasons) : Object.fromEntries(Object.keys(plan.reasons ?? {}).map((task) => [task, []])),
+    reasons: replanned?.reasons ?? Object.fromEntries(Object.keys(plan.reasons ?? {}).map((task) => [task, []])),
     jobs,
     staple: { version: 2, scope: "routine", vitestSelection: true, focused: true, maxTestJobs: scope.routine.maxTestJobs,
       policyOnly, gates, deferred, unplanned, ...(testConfig ? { testConfig } : {}), affected: { run: Boolean(all) || packages.length > 0, all, packages },
@@ -163,7 +181,7 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
     lanes: JSON.parse(readFileSync(process.env.CI_TASK_MATRIX ?? ".github/ci-task-matrix.json", "utf8")),
     forceReason: process.env.CI_FORCE_REASON || null,
   });
-  const line = `plan=${plan ? JSON.stringify(plan) : ""}\n`;
+  const line = `plan=${plan ? JSON.stringify(publishedPlan(plan)) : ""}\n`;
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, line);
   else process.stdout.write(line);
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, scopeSummary(plan));

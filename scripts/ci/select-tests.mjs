@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { refineTestPlan, selectionDurations } from "./test-selection-plan.mjs";
 import { productInputs } from "../../.github/scripts/ci-inputs.mjs";
 import { mergeDiff } from "../../.github/scripts/ci-diff.mjs";
+import { boundedList, changedDigest } from "../../.github/scripts/staple-ci-scope.mjs";
 import { selectProjects } from "./select-projects.mjs";
 
 export function selectionEligibility(plan, root = process.cwd()) {
@@ -201,6 +202,35 @@ function focusSummary(focus) {
     ""].join("\n");
 }
 
+/**
+ * The changed files this selection may use. A Staple plan publishes the trusted routing diff as a
+ * digest and count (it travels as an environment variable); the local diff of the same merge
+ * parents must match it exactly. An upstream plan carries the list itself.
+ */
+export function trustedChanged(plan, local) {
+  if (typeof plan.changedSha256 === "string") {
+    assert.equal(local.length, plan.changedCount, "Local diff disagrees with the trusted routing diff");
+    assert.equal(changedDigest(local), plan.changedSha256, "Local diff disagrees with the trusted routing diff");
+    return local;
+  }
+  assert.deepEqual(local, [...new Set(plan.changed)].sort(), "Local diff disagrees with the trusted routing diff");
+  return plan.changed;
+}
+
+/**
+ * The selection plan as published, under the same environment limit as the routing plan: no
+ * changed list, and the focus lists keep their first entries and a count. The selected tests are
+ * in manifest.json and audit.json. An upstream plan is published as it came.
+ */
+export function publishedSelectionPlan(plan, routed) {
+  if (typeof routed?.changedSha256 !== "string") return plan;
+  const { changed, ...rest } = plan;
+  const focus = rest.testSelection?.focus;
+  if (!focus) return rest;
+  return { ...rest, testSelection: { ...rest.testSelection, focus: { ...focus, ungraphed: boundedList(focus.ungraphed),
+    uncovered: boundedList(focus.uncovered), unrouted: boundedList(focus.unrouted) } } };
+}
+
 async function main() {
   const plan = JSON.parse(process.env.CI_PLAN || "null");
   const output = (key, value) => {
@@ -222,11 +252,11 @@ async function main() {
     assert.ok(plan.diff, "Missing trusted merge diff");
     const local = mergeDiff(head, plan.diff.prHead);
     assert.deepEqual(local.diff, plan.diff, "Selection must use the trusted merge parents");
-    assert.deepEqual(local.changed, [...new Set(plan.changed)].sort(), "Local diff disagrees with the trusted routing diff");
+    const changed = trustedChanged(plan, local.changed);
     assert.equal(git("status", "--porcelain", "--untracked-files=normal"), "", "Source inputs changed during dependency setup");
     process.env.NODE_ENV = "test";
     process.env.VITEST = "true";
-    result = await createTestSelection(plan, head);
+    result = await createTestSelection({ ...plan, changed }, head);
     writeFileSync(`${directory}/manifest.json`, JSON.stringify(result.manifest));
     writeFileSync(`${directory}/audit.json`, JSON.stringify(result.graphs, null, 2));
     output("selected", "true");
@@ -235,7 +265,7 @@ async function main() {
     result = { plan: { ...plan, testSelectionFallback: error.message } };
     output("selected", "false");
   }
-  writeFileSync(`${directory}/plan.json`, JSON.stringify(result.plan));
+  writeFileSync(`${directory}/plan.json`, JSON.stringify(publishedSelectionPlan(result.plan, plan)));
   if (process.env.GITHUB_STEP_SUMMARY) {
     const stats = result.plan.testSelection?.stats;
     appendFileSync(process.env.GITHUB_STEP_SUMMARY, stats

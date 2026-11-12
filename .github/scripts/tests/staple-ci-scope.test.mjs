@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { matchesGlob } from "node:path";
 import test from "node:test";
 import { planTasks } from "../ci-plan.mjs";
-import { MAX_TASK_REASONS, scopePlan, scopeSummary, validateScope } from "../staple-ci-scope.mjs";
+import { changedDigest, MAX_LISTED, publishedPlan, scopePlan, scopeSummary, validateScope } from "../staple-ci-scope.mjs";
 
 // STA-223: holds the Staple CI scope map. Every workspace package must be classified, every task
 // matrix job must have a rule, a routine push plans only light checks, and a complete suite is
@@ -167,21 +167,35 @@ test("broad, configuration and upstream-sync changes stay light and say what the
   assert.equal(scope.fullSuiteBranches, undefined);
 });
 
-test("a large upstream sync stays within GitHub's 1 MiB job output with every changed file kept", () => {
-  // PR #58 (STA-323) changed 2,103 files; listing each under every task made a 976 KB plan.
+test("a large upstream sync publishes a plan that fits GitHub's job output and one environment variable", () => {
+  // PR #58 (STA-323) changed 2,103 files: the plan was 976 KB, and its changed list alone 122 KB.
   const files = Array.from({ length: 2500 }, (_, i) => [`server/src/services/sync-${i}.ts`, `ui/src/components/Sync${i}.tsx`,
-    `packages/shared/src/sync-${i}.ts`][i % 3]);
+    `packages/shared/src/sync-${i}.ts`, `doc/sync-${i}.md`, `scripts/sync-${i}.mjs`][i % 5]);
   const plan = scoped(files);
-  assert.equal(plan.staple.scope, "routine");
+  // The plan this step computes keeps every file for its summary.
   assert.deepEqual(plan.changed, files);
-  for (const [task, reasons] of Object.entries(plan.reasons)) {
-    assert.ok(reasons.length <= MAX_TASK_REASONS + 1, task);
-    if (reasons.length > MAX_TASK_REASONS) assert.match(reasons.at(-1), /^\.\.\. and \d+ more changed inputs$/, task);
+  assert.ok(Object.values(plan.reasons).some((reasons) => reasons.length > MAX_LISTED));
+  assert.ok(plan.staple.unplanned.length > MAX_LISTED);
+  const published = publishedPlan(plan);
+  assert.equal(published.changed, undefined);
+  assert.equal(published.changedCount, files.length);
+  assert.equal(published.changedSha256, changedDigest([...files].reverse()));
+  assert.notEqual(published.changedSha256, changedDigest(files.slice(1)));
+  for (const list of [...Object.values(published.reasons), published.documentation, published.staple.unplanned, published.staple.policyOnly]) {
+    assert.ok(list.length <= MAX_LISTED + 1);
+    if (list.length > MAX_LISTED) assert.match(list.at(-1), /^\.\.\. and \d+ more$/);
   }
-  assert.ok(Object.values(plan.reasons).some((reasons) => reasons.length > MAX_TASK_REASONS));
-  // Bounding the display list selects exactly the lanes the complete list selects.
-  assert.deepEqual(counts(plan), counts(scoped(files.slice(0, 3))));
-  assert.ok(Buffer.byteLength(`plan=${JSON.stringify(plan)}\n`) < 512 * 1024);
+  assert.match(published.staple.unplanned.at(-1), /^\.\.\. and \d+ more$/);
+  // Only the lists shrink: every decision a job reads is the one the step computed.
+  assert.deepEqual(published.jobs, plan.jobs);
+  assert.deepEqual({ ...published.staple, unplanned: null, policyOnly: null }, { ...plan.staple, unplanned: null, policyOnly: null });
+  assert.deepEqual(published.diff, plan.diff);
+  assert.ok(Buffer.byteLength(`CI_PLAN=${JSON.stringify(published)}`) < 64 * 1024);
+  // A complete suite is published the same way.
+  const full = publishedPlan(scoped(files, { forceReason: "Full suite requested by label" }));
+  assert.equal(full.changed, undefined);
+  assert.ok(Buffer.byteLength(`CI_PLAN=${JSON.stringify(full)}`) < 64 * 1024);
+  assert.equal(publishedPlan(null), null);
 });
 
 test("package-owned suites run only with their own paths", () => {
