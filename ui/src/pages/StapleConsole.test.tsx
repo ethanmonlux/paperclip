@@ -147,6 +147,26 @@ describe("Staple Console progressive depth", () => {
     expect(claims[0]!.querySelector("[data-testid=staple-console-proof]")?.textContent).toContain("No PR linked");
   });
 
+  it("lets a shipped card outside the capability map expand its proof, listed once with its anchor", async () => {
+    await render(board({
+      issues: [issue({ id: "m", identifier: "STA-30", title: "FAC-832: Self-serve accounts", status: "done", completedAt: minutesAgo(60) })],
+      pullRequests: [{
+        issueId: "m", repo: "ethanmonlux/facette", number: 900, url: "https://github.com/ethanmonlux/facette/pull/900",
+        state: "merged", mergedAt: minutesAgo(70), ci: "success", ciStartedAt: null, source: "github",
+      }],
+      capabilityMap,
+    }));
+    const rows = q("[data-testid=staple-console-shipped-row]");
+    expect(rows).toHaveLength(1);
+    expect(q("[data-testid=staple-console-card]")).toHaveLength(0);
+    expect(rows[0]!.id).toBe("console-card-m");
+    expect(rows[0]!.querySelector("[data-testid=staple-console-card-detail]")).toBeNull();
+    await click(rows[0]!.querySelector<HTMLElement>("button[aria-expanded]")!);
+    const detail = rows[0]!.querySelector("[data-testid=staple-console-card-detail]");
+    expect(detail?.textContent).toContain("PR and CI");
+    expect(detail?.textContent).toContain("STA-30");
+  });
+
   it("collapses Up next behind its count", async () => {
     const value = board();
     await render(value);
