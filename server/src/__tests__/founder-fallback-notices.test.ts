@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray, like } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals, chatIdentityLinks,
   chatPublications, companies, companyMemberships, createDb, heartbeatRuns, issueAccessGrants, issueThreadInteractions, issues,
@@ -124,6 +124,8 @@ const support = await getEmbeddedPostgresTestSupport();
     database = await startEmbeddedPostgresTestDatabase("founder-fallback-notices-");
     db = createDb(database.connectionString);
   }, 90_000);
+  // A run's own https PAPERCLIP_API_URL would otherwise add card links; tests opt in.
+  beforeEach(() => { vi.stubEnv("PAPERCLIP_API_URL", ""); });
   afterEach(async () => {
     for (const table of [chatPublications, chatDeliveries, chatIdentityLinks, chatExternalPrincipals, chatConversations,
       chatEndpoints, toolConnections, toolApplications, issueThreadInteractions, heartbeatRuns, issues, companyMemberships,
@@ -207,7 +209,10 @@ const support = await getEmbeddedPostgresTestSupport();
   const kinds = async (f: { companyId: string }) => (await rows(f)).map(row => row.idempotencyKey.split(":")[3]);
 
   it("replays the Nov 9 drain pause, three founder cards and their resolution as one-line asks and retractions (STA-219)", async () => {
-    vi.stubEnv("PAPERCLIP_AUTH_PUBLIC_BASE_URL", "https://ethan-desktop.tail5192df.ts.net");
+    // The live install's shape: no explicit public URL, only its https API origin.
+    for (const name of ["PAPERCLIP_AUTH_PUBLIC_BASE_URL", "BETTER_AUTH_URL", "BETTER_AUTH_BASE_URL",
+      "PAPERCLIP_PUBLIC_URL", "PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL"]) vi.stubEnv(name, "");
+    vi.stubEnv("PAPERCLIP_API_URL", "https://ethan-desktop.tail5192df.ts.net");
     try {
       const f = await fixture();
       await db.delete(issueThreadInteractions);
@@ -270,6 +275,12 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(message).not.toMatch(/Master Builder|paused|available again|fallback|automatic|UTC/i);
       }
       expect(await kinds(f)).toEqual(["asks", "asks", "done", "done", "done"]);
+      // The receipt shows the delivered ask carried the tappable card link.
+      expect(await f.service.interactionReceipt(f.companyId, riv.issueId, riv.id)).toMatchObject({
+        cardUrl: "https://ethan-desktop.tail5192df.ts.net/STA/issues/STA-198",
+        publications: [{ idempotencyKey: expect.stringContaining(":asks:"), state: "published", linked: true },
+          { idempotencyKey: expect.stringContaining(":done:"), state: "published", linked: false }],
+      });
     } finally {
       vi.unstubAllEnvs();
     }
@@ -286,6 +297,11 @@ const support = await getEmbeddedPostgresTestSupport();
     const after = await f.service.interactionReceipt(f.companyId, f.otherIssueId, decision.id);
     expect(after?.publications).toMatchObject([{ endpointId: f.endpointId, conversationId: f.conversationId,
       idempotencyKey: asksKey(f, [decision.id]), state: "pending" }]);
+    // No public URL and no https API origin: the ask goes out without a link, and the receipt says so.
+    expect(after).toMatchObject({ cardUrl: null, publications: [{ linked: false }] });
+    vi.stubEnv("PAPERCLIP_API_URL", "http://127.0.0.1:3100");
+    expect((await f.service.interactionReceipt(f.companyId, f.otherIssueId, decision.id))?.cardUrl).toBeNull();
+    vi.stubEnv("PAPERCLIP_API_URL", "");
     expect(after?.publications[0]).not.toHaveProperty("providerUrl");
     expect(after?.publications[0]).not.toHaveProperty("redactedError");
     expect(await f.service.interactionReceipt(f.companyId, f.dmIssueId, decision.id)).toBeNull();
