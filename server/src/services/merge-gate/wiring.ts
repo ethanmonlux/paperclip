@@ -164,7 +164,8 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         .orderBy(desc(issueThreadInteractions.createdAt)).limit(20);
       return rows.some(row => row.idempotencyKey?.startsWith(`confirmation:${issueId}:route-review:`) &&
         row.title?.startsWith("Route cross-model review:") &&
-        row.payload.target?.type === "issue_document" && row.payload.target.issueId === issueId);
+        "target" in row.payload && row.payload.target?.type === "issue_document" &&
+        row.payload.target.issueId === issueId);
     },
     async loadTaskAuthorship(companyId, input) {
       // Without a reviewer-attested source author set, every task run remains
