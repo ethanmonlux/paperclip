@@ -106,6 +106,15 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
       .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
     await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
       sourceAuthorAgentIds: ["00000000-0000-4000-8000-000000000000"] })).resolves.toBeNull();
+    // The attestation never narrows away its own reviewer's runs on the task;
+    // an attester with no run there adds nothing and is not required to.
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id], attesterAgentId: reviewer.id }))
+      .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
+    const outsider = await f.agent("Outside reviewer", "codex_local");
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id], attesterAgentId: outsider.id }))
+      .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
     await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: coordinator.id }))
       .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
 

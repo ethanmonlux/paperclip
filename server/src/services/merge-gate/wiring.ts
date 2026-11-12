@@ -201,16 +201,19 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
     },
     async loadTaskAuthorship(companyId, input) {
       // Without a reviewer-attested source author set, every task run remains
-      // a potential author. An attested set must be backed by started runs.
+      // a potential author. An attested set must be backed by started runs,
+      // and never narrows away the attesting reviewer's own runs: nothing
+      // recorded shows a run on the task wrote no source.
       const sourceIds = input.sourceAuthorAgentIds;
       if (sourceIds && (sourceIds.length === 0 || sourceIds.length > MAX_AUTHOR_RUNS)) return null;
+      const countedIds = sourceIds && input.attesterAgentId ? [...new Set([...sourceIds, input.attesterAgentId])] : sourceIds;
       const runs = await db.select({ agentId: heartbeatRuns.agentId, usage: heartbeatRuns.usageJson })
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.issueId, input.issueId),
           isNotNull(heartbeatRuns.startedAt),
-          sourceIds ? inArray(heartbeatRuns.agentId, sourceIds) : undefined,
+          countedIds ? inArray(heartbeatRuns.agentId, countedIds) : undefined,
           input.excludeAgentId ? ne(heartbeatRuns.agentId, input.excludeAgentId) : undefined,
         ))
         .orderBy(desc(heartbeatRuns.createdAt))

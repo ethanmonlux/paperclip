@@ -110,7 +110,11 @@ export interface MergeGateDependencies {
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
    */
-  loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[] }) =>
+  loadTaskAuthorship: (companyId: string, input: {
+    issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[];
+    /** The reviewer that attested `sourceAuthorAgentIds`; its own runs on the task always count. */
+    attesterAgentId?: string;
+  }) =>
     Promise<{ agentIds: string[]; modelFamilies: string[] } | null>;
   /**
    * Agents the task's own record ties to it as a possible implementer: its
@@ -314,11 +318,13 @@ async function evaluateLocked(
   // so its runs remain potential authorship.
   // A completed review can attest the exhaustive source author set, so
   // coordination and review runs on the task stop counting as authorship.
-  // The attesting reviewer must be independent of the implementation by the
-  // task's own history (never its creator, assignee or checkout holder),
-  // which the attestation cannot narrow; otherwise an implementer could list
-  // only another agent and pass its own review. The attested agents must
-  // still have started runs on the task.
+  // The attestation never narrows away its own reviewer: any started run the
+  // reviewer has on the task still counts, so a reviewer that ran there is a
+  // potential author and its review is not independent. Nothing recorded
+  // shows that such a run wrote no source, and the reviewer's own list cannot
+  // be that evidence. The reviewer must also never have been the task's
+  // creator, assignee or checkout holder. The attested agents must still have
+  // started runs on the task.
   const attestations = independentOfMerger.filter(review =>
     review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
     review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
@@ -333,6 +339,7 @@ async function evaluateLocked(
     issueId: issue.id,
     excludeAgentId: sourceAuthorAgentIds ? null : handoffCoordinator ? null : request.actor.agentId ?? null,
     sourceAuthorAgentIds,
+    ...(sourceReview?.reviewerAgentId ? { attesterAgentId: sourceReview.reviewerAgentId } : {}),
   });
   const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
   const author: MergeGateAuthor = {
