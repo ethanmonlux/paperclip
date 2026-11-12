@@ -311,12 +311,17 @@ export async function selectProjectTests({ root = process.cwd(), project, change
       if (opaque) retained.push(spec);
     }
     const selected = [...new Set([...raw, ...inputRelated, ...retained].map(relative))].sort();
+    // Tests one import away from a change: the changed tests and the direct importers.
+    const changes = new Set(absoluteChanges);
+    const direct = inventory.filter(spec => changes.has(spec.moduleId)
+      || (localImports.get(spec.moduleId) ?? []).some(dependency => changes.has(dependency)));
     return {
       project,
       isolated: owner.config.isolate !== false,
       inventory: inventory.map(relative).sort(),
       selected,
       related: raw.map(relative).sort(),
+      direct: direct.map(relative).sort(),
       inputRelated: [...new Set(inputRelated.map(relative))].sort(),
       alwaysRun: retained.map(relative).sort(),
       retentionReasons,

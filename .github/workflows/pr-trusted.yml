@@ -19,7 +19,9 @@ env:
   # Set the CI_VITEST_RETRY repository variable to 0 to switch retries off.
   PAPERCLIP_VITEST_RETRY: ${{ vars.CI_VITEST_RETRY }}
 
-# A new push to a PR cancels its superseded run. Other callers (the nightly
+# A new push to a PR cancels that PR's superseded run, and no other run: the
+# group names one pull request. pr.yml holds the same rule on its calling job,
+# where it applies as soon as the new run is created. Other callers (the nightly
 # staple-certify.yml certification) queue per commit and are never cancelled.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('ci-certify-{0}', github.sha) }}
@@ -34,11 +36,13 @@ jobs:
     needs: [gate]
     # Forks get path-scoped job groups from the task plan. File-level Vitest
     # selection runs upstream, in a fork that sets CI_VITEST_SELECTION=enabled,
-    # or when the Staple PR scope (STA-223) narrowed the plan.
+    # or when the Staple scope (STA-223) planned a routine push. A routine push
+    # then runs the focused regression tests only (scripts/ci/select-tests.mjs).
     if: >-
       needs.gate.outputs.full_ci == 'true' && needs.gate.outputs.plan != '' &&
       fromJSON(needs.gate.outputs.plan).mode == 'enabled' &&
       fromJSON(needs.gate.outputs.plan).forceReason == null &&
+      (fromJSON(needs.gate.outputs.plan).jobs.general_tests.run || fromJSON(needs.gate.outputs.plan).jobs.verify_serialized_server.run) &&
       (vars.CI_VITEST_SELECTION == '' || vars.CI_VITEST_SELECTION == 'enabled') &&
       (github.repository == 'paperclipai/paperclip' || vars.CI_VITEST_SELECTION == 'enabled' ||
        fromJSON(needs.gate.outputs.plan).staple.vitestSelection == true)
@@ -508,6 +512,46 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Routine pushes (Staple, STA-223): typecheck the packages the change affects
+  # and their dependents. The repository-wide typecheck above and the build
+  # below run in the nightly certification and under the full-ci label.
+  affected_packages:
+    name: Affected packages (typecheck)
+    needs: [gate]
+    if: ${{ needs.gate.outputs.full_ci == 'true' && needs.gate.outputs.plan != '' && fromJSON(needs.gate.outputs.plan).staple.affected.run == true }}
+    runs-on: ${{ needs.gate.outputs.runner }}
+    timeout-minutes: 20
+
+    env:
+      CI_PLAN: ${{ needs.gate.outputs.plan }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js for pnpm bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+
+      - name: Restore materialized dependencies and shared builds
+        uses: ./.github/actions/setup-ci-dependencies
+
+      - name: Typecheck the affected packages and their dependents
+        run: node scripts/ci/affected-packages.mjs
+
   general_tests:
     name: General tests (${{ matrix.group_label }})
     needs: [gate, test_selection]
@@ -814,7 +858,7 @@ jobs:
     if: ${{ always() }}
     # The single stable aggregate check (STA-223): it covers every planned suite,
     # e2e included, so required-check names do not change with a PR's scope.
-    needs: [gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards]
+    needs: [gate, test_selection, policy, typecheck_release_registry, affected_packages, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards]
     runs-on: ${{ needs.gate.outputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -823,6 +867,7 @@ jobs:
           FULL_CI: ${{ needs.gate.outputs.full_ci }}
           CI_PLAN: ${{ needs.test_selection.outputs.plan || needs.gate.outputs.plan }}
           CI_RESULTS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -832,6 +877,15 @@ jobs:
           assert.ok(['true', 'false'].includes(process.env.FULL_CI), 'Valid scope required');
           const plan = process.env.CI_PLAN ? JSON.parse(process.env.CI_PLAN) : null;
           if (plan) assert.equal(plan.version, 1, 'Supported task plan required');
+          // Only a pull request may run a narrowed plan. The certification and
+          // every other caller must run each suite in full, so a verdict from
+          // them can never stand for a partial run.
+          if (process.env.EVENT_NAME !== 'pull_request') {
+            assert.equal(process.env.FULL_CI, 'true', 'A run outside a pull request must be complete');
+            assert.equal(plan, null, 'A run outside a pull request must not be narrowed by a plan');
+          }
+          const affected = process.env.FULL_CI === 'true' && plan?.staple?.affected?.run === true;
+          assert.equal(results.affected_packages.result, affected ? 'success' : 'skipped', 'affected_packages');
           if (plan?.testSelection) assert.equal(results.test_selection.result, 'success', 'Published selection must succeed');
           for (const job of ["typecheck_release_registry","general_tests","verify_paperclip_runner","build","docker_context_integrity","sandbox_provider_tests","verify_serialized_server","canary_dry_run","verify_runner_e2e_support","e2e_shards"]) {
             if (plan) assert.equal(typeof plan.jobs[job]?.run, 'boolean', 'Missing suite decision: ' + job);

@@ -12,7 +12,7 @@
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
 #
-# Certification (STA-223): PRs run change-scoped checks only. The nightly staple-certify.yml run
+# Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
 # Only the newest first-parent master commit certified `success` is installed. A missing, pending,
 # failed or unreadable certification blocks that commit, and an older certified one is used instead.
@@ -225,7 +225,7 @@ for fam,js in sorted(fams.items()):
     body="\n".join(["The nightly full-suite certification failed, so `%s` is not `staple/certified` and will not be installed."%sha,
         "","Run: %s"%run.get("html_url",""),"","Failing jobs (%d):"%len(js),""]+[excerpt(j) for j in js[:3]]+
         (["- and %d more"%(len(js)-3)] if len(js)>3 else [])+
-        ["","**Repair:** merge the fix under the normal bar with its own change-scoped checks. Then run `staple-certify.yml`",
+        ["","**Repair:** merge the fix under the normal bar with its own routine checks. Then run `staple-certify.yml`",
          "with `workflow_dispatch` on master to certify the new head. Until a newer commit is certified, the installer keeps",
          "the last certified build.","","Opened by `staple-nightly-upgrade certify-report` (STA-223)."])
     if dry: print("DRY RUN: would open critical task %r for %s\n%s\n"%(title,who,body)); continue

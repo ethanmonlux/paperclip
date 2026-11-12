@@ -1,7 +1,6 @@
 {
-  "version": 1,
-  "about": "Staple PR CI scope (STA-223). Read by .github/scripts/staple-ci-scope.mjs in the fork's routing step, on pull_request only. PRs run build, typecheck, policy and the suites that cover the changed paths; the nightly staple-certify.yml run keeps the complete suite, and the installer installs only commits it certified. Held by .github/scripts/tests/staple-ci-scope.test.mjs.",
-  "fullSuiteBranches": ["staple/upstream-sync-*"],
+  "version": 2,
+  "about": "Staple CI scope (STA-223). Read by .github/scripts/staple-ci-scope.mjs in the fork's routing step, on pull_request only. A routine push runs policy, a typecheck of the packages the change affects, and the focused regression tests whose import graph reaches the change. Suites marked \"certification\" never run on a routine push: the nightly staple-certify.yml run builds one merged master commit and runs the complete suite, and the installer installs only a commit it certified. The full-ci label runs the complete suite on one pull request. Held by .github/scripts/tests/staple-ci-scope.test.mjs.",
   "policyOnlyPaths": [
     "scripts/staple/**",
     "scripts/__tests__/staple-*.test.mjs",
@@ -12,37 +11,19 @@
     ".github/scripts/tests/staple-certify-workflow.test.mjs",
     ".github/workflows/staple-certify.yml"
   ],
+  "routine": {
+    "maxTestJobs": 6,
+    "typecheckAllPaths": [
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      ".npmrc",
+      "tsconfig*.json",
+      "patches/**",
+      "scripts/run-tsc.mjs"
+    ]
+  },
   "pathSets": {
-    "lifecycle": [
-      "server/src/services/heartbeat/**",
-      "server/src/services/heartbeat*",
-      "server/src/services/agent-lifecycle*",
-      "server/src/services/agent-execution*",
-      "server/src/services/agent-start*",
-      "server/src/services/agent-run*",
-      "server/src/services/agents.ts",
-      "server/src/services/issues.ts",
-      "server/src/services/issue-assignment*",
-      "server/src/services/*routing*",
-      "server/src/services/access.ts",
-      "server/src/services/recovery/**",
-      "server/src/services/native-runtime/**",
-      "server/src/services/wake*",
-      "server/src/modules/wake-queue/**",
-      "server/src/agent-run-cancellation.ts",
-      "server/src/index.ts",
-      "server/src/app.ts",
-      "server/src/routes/**",
-      "server/src/middleware/**",
-      "server/src/auth/**",
-      "server/src/realtime/**",
-      "packages/shared/src/api.ts",
-      "packages/shared/src/validators/**",
-      "packages/db/**",
-      "packages/adapter-utils/**",
-      "packages/adapters/**",
-      "ui/src/api/**"
-    ],
     "chat": [
       "server/src/services/chat*",
       "server/src/services/chat-channels/**",
@@ -53,60 +34,49 @@
       "server/src/routes/*chat*",
       "packages/shared/src/*chat*"
     ],
-    "runner": [
-      "packages/paperclip-runner/**",
-      "server/src/services/native-runtime/**",
-      "server/src/services/agent-runner*",
-      "server/src/services/*runner*",
-      "server/src/vendor/**",
-      "server/src/dev-native-runner-status.ts",
-      "server/src/dev-runner-worktree.ts"
-    ],
+    "runner": ["packages/paperclip-runner/**"],
     "docker": [
       "Dockerfile*",
       "**/Dockerfile*",
       ".dockerignore",
       "**/.dockerignore",
       "docker/**"
-    ],
-    "release": [
-      "cli/**",
-      "server/src/version.ts",
-      "server/src/build-*.ts",
-      "server/src/startup-*.ts",
-      "releases/**"
     ]
   },
   "jobs": {
-    "typecheck_release_registry": "always",
-    "build": "always",
-    "general_tests": { "groups": { "general-chat": ["lifecycle", "chat"] } },
+    "typecheck_release_registry": "certification",
+    "build": "certification",
+    "general_tests": {
+      "groups": {
+        "general-chat": ["chat"]
+      }
+    },
     "verify_serialized_server": "plan",
     "sandbox_provider_tests": "plan",
-    "e2e_shards": ["lifecycle"],
+    "e2e_shards": "certification",
     "verify_paperclip_runner": ["runner"],
-    "verify_runner_e2e_support": ["runner"],
+    "verify_runner_e2e_support": "certification",
     "docker_context_integrity": ["docker"],
-    "canary_dry_run": ["release"]
+    "canary_dry_run": "certification"
   },
   "packages": {
-    "cli": ["release"],
+    "cli": [],
     "server": [],
     "ui": [],
-    "packages/adapter-utils": ["lifecycle"],
-    "packages/adapters/claude-local": ["lifecycle"],
-    "packages/adapters/codex-local": ["lifecycle"],
-    "packages/adapters/cursor-cloud": ["lifecycle"],
-    "packages/adapters/cursor-local": ["lifecycle"],
-    "packages/adapters/gemini-local": ["lifecycle"],
-    "packages/adapters/grok-local": ["lifecycle"],
-    "packages/adapters/hermes": ["lifecycle"],
-    "packages/adapters/hermes-gateway": ["lifecycle"],
-    "packages/adapters/kimi-local": ["lifecycle"],
-    "packages/adapters/openclaw-gateway": ["lifecycle"],
-    "packages/adapters/opencode-local": ["lifecycle"],
-    "packages/adapters/pi-local": ["lifecycle"],
-    "packages/db": ["lifecycle"],
+    "packages/adapter-utils": [],
+    "packages/adapters/claude-local": [],
+    "packages/adapters/codex-local": [],
+    "packages/adapters/cursor-cloud": [],
+    "packages/adapters/cursor-local": [],
+    "packages/adapters/gemini-local": [],
+    "packages/adapters/grok-local": [],
+    "packages/adapters/hermes": [],
+    "packages/adapters/hermes-gateway": [],
+    "packages/adapters/kimi-local": [],
+    "packages/adapters/openclaw-gateway": [],
+    "packages/adapters/opencode-local": [],
+    "packages/adapters/pi-local": [],
+    "packages/db": [],
     "packages/google-sheets-mcp-server": [],
     "packages/kv-demo-mcp-server": [],
     "packages/mcp-server": [],

@@ -14,6 +14,14 @@ permissions:
 jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
+    # A new push supersedes the checks of the same pull request, and only those:
+    # the group names one pull request, so no other pull request and no nightly
+    # certification (staple-certify.yml, its own group) is ever cancelled. The
+    # rule sits on this job, not on the workflow, so a run that an unrelated
+    # label skips cannot cancel the checks in progress.
+    concurrency:
+      group: pr-checks-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     # Fork: run this branch's own CI definition. Upstream master's reusable
     # workflow drifts ahead of the fork's scripts and fails before any test runs.
     uses: ./.github/workflows/pr-trusted.yml
