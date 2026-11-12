@@ -195,3 +195,58 @@ test("a green or cancelled nightly opens nothing", async () => {
     }
   }
 });
+
+/** Runs the 02:30 `hold` mode against a fake Staple API on `installed`; records hold requests. */
+async function holdRun({ installed, chain, statuses = {} }) {
+  const holds = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const send = (value, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(value)); };
+      if (req.method === "GET" && req.url === "/api/health") return send({ commit: installed ? sha(installed) : "" });
+      if (req.method === "POST" && req.url === "/api/instance/maintenance-hold") {
+        holds.push(JSON.parse(body));
+        return send({ hold: { startedAt: "s", drainDeadlineAt: "d", expiresAt: "e" }, queuedRuns: 0, runningRuns: 0 }, 201);
+      }
+      send({ error: "not found" }, 404);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const home = mkdtempSync(path.join(tmpdir(), "staple-hold-home-"));
+  const fixtures = path.join(home, "fixtures");
+  mkdirSync(path.join(home, ".paperclip"));
+  mkdirSync(fixtures);
+  writeFileSync(path.join(home, ".paperclip", "auth.json"), JSON.stringify({ token: "staple-test-token" }));
+  if (chain) writeFileSync(path.join(fixtures, "chain"), chain.map(sha).join("\n") + "\n");
+  for (const [name, list] of Object.entries(statuses)) {
+    writeFileSync(path.join(fixtures, `statuses-${sha(name)}.json`), JSON.stringify(list));
+  }
+  try {
+    const { stdout } = await promisify(execFile)("bash", [script, "hold"], { env: {
+      ...process.env, HOME: home, STAPLE_GITHUB_FIXTURES: fixtures, STAPLE_API: `http://127.0.0.1:${server.address().port}`,
+      NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1",
+    } });
+    return { out: stdout, holds };
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("the 02:30 hold is not placed when nothing newer than the installed build is certified", async () => {
+  // Red nightly on m2, installed m1: the 03:30 run would skip, so holding would only park work.
+  const red = await holdRun({ installed: "m1", chain: ["m2", "m1"], statuses: { m2: [status("failure")] } });
+  assert.match(red.out, /no certified commit to install \(installed-newest\); not placing the hold/);
+  assert.deepEqual(red.holds, []);
+  const unreadable = await holdRun({ installed: "m1" });
+  assert.match(unreadable.out, /not placing the hold/);
+  assert.deepEqual(unreadable.holds, []);
+});
+
+test("the 02:30 hold is placed when a newer certified commit is waiting", async () => {
+  const { out, holds } = await holdRun({ installed: "m1", chain: ["m3", "m2", "m1"], statuses: { m3: [status("failure")], m2: [status("success")] } });
+  assert.match(out, /certified target: target:m2/);
+  assert.equal(holds.length, 1);
+  assert.equal(holds[0].reason, "nightly maintenance window");
+});

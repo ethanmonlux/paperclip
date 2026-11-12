@@ -95,10 +95,11 @@ function runAggregate(block, fullCi, overrides = {}) {
   const code = block.split("          node --input-type=module <<'NODE'\n")[1].split("\n          NODE")[0]
     .split("\n").map((line) => line.slice(10)).join("\n");
   const names = /needs: \[([^\]]+)\]/.exec(block)[1].split(", ");
+  // Without a plan there is no routine push, so the affected-package typecheck never runs.
   const results = Object.fromEntries(names.map((name) => [name, { result: overrides[name]
-    ?? (name === "gate" || name === "policy" || fullCi ? "success" : "skipped") }]));
+    ?? (name === "affected_packages" ? "skipped" : name === "gate" || name === "policy" || fullCi ? "success" : "skipped") }]));
   return spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", env: {
-    ...process.env, FULL_CI: String(fullCi), CI_PLAN: "", CI_RESULTS: JSON.stringify(results),
+    ...process.env, FULL_CI: String(fullCi), EVENT_NAME: "pull_request", CI_PLAN: "", CI_RESULTS: JSON.stringify(results),
   } });
 }
 
@@ -266,7 +267,7 @@ test("the trusted PR workflow limits full CI to merge-relevant stack layers", ()
   const verify = jobs.get("verify");
   assert.match(
     verify,
-    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards\]$/m,
+    /^ {4}needs: \[gate, test_selection, policy, typecheck_release_registry, affected_packages, general_tests, verify_paperclip_runner, build, docker_context_integrity, sandbox_provider_tests, verify_serialized_server, canary_dry_run, verify_runner_e2e_support, e2e_shards\]$/m,
     "verify is the single stable aggregate and must cover e2e (STA-223)",
   );
   assert.equal(runAggregate(verify, true).status, 0);

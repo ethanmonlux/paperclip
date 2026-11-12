@@ -12,7 +12,9 @@ export function partitionSelection(inventory, selected, maxShards, durations = {
   return selected.length ? partitionGeneralServerSuites(selected, count, durations).map((shard) => shard.files) : [];
 }
 
-export function refineTestPlan({ plan, head, owners, graphs, durations = {} }) {
+// `empty` publishes a selection with no test lane (a routine push whose change no test graph
+// covers). `focus` is the routine push's record of what the selection left to the certification.
+export function refineTestPlan({ plan, head, owners, graphs, durations = {}, empty = false, focus = null }) {
   const result = structuredClone(plan);
   const manifest = { version: 1, head, lanes: {} };
   const stats = [];
@@ -25,6 +27,7 @@ export function refineTestPlan({ plan, head, owners, graphs, durations = {} }) {
     for (const group of groups) {
       const original = entries.filter((entry) => (entry.group ?? "serialized") === group);
       if (group === "general-chat") { matrix.push(...original); continue; }
+      if (empty) { stats.push({ group, total: 0, selected: 0, beforeJobs: original.length, jobs: 0 }); continue; }
       const owned = owners[group];
       assert.ok(owned, `Missing inventory owner: ${group}`);
       const projectByFile = new Map();
@@ -65,7 +68,7 @@ export function refineTestPlan({ plan, head, owners, graphs, durations = {} }) {
       matrix: { include: matrix.length ? matrix : entries } };
   }
   validateSelection(manifest);
-  result.testSelection = { version: 1, head, hash: selectionHash(manifest), stats };
+  result.testSelection = { version: 1, head, hash: selectionHash(manifest), stats, ...(focus ? { focus } : {}) };
   return { plan: result, manifest };
 }
 
