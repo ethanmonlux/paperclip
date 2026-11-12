@@ -115,7 +115,7 @@ describe("Coordinator pinned pages", () => {
     const saved = ["agent-chat:company:cto", "agent-chat:another-company:hidden", "/artifacts", "/dashboard"];
     localStorage.setItem("paperclip.coordinator.pinned-nav.v1:reviewer", JSON.stringify(saved));
     await renderSidebar();
-    const links = [...navigation().querySelectorAll<HTMLAnchorElement>("a")].slice(3);
+    const links = [...navigation().querySelectorAll<HTMLAnchorElement>("a")].slice(4);
     expect(links.map(link => link.textContent)).toEqual(["CTO", "Artifacts", "Dashboard"]);
     const more = navigation().querySelector('button[aria-label="More workspace pages"]')!;
     expect(links.at(-1)!.compareDocumentPosition(more) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
