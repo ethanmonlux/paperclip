@@ -99,11 +99,22 @@ describe("capability claim colors (FAC-620 v2)", () => {
     expect(deriveStapleConsoleClaim("c", claim(), lookups([facts({ identifier: "STA-1" })])).state).toBe("blue");
   });
 
+  it("stays blue when a healthy fix is in flight beside a stuck defect or a waiting task", () => {
+    const mixed = deriveStapleConsoleClaim("c", claim({ issues: ["STA-1", "STA-4"], defects: ["STA-2"] }), lookups([
+      facts({ identifier: "STA-1" }),
+      facts({ identifier: "STA-2", status: "todo", stuckReason: "No run in 45 min" }),
+      facts({ identifier: "STA-4", needsEthanReason: "Ship it?" }),
+    ]));
+    expect(mixed.state).toBe("blue");
+    expect(mixed.stateReason).toBe("STA-1 is on it; STA-4 waits on Ethan: Ship it?");
+    expect(mixed.tasks.find((task) => task.identifier === "STA-2")).toMatchObject({ defect: true });
+  });
+
   it("is red when nothing is fixing it: no owner, stuck, waiting on Ethan, or an open defect alone", () => {
     expect(deriveStapleConsoleClaim("c", claim(), lookups([facts({ identifier: "STA-1", owned: false })])).state).toBe("red");
-    const stuck = deriveStapleConsoleClaim("c", claim({ issues: ["STA-1", "STA-2"] }), lookups([
-      facts({ identifier: "STA-1" }),
+    const stuck = deriveStapleConsoleClaim("c", claim({ issues: ["STA-2", "STA-3"] }), lookups([
       facts({ identifier: "STA-2", stuckReason: "No run in 45 min" }),
+      facts({ identifier: "STA-3", owned: false }),
     ]));
     expect(stuck.state).toBe("red");
     expect(stuck.stateReason).toBe("STA-2 is stuck: No run in 45 min");
