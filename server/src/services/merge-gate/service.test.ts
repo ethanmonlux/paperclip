@@ -24,7 +24,7 @@ function fakeBase() {
   return { head: BASE };
 }
 
-function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headChecks: MergeGateCheck[]; behindBy: number; headSha: string; base: { head: string } }> = {}) {
+function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headChecks: MergeGateCheck[]; behindBy: number; headSha: string; base: { head: string }; commitMessage: string }> = {}) {
   const headSha = overrides.headSha ?? HEAD;
   const base = overrides.base ?? fakeBase();
   // Merging advances the shared base, as GitHub would.
@@ -44,7 +44,7 @@ function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headCheck
       if (to === headSha) {
         // compare(base...head): a head built on BASE is behind any newer base.
         return { status: "ahead", aheadBy: 3, behindBy: from === BASE ? (overrides.behindBy ?? 0) : 1, totalCommits: 3, files: [], complete: true,
-          commits: [{ sha: "own", parentCount: 1, message: "feat: change\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" }] };
+          commits: [{ sha: "own", parentCount: 1, message: overrides.commitMessage ?? "feat: change\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" }] };
       }
       // compare(base...reviewed): the PR's own diff at review time.
       return { status: "diverged", aheadBy: 1, behindBy: 2, totalCommits: 1, complete: true, commits: [],
@@ -88,9 +88,11 @@ function harness(input: {
     loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
+      // `coordinatorFamilies` means the coordinator has runs on the task.
+      const coordinatorRuns = input.coordinatorFamilies && query.excludeAgentId !== "coordinator";
       return families === null ? null : {
-        agentIds: query.sourceAuthorAgentIds ?? [...(input.authorAgents ?? ["claude-engineer"]), ...(query.excludeAgentId ? [] : ["coordinator"])],
-        modelFamilies: query.sourceAuthorAgentIds ? families : [...families, ...(query.excludeAgentId ? [] : input.coordinatorFamilies ?? [])],
+        agentIds: query.sourceAuthorAgentIds ?? [...(input.authorAgents ?? ["claude-engineer"]), ...(coordinatorRuns ? ["coordinator"] : [])],
+        modelFamilies: query.sourceAuthorAgentIds ? families : [...families, ...(coordinatorRuns ? input.coordinatorFamilies ?? [] : [])],
       };
     },
     // The database lock is a try-lock shared across server instances.
@@ -211,6 +213,20 @@ describe("merge gate service", () => {
     expect(merge).not.toHaveBeenCalled();
   });
 
+  it("refuses a creator that implemented before handing the task to another agent", async () => {
+    // Codex created and ran the task, then assigned it to Claude. The commit
+    // trailer says only Paperclip, so it supplies no Codex family evidence.
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const h = harness({ github, issues: [issue({ id: "task", createdByAgentId: "codex-engineer",
+      assigneeAgentId: "claude-engineer" })], authorAgents: ["codex-engineer", "claude-engineer"],
+      authorFamilies: ["anthropic"] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "codex-engineer", runId: "creator-run" } })))
+      .rejects.toThrow(/implementer cannot merge/);
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
   it("lets the routed coordinator merge after independent review and exact-head CI", async () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
     const h = harness({ github, routedCoordinator: "coordinator", issues: [
@@ -232,6 +248,27 @@ describe("merge gate service", () => {
       .resolves.toMatchObject({ outcome: "mergeable", reasons: [] });
     expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null,
       sourceAuthorAgentIds: ["claude-engineer"] }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("refuses an ancestor coordinator that implemented before handing the task to another agent", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const h = harness({ github, issues: [
+      issue({ id: "task", parentId: "parent", createdByAgentId: null, assigneeAgentId: "claude-engineer" }),
+      issue({ id: "parent", assigneeAgentId: "codex-engineer" }),
+    ], authorAgents: ["codex-engineer", "claude-engineer"], authorFamilies: ["anthropic"] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "codex-engineer", runId: "ancestor-run" } })))
+      .rejects.toThrow(/implementer cannot merge/);
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a creator's run history cannot be established", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, authorFamilies: null });
+    await expect(evaluateAndMerge(h.deps, request()))
+      .rejects.toThrow(/authorship could not be established/);
     expect(merge).not.toHaveBeenCalled();
   });
 
@@ -333,14 +370,20 @@ describe("merge gate service", () => {
     await expect(evaluateAndMerge(sameFamily.deps, request()))
       .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
     // Only the merging coordinator's runs are left out; reviewers' runs count.
-    expect(sameFamily.authorQueries).toEqual([{ issueId: "task", excludeAgentId: "coordinator" }]);
+    expect(sameFamily.authorQueries).toEqual([
+      { issueId: "task", excludeAgentId: null },
+      { issueId: "task", excludeAgentId: "coordinator" },
+    ]);
     // A run with no recorded model leaves only the trailers, which still name Claude.
     const trailersOnly = harness({ github, authorFamilies: [], reviews: [review({ reviewerModelFamilies: ["anthropic"] })] });
     await expect(evaluateAndMerge(trailersOnly.deps, request()))
       .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("anthropic") }] });
-    const missing = harness({ github, authorFamilies: null });
+    const missing = harness({ github, authorFamilies: null, issues: [
+      issue({ id: "task", parentId: "parent", assigneeAgentId: "claude-engineer", createdByAgentId: null }),
+      issue({ id: "parent", assigneeAgentId: "coordinator" }),
+    ] });
     await expect(evaluateAndMerge(missing.deps, request()))
-      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("no recorded model") }] });
+      .rejects.toThrow(/authorship could not be established/);
     expect(coAuthorModelFamilies(["fix\n\nCo-authored-by: Codex <codex@openai.com>", null])).toEqual(["openai"]);
   });
 

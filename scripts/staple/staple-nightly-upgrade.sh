@@ -3,7 +3,8 @@
 # Installed as ~/.local/bin/staple-nightly-upgrade. It is the only Staple install path (FAC-840 C1).
 #
 # Usage:
-#   staple-nightly-upgrade hold              02:30: place the maintenance hold (admission held, wakes queue)
+#   staple-nightly-upgrade hold              02:30: place the maintenance hold (admission held, wakes queue),
+#                                            only when a certified commit newer than the installed build exists
 #   staple-nightly-upgrade [--dry-run]       03:30: upgrade under the hold, then release it
 #   QUIET_MODE=1 staple-nightly-upgrade      hourly: opportunistic daytime install, only when already quiet
 #   staple-nightly-upgrade ci-state CHECKS WORKFLOWS   print the Gate 0 state for saved GitHub JSON (no side effects)
@@ -11,7 +12,7 @@
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
 #
-# Certification (STA-223): PRs run change-scoped checks only. The nightly staple-certify.yml run
+# Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
 # Only the newest first-parent master commit certified `success` is installed. A missing, pending,
 # failed or unreadable certification blocks that commit, and an older certified one is used instead.
@@ -140,6 +141,8 @@ PY
 }
 # First-parent history of $BRANCH, newest first, from a commits-only shallow fetch (no API quota).
 first_parent_chain() {
+  # Tests: $STAPLE_GITHUB_FIXTURES/chain holds the first-parent SHAs, newest first.
+  if [ -n "${STAPLE_GITHUB_FIXTURES:-}" ] && [ -f "$STAPLE_GITHUB_FIXTURES/chain" ]; then cat "$STAPLE_GITHUB_FIXTURES/chain"; return; fi
   local dir rc; dir=$(mktemp -d)
   git init -q --bare "$dir" && git -C "$dir" fetch -q --no-tags --filter=tree:0 --depth="$CERT_WINDOW" \
     "https://github.com/$REPO.git" "+refs/heads/$BRANCH:refs/heads/$BRANCH" &&
@@ -222,7 +225,7 @@ for fam,js in sorted(fams.items()):
     body="\n".join(["The nightly full-suite certification failed, so `%s` is not `staple/certified` and will not be installed."%sha,
         "","Run: %s"%run.get("html_url",""),"","Failing jobs (%d):"%len(js),""]+[excerpt(j) for j in js[:3]]+
         (["- and %d more"%(len(js)-3)] if len(js)>3 else [])+
-        ["","**Repair:** merge the fix under the normal bar with its own change-scoped checks. Then run `staple-certify.yml`",
+        ["","**Repair:** merge the fix under the normal bar with its own routine checks. Then run `staple-certify.yml`",
          "with `workflow_dispatch` on master to certify the new head. Until a newer commit is certified, the installer keeps",
          "the last certified build.","","Opened by `staple-nightly-upgrade certify-report` (STA-223)."])
     if dry: print("DRY RUN: would open critical task %r for %s\n%s\n"%(title,who,body)); continue
@@ -336,11 +339,25 @@ d=json.load(sys.stdin); d=d if isinstance(d,list) else d.get("items",[])
 print(len([x for x in d if x.get("status")=="running"]))'
 }
 
+health_commit() { curl -s -m 10 $API/api/health | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null; }
+
 if [ "$MODE" = certify-report ]; then certification_repairs "$CERT_RUN"; exit $?; fi
 
 if [ "$MODE" = hold ]; then
   exec 9>"$LOGDIR/upgrade.lock"; flock -n 9 || { say "an upgrade run holds the lock; it manages the hold itself"; exit 0; }
   say "== Staple maintenance hold (drain ${HOLD_DRAIN_MIN} min, max ${HOLD_MAX_MIN} min)"
+  # Hold only when there is a certified commit to install. Without one the 03:30 run skips, so a
+  # hold would drain and park work for nothing. If a commit is certified after this check, the
+  # 03:30 run places its own hold with the same drain before installing.
+  INSTALLED=$(health_commit); CHAIN=$(mktemp)
+  if [ -z "$INSTALLED" ]; then PICK="error:installed build unreadable"
+  elif ! first_parent_chain > "$CHAIN" || [ ! -s "$CHAIN" ]; then PICK="error:could not read $BRANCH history"
+  else PICK=$(certified_pick "$INSTALLED" "$CHAIN"); fi
+  rm -f "$CHAIN"
+  case "$PICK" in
+    target:*) say "certified target: $PICK" ;;
+    *) say "no certified commit to install ($PICK); not placing the hold. Installed stays ${INSTALLED:0:8}."; exit 0 ;;
+  esac
   [ $DRY = 1 ] && { say "DRY RUN: would place the maintenance hold"; exit 0; }
   place_hold "$HOLD_DRAIN_MIN" "$HOLD_MAX_MIN" "nightly maintenance window" || exit 1
   # The 03:30 upgrade releases it; the server's expiry releases it if that never runs.
@@ -348,7 +365,6 @@ if [ "$MODE" = hold ]; then
 fi
 
 exec 9>"$LOGDIR/upgrade.lock"; flock -n 9 || { echo "another upgrade run holds the lock; exiting"; exit 0; }
-health_commit() { curl -s -m 10 $API/api/health | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null; }
 REPORT_ISSUE_FILE=$LOGDIR/report-issue-id
 report() {  # $1 = one-line outcome, $2 = detail
   if [ "$QUIET_MODE" = 1 ] && [[ "$1" == Skipped:* || "$1" == Waiting:* ]]; then say "quiet-mode skip (not reported): $1"; return; fi

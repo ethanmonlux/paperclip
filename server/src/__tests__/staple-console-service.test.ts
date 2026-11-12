@@ -4,6 +4,8 @@ import {
   agents,
   companies,
   createDb,
+  documents,
+  issueDocuments,
   issueAccessGrants,
   issueComments,
   issueExecutionDecisions,
@@ -232,5 +234,31 @@ suite("staple console service", () => {
     ]);
     expect(board.sources.github.detail).toContain("GitHub read failed for 1 of 25 PRs");
     expect(board.sources.github.detail).toContain("2 older PRs are beyond the 25-PR refresh limit");
+  });
+  it("reads the capability map only from its owning task, never a newer same-key copy elsewhere (FAC-906)", async () => {
+    const companyId = await seedCompany();
+    const actor: AuthorizationActor = { type: "board", userId: "reader", authorizingUserId: "reader" };
+    const svc = stapleConsoleService(db, { credentialProvider: async () => null });
+    const mapBody = (title: string) => JSON.stringify({ groups: [{ key: "staple", label: "Staple", capabilities: [{
+      key: "tells", title, claims: [{ text: "Tasks wake when their blocker lands", why: "Blocked tasks sat idle.", issues: [] }],
+    }] }] });
+    const [scratch] = await db.insert(issues).values({ companyId, title: "Scratch task", status: "todo", identifier: "SCR-1" }).returning();
+    const [scratchDoc] = await db.insert(documents).values({ companyId, latestBody: mapBody("Scratch copy") }).returning();
+    await db.insert(issueDocuments).values({ companyId, issueId: scratch!.id, documentId: scratchDoc!.id, key: "capability-map" });
+
+    const ownerless = await svc.board(companyId, actor);
+    expect(ownerless.capabilities.source.available).toBe(false);
+    expect(boardText(ownerless)).not.toContain("Scratch copy");
+
+    const [owner] = await db.insert(issues).values({ companyId, title: "Staple Console", status: "blocked", identifier: "STA-152" }).returning();
+    const [ownerDoc] = await db.insert(documents).values({
+      companyId, latestBody: mapBody("Canonical map"), updatedAt: new Date(Date.now() - 60 * 60_000),
+    }).returning();
+    await db.insert(issueDocuments).values({ companyId, issueId: owner!.id, documentId: ownerDoc!.id, key: "capability-map" });
+
+    const board = await svc.board(companyId, actor);
+    expect(board.capabilities.source).toMatchObject({ available: true, issueIdentifier: "STA-152" });
+    expect(board.capabilities.groups[0]!.capabilities[0]!.title).toBe("Canonical map");
+    expect(boardText(board)).not.toContain("Scratch copy");
   });
 });

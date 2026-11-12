@@ -379,7 +379,6 @@ jobs:
           CI_INCREMENTAL_MODE: ${{ vars.CI_INCREMENTAL_MODE || 'enabled' }}
           STACK_JSON: ${{ toJSON(github.event.pull_request.stack) }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EVENT_HEAD_REF: ${{ github.head_ref }}
           EVENT_MERGE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -438,8 +437,10 @@ jobs:
           export CI_TASK_CONFIG="$directory/turbo.json"
           export CI_TASK_MATRIX="$directory/ci-task-matrix.json"
           export CI_DIFF_REPOSITORY="$directory/repository.git"
-          # Staple fork (STA-223): narrow PR plans with the scope map from the same
-          # tested merge. Without the map, or if narrowing fails, the plan stays whole.
+          # Staple fork (STA-223): turn the plan into the routine plan for this push
+          # (light checks; the nightly certification runs the complete suite) with
+          # the scope map from the same tested merge. Without the map, or if that
+          # fails, the plan stays whole.
           scoped='false'
           if [[ "$repository" != 'paperclipai/paperclip' ]]; then
             scoped='true'

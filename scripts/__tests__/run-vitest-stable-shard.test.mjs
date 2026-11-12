@@ -445,6 +445,30 @@ test("shard flags are rejected for the native-runner group", () => {
   assert.notEqual(result.status, 0, "the native-runner lane is a single suite and must not accept shard flags");
 });
 
+// Staple certification (staple-certify.yml, STA-223) calls the same
+// pr-trusted.yml on master, whose Rust-cached lane runs the native-runner
+// group. Its general shards must match PR's exactly: under any other caller
+// name they also pick up the cargo-dependent suites, which then fail without a
+// Runner binary (certification run 43024850213).
+test("Staple certification selects exactly the PR server shards", () => {
+  for (let index = 0; index < 12; index += 1) {
+    const args = ["--mode", "general", "--group", "general-server-without-chat",
+      "--shard-index", String(index), "--shard-count", "12"];
+    assert.deepEqual(
+      dryRunJson(args, { GITHUB_WORKFLOW: "Staple certification" }).selectedGeneralServerSuites,
+      dryRunJson(args, { GITHUB_WORKFLOW: "PR" }).selectedGeneralServerSuites,
+      `shard ${index + 1}/12`,
+    );
+  }
+});
+
+test("the Staple certification workflow keeps the PR lane name", () => {
+  const certify = readFileSync(path.join(repoRoot, ".github/workflows/staple-certify.yml"), "utf8");
+  assert.match(certify, /^name: Staple certification$/m,
+    "renaming staple-certify.yml moves the native-runner suites into server shards without a Runner binary; update prLaneWorkflowNames too");
+  assert.match(certify, /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml$/m);
+});
+
 // The PR-side exclusion above is safe only while the wiring it assumes holds:
 // pr.yml (the caller whose name reusable pr-trusted.yml jobs see as
 // GITHUB_WORKFLOW) is named PR, the package vitest lanes cover every

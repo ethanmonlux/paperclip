@@ -68,6 +68,66 @@ jobs:
             console.log(file, JSON.stringify(selected.plan.testSelection.stats, null, 2));
           }
           NODE
+      # Staple routine pushes (STA-223): the same real graphs, narrowed to the
+      # tests known to be affected. Six merge-gate files once kept 1,723 of
+      # 1,903 server test files; the focused selection runs the tests that
+      # import them and names the opaque remainder it leaves to certification.
+      - name: Qualify the focused selection of a routine push against the real workspace
+        env:
+          NODE_ENV: test
+          VITEST: 'true'
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { planTasks } from './.github/scripts/ci-plan.mjs';
+          import { scopePlan } from './.github/scripts/staple-ci-scope.mjs';
+          import { createTestSelection } from './scripts/ci/select-tests.mjs';
+          const config = JSON.parse(readFileSync('turbo.json', 'utf8'));
+          const lanes = JSON.parse(readFileSync('.github/ci-task-matrix.json', 'utf8'));
+          const scope = JSON.parse(readFileSync('.github/staple-ci-scope.json', 'utf8'));
+          const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          const select = async (paths) => {
+            const plan = scopePlan({ plan: planTasks({ config, lanes, paths }), scope, config, lanes });
+            assert.equal(plan.staple.scope, 'routine');
+            const selected = await createTestSelection(plan, head);
+            const files = Object.values(selected.manifest.lanes).flatMap((lane) => lane.shards.flatMap((shard) => Object.values(shard).flat()));
+            const jobs = selected.plan.testSelection.stats.reduce((total, lane) => total + lane.jobs, 0);
+            console.log(paths.join(', '), JSON.stringify({ files: files.length, jobs, focus: selected.plan.testSelection.focus }, null, 2));
+            return { selected, files, jobs, focus: selected.plan.testSelection.focus };
+          };
+          const mergeGate = ['policy.test.ts', 'policy.ts', 'service.test.ts', 'service.ts', 'wiring.test.ts', 'wiring.ts']
+            .map((file) => `server/src/services/merge-gate/${file}`);
+          const gate = await select(mergeGate);
+          for (const file of mergeGate.filter((file) => file.endsWith('.test.ts'))) assert.ok(gate.files.includes(file), file);
+          assert.ok(gate.files.length < 100, 'Only the tests that import the change run');
+          assert.ok(gate.jobs >= 1 && gate.jobs <= 3, 'A small change needs a small number of jobs');
+          assert.ok(gate.focus.deferred['@paperclipai/server'] > 1000, 'The opaque remainder is counted, not hidden');
+          assert.equal(gate.focus.budget.exceeded, null);
+          assert.ok(gate.selected.graphs.every((graph) => graph.deferred.every((file) => graph.retentionReasons[file])), 'Every deferred test has a recorded reason');
+          // A widely re-exported source reaches most of the suite: keep the nearest tests, within the budget.
+          const launcher = await select(['packages/adapter-utils/src/github-launcher.test.ts', 'packages/adapter-utils/src/github-launcher.ts']);
+          assert.ok(launcher.files.includes('packages/adapter-utils/src/github-launcher.test.ts'));
+          assert.ok(launcher.jobs >= 1 && launcher.jobs <= scope.routine.maxTestJobs);
+          assert.ok(launcher.focus.budget.exceeded.jobs > scope.routine.maxTestJobs);
+          // The audit names each affected test that the budget left to the certification.
+          const left = launcher.selected.graphs.flatMap((graph) => graph.budgetDeferred);
+          assert.equal(left.length, launcher.focus.budget.exceeded.left);
+          assert.ok(left.length > 0 && !left.some((file) => launcher.files.includes(file)));
+          // A changed setup file invalidates its whole project. It reaches the graph, and the budget never prunes it.
+          const setup = await select(['ui/vitest.setup.ts']);
+          assert.deepEqual(setup.focus.wholeProjects, ['@paperclipai/ui']);
+          const ui = setup.selected.graphs.find((graph) => graph.project === '@paperclipai/ui');
+          assert.ok(ui.setupChanged && ui.inventory.every((file) => setup.files.includes(file)), 'Every UI test runs');
+          const helper = await select(['server/src/__tests__/helpers/isolated-test-home.ts']);
+          assert.deepEqual(helper.focus.wholeProjects, ['@paperclipai/server']);
+          assert.ok(helper.jobs > scope.routine.maxTestJobs, 'A setup-invalidated project runs whole, over the budget');
+          assert.ok(helper.files.length > 1800);
+          // Nothing a test graph covers: no test lane, and the change is named.
+          const config_only = await select(['package.json', 'scripts/ci/select-tests.mjs', 'server/src/app.ts']);
+          assert.deepEqual(config_only.focus.ungraphed, ['package.json', 'scripts/ci/select-tests.mjs']);
+          NODE
 
   qualify:
     runs-on: ubuntu-latest

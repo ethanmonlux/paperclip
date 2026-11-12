@@ -103,8 +103,10 @@ export interface MergeGateDependencies {
   loadAcceptedCoordinatorRouting: (companyId: string, issueId: string, implementerAgentId: string, coordinatorAgentId: string) => Promise<boolean>;
   /**
    * Who may have authored the task: every agent with a run on it and the
-   * model families those runs recorded. Only a non-legacy coordinator's runs
-   * may be left out (`excludeAgentId`). Reviewers are not: a reviewer with a run
+   * model families those runs recorded. A creator or ancestor coordinator's
+   * runs may be left out (`excludeAgentId`) only after its coordinator
+   * authority is checked; a handoff coordinator's runs never are.
+   * Reviewers are not: a reviewer with a run
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
    */
@@ -136,7 +138,11 @@ function normalizeRepo(repo: string) {
  * Coordinator-only: a board operator, or an agent that delegated the task
  * (its creator, an ancestor's assignee, or a recorded legacy handoff).
  */
-export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation" | "loadAcceptedCoordinatorRouting">, issue: GateIssue, actor: MergeGateActor) {
+export async function assertMayMerge(
+  deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation" | "loadAcceptedCoordinatorRouting" | "loadTaskAuthorship">,
+  issue: GateIssue,
+  actor: MergeGateActor,
+) {
   if (actor.type === "board") return false;
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
@@ -144,17 +150,34 @@ export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssu
     if (await deps.loadLegacyDelegation(issue.companyId, issue.id, agentId)) return true;
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
-  if (issue.createdByAgentId === agentId) return false;
-  let parentId = issue.parentId;
-  for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
-    const parent = await deps.loadIssue(issue.companyId, parentId);
-    if (!parent) break;
-    if (parent.assigneeAgentId === agentId) return false;
-    parentId = parent.parentId;
-  }
+  // An engineer that created and still holds its task may route review to a
+  // coordinator. That coordinator's runs stay potential authorship.
   if (issue.assigneeAgentId && issue.createdByAgentId === issue.assigneeAgentId &&
     await deps.loadAcceptedCoordinatorRouting(issue.companyId, issue.id, issue.assigneeAgentId, agentId)) return true;
-  throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
+  let coordinatesTask = issue.createdByAgentId === agentId;
+  if (!coordinatesTask) {
+    let parentId = issue.parentId;
+    for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const parent = await deps.loadIssue(issue.companyId, parentId);
+      if (!parent) break;
+      if (parent.assigneeAgentId === agentId) {
+        coordinatesTask = true;
+        break;
+      }
+      parentId = parent.parentId;
+    }
+  }
+  if (!coordinatesTask) {
+    throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
+  }
+  // Either authority path can belong to a former implementer. Never exclude
+  // the coordinator's task runs without first checking the full run history.
+  const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
+  if (!authorship) throw forbidden("Task authorship could not be established; the merge gate cannot authorize this agent");
+  if (authorship.agentIds.includes(agentId)) {
+    throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
+  }
+  return false;
 }
 
 async function isRedMainExempt(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, ownerIssueId: string) {
@@ -278,8 +301,9 @@ async function evaluateLocked(
   // Who may have authored the change is read from what the runs recorded,
   // not from the assignee's current adapter configuration. No run says
   // whether it wrote code, so every agent that ran on the task counts,
-  // including one that reviews it now. A non-legacy merging coordinator is
-  // excluded. A legacy coordinator was an assignee and may have authored code,
+  // including one that reviews it now. A creator or ancestor coordinator,
+  // already shown to have no runs on the task, is excluded. A handoff
+  // coordinator (legacy return or accepted routing) may have authored code,
   // so its runs remain potential authorship.
   // A completed review can attest the exhaustive source author set. Validate
   // those identities against started task runs in the database; coordination
