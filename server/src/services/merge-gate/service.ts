@@ -108,7 +108,7 @@ export interface MergeGateDependencies {
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
    */
-  loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null }) =>
+  loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[] }) =>
     Promise<{ agentIds: string[]; modelFamilies: string[] } | null>;
   /**
    * Run `action` holding the merge lock for one repository branch, across
@@ -281,14 +281,23 @@ async function evaluateLocked(
   // including one that reviews it now. A non-legacy merging coordinator is
   // excluded. A legacy coordinator was an assignee and may have authored code,
   // so its runs remain potential authorship.
+  // A completed review can attest the exhaustive source author set. Validate
+  // those identities against started task runs in the database; coordination
+  // and review runs on the source task are not source authors by default.
+  const sourceReview = [...independentOfMerger].reverse().find(review =>
+    review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
+    review.pullRequest?.toLowerCase() === label.toLowerCase() && review.reviewedSha === headSha &&
+    review.sourceAuthorAgentIds?.length);
+  const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
   const authorship = await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentId: handoffCoordinator ? null : request.actor.agentId ?? null,
+    excludeAgentId: sourceAuthorAgentIds ? null : handoffCoordinator ? null : request.actor.agentId ?? null,
+    sourceAuthorAgentIds,
   });
   const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
   const author: MergeGateAuthor = {
     agentIds: authorship === null ? null
-      : [...new Set([...authorship.agentIds, ...(issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
+      : [...new Set([...authorship.agentIds, ...(!sourceAuthorAgentIds && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
     modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
   };
   const deltas = new Map<string, HeadDelta>();

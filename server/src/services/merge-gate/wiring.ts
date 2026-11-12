@@ -167,14 +167,17 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         row.payload.target?.type === "issue_document" && row.payload.target.issueId === issueId);
     },
     async loadTaskAuthorship(companyId, input) {
-      // Every run that started on the task may have authored part of it,
-      // whatever role its agent holds now.
+      // Without a reviewer-attested source author set, every task run remains
+      // a potential author. An attested set must be backed by started runs.
+      const sourceIds = input.sourceAuthorAgentIds;
+      if (sourceIds && (sourceIds.length === 0 || sourceIds.length > MAX_AUTHOR_RUNS)) return null;
       const runs = await db.select({ agentId: heartbeatRuns.agentId, usage: heartbeatRuns.usageJson })
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.issueId, input.issueId),
           isNotNull(heartbeatRuns.startedAt),
+          sourceIds ? inArray(heartbeatRuns.agentId, sourceIds) : undefined,
           input.excludeAgentId ? ne(heartbeatRuns.agentId, input.excludeAgentId) : undefined,
         ))
         .orderBy(desc(heartbeatRuns.createdAt))
@@ -188,6 +191,7 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         for (const family of families) entry.families.add(family);
         byAgent.set(run.agentId, entry);
       }
+      if (sourceIds && sourceIds.some(id => !byAgent.has(id))) return null;
       // A run that recorded no model (killed early, say) is attributed to its
       // agent's recorded families on this task; an agent with none is unknown.
       const families = new Set<string>();
@@ -216,7 +220,7 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
           eq(issueDocuments.companyId, companyId),
           eq(issueDocuments.key, MERGE_REVIEW_DOCUMENT_KEY),
           input.reviewIssueIds.length > 0
-            ? sql`(${inArray(issueDocuments.issueId, input.reviewIssueIds)} or ${documents.latestBody} ilike ${`%${reference}%`})`
+            ? inArray(issueDocuments.issueId, input.reviewIssueIds)
             : sql`${documents.latestBody} ilike ${`%${reference}%`}`,
         ))
         .orderBy(documents.updatedAt)

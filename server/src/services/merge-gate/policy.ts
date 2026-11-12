@@ -391,6 +391,8 @@ export interface MergeReviewAttestation {
   reviewerModelFamilies: string[];
   /** The document revision was written by the review issue's assignee. */
   writtenByReviewer: boolean;
+  /** Exhaustive source author agents attested by the independent reviewer, when known. */
+  sourceAuthorAgentIds: string[] | null;
   scope: "full" | "conflict_hunks";
   reviewedSha: string;
   pullRequest: string | null;
@@ -431,7 +433,11 @@ export function parseMergeReviewDocument(body: string): Omit<MergeReviewAttestat
   if (!scope) return null;
   const p2Value = field("p2") ?? "none";
   const p2 = /^(none|0|-)$/i.test(p2Value) ? [] : p2Value.split(/[,\s]+/).filter(Boolean);
-  return { scope, reviewedSha, pullRequest: field("pullRequest"), p0, p1, p2 };
+  const sourceAuthors = field("sourceAuthorAgentIds");
+  const sourceAuthorAgentIds = sourceAuthors === null ? null : sourceAuthors.split(/[,\s]+/).filter(Boolean);
+  if (sourceAuthorAgentIds !== null && (sourceAuthorAgentIds.length === 0 ||
+    sourceAuthorAgentIds.some(id => !/^[0-9a-f]{8}-[0-9a-f-]{27,}$/.test(id)))) return null;
+  return { scope, reviewedSha, pullRequest: field("pullRequest"), p0, p1, p2, sourceAuthorAgentIds };
 }
 
 const TRACKED_ISSUE = /^[A-Z][A-Z0-9]*-\d+$/;

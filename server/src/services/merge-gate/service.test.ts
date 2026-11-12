@@ -60,7 +60,7 @@ function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headCheck
 function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAttestation {
   return {
     reviewIssueId: "review", reviewIssueIdentifier: "STA-REVIEW", reviewIssueStatus: "done", reviewerAgentId: "codex-reviewer",
-    reviewerModelFamilies: ["openai"], writtenByReviewer: true, scope: "full", reviewedSha: HEAD,
+    reviewerModelFamilies: ["openai"], writtenByReviewer: true, sourceAuthorAgentIds: null, scope: "full", reviewedSha: HEAD,
     pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [], ...overrides,
   };
 }
@@ -78,7 +78,7 @@ function harness(input: {
   const parked: Array<{ issueId: string; blockerIssueId: string }> = [];
   const logs: Array<{ action: string; details: Record<string, unknown> }> = [];
   const locks = input.locks ?? new Set<string>();
-  const authorQueries: Array<{ issueId: string; excludeAgentId: string | null }> = [];
+  const authorQueries: Array<{ issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[] }> = [];
   const deps: MergeGateDependencies = {
     github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
@@ -89,8 +89,8 @@ function harness(input: {
       authorQueries.push(query);
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
       return families === null ? null : {
-        agentIds: [...(input.authorAgents ?? ["claude-engineer"]), ...(query.excludeAgentId ? [] : ["coordinator"])],
-        modelFamilies: [...families, ...(query.excludeAgentId ? [] : input.coordinatorFamilies ?? [])],
+        agentIds: query.sourceAuthorAgentIds ?? [...(input.authorAgents ?? ["claude-engineer"]), ...(query.excludeAgentId ? [] : ["coordinator"])],
+        modelFamilies: query.sourceAuthorAgentIds ? families : [...families, ...(query.excludeAgentId ? [] : input.coordinatorFamilies ?? [])],
       };
     },
     // The database lock is a try-lock shared across server instances.
@@ -220,6 +220,19 @@ describe("merge gate service", () => {
       .rejects.toThrow(/Only the coordinator/);
     await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
     expect(merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the completed reviewer's attested source authors for the live STA-315 board shape", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, coordinatorFamilies: ["openai"], reviews: [review({
+      reviewIssueIdentifier: "STA-326", sourceAuthorAgentIds: ["claude-engineer"],
+    })], issues: [issue({ id: "task", status: "blocked", assigneeAgentId: "coordinator",
+      createdByAgentId: "claude-engineer", parentId: null })] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject({ outcome: "mergeable", reasons: [] });
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null,
+      sourceAuthorAgentIds: ["claude-engineer"] }]);
+    expect(merge).not.toHaveBeenCalled();
   });
 
   it("needs only CI after a clean update from main since the review", async () => {

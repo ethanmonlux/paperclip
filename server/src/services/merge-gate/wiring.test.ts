@@ -84,7 +84,7 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     // The implementer is reconfigured after authoring; history is unchanged.
     await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, implementer.id));
     const reviewRun = await f.run(reviewer.id, reviewIssue.id, { model: "gpt-6.1-sol", provider: "openai" });
-    const body = `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\nscope: full\np0: 0\np1: 0\np2: none`;
+    const body = `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\nscope: full\np0: 0\np1: 0\np2: none\nsourceAuthorAgentIds: ${implementer.id}`;
     const [document] = await db.insert(documents).values({ companyId: f.company.id, latestBody: body, updatedByAgentId: reviewer.id }).returning();
     await db.insert(documentRevisions).values({ companyId: f.company.id, documentId: document!.id, revisionNumber: 1, body,
       createdByAgentId: reviewer.id, createdByRunId: reviewRun.id });
@@ -101,6 +101,11 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
     const coordinator = await f.agent("Coordinator", "codex_local");
     await f.run(coordinator.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
     await f.run(reviewer.id, task.id, { model: "gpt-6.1-sol", provider: "openai" });
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: [implementer.id] }))
+      .resolves.toEqual({ agentIds: [implementer.id], modelFamilies: ["anthropic"] });
+    await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: null,
+      sourceAuthorAgentIds: ["00000000-0000-4000-8000-000000000000"] })).resolves.toBeNull();
     await expect(deps.loadTaskAuthorship(f.company.id, { issueId: task.id, excludeAgentId: coordinator.id }))
       .resolves.toEqual({ agentIds: [implementer.id, reviewer.id].sort(), modelFamilies: ["anthropic", "openai"] });
 
