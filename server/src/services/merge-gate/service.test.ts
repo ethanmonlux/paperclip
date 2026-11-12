@@ -60,14 +60,20 @@ function fakeGitHub(overrides: Partial<{ baseChecks: MergeGateCheck[]; headCheck
 function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAttestation {
   return {
     reviewIssueId: "review", reviewIssueIdentifier: "STA-REVIEW", reviewIssueStatus: "done", reviewerAgentId: "codex-reviewer",
-    reviewerModelFamilies: ["openai"], writtenByReviewer: true, scope: "full", reviewedSha: HEAD,
+    reviewerModelFamilies: ["openai"], writtenByReviewer: true, sourceAuthorAgentIds: null, scope: "full", reviewedSha: HEAD,
     pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [], ...overrides,
   };
 }
 
 function harness(input: {
   github: MergeGateGitHub | ((repo: string) => MergeGateGitHub); reviews?: MergeReviewAttestation[]; issues?: GateIssue[];
-  authorFamilies?: string[] | null; authorAgents?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
+  authorFamilies?: string[] | null; authorAgents?: string[]; coordinatorFamilies?: string[]; locks?: Set<string>; onLoadReviews?: () => void;
+  legacyCoordinator?: string;
+  routedCoordinator?: string;
+  /** The task's recorded creator/assignee/checkout history; defaults to its creator and assignee. */
+  custodians?: string[] | null;
+  /** Started runs on the task per agent, read with the real wiring's filtering. */
+  runFamilies?: Record<string, string[]>;
 }) {
   const issues = new Map((input.issues ?? []).map(row => [row.id, row]));
   issues.set("task", issues.get("task") ?? issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "coordinator", parentId: "parent" }));
@@ -76,15 +82,36 @@ function harness(input: {
   const parked: Array<{ issueId: string; blockerIssueId: string }> = [];
   const logs: Array<{ action: string; details: Record<string, unknown> }> = [];
   const locks = input.locks ?? new Set<string>();
-  const authorQueries: Array<{ issueId: string; excludeAgentId: string | null }> = [];
+  const authorQueries: Array<{ issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[]; attesterAgentId?: string }> = [];
+  const custodianQueries: string[] = [];
   const deps: MergeGateDependencies = {
     github: repo => typeof input.github === "function" ? input.github(repo) : input.github,
     resolveToken: async () => "token",
     loadIssue: async (_company, id) => issues.get(id) ?? null,
+    loadLegacyDelegation: async (_company, _issueId, agentId) => input.legacyCoordinator === agentId,
+    loadAcceptedCoordinatorRouting: async (_company, _issueId, _implementerId, agentId) => input.routedCoordinator === agentId,
     loadTaskAuthorship: async (_company, query) => {
       authorQueries.push(query);
+      if (input.runFamilies) {
+        const counted = query.sourceAuthorAgentIds && [...query.sourceAuthorAgentIds, ...(query.attesterAgentId ? [query.attesterAgentId] : [])];
+        const ran = Object.keys(input.runFamilies)
+          .filter(id => (!counted || counted.includes(id)) && id !== query.excludeAgentId).sort();
+        if (query.sourceAuthorAgentIds?.some(id => !ran.includes(id))) return null;
+        return { agentIds: ran, modelFamilies: [...new Set(ran.flatMap(id => input.runFamilies![id]!))].sort() };
+      }
       const families = input.authorFamilies === undefined ? ["anthropic"] : input.authorFamilies;
-      return families === null ? null : { agentIds: input.authorAgents ?? ["claude-engineer"], modelFamilies: families };
+      // `coordinatorFamilies` means the coordinator has runs on the task.
+      const coordinatorRuns = input.coordinatorFamilies && query.excludeAgentId !== "coordinator";
+      return families === null ? null : {
+        agentIds: query.sourceAuthorAgentIds ?? [...(input.authorAgents ?? ["claude-engineer"]), ...(coordinatorRuns ? ["coordinator"] : [])],
+        modelFamilies: query.sourceAuthorAgentIds ? families : [...families, ...(coordinatorRuns ? input.coordinatorFamilies ?? [] : [])],
+      };
+    },
+    loadTaskCustodians: async (_company, issueId) => {
+      custodianQueries.push(issueId);
+      if (input.custodians !== undefined) return input.custodians;
+      const task = issues.get(issueId);
+      return [task?.createdByAgentId, task?.assigneeAgentId].filter((id): id is string => Boolean(id));
     },
     // The database lock is a try-lock shared across server instances.
     withMergeLock: async (key, action) => {
@@ -107,7 +134,7 @@ function harness(input: {
     parkOnIssue: async request => { parked.push({ issueId: request.issueId, blockerIssueId: request.blockerIssueId }); },
     log: async entry => { logs.push({ action: entry.action, details: entry.details }); },
   };
-  return { deps, issues, owners, parked, logs, authorQueries };
+  return { deps, issues, owners, parked, logs, authorQueries, custodianQueries };
 }
 
 const coordinator = { type: "agent" as const, agentId: "coordinator", runId: "run-1" };
@@ -156,6 +183,54 @@ describe("merge gate service", () => {
     expect(merge).toHaveBeenCalledTimes(1);
   });
 
+  it("allows a recorded legacy coordinator handoff while rejecting its implementer and unrelated agents", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, legacyCoordinator: "coordinator", issues: [
+      issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null }),
+    ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "claude-engineer", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "someone-else", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
+    expect(merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat current assignment alone as a legacy handoff", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, issues: [issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null })] });
+    await expect(evaluateAndMerge(h.deps, request())).rejects.toThrow(/implementer cannot merge/);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("counts a legacy coordinator's Codex runs as authorship before or after handoff", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, legacyCoordinator: "coordinator", coordinatorFamilies: ["openai"],
+      reviews: [review({ reviewerModelFamilies: ["openai"] })], issues: [
+        issue({ id: "task", assigneeAgentId: "coordinator", createdByAgentId: null, parentId: null }),
+      ] });
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({
+      outcome: "refused", reasons: [{ code: "review_not_independent" }],
+    });
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("recognizes an accepted engineer-to-coordinator routing without allowing self merge or same-family review", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, routedCoordinator: "coordinator", coordinatorFamilies: ["openai"],
+      reviews: [review({ reviewerModelFamilies: ["openai"] })], issues: [
+        issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "claude-engineer", parentId: null }),
+      ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "claude-engineer", runId: "r" } })))
+      .rejects.toThrow(/implementer cannot merge/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({
+      outcome: "refused", reasons: [{ code: "review_not_independent" }],
+    });
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
   it("refuses a creator that implemented before handing the task to another agent", async () => {
     // Codex created and ran the task, then assigned it to Claude. The commit
     // trailer says only Paperclip, so it supplies no Codex family evidence.
@@ -167,6 +242,96 @@ describe("merge gate service", () => {
     await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "codex-engineer", runId: "creator-run" } })))
       .rejects.toThrow(/implementer cannot merge/);
     expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("lets the routed coordinator merge after independent review and exact-head CI", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = harness({ github, routedCoordinator: "coordinator", issues: [
+      issue({ id: "task", assigneeAgentId: "claude-engineer", createdByAgentId: "claude-engineer", parentId: null }),
+    ] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "someone-else", runId: "r" } })))
+      .rejects.toThrow(/Only the coordinator/);
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
+    expect(merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the completed reviewer's attested source authors for the live STA-315 board shape", async () => {
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    // The attesting reviewer has no run on the task; the Codex coordinator's
+    // runs there are coordination, not source.
+    const h = harness({ github, custodians: ["claude-engineer", "coordinator"],
+      runFamilies: { "claude-engineer": ["anthropic"], coordinator: ["openai"] }, reviews: [review({
+      reviewIssueIdentifier: "STA-326", sourceAuthorAgentIds: ["claude-engineer"],
+    })], issues: [issue({ id: "task", status: "blocked", assigneeAgentId: "coordinator",
+      createdByAgentId: "claude-engineer", parentId: null })] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject({ outcome: "mergeable", reasons: [] });
+    expect(h.custodianQueries).toEqual(["task"]);
+    expect(h.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null,
+      sourceAuthorAgentIds: ["claude-engineer"], attesterAgentId: "codex-reviewer" }]);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("does not let a non-custodian that ran on the task attest itself out of the source authors", async () => {
+    // A Codex helper ran on the task without ever creating, holding or
+    // checking it out, so only its runs tie it to the source. It then reviews
+    // the task and lists only Claude. No commit trailer names Codex.
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const helperReview = review({ reviewIssueIdentifier: "STA-HELPER", reviewerAgentId: "codex-helper",
+      sourceAuthorAgentIds: ["claude-engineer"] });
+    const refusedSelfReview = { outcome: "refused", reasons: [{ code: "review_not_independent",
+      detail: expect.stringContaining("worked on this task") }] };
+    const h = harness({ github, reviews: [helperReview], custodians: ["claude-engineer", "coordinator"],
+      runFamilies: { "claude-engineer": ["anthropic"], "codex-helper": ["openai"] } });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "lead-coordinator", runId: "r" } })))
+      .resolves.toMatchObject(refusedSelfReview);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    // The helper's own runs stayed counted, despite its narrower list.
+    expect(h.authorQueries.filter(query => query.sourceAuthorAgentIds).map(query => query.attesterAgentId))
+      .toEqual(["codex-helper", "codex-helper"]);
+    // The same holds for a reviewer whose only runs on the task were comments:
+    // no record shows those runs wrote no source.
+    const commented = harness({ github, custodians: ["claude-engineer", "coordinator"],
+      runFamilies: { "claude-engineer": ["anthropic"], coordinator: ["openai"], "codex-reviewer": ["openai"] },
+      reviews: [review({ sourceAuthorAgentIds: ["claude-engineer"] })] });
+    await expect(evaluateAndMerge(commented.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  it("does not let an implementer attest itself out of the source authors", async () => {
+    // Codex held and implemented the task before it went to Claude. Codex then
+    // reviews it and lists only Claude as the source author. No commit trailer
+    // names Codex.
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
+    const selfAttested = review({ reviewIssueIdentifier: "STA-SELF", reviewerAgentId: "codex-implementer",
+      sourceAuthorAgentIds: ["claude-engineer"] });
+    const refusedSelfReview = { outcome: "refused", reasons: [{ code: "review_not_independent",
+      detail: expect.stringContaining("worked on this task") }] };
+    const h = harness({ github, reviews: [selfAttested], authorAgents: ["codex-implementer", "claude-engineer"],
+      authorFamilies: ["anthropic", "openai"], custodians: ["claude-engineer", "codex-implementer", "coordinator"] });
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "agent", agentId: "lead-coordinator", runId: "r" } })))
+      .resolves.toMatchObject(refusedSelfReview);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    // The attestation never narrowed authorship: every run on the task counted.
+    expect(h.authorQueries.filter(query => query.sourceAuthorAgentIds)).toEqual([]);
+    // Unreadable task history cannot establish the attester's independence either.
+    const unknownHistory = harness({ github, reviews: [selfAttested], authorAgents: ["codex-implementer", "claude-engineer"],
+      authorFamilies: ["anthropic", "openai"], custodians: null });
+    await expect(evaluateAndMerge(unknownHistory.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    expect(unknownHistory.authorQueries).toEqual([{ issueId: "task", excludeAgentId: null }]);
+    // A reviewer that lists itself as a source author is not attesting independence.
+    const listsItself = harness({ github, reviews: [review({ sourceAuthorAgentIds: ["codex-reviewer"] })],
+      authorAgents: ["codex-reviewer", "claude-engineer"], authorFamilies: ["anthropic", "openai"] });
+    await expect(evaluateAndMerge(listsItself.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject(refusedSelfReview);
+    expect(listsItself.custodianQueries).toEqual([]);
     expect(merge).not.toHaveBeenCalled();
   });
 
