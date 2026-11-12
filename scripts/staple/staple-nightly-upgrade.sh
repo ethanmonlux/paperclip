@@ -11,6 +11,7 @@
 #   staple-nightly-upgrade certified-pick INSTALLED CHAIN   print the certified target for a saved first-parent chain
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
+#   staple-nightly-upgrade backup-result OUTPUT RC          print the Gate 2 result for saved db:backup stdout
 #
 # Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
@@ -65,6 +66,38 @@ if red: print("red:"+"; ".join(red[:5]))
 elif pending: print("pending:"+"; ".join(pending[:5]))
 elif not checks: print("none")
 else: print("green")
+PY
+}
+
+# Gate 2 result (STA-223). $1 = file holding the stdout of `paperclipai db:backup --json`, $2 = its exit code.
+# The CLI prints its banner and progress, then the metadata as pretty-printed JSON, then an outro, all on
+# stdout, so the metadata is found anywhere in the output rather than on one line. Prints one line:
+#   file:<path>        exit 0, metadata names an absolute backupFile that exists, is non-empty and has sizeBytes
+#   error:<reason>     anything else: nonzero exit, no metadata, missing, empty or mismatched file
+backup_result() {
+  python3 - "$1" "$2" <<'PY'
+import json,os,re,sys
+path,rc=sys.argv[1],sys.argv[2]
+if rc!="0": print("error:db:backup exited %s"%rc); sys.exit()
+try: text=re.sub(r"\x1b\[[0-9;?]*[A-Za-z]","",open(path,encoding="utf-8",errors="replace").read())
+except OSError as e: print("error:db:backup output unreadable (%s)"%str(e)[:80]); sys.exit()
+dec=json.JSONDecoder(); meta=None; i=text.find("{")
+while i>=0:
+    try: obj,end=dec.raw_decode(text,i)
+    except ValueError: end=i+1
+    else:
+        if isinstance(obj,dict) and "backupFile" in obj: meta=obj
+    i=text.find("{",end)
+if meta is None: print("error:no backup metadata in db:backup output"); sys.exit()
+f=meta.get("backupFile")
+if not isinstance(f,str) or not os.path.isabs(f): print("error:backupFile is not an absolute path (%r)"%(f,)); sys.exit()
+if not os.path.isfile(f): print("error:backup file missing (%s)"%f); sys.exit()
+size=os.path.getsize(f)
+if size<=0: print("error:backup file empty (%s)"%f); sys.exit()
+want=meta.get("sizeBytes")
+if isinstance(want,int) and not isinstance(want,bool) and want!=size:
+    print("error:backup file is %d bytes, db:backup reported %d (%s)"%(size,want,f)); sys.exit()
+print("file:%s"%f)
 PY
 }
 
@@ -243,6 +276,7 @@ PY
 case "${1:-}" in
   ci-state) ci_state "${2:?check-runs JSON}" "${3:?workflow-runs JSON}"; exit $? ;;
   certified-pick) certified_pick "${2:?installed SHA}" "${3:?first-parent chain file}"; exit $? ;;
+  backup-result) backup_result "${2:?db:backup output file}" "${3:?db:backup exit code}"; exit $? ;;
   certified-target)
     CHAIN=$(mktemp); trap 'rm -f "$CHAIN"' EXIT
     first_parent_chain > "$CHAIN" || { echo "error:could not read $BRANCH history"; exit 1; }
@@ -459,10 +493,17 @@ while :; do
   sleep 60
 done
 
-# Gate 2: backup
-BK=$(paperclipai db:backup --filename-prefix staple-nightly-pre-${TARGET:0:8} --json 2>/dev/null | tail -1)
+# Gate 2: backup. Its stderr goes to the log; its stdout is kept whole for backup_result.
+BK_OUT=$(mktemp)
+paperclipai db:backup --filename-prefix staple-nightly-pre-${TARGET:0:8} --json > "$BK_OUT"
+BK_RC=$?
+BK=$(backup_result "$BK_OUT" "$BK_RC")
 say "backup: $BK"
-echo "$BK" | grep -q '"path\|"file' || { report "Skipped: database backup failed" "Nothing installed. Hold released."; exit 1; }
+if [[ "$BK" != file:* ]]; then
+  tail -n 20 "$BK_OUT" | sed 's/^/  db:backup: /'; rm -f "$BK_OUT"
+  report "Skipped: database backup failed (${BK#error:})" "Nothing installed. Hold released."; exit 1
+fi
+rm -f "$BK_OUT"; BK=${BK#file:}
 
 # Upgrade
 place_hold "$DRAIN_MIN" "$MAX_MIN" "managed upgrade to ${TARGET:0:8}" >/dev/null   # renew before the build
