@@ -142,29 +142,45 @@ function readMs(value: string | null | undefined) {
 }
 
 // A completed run whose jobs were all skipped (e.g. a `pull_request: labeled` run whose
-// `if:` excluded every job) executed no CI, so it must not supersede real evidence.
-function skippedOnly(run: GitHubWorkflowRunReading, checkRuns: GitHubCheckRunReading[]) {
-  if (run.status !== "completed") return false;
-  if (run.conclusion === "skipped") return true;
-  if (run.checkSuiteId === null) return false;
+// `if:` excluded every job) executed no CI, so it must not supersede real evidence. Only a
+// `skipped` conclusion, or a `success` whose complete job list is all skipped, proves that;
+// a truncated job page leaves a successful run with only skipped visible jobs `unproven`.
+type RunEvidence = "substantive" | "skipped" | "unproven";
+
+function runEvidence(run: GitHubWorkflowRunReading, checkRuns: GitHubCheckRunReading[], complete: boolean): RunEvidence {
+  if (run.status !== "completed") return "substantive";
+  if (run.conclusion === "skipped") return "skipped";
+  if (run.conclusion !== "success" || run.checkSuiteId === null) return "substantive";
   const jobs = checkRuns.filter(job => job.checkSuiteId === run.checkSuiteId);
-  return jobs.length > 0 && jobs.every(job => job.conclusion === "skipped");
+  if (jobs.length === 0 || !jobs.every(job => job.conclusion === "skipped")) return "substantive";
+  return complete ? "skipped" : "unproven";
 }
 
-function latestWorkflowRuns(runs: GitHubWorkflowRunReading[], checkRuns: GitHubCheckRunReading[]) {
-  const latest = new Map<string, GitHubWorkflowRunReading>();
+function isNewer(run: GitHubWorkflowRunReading, other: GitHubWorkflowRunReading) {
+  const time = readMs(run.createdAt);
+  const otherTime = readMs(other.createdAt);
+  return time !== null && otherTime !== null && time !== otherTime ? time > otherTime : run.id > other.id;
+}
+
+function latestWorkflowRuns(runs: GitHubWorkflowRunReading[], checkRuns: GitHubCheckRunReading[], complete: boolean) {
+  const groups = new Map<string, GitHubWorkflowRunReading[]>();
   for (const run of runs) {
     const key = run.workflowId == null ? `run:${run.id}` : `workflow:${run.workflowId}`;
-    const previous = latest.get(key);
-    const skipped = skippedOnly(run, checkRuns);
-    const previousSkipped = previous ? skippedOnly(previous, checkRuns) : false;
-    const time = readMs(run.createdAt);
-    const previousTime = readMs(previous?.createdAt);
-    const newer = previous && (time !== null && previousTime !== null && time !== previousTime
-      ? time > previousTime : run.id > previous.id);
-    if (!previous || (skipped === previousSkipped ? newer : previousSkipped)) latest.set(key, run);
+    groups.set(key, [...(groups.get(key) ?? []), run]);
   }
-  return [...latest.values()];
+  const latest: GitHubWorkflowRunReading[] = [];
+  for (const group of groups.values()) {
+    const newestFirst = [...group].sort((a, b) => (isNewer(a, b) ? -1 : isNewer(b, a) ? 1 : 0));
+    const evidence = new Map(newestFirst.map(run => [run, runEvidence(run, checkRuns, complete)]));
+    const substantive = newestFirst.find(run => evidence.get(run) === "substantive");
+    if (!substantive) {
+      latest.push(newestFirst[0]);
+      continue;
+    }
+    // A newer unproven run can neither hide the substantive run nor be dropped as skipped.
+    latest.push(substantive, ...newestFirst.filter(run => evidence.get(run) === "unproven" && isNewer(run, substantive)));
+  }
+  return latest;
 }
 
 function pullRequestGate(
@@ -231,7 +247,7 @@ export function classifyCiWait(input: {
     }
   }
 
-  const workflowRuns = latestWorkflowRuns(snapshot.workflowRuns, snapshot.checkRuns);
+  const workflowRuns = latestWorkflowRuns(snapshot.workflowRuns, snapshot.checkRuns, snapshot.checkRunsComplete);
   const currentSuites = new Set(workflowRuns.map(run => run.checkSuiteId));
   const supersededSuites = new Set(snapshot.workflowRuns
     .filter(run => !workflowRuns.includes(run) && run.checkSuiteId !== null && !currentSuites.has(run.checkSuiteId))

@@ -191,6 +191,33 @@ describe("ci wait record (FAC-840 incident replays)", () => {
           .toMatchObject({ action: "wake", observation: { state: "passed" } });
       }
     });
+
+    // The SHA reader returns at most 100 checks; a visible skipped job does not prove the rest were skipped.
+    const otherChecks = Array.from({ length: 98 }, (_, i) =>
+      ({ name: `other-${i}`, status: "completed", conclusion: "success", checkSuiteId: 100 + i }));
+    const truncated = (checkRuns: GitHubWaitSnapshot["checkRuns"], workflowRuns: GitHubWaitSnapshot["workflowRuns"]) =>
+      snapshot({ checkRuns: [...checkRuns, ...otherChecks], checkRunsComplete: false, workflowRuns });
+
+    it("wakes failed when a newer run failed even if its visible jobs are skipped (STA-339 R1)", () => {
+      const { checkRuns, workflowRun } = finished("success");
+      const failed = { ...labeledRuns[0], conclusion: "failure" };
+      expect(classifyCiWait({ target, now, snapshot: truncated(checkRuns, [workflowRun, failed]) }))
+        .toMatchObject({ action: "wake", observation: { state: "failed" } });
+      expect(classifyCiWait({ target, now, snapshot: snapshot({ checkRuns, workflowRuns: [workflowRun, failed] }) }))
+        .toMatchObject({ action: "wake", observation: { state: "failed" } });
+    });
+
+    it("does not let a truncated skipped-looking success hide real CI", () => {
+      const labeled = labeledRuns[0];
+      expect(classifyCiWait({ target, now, snapshot: truncated([realCheck, skippedCheck], [real, labeled]) }))
+        .toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
+      const failed = finished("failure");
+      expect(classifyCiWait({ target, now, snapshot: truncated(failed.checkRuns, [failed.workflowRun, labeled]) }))
+        .toMatchObject({ action: "wake", observation: { state: "failed" } });
+      const passed = finished("success");
+      expect(classifyCiWait({ target, now, snapshot: truncated(passed.checkRuns, [passed.workflowRun, labeled]) }))
+        .toMatchObject({ action: "wake", observation: { state: "passed" } });
+    });
   });
 
   it("keeps an active rerun of the same run ID waiting despite an earlier failed check", () => {
