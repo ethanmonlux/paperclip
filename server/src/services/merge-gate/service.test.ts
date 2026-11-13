@@ -335,6 +335,59 @@ describe("merge gate service", () => {
     expect(merge).not.toHaveBeenCalled();
   });
 
+  it("lets a creator coordinator that ran on the task merge once an independent review attests the source authors (STA-287)", async () => {
+    // The Codex coordinator created the task for Claude and later woke on it
+    // to route review. A Codex reviewer that never held or ran on the task
+    // attests Claude as the only source author at the merge head.
+    const sta287 = (github: MergeGateGitHub, reviews: MergeReviewAttestation[], runFamilies?: Record<string, string[]>) => harness({
+      github, reviews, runFamilies: runFamilies ?? { "claude-engineer": ["anthropic"], coordinator: ["openai"] },
+      issues: [issue({ id: "task", createdByAgentId: "coordinator", assigneeAgentId: "claude-engineer", parentId: null })],
+    });
+    const attested = review({ reviewIssueIdentifier: "STA-300", sourceAuthorAgentIds: ["claude-engineer"] });
+    const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+    const h = sta287(github, [attested]);
+    await expect(evaluateAndMerge(h.deps, request({ dryRun: true }))).resolves.toMatchObject({ outcome: "mergeable", reasons: [] });
+    await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged" });
+    expect(merge).toHaveBeenCalledTimes(1);
+    // The coordinator's own runs were read, then left out only by the attested set.
+    expect(h.authorQueries.slice(0, 2)).toEqual([{ issueId: "task", excludeAgentId: null },
+      { issueId: "task", excludeAgentId: null, sourceAuthorAgentIds: ["claude-engineer"], attesterAgentId: "codex-reviewer" }]);
+
+    // A commit trailer naming Codex is still Codex authorship, whatever the attestation says.
+    const codexCommit = fakeGitHub({ headChecks: accountWebCi,
+      commitMessage: "fix: change\n\nCo-Authored-By: GPT-6 Codex <noreply@openai.com>" });
+    await expect(evaluateAndMerge(sta287(codexCommit.github, [attested]).deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
+    // An attesting reviewer that ran on the task is a potential author.
+    const ranThere = fakeGitHub({ headChecks: accountWebCi });
+    await expect(evaluateAndMerge(sta287(ranThere.github, [attested],
+      { "claude-engineer": ["anthropic"], coordinator: ["openai"], "codex-reviewer": ["openai"] }).deps, request()))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
+    expect(codexCommit.merge).not.toHaveBeenCalled();
+    expect(ranThere.merge).not.toHaveBeenCalled();
+  });
+
+  it("refuses a coordinator that ran on the task without an attestation that leaves it out", async () => {
+    const red = { ...ok("verify"), conclusion: "failure" };
+    const cases: Array<[MergeReviewAttestation[], RegExp]> = [
+      [[review()], /ran on the task/],
+      // A review of an older head attests nothing about this one.
+      [[review({ reviewedSha: REVIEWED, sourceAuthorAgentIds: ["claude-engineer"] })], /ran on the task/],
+      // The task's assignee cannot attest the source authors.
+      [[review({ reviewerAgentId: "claude-engineer", sourceAuthorAgentIds: ["coordinator"] })], /ran on the task/],
+      [[review({ sourceAuthorAgentIds: ["claude-engineer", "coordinator"] })], /attests this agent as a source author/],
+    ];
+    for (const [reviews, message] of cases) {
+      const { github, merge } = fakeGitHub({ headChecks: accountWebCi, baseChecks: [red] });
+      const h = harness({ github, reviews, runFamilies: { "claude-engineer": ["anthropic"], coordinator: ["openai"] },
+        issues: [issue({ id: "task", createdByAgentId: "coordinator", assigneeAgentId: "claude-engineer", parentId: null })] });
+      await expect(evaluateAndMerge(h.deps, request())).rejects.toThrow(message);
+      // Refused before the gate could open a red-main issue for this actor.
+      expect(h.owners.size).toBe(0);
+      expect(merge).not.toHaveBeenCalled();
+    }
+  });
+
   it("refuses an ancestor coordinator that implemented before handing the task to another agent", async () => {
     const { github, merge } = fakeGitHub({ headChecks: accountWebCi,
       commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>" });
