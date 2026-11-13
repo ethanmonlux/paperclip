@@ -5789,6 +5789,35 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * Move a blocked task whose blockers are all done back to `todo`, but only
+   * while it is still the blocked cycle the sweep observed and every blocker
+   * is still done and finalized under the task's lock.
+   */
+  async function returnStaleBlockedIssueToTodo(
+    companyId: string,
+    candidate: { id: string; assigneeAgentId: string; blockedTransitionAt: Date | null },
+  ) {
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const updated = await db.transaction(async (tx) => {
+      const current = await tx.select().from(issues).where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.id, candidate.id),
+      )).for("update").limit(1).then((rows) => rows[0] ?? null);
+      if (!current || current.hiddenAt || current.status !== "blocked"
+        || current.assigneeAgentId !== candidate.assigneeAgentId || current.assigneeUserId
+        || (current.blockedTransitionAt?.getTime() ?? null) !== (candidate.blockedTransitionAt?.getTime() ?? null)) {
+        return null;
+      }
+      const readiness = (await issuesSvc.listDependencyReadiness(companyId, [candidate.id], tx)).get(candidate.id);
+      if (!readiness?.isDependencyReady || readiness.blockerIssueIds.length === 0) return null;
+      return issuesSvc.update(candidate.id, { status: "todo" }, tx, undefined, postCommitActions);
+    });
+    if (!updated) return false;
+    await executeIssuePostCommitActions(db, postCommitActions);
+    return true;
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(
     opts?: ResolvedDependencyWakeBackstopOptions,
   ) {
@@ -5805,6 +5834,7 @@ export function recoveryService(
       deferredOrFailed: 0,
       enqueueFailed: 0,
       orphanWaitsWoken: 0,
+      staleBlockersCleared: 0,
       issueIds: [] as string[],
     };
 
@@ -6092,12 +6122,19 @@ export function recoveryService(
         // their wake is spent or withheld for a self-block (FAC-851).
         dependencyWakeDisowned: async (companyId, candidate) => dependencyWakeDisowned(db, companyId, candidate,
           (await issuesSvc.listDependencyReadiness(companyId, [candidate.id])).get(candidate.id)),
+        // STA-361: blockers all done and nothing else recorded: back to todo.
+        returnStaleBlockedToTodo: returnStaleBlockedIssueToTodo,
         hasLivePath: async (companyId, issueId, agentId) =>
           (await hasActiveExecutionPath(companyId, issueId, agentId)) ||
           (await hasQueuedIssueWake(companyId, issueId, agentId)) ||
           (await isAutomaticRecoverySuppressedByPauseHold(db, companyId, issueId, treeControlSvc)),
       });
       result.orphanWaitsWoken = orphans.woken;
+      result.staleBlockersCleared = orphans.staleBlockersCleared;
+      if (orphans.staleBlockersCleared > 0) {
+        logger.warn({ cleared: orphans.staleBlockersCleared, issueIds: orphans.staleBlockerIssueIds },
+          "wait contract returned blocked tasks whose blockers are all done to todo");
+      }
       // A failed orphan wake is retried by the worker; a grace period or a
       // refused wake names when the worker looks again.
       result.enqueueFailed += orphans.failed;

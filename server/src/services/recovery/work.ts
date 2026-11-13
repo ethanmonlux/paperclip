@@ -1,6 +1,6 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
-import { issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { issueRecoveryActions, issueRelations, issues, issueTreeHolds, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
@@ -21,6 +21,8 @@ export function registerIssueRecoveryWork(
     dependencies(scope: Scope): Promise<{ enqueueFailed: number }>;
     locks(scope: Scope): Promise<unknown>;
     watchdogs(scope: { companyId: string; watchdogId: string; onDeferredDeadline: (at: number) => void }): Promise<{ incomplete: number }>;
+    /** Releases the company's due pause holds; returns the next expiry still ahead. */
+    holdExpiry?(scope: { companyId: string }): Promise<number | null>;
     schedulingSuppressed(): Promise<boolean>;
   },
   canRun: () => boolean,
@@ -117,10 +119,33 @@ export function registerIssueRecoveryWork(
     if (result.enqueueFailed > 0) throw new Error("Resolved dependency wake remains undelivered");
   });
   const locks = register(DELIVERY_QUEUES.staleIssueLocks, null, owner.locks);
+  // One entry per company with an expiring pause hold, due at its earliest expiry.
+  let holdExpiryEnabled = false;
+  const holdExpiry = registerScopedDeadlineWork<Entry, IssueRecoveryScope>(coordinator, {
+    queue: DELIVERY_QUEUES.issueTreeHoldExpiry,
+    reconstructionIntervalMs: 60_000,
+    beforePass: async () => { holdExpiryEnabled = Boolean(owner.holdExpiry) && !(await owner.schedulingSuppressed()); },
+    decodeScope: hint => hint === "*" ? undefined : JSON.parse(hint) as IssueRecoveryScope,
+    matches: (entry, scope) => !scope || entry.companyId === scope.companyId,
+    load: async scope => {
+      if (!holdExpiryEnabled) return [];
+      const rows = await db.select({ companyId: issueTreeHolds.companyId,
+        dueAt: sql<Date | string>`min(${issueTreeHolds.expiresAt})` }).from(issueTreeHolds).where(and(
+        scope ? eq(issueTreeHolds.companyId, scope.companyId) : undefined,
+        eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "pause"), isNotNull(issueTreeHolds.expiresAt),
+      )).groupBy(issueTreeHolds.companyId);
+      return rows.map(row => ({ id: row.companyId, companyId: row.companyId, dueAt: new Date(row.dueAt).getTime() }));
+    },
+    check: async entry => {
+      if (!holdExpiryEnabled) return null;
+      const next = await owner.holdExpiry!({ companyId: entry.companyId });
+      return next === null ? null : { ...entry, dueAt: next };
+    },
+  }, canRun);
   const watchdogs = registerTaskWatchdogWork(db, coordinator, {
     reconcile: owner.watchdogs, enabled: async () => !(await owner.schedulingSuppressed()),
   }, canRun);
-  const workers = [assignments, orphanBlockers, recoveryActions, dependencies, locks, watchdogs];
+  const workers = [assignments, orphanBlockers, recoveryActions, dependencies, locks, watchdogs, holdExpiry];
   return { watchdogs, assignments, ready: Promise.all(workers.map(worker => worker.ready)),
     wake() { for (const worker of workers) worker.invalidate(); },
     async stop() { await Promise.all(workers.map(worker => worker.stop())); } };

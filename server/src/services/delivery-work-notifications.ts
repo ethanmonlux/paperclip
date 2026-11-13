@@ -25,6 +25,7 @@ export const DELIVERY_QUEUES = {
   activeRecoveryActions: "active-recovery-actions",
   strandedAssignments: "stranded-assignments",
   resolvedDependencies: "resolved-dependencies",
+  issueTreeHoldExpiry: "issue-tree-hold-expiry",
   taskWatchdogs: "task-watchdogs",
   staleIssueLocks: "stale-issue-locks",
   scheduledRetryDispatch: "scheduled-retry-dispatch",

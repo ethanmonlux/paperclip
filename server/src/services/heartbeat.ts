@@ -12,6 +12,7 @@ import { registerDeferredReceiptWork } from "./heartbeat/deferred-receipt-work.j
 import { registerProviderLimitResumeWork, type PrepareChatRetry } from "./native-runtime/provider-limit-resume.js";
 import { reconcileTaskChatRetryReceipts } from "./task-retry.js";
 import { registerIssueRecoveryWork } from "./recovery/work.js";
+import { expireDuePauseHolds } from "./issue-tree-hold-expiry.js";
 import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
 import { describeFailedAttachment } from "./native-runtime/remote-warm-session-recovery.js";
@@ -4569,6 +4570,10 @@ export function heartbeatService(
         dependencies: reconcileResolvedDependencyWakes,
         locks: sweepStaleIssueLocks,
         watchdogs: reconcileTaskWatchdogs,
+        holdExpiry: async scope => {
+          const result = await expireDuePauseHolds(db, { companyId: scope.companyId, wakeup: trackWakeup });
+          return result.nextExpiresAt;
+        },
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
       }, () => canRun() && readTaskDrain(new Date()) === null),
     registerRunDispatchWork: (coordinator: Parameters<typeof registerRunDispatchWork>[0], canRun: () => boolean) =>

@@ -16,6 +16,16 @@
  * task stays visible as `blocked_without_wait_path` in the blocked inbox and
  * Staple Console instead of being woken again.
  *
+ * Stale blockers (STA-361): a blocked task whose every blocker is done and
+ * finalized, whose dependency wake is spent or withheld, and that records no
+ * other wait, is waiting on nothing. Instead of an orphan wake it moves back to
+ * `todo` and its assignee is woken (`issue_blockers_resolved`), under the same
+ * grace period, live-path and pause-hold checks. Both outcomes share the daily
+ * cap, so an owner that keeps re-blocking ends at a visible
+ * `blocked_without_wait_path` task instead of a loop. A cancelled blocker is not
+ * stale: dependency readiness and the dispatch gate keep it unresolved until
+ * the relation is removed.
+ *
  * The scoped recovery worker drops an issue it has checked unless the check
  * names a deadline, so a task still inside its grace period, or whose wake was
  * refused, reports when to look again (`retryAt`), and a wake that failed to
@@ -24,6 +34,7 @@
 import { and, eq, gte, isNull, lte, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, companies, issues, type Db } from "@paperclipai/db";
 import { ISSUE_WAIT_ORPHANED_WAKE_REASON } from "@paperclipai/shared";
+import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../issue-dependency-wakeups.js";
 import { logActivity } from "../activity-log.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { RECOVERY_ORIGIN_KINDS } from "./origins.js";
@@ -56,6 +67,10 @@ export type OrphanWaitWakeup = (agentId: string, input: {
   contextSnapshot: Record<string, unknown>;
   issueStateGuard: { statuses: string[]; assigneeAgentId: string };
 }) => Promise<unknown>;
+
+export function staleBlockersClearedWakeKey(issueId: string, blockedTransitionAt: Date | null) {
+  return ["issue_stale_blockers_cleared", issueId, blockedTransitionAt?.toISOString() ?? "unknown"].join(":");
+}
 
 export function orphanWaitWakeKey(issueId: string, blockedTransitionAt: Date | null) {
   return [ISSUE_WAIT_ORPHANED_WAKE_REASON, issueId, blockedTransitionAt?.toISOString() ?? "unknown"].join(":");
@@ -131,18 +146,26 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
   dependencyWakeDisowned?: (companyId: string, candidate: {
     id: string; assigneeAgentId: string; blockedTransitionAt: Date | null;
   }) => Promise<boolean>;
+  /**
+   * Moves a stale-blocked task (blockers all done, dependency wake disowned)
+   * back to `todo` when it is still in the observed blocked cycle. True when
+   * it moved. Without it, such a task gets the orphan wake instead.
+   */
+  returnStaleBlockedToTodo?: (companyId: string, candidate: {
+    id: string; assigneeAgentId: string; blockedTransitionAt: Date | null;
+  }) => Promise<boolean>;
 }) {
   const now = opts.now ?? new Date();
   const result = { orphans: 0, woken: 0, alreadyWoken: 0, capped: 0, livePathSkipped: 0, dependencySkipped: 0,
-    inGrace: 0, deferred: 0, failed: 0,
-    retryAt: null as number | null, issueIds: [] as string[] };
+    inGrace: 0, deferred: 0, failed: 0, staleBlockersCleared: 0,
+    retryAt: null as number | null, issueIds: [] as string[], staleBlockerIssueIds: [] as string[] };
   const retryAt = (at: number) => { result.retryAt = result.retryAt === null ? at : Math.min(result.retryAt, at); };
   const candidates = await readOrphanCandidates(db, { companyId: opts.companyId, issueId: opts.issueId, now });
   for (const candidate of candidates) {
     const agentId = candidate.assigneeAgentId!;
     if (hasRecordedExternalOwner(candidate.description)) continue;
-    if (candidate.hasBlockerRelation && !(await opts.dependencyWakeDisowned?.(candidate.companyId,
-      { id: candidate.id, assigneeAgentId: agentId, blockedTransitionAt: candidate.blockedTransitionAt }))) {
+    const subject = { id: candidate.id, assigneeAgentId: agentId, blockedTransitionAt: candidate.blockedTransitionAt };
+    if (candidate.hasBlockerRelation && !(await opts.dependencyWakeDisowned?.(candidate.companyId, subject))) {
       result.dependencySkipped += 1;
       continue;
     }
@@ -159,9 +182,11 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
     }
     result.orphans += 1;
     const idempotencyKey = orphanWaitWakeKey(candidate.id, candidate.blockedTransitionAt);
+    // Orphan wakes and stale-blocker returns share one daily cap per task.
     const priorWakes = await db.select({ key: agentWakeupRequests.idempotencyKey }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, candidate.companyId),
-      eq(agentWakeupRequests.reason, ISSUE_WAIT_ORPHANED_WAKE_REASON),
+      or(eq(agentWakeupRequests.reason, ISSUE_WAIT_ORPHANED_WAKE_REASON),
+        sql`${agentWakeupRequests.idempotencyKey} like ${`issue_stale_blockers_cleared:${candidate.id}:%`}`),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${candidate.id}`,
       sql`${agentWakeupRequests.status} not in (${sql.join(SKIPPED_WAKE_STATUSES.map(status => sql`${status}`), sql`, `)})`,
       gte(agentWakeupRequests.createdAt, new Date(now.getTime() - DAY_MS)),
@@ -172,6 +197,49 @@ export async function wakeOwnersOfOrphanedWaits(db: Db, enqueueWakeup: OrphanWai
     }
     if (priorWakes.length >= MAX_ORPHAN_WAKES_PER_DAY) {
       result.capped += 1;
+      continue;
+    }
+    if (candidate.hasBlockerRelation && opts.returnStaleBlockedToTodo) {
+      let moved: boolean;
+      try {
+        moved = await opts.returnStaleBlockedToTodo(candidate.companyId, subject);
+      } catch {
+        result.failed += 1;
+        continue;
+      }
+      // The task changed under the observation (re-blocked, reassigned, a
+      // blocker reopened); its next check decides again.
+      if (!moved) continue;
+      result.staleBlockersCleared += 1;
+      result.staleBlockerIssueIds.push(candidate.id);
+      await logActivity(db, {
+        companyId: candidate.companyId, actorType: "system", actorId: "wait_contract", agentId,
+        action: "issue.stale_blockers_cleared", entityType: "issue", entityId: candidate.id,
+        details: { identifier: candidate.identifier, fromStatus: "blocked", toStatus: "todo",
+          blockedTransitionAt: candidate.blockedTransitionAt?.toISOString() ?? null, returnsToday: priorWakes.length + 1 },
+      }).catch(() => undefined);
+      const staleKey = staleBlockersClearedWakeKey(candidate.id, candidate.blockedTransitionAt);
+      try {
+        // A refused or failed wake leaves an assigned todo task, which the
+        // stranded-assignment recovery wakes; the status change is not undone.
+        const wake = await enqueueWakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: { issueId: candidate.id, staleBlockersCleared: true },
+          idempotencyKey: staleKey,
+          requestedByActorType: "system",
+          requestedByActorId: "wait_contract",
+          contextSnapshot: {
+            issueId: candidate.id, taskId: candidate.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            source: "issue.wait_contract.stale_blockers",
+          },
+          issueStateGuard: { statuses: ["todo"], assigneeAgentId: agentId },
+        });
+        if (!wake) result.deferred += 1;
+      } catch {
+        result.deferred += 1;
+      }
       continue;
     }
     try {

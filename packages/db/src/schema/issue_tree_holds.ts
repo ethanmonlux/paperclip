@@ -18,6 +18,11 @@ export const issueTreeHolds = pgTable(
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
     createdByUserId: text("created_by_user_id"),
     createdByRunId: uuid("created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    /** Who answers for a pause hold while it lasts. New pause holds always name one. */
+    ownerAgentId: uuid("owner_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    ownerUserId: text("owner_user_id"),
+    /** When an active pause hold releases itself. */
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
     releasedAt: timestamp("released_at", { withTimezone: true }),
     releasedByActorType: text("released_by_actor_type"),
     releasedByAgentId: uuid("released_by_agent_id").references(() => agents.id, { onDelete: "set null" }),

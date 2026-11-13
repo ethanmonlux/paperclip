@@ -9,9 +9,10 @@ import { notifyNativeStatusReassessment } from "./native-status-reassessment-not
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { notifyChatResponseAvailability } from "./chat-response-availability.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
-import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -104,6 +105,10 @@ function readPauseSuppressionHoldId(resultJson: Record<string, unknown> | null) 
 }
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
+/** A pause hold releases itself this long after creation unless it names another time. */
+export const DEFAULT_PAUSE_HOLD_TTL_MS = 12 * 60 * 60_000;
+/** Recorded on a pause hold released because it reached its expiry. */
+export const PAUSE_HOLD_EXPIRED_RELEASE_REASON = "Pause hold expired";
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
 export const ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_commented",
@@ -294,6 +299,9 @@ function toHold(row: HoldRow, members?: HoldMemberRow[]): IssueTreeHold {
     createdByAgentId: row.createdByAgentId,
     createdByUserId: row.createdByUserId,
     createdByRunId: row.createdByRunId,
+    ownerAgentId: row.ownerAgentId,
+    ownerUserId: row.ownerUserId,
+    expiresAt: row.expiresAt,
     releasedAt: row.releasedAt,
     releasedByActorType: row.releasedByActorType as IssueTreeHold["releasedByActorType"],
     releasedByAgentId: row.releasedByAgentId,
@@ -751,6 +759,35 @@ export function issueTreeControlService(db: Db) {
     };
   }
 
+  /**
+   * A pause hold always names who answers for it and when it ends, so it
+   * cannot park a tree forever. The owner defaults to the creator; the expiry
+   * defaults to DEFAULT_PAUSE_HOLD_TTL_MS from now.
+   */
+  async function resolvePauseHoldTerms(
+    companyId: string,
+    input: { ownerAgentId?: string | null; ownerUserId?: string | null; expiresAt?: Date | string | null; actor: ActorInput },
+  ) {
+    const explicitOwner = Boolean(input.ownerAgentId || input.ownerUserId);
+    if (input.ownerAgentId && input.ownerUserId) {
+      throw unprocessable("A pause hold has one owner: name an agent or a user, not both");
+    }
+    const actorUserId = input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null);
+    const ownerAgentId = explicitOwner ? input.ownerAgentId ?? null : input.actor.agentId ?? null;
+    const ownerUserId = explicitOwner ? input.ownerUserId ?? null : ownerAgentId ? null : actorUserId;
+    if (!ownerAgentId && !ownerUserId) throw unprocessable("A pause hold needs an owner");
+    if (ownerAgentId) {
+      const [owner] = await db.select({ id: agents.id }).from(agents)
+        .where(and(eq(agents.id, ownerAgentId), eq(agents.companyId, companyId)));
+      if (!owner) throw unprocessable("Pause hold owner agent not found");
+    }
+    const now = Date.now();
+    const expiresAt = input.expiresAt == null ? new Date(now + DEFAULT_PAUSE_HOLD_TTL_MS) : new Date(input.expiresAt);
+    if (Number.isNaN(expiresAt.getTime())) throw unprocessable("Pause hold expiry is not a valid time");
+    if (expiresAt.getTime() <= now) throw unprocessable("Pause hold expiry must be in the future");
+    return { ownerAgentId, ownerUserId, expiresAt };
+  }
+
   async function createHold(
     companyId: string,
     rootIssueId: string,
@@ -758,6 +795,11 @@ export function issueTreeControlService(db: Db) {
       mode: IssueTreeControlMode;
       reason?: string | null;
       releasePolicy?: IssueTreeHoldReleasePolicy | null;
+      /** Pause only: who answers for the hold. Defaults to its creator. */
+      ownerAgentId?: string | null;
+      ownerUserId?: string | null;
+      /** Pause only: when the hold releases itself. Defaults to DEFAULT_PAUSE_HOLD_TTL_MS from now. */
+      expiresAt?: Date | string | null;
       actor: ActorInput;
     },
   ): Promise<{
@@ -772,6 +814,7 @@ export function issueTreeControlService(db: Db) {
       if (conversation) throw unprocessable("Stop the active reply instead of cancelling the persistent conversation");
     }
     const holdReleasePolicy = normalizeReleasePolicy(input.releasePolicy);
+    const pauseTerms = input.mode === "pause" ? await resolvePauseHoldTerms(companyId, input) : null;
     const holdPreview = await preview(companyId, rootIssueId, {
       mode: input.mode,
       releasePolicy: holdReleasePolicy,
@@ -865,6 +908,8 @@ export function issueTreeControlService(db: Db) {
     const { hold, members } = await db.transaction(async (tx) => {
       await notifyIssueRecovery(tx, { companyId });
       await notifyDeferredExecutionEligibility(tx, { companyId });
+      // The expiry worker schedules this hold's release at its expiry.
+      if (pauseTerms) await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueTreeHoldExpiry, JSON.stringify({ companyId }));
       const [createdHold] = await tx
         .insert(issueTreeHolds)
         .values({
@@ -878,6 +923,9 @@ export function issueTreeControlService(db: Db) {
           createdByAgentId: input.actor.agentId ?? null,
           createdByUserId: input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null),
           createdByRunId: input.actor.runId ?? null,
+          ownerAgentId: pauseTerms?.ownerAgentId ?? null,
+          ownerUserId: pauseTerms?.ownerUserId ?? null,
+          expiresAt: pauseTerms?.expiresAt ?? null,
         })
         .returning();
 
@@ -1194,6 +1242,8 @@ export function issueTreeControlService(db: Db) {
       releasePolicy?: IssueTreeHoldReleasePolicy | null;
       metadata?: Record<string, unknown> | null;
       actor: ActorInput;
+      /** Release only a pause hold whose expiry is at or before this time. */
+      expiredBy?: Date;
     },
   ) {
     const existing = await db
@@ -1228,7 +1278,10 @@ export function issueTreeControlService(db: Db) {
         updatedAt: new Date(),
       })
       .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId),
-        eq(issueTreeHolds.status, "active")))
+        eq(issueTreeHolds.status, "active"),
+        input.expiredBy
+          ? and(eq(issueTreeHolds.mode, "pause"), lte(issueTreeHolds.expiresAt, input.expiredBy))
+          : undefined))
       .returning();
     });
     // A concurrent release won; it alone owns the resumed work.
@@ -1302,6 +1355,36 @@ export function issueTreeControlService(db: Db) {
     return { issueId, agentId: run.agentId, interruptedRunId: run.id, holdId: hold.id };
   }
 
+  /** Active pause holds whose expiry has passed, oldest expiry first. */
+  async function listExpiredPauseHolds(input: { now: Date; companyId?: string | null; limit?: number }) {
+    return db
+      .select({ id: issueTreeHolds.id, companyId: issueTreeHolds.companyId, rootIssueId: issueTreeHolds.rootIssueId,
+        expiresAt: issueTreeHolds.expiresAt })
+      .from(issueTreeHolds)
+      .where(and(
+        input.companyId ? eq(issueTreeHolds.companyId, input.companyId) : undefined,
+        eq(issueTreeHolds.status, "active"),
+        eq(issueTreeHolds.mode, "pause"),
+        isNotNull(issueTreeHolds.expiresAt),
+        lte(issueTreeHolds.expiresAt, input.now),
+      ))
+      .orderBy(asc(issueTreeHolds.expiresAt), asc(issueTreeHolds.id))
+      .limit(input.limit ?? 50);
+  }
+
+  /** The earliest expiry among active pause holds, for scheduling the next check. */
+  async function nextPauseHoldExpiry(companyId?: string | null) {
+    const [row] = await db
+      .select({ expiresAt: sql<Date | string | null>`min(${issueTreeHolds.expiresAt})` })
+      .from(issueTreeHolds)
+      .where(and(
+        companyId ? eq(issueTreeHolds.companyId, companyId) : undefined,
+        eq(issueTreeHolds.status, "active"),
+        eq(issueTreeHolds.mode, "pause"),
+      ));
+    return row?.expiresAt ? new Date(row.expiresAt) : null;
+  }
+
   async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string) {
     const treeIssues = await listTreeIssues(companyId, rootIssueId);
     const issueIds = treeIssues.map((issue) => issue.id);
@@ -1349,6 +1432,8 @@ export function issueTreeControlService(db: Db) {
     listHolds,
     getActivePauseHoldGate,
     releaseHold,
+    listExpiredPauseHolds,
+    nextPauseHoldExpiry,
     findOwedPauseResume,
     cancelUnclaimedWakeupsForTree,
   };

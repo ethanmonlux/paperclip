@@ -102,6 +102,11 @@ export interface IssueTreeHold {
   createdByAgentId: string | null;
   createdByUserId: string | null;
   createdByRunId: string | null;
+  /** Who answers for a pause hold while it lasts. */
+  ownerAgentId?: string | null;
+  ownerUserId?: string | null;
+  /** When an active pause hold releases itself. */
+  expiresAt?: Date | null;
   releasedAt: Date | null;
   releasedByActorType: "user" | "agent" | "system" | null;
   releasedByAgentId: string | null;

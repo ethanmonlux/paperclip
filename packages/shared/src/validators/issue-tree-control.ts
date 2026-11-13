@@ -28,6 +28,11 @@ export const createIssueTreeHoldSchema = z
     reason: z.string().trim().min(1).max(1000).optional().nullable(),
     releasePolicy: issueTreeHoldReleasePolicySchema.optional().nullable(),
     metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+    /** Pause only: who answers for the hold. Defaults to its creator. */
+    ownerAgentId: z.string().uuid().optional().nullable(),
+    ownerUserId: z.string().trim().min(1).optional().nullable(),
+    /** Pause only: when the hold releases itself. Defaults to 12 hours after creation. */
+    expiresAt: z.string().datetime({ offset: true }).optional().nullable(),
   })
   .strict();
 
