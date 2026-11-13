@@ -146,6 +146,15 @@ function normalizeRepo(repo: string) {
 }
 
 /**
+ * How the merging actor is authorized. `handoff`: a legacy-return or
+ * accepted-routing coordinator, whose task runs stay potential authorship.
+ * `coordinator_with_task_runs`: a creator or ancestor coordinator that also
+ * ran on the task; it may merge only when an independent exact-head review
+ * attests source authors that exclude it.
+ */
+export type MergeAuthority = "board" | "coordinator" | "coordinator_with_task_runs" | "handoff";
+
+/**
  * Coordinator-only: a board operator, or an agent that delegated the task
  * (its creator, an ancestor's assignee, or a recorded legacy handoff).
  */
@@ -153,18 +162,18 @@ export async function assertMayMerge(
   deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation" | "loadAcceptedCoordinatorRouting" | "loadTaskAuthorship">,
   issue: GateIssue,
   actor: MergeGateActor,
-) {
-  if (actor.type === "board") return false;
+): Promise<MergeAuthority> {
+  if (actor.type === "board") return "board";
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
   if (issue.assigneeAgentId === agentId) {
-    if (await deps.loadLegacyDelegation(issue.companyId, issue.id, agentId)) return true;
+    if (await deps.loadLegacyDelegation(issue.companyId, issue.id, agentId)) return "handoff";
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
   // An engineer that created and still holds its task may route review to a
   // coordinator. That coordinator's runs stay potential authorship.
   if (issue.assigneeAgentId && issue.createdByAgentId === issue.assigneeAgentId &&
-    await deps.loadAcceptedCoordinatorRouting(issue.companyId, issue.id, issue.assigneeAgentId, agentId)) return true;
+    await deps.loadAcceptedCoordinatorRouting(issue.companyId, issue.id, issue.assigneeAgentId, agentId)) return "handoff";
   let coordinatesTask = issue.createdByAgentId === agentId;
   if (!coordinatesTask) {
     let parentId = issue.parentId;
@@ -183,12 +192,12 @@ export async function assertMayMerge(
   }
   // Either authority path can belong to a former implementer. Never exclude
   // the coordinator's task runs without first checking the full run history.
+  // A coordinator that ran on the task (to route review, say) may still have
+  // written source: no run records that it did not. It needs the review's
+  // source-author attestation, checked at the merge head.
   const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
   if (!authorship) throw forbidden("Task authorship could not be established; the merge gate cannot authorize this agent");
-  if (authorship.agentIds.includes(agentId)) {
-    throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
-  }
-  return false;
+  return authorship.agentIds.includes(agentId) ? "coordinator_with_task_runs" : "coordinator";
 }
 
 async function isRedMainExempt(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, ownerIssueId: string) {
@@ -233,7 +242,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
   if (!Number.isSafeInteger(request.pullNumber) || request.pullNumber <= 0) throw unprocessable("pullNumber must be a positive integer");
   const issue = await deps.loadIssue(request.companyId, request.issueId);
   if (!issue) throw notFound("Issue not found");
-  const handoffCoordinator = await assertMayMerge(deps, issue, request.actor);
+  const authority = await assertMayMerge(deps, issue, request.actor);
 
   const token = await deps.resolveToken(request.companyId, request.actor);
   if (!token) throw unprocessable("No GitHub credential is available to the merge gate for this actor");
@@ -249,7 +258,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
     }
   };
   const first = await readPullRequest();
-  const context = { repo, label, policy, github, issue, handoffCoordinator };
+  const context = { repo, label, policy, github, issue, authority };
   if (request.dryRun) return evaluateLocked(deps, request, context, first);
   // One check-and-merge at a time per repository branch, so two merges
   // cannot both pass against the same base and land one after the other.
@@ -272,10 +281,10 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
 async function evaluateLocked(
   deps: MergeGateDependencies,
   request: MergeGateRequest,
-  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue; handoffCoordinator: boolean },
+  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue; authority: MergeAuthority },
   pr: Awaited<ReturnType<MergeGateGitHub["pullRequest"]>>,
 ): Promise<MergeGateResult> {
-  const { repo, label, policy, github, issue, handoffCoordinator } = context;
+  const { repo, label, policy, github, issue, authority } = context;
   const headSha = pr.headSha.toLowerCase();
   const baseSha = (await github.branchHead(pr.baseRef)).toLowerCase();
   // Everything below compares against this one base SHA, not the moving ref.
@@ -284,6 +293,71 @@ async function evaluateLocked(
     github.compare(baseSha, headSha).catch(() => null),
   ]);
   const [headChecks, baseChecks] = await Promise.all([github.checks(headSha), github.checks(baseSha)]);
+
+  const reviews = await deps.loadReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber });
+  // A review written by the merging coordinator is not independent of the merge.
+  const independentOfMerger = reviews.filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId);
+  // Who may have authored the change is read from what the runs recorded,
+  // not from the assignee's current adapter configuration. No run says
+  // whether it wrote code, so every agent that ran on the task counts,
+  // including one that reviews it now. A creator or ancestor coordinator
+  // with no runs on the task is excluded; one that ran there (routing review,
+  // say) merges only when the attestation below leaves it out. A handoff
+  // coordinator (legacy return or accepted routing) may have authored code,
+  // so its runs remain potential authorship.
+  // A completed review can attest the exhaustive source author set, so
+  // coordination and review runs on the task stop counting as authorship.
+  // The attestation never narrows away its own reviewer: any started run the
+  // reviewer has on the task still counts, so a reviewer that ran there is a
+  // potential author and its review is not independent. Nothing recorded
+  // shows that such a run wrote no source, and the reviewer's own list cannot
+  // be that evidence. The reviewer must also never have been the task's
+  // creator, assignee or checkout holder. The attested agents must still have
+  // started runs on the task.
+  const attestations = independentOfMerger.filter(review =>
+    review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
+    review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
+    review.reviewedSha === headSha && review.sourceAuthorAgentIds?.length &&
+    !review.sourceAuthorAgentIds.includes(review.reviewerAgentId));
+  // Any exact-head attestation naming this coordinator as a source author
+  // stands, whichever review the gate would otherwise rely on.
+  const attestedAsAuthor = authority === "coordinator_with_task_runs" &&
+    attestations.some(review => review.sourceAuthorAgentIds!.includes(request.actor.agentId!));
+  const custodians = attestations.length > 0 && !attestedAsAuthor ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
+  const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
+  const authorFrom = (authorship: Awaited<ReturnType<MergeGateDependencies["loadTaskAuthorship"]>>, attested: boolean): MergeGateAuthor => ({
+    agentIds: authorship === null ? null
+      : [...new Set([...authorship.agentIds, ...(!attested && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
+    modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
+  });
+  // The attesting review must itself pass at the exact head against the
+  // authorship its list yields: independent, cross-model, with recorded
+  // provenance, and within the merge bar. Otherwise another passing review
+  // could launder an ineligible list. The newest qualifying attestation is used.
+  let sourceReview: MergeReviewAttestation | undefined;
+  let attestedAuthorship: Awaited<ReturnType<MergeGateDependencies["loadTaskAuthorship"]>> = null;
+  let unqualified: string | null = null;
+  for (const review of custodians ? [...attestations].reverse() : []) {
+    if (custodians!.includes(review.reviewerAgentId!)) continue;
+    const authorship = await deps.loadTaskAuthorship(request.companyId, {
+      issueId: issue.id, excludeAgentId: null, sourceAuthorAgentIds: review.sourceAuthorAgentIds!, attesterAgentId: review.reviewerAgentId!,
+    });
+    const problems = evaluateReviewCoverage({ pullRequest: label, headSha, author: authorFrom(authorship, true), reviews: [review],
+      deltaFor: () => ({ kind: "identical" }) });
+    if (problems.length === 0) {
+      sourceReview = review;
+      attestedAuthorship = authorship;
+      break;
+    }
+    unqualified ??= `${review.reviewIssueIdentifier ?? review.reviewIssueId} does not qualify: ${problems[0]!.detail}`;
+  }
+  const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
+  // Checked before anything below can open a red-main issue for this actor.
+  if (authority === "coordinator_with_task_runs" && (attestedAsAuthor || !sourceAuthorAgentIds)) {
+    throw forbidden(attestedAsAuthor
+      ? "The implementer cannot merge its own task; an exact-head review attests this agent as a source author"
+      : `The implementer cannot merge its own task: this coordinator ran on the task, so it may merge only with a completed, passing, cross-model full review of ${headSha.slice(0, 12)} whose sourceAuthorAgentIds, written by a reviewer that never held or ran on the task, exclude it${unqualified ? ` (${unqualified})` : ""}`);
+  }
 
   // Main stays green: CI red on the base head, or an open owner issue.
   const baseCi = evaluateBaseCi({ baseSha, checks: baseChecks.checks, policy });
@@ -306,47 +380,11 @@ async function evaluateLocked(
   const requiredChecks = requiredPathScopedChecks({ policy, changedFiles });
   const ciReasons = evaluateHeadCi({ headSha, policy, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
 
-  const reviews = await deps.loadReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber });
-  // A review written by the merging coordinator is not independent of the merge.
-  const independentOfMerger = reviews.filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId);
-  // Who may have authored the change is read from what the runs recorded,
-  // not from the assignee's current adapter configuration. No run says
-  // whether it wrote code, so every agent that ran on the task counts,
-  // including one that reviews it now. A creator or ancestor coordinator,
-  // already shown to have no runs on the task, is excluded. A handoff
-  // coordinator (legacy return or accepted routing) may have authored code,
-  // so its runs remain potential authorship.
-  // A completed review can attest the exhaustive source author set, so
-  // coordination and review runs on the task stop counting as authorship.
-  // The attestation never narrows away its own reviewer: any started run the
-  // reviewer has on the task still counts, so a reviewer that ran there is a
-  // potential author and its review is not independent. Nothing recorded
-  // shows that such a run wrote no source, and the reviewer's own list cannot
-  // be that evidence. The reviewer must also never have been the task's
-  // creator, assignee or checkout holder. The attested agents must still have
-  // started runs on the task.
-  const attestations = independentOfMerger.filter(review =>
-    review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
-    review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
-    review.reviewedSha === headSha && review.sourceAuthorAgentIds?.length &&
-    !review.sourceAuthorAgentIds.includes(review.reviewerAgentId));
-  const custodians = attestations.length > 0 ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
-  const sourceReview = custodians
-    ? attestations.reverse().find(review => !custodians.includes(review.reviewerAgentId!))
-    : undefined;
-  const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
-  const authorship = await deps.loadTaskAuthorship(request.companyId, {
+  const authorship = sourceReview ? attestedAuthorship : await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentId: sourceAuthorAgentIds ? null : handoffCoordinator ? null : request.actor.agentId ?? null,
-    sourceAuthorAgentIds,
-    ...(sourceReview?.reviewerAgentId ? { attesterAgentId: sourceReview.reviewerAgentId } : {}),
+    excludeAgentId: authority === "handoff" ? null : request.actor.agentId ?? null,
   });
-  const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
-  const author: MergeGateAuthor = {
-    agentIds: authorship === null ? null
-      : [...new Set([...authorship.agentIds, ...(!sourceAuthorAgentIds && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
-    modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
-  };
+  const author = authorFrom(authorship, Boolean(sourceReview));
   const deltas = new Map<string, HeadDelta>();
   for (const review of independentOfMerger) {
     if (!deltas.has(review.reviewedSha)) {
