@@ -299,6 +299,36 @@ describe("buildStapleConsoleUpgradeStatus", () => {
     expect(unreleased.nextAction).toBe("The hold lifts by itself at its expiry");
   });
 
+  it("shows a quiet attempt's result over an earlier hold it renewed (FAC-942)", () => {
+    const hold = {
+      since: "2026-11-13T09:30:00.000Z", drainDeadlineAt: "2026-11-13T10:15:00.000Z", expiresAt: "2026-11-13T12:00:00.000Z",
+      queuedWakes: 4, runningRuns: 0, parkedRuns: 0,
+    };
+    // The quiet path passed its busy checks, then renewed the hold already in place: the hold
+    // keeps its 09:30 start, an hour before this attempt began.
+    const quietNeeds = [
+      "[2026-11-13 03:30:01] == Staple nightly upgrade (dry=0 quiet=1)",
+      `[2026-11-13 03:30:03] installed=${INSTALLED} master=${TARGET}`,
+      `[2026-11-13 03:30:05] certified target: target:${TARGET} installed-in-chain:yes`,
+      "[2026-11-13 03:30:05] CI on target: green",
+      "[2026-11-13 03:30:05] quiet-mode check 1: running=0",
+      "[2026-11-13 03:31:05] quiet-mode check 2: running=0",
+      "[2026-11-13 03:32:05] quiet-mode check 3: running=0",
+      "[2026-11-13 03:32:06] maintenance hold active since 2026-11-13T09:30:00.000Z; park at 2026-11-13T10:15:00.000Z; auto-release by 2026-11-13T12:00:00.000Z; queued=4 running=0",
+      "[2026-11-13 03:32:06] running or settling work: 0 (queued work is held)",
+      "[2026-11-13 03:32:40] backup: file:/home/paperclip/.paperclip/backups/staple-nightly-pre-92585ac2.sql.gz",
+      "[2026-11-13 03:32:41] installing 92585ac2",
+      "[2026-11-13 03:47:00] verify: health commit unreadable, startup not-checked",
+      "[2026-11-13 03:47:00] upgrade failed verification; rolling back",
+      "[2026-11-13 03:52:00] REPORT: NEEDS ETHAN: upgrade and rollback both failed",
+    ];
+    const status = buildStapleConsoleUpgradeStatus(input([log("quiet-window.log", quietNeeds, "2026-11-13T10:52:00.000Z")], { now: "2026-11-13T10:59:00.000Z", hold }));
+    expect(status.quiet).toBe(true);
+    expect(status.phase).toBe("needs_ethan");
+    expect(status.needsEthan).toMatch(/restore the pre-upgrade backup/);
+    expect(status.hold).toEqual(hold);
+  });
+
   it("shows a hold placed after the last attempt ended as the next window draining", () => {
     const yesterday = log("upgrade-20261112-0330.log", [
       "[2026-11-12 03:30:01] == Staple nightly upgrade (dry=0 quiet=0)",

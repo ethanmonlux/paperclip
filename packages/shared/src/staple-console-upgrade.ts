@@ -426,7 +426,10 @@ const HOLD_SLACK_MS = 5 * 60_000;
 function holdBelongsTo(hold: StapleConsoleUpgradeHold, attempt: Attempt, terminal: Terminal) {
   const since = Date.parse(hold.since);
   if (!Number.isFinite(since) || since > Date.parse(terminal.at) + HOLD_SLACK_MS) return false;
-  return !attempt.quiet || since >= Date.parse(attempt.startedAt) - HOLD_SLACK_MS;
+  if (!attempt.quiet || since >= Date.parse(attempt.startedAt) - HOLD_SLACK_MS) return true;
+  // A quiet attempt that went on to place the hold renewed the one already in place (renewal keeps
+  // its start), so that hold is its own. One that stopped at its busy checks never touched it.
+  return attempt.lines.some((line) => /^maintenance hold active since /.test(line.text));
 }
 
 function sortByStart(attempts: Attempt[]) {
@@ -597,7 +600,8 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
   // The nightly hold is placed at 02:30, an hour before the upgrade run: the window is draining.
   // A hold still active after the latest attempt ended, placed before or during it, is that
   // attempt's (a release that failed, or NEEDS ETHAN, where it lifts at its expiry): the result
-  // wins and the hold shows beside it. A quiet-window check doesn't own a hold it found in place.
+  // wins and the hold shows beside it. A quiet-window check doesn't own a hold it found in place
+  // unless it went on to renew it.
   if (input.hold && !(latest && latestTerminal && holdBelongsTo(input.hold, latest, latestTerminal))) {
     const holdAttempt = latestHold && Date.parse(latestHold.startedAt) <= Date.parse(input.hold.since) + 5 * 60_000
       && Date.parse(latestHold.startedAt) >= Date.parse(input.hold.since) - 5 * 60_000 ? latestHold : null;
