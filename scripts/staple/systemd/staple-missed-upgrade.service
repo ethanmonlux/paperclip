@@ -1,0 +1,6 @@
+[Unit]
+Description=Staple missed-upgrade report (reports only; never installs or restarts)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env node %h/.local/bin/staple-missed-upgrade.mjs

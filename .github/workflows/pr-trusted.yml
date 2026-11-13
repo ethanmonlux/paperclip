@@ -263,8 +263,8 @@ jobs:
       - name: Test e2e shard partition
         run: node "$CI_NODE_TEST" ./scripts/__tests__/e2e-shard.test.mjs
 
-      - name: Test Staple installer CI gate and certification
-        run: node "$CI_NODE_TEST" ./scripts/__tests__/staple-nightly-ci-state.test.mjs ./scripts/__tests__/staple-nightly-certified.test.mjs
+      - name: Test Staple installer CI gate, certification and missed-upgrade report
+        run: node "$CI_NODE_TEST" ./scripts/__tests__/staple-nightly-ci-state.test.mjs ./scripts/__tests__/staple-nightly-certified.test.mjs ./scripts/__tests__/staple-missed-upgrade.test.mjs
 
       - name: Test release verify workflow wiring
         run: node "$CI_NODE_TEST" ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/__tests__/eval-schedule-monitor.test.mjs ./scripts/__tests__/prepare-runner-release-image.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs ./scripts/reuse-canary-image.test.mjs

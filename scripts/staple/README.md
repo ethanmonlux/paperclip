@@ -59,6 +59,58 @@ Activation is outside agent runs: copy the script to `~/.local/bin/staple-nightl
 the 02:30 trigger, either the `systemd/` units or an equivalent cron line
 (`30 2 * * * ~/.local/bin/staple-nightly-upgrade hold`).
 
+## Missed-upgrade report
+
+`staple-missed-upgrade.mjs` (STA-225) checks hourly whether an upgrade was missed. It only reads and
+reports. It never installs, restarts, places a hold or takes the installer's lock, and it stays
+silent from 02:15 to 04:30 while the nightly run works.
+
+A report is due when either:
+- the chosen commit was certified before the 03:30 run and is still not installed an hour after it
+  (missed nightly), or
+- a merged change has been uninstalled for two hours.
+
+The chosen commit is the installer's own pick (`certified-target`), checked with the installer's
+Gate 0 (`ci-state`). A Gate 0 `pending` is a CI wait: no report and no card, and the next check
+looks again. An unreadable read is retried the same way. A completed red Gate 0 is reported as the
+failure, and that commit is not recommended.
+
+The report is one comment on the upgrade-log issue (STA-193, `report-issue-id`). It lists every
+merged PR and upstream sync between the installed build and the chosen commit, then everything
+merged after it that is not certified yet. Each item is classified from the Staple issues named in
+its PR title or branch:
+
+| Class | When |
+| --- | --- |
+| Critical | A linked issue is `critical`. |
+| Valuable | A linked issue is `high`, or the change is an unlinked `fix`. It costs a day while that issue still blocks open work. |
+| Can wait | Anything else, including `ci`, `test`, `chore` and `docs` changes. |
+
+The report recommends upgrading now when a Critical or day-costly Valuable change is installable.
+Otherwise it recommends waiting for tonight. Only then is a founder card raised: Upgrade now / Wait
+for tonight, with each consequential change, the chosen commit, and the expected time (a drain of
+up to 10 minutes plus about 10 minutes to back up, build, restart and verify). With no newer
+certified commit there is no card. A Critical change then gets "certify master now".
+
+One report and at most one card exist per (installed build, chosen commit) pair, across hourly
+checks and restarts. The pair is kept in `~/.paperclip/nightly/missed-upgrade-state.json` and
+written as a marker into the report comment, which covers a lost state file. It is also the card's
+idempotency key.
+
+The answer is followed up once on the same issue:
+- **Upgrade now** hands the install to the qualified operator, who runs
+  `HOLD_DRAIN_MIN=10 ~/.local/bin/staple-nightly-upgrade`.
+- **Wait for tonight** leaves the install to the 03:30 run.
+- A card still pending after Staple moves past its installed build is withdrawn.
+
+`--dry-run` prints the report and card without writing anything.
+
+The script needs Node 20 or later. Set `STAPLE_GITHUB_TOKEN` (read-only) so the hourly GitHub reads
+stay inside the API rate limit. Activation is outside agent runs: copy the script to
+`~/.local/bin/staple-missed-upgrade.mjs` next to the installer, and enable the `systemd/`
+`staple-missed-upgrade` units. They run at :45 past each hour, or use an equivalent cron line
+(`45 * * * * node ~/.local/bin/staple-missed-upgrade.mjs`).
+
 ## Routine checks and nightly certification
 
 Every push to a pull request, including a base refresh and an upstream-sync branch, runs routine
