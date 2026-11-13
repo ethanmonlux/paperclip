@@ -2076,6 +2076,11 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" |
   actorRunId?: string | null;
   actorResponsibleUserId?: string | null;
   trustExplicitResponsibleUserId?: boolean;
+  /**
+   * Authorization only: the agent whose interaction policy governs this create when it
+   * has no creating agent (for example a scheduled routine). Not recorded as the creator.
+   */
+  interactionActor?: { agentId: string; companyId?: string } | null;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
@@ -10405,6 +10410,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorResponsibleUserId,
         trustExplicitResponsibleUserId,
+        interactionActor,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
         assertCanReuseIssue,
@@ -10461,8 +10467,12 @@ export function issueService(db: Db) {
       const persist = async (tx: DbTransaction) => {
         await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).for("no key update");
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${companyId}`}, 0))`);
+        // Checked under the parent lock, so a parent reassigned since the caller's own check
+        // is judged by its current owner.
+        const interactionAgentId = issueData.createdByAgentId ?? interactionActor?.agentId ?? null;
+        const interactionAgentCompanyId = issueData.createdByAgentId ? undefined : interactionActor?.companyId;
         await assertAgentInteraction(tx as unknown as Db, {
-          companyId, actorAgentId: issueData.createdByAgentId,
+          companyId, actorAgentId: interactionAgentId, actorCompanyId: interactionAgentCompanyId,
           operation: "assign", targetAgentId: issueData.assigneeAgentId,
           assigneeUserId: issueData.assigneeUserId, parentIssueId: requestedParentId,
           texts: [resolvedTitle, issueData.description ?? "", initialPlan ?? ""], lock: true,
@@ -10479,8 +10489,8 @@ export function issueService(db: Db) {
         parentAdjustment = parentResolution.adjustment;
         issueData.parentId = parentResolution.effectiveParentId;
         if (issueData.parentId && issueData.parentId !== requestedParentId) {
-          await assertAgentInteraction(tx, { companyId, actorAgentId: issueData.createdByAgentId,
-            operation: "edit", issueId: issueData.parentId, lock: true });
+          await assertAgentInteraction(tx, { companyId, actorAgentId: interactionAgentId,
+            actorCompanyId: interactionAgentCompanyId, operation: "edit", issueId: issueData.parentId, lock: true });
         }
         await assertParentInCompany(tx, companyId, issueData.parentId);
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);

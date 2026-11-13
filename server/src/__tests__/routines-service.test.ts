@@ -45,6 +45,25 @@ import { readTaskCreationProvenance } from "../services/task-creation-provenance
 import { createSentryRunLinkResolver } from "../services/sentry-run-links.js";
 import { addSentryRunLinks, setSentryRunLinkResolver } from "../sentry-links.js";
 
+// Lets a test change the database between a routine's own checks and its child insert.
+const issueCreateHook = vi.hoisted(() => ({ before: null as null | (() => Promise<void>) }));
+vi.mock("../services/issues.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/issues.js")>();
+  return {
+    ...actual,
+    issueService: (...args: Parameters<typeof actual.issueService>) => {
+      const svc = actual.issueService(...args);
+      return {
+        ...svc,
+        create: async (...createArgs: Parameters<typeof svc.create>) => {
+          await issueCreateHook.before?.();
+          return svc.create(...createArgs);
+        },
+      };
+    },
+  };
+});
+
 const externalUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_ROUTINES_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalUrl ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -80,6 +99,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
   afterEach(async () => {
     vi.unstubAllEnvs();
+    issueCreateHook.before = null;
     setSentryRunLinkResolver(null);
     if (originalSecretsProviderEnv === undefined) {
       delete process.env.PAPERCLIP_SECRETS_PROVIDER;
@@ -109,6 +129,23 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(companies);
     await db.delete(instanceSettings);
   });
+
+  // Makes matching run inserts for one routine fail until the returned restore runs.
+  async function failRoutineRunInserts(routineId: string, condition: string) {
+    const name = `fail_routine_runs_${randomUUID().replace(/-/g, "")}`;
+    await db.execute(sql.raw(`create function ${name}() returns trigger language plpgsql as $$
+      begin
+        if new.routine_id = '${routineId}' and (${condition}) then
+          raise exception 'injected routine run insert failure';
+        end if;
+        return new;
+      end $$`));
+    await db.execute(sql.raw(`create trigger ${name} before insert on routine_runs for each row execute function ${name}()`));
+    return async () => {
+      await db.execute(sql.raw(`drop trigger if exists ${name} on routine_runs`));
+      await db.execute(sql.raw(`drop function if exists ${name}()`));
+    };
+  }
 
   afterAll(async () => {
     await tempDb?.cleanup();
@@ -1841,6 +1878,33 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(child?.parentId).toBe(parent!.id);
   }, 30_000);
 
+  it("rechecks a scheduled routine's agent against a parent reassigned before its child insert", async () => {
+    const { companyId, agentId, svc } = await seedFixture();
+    const guardedAgentId = randomUUID();
+    await db.insert(agents).values({ id: guardedAgentId, companyId, name: "Guarded", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {},
+      permissions: { interactions: { canReceiveTaskEditsFromAgents: false } } });
+    const [parent] = await db.insert(issues).values({ companyId, title: "Routine parent", status: "todo",
+      assigneeAgentId: agentId }).returning();
+    const routine = await svc.create(companyId, createRoutineSchema.parse({
+      title: "Agent-authored child refresh", assigneeAgentId: agentId, parentIssueId: parent!.id, status: "active",
+    }), { agentId });
+    const { trigger } = await svc.createTrigger(routine.id,
+      { kind: "schedule", enabled: true, cronExpression: "0 0 * * *", timezone: "UTC" }, { agentId });
+    // A board reassignment lands after dispatch checked the unlocked parent.
+    issueCreateHook.before = async () => {
+      await db.update(issues).set({ assigneeAgentId: guardedAgentId }).where(eq(issues.id, parent!.id));
+    };
+
+    await expect(svc.tickScheduledTriggers(trigger.nextRunAt!)).resolves.toEqual({ triggered: 1 });
+
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(runs).toMatchObject([{ source: "schedule", status: "failed", linkedIssueId: null,
+      failureReason: expect.stringContaining("canReceiveTaskEditsFromAgents") }]);
+    const children = await db.select({ id: issues.id }).from(issues).where(eq(issues.parentId, parent!.id));
+    expect(children).toEqual([]);
+  }, 30_000);
+
   it("marks a claimed tick pending before its dispatch commits", async () => {
     let triggerId = "";
     let pendingDuringDispatch: unknown = null;
@@ -1902,6 +1966,65 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runs).toMatchObject([
       { status: "failed", triggeredAt: interruptedAt, linkedIssueId: null,
         failureReason: "Scheduled dispatch was interrupted before it recorded a run" },
+      { status: "issue_created" },
+    ]);
+  });
+
+  it("keeps an earlier pending claim when recording it fails, then records it once", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(routine.id,
+      { kind: "schedule", enabled: true, cronExpression: "0 0 * * *", timezone: "UTC" }, {});
+    const interruptedAt = new Date(trigger.nextRunAt!.getTime() - 24 * 60 * 60 * 1000);
+    await db.update(routineTriggers).set({ lastFiredAt: interruptedAt, lastResult: "Dispatch pending" })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    const restore = await failRoutineRunInserts(routine.id, "new.status = 'failed'");
+    try {
+      await expect(svc.tickScheduledTriggers(trigger.nextRunAt!)).resolves.toEqual({ triggered: 0 });
+    } finally {
+      await restore();
+    }
+
+    const [unclaimed] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(unclaimed).toMatchObject({ nextRunAt: trigger.nextRunAt, lastFiredAt: interruptedAt,
+      lastResult: "Dispatch pending" });
+    expect(await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).toEqual([]);
+
+    await expect(svc.tickScheduledTriggers(trigger.nextRunAt!)).resolves.toEqual({ triggered: 1 });
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))
+      .orderBy(routineRuns.triggeredAt);
+    expect(runs).toMatchObject([
+      { status: "failed", triggeredAt: interruptedAt, linkedIssueId: null },
+      { status: "issue_created" },
+    ]);
+  });
+
+  it("recovers a claim whose dispatch and failure record were both lost, without repeating the earlier claim", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(routine.id,
+      { kind: "schedule", enabled: true, cronExpression: "0 0 * * *", timezone: "UTC" }, {});
+    const interruptedAt = new Date(trigger.nextRunAt!.getTime() - 24 * 60 * 60 * 1000);
+    await db.update(routineTriggers).set({ lastFiredAt: interruptedAt, lastResult: "Dispatch pending" })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    // After the claim commits, every other run insert fails, as if the process stopped there.
+    const restore = await failRoutineRunInserts(routine.id,
+      "new.failure_reason is distinct from 'Scheduled dispatch was interrupted before it recorded a run'");
+    try {
+      await expect(svc.tickScheduledTriggers(trigger.nextRunAt!)).resolves.toEqual({ triggered: 0 });
+    } finally {
+      await restore();
+    }
+    const [claimed] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(claimed?.lastResult).toBe("Dispatch pending");
+    expect(claimed?.nextRunAt!.getTime()).toBeGreaterThan(trigger.nextRunAt!.getTime());
+
+    await expect(svc.tickScheduledTriggers(claimed!.nextRunAt!)).resolves.toEqual({ triggered: 1 });
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))
+      .orderBy(routineRuns.triggeredAt);
+    expect(runs).toMatchObject([
+      { status: "failed", triggeredAt: interruptedAt, linkedIssueId: null },
+      { status: "failed", triggeredAt: claimed!.lastFiredAt, linkedIssueId: null },
       { status: "issue_created" },
     ]);
   });

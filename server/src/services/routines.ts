@@ -1548,47 +1548,36 @@ export function routineService(
     return run;
   }
 
-  // Records a claimed schedule tick whose dispatch never committed a run, so an advanced
-  // trigger always leaves a durable outcome.
-  async function recordFailedScheduledDispatch(input: {
+  type FailedScheduledDispatch = {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect;
     triggeredAt: Date;
     reason: string;
-    touchTrigger: boolean;
-  }) {
-    const run = await db.transaction(async (tx) => {
-      const txDb = tx as unknown as Db;
-      await tx.execute(
-        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
-      );
-      const [createdRun] = await txDb
-        .insert(routineRuns)
-        .values({
-          companyId: input.routine.companyId,
-          routineId: input.routine.id,
-          triggerId: input.trigger.id,
-          source: "schedule",
-          status: "failed",
-          triggeredAt: input.triggeredAt,
-          failureReason: input.reason,
-          completedAt: new Date(),
-          linkedIssueId: null,
-          routineRevisionId: input.routine.latestRevisionId,
-          responsibleUserId: input.routine.responsibleUserId ?? null,
-        })
-        .returning();
-      if (input.touchTrigger) {
-        await updateRoutineTouchedState({
-          routineId: input.routine.id,
-          triggerId: input.trigger.id,
-          triggeredAt: input.triggeredAt,
-          status: "dispatch_failed",
-        }, txDb);
-      }
-      return createdRun;
-    });
+  };
 
+  // Records a claimed schedule tick whose dispatch never committed a run, so an advanced
+  // trigger always leaves a durable outcome. The caller holds the routine lock.
+  async function insertFailedScheduledRun(input: FailedScheduledDispatch, executor: Db) {
+    const [createdRun] = await executor
+      .insert(routineRuns)
+      .values({
+        companyId: input.routine.companyId,
+        routineId: input.routine.id,
+        triggerId: input.trigger.id,
+        source: "schedule",
+        status: "failed",
+        triggeredAt: input.triggeredAt,
+        failureReason: input.reason,
+        completedAt: new Date(),
+        linkedIssueId: null,
+        routineRevisionId: input.routine.latestRevisionId,
+        responsibleUserId: input.routine.responsibleUserId ?? null,
+      })
+      .returning();
+    return createdRun;
+  }
+
+  async function logFailedScheduledDispatch(input: FailedScheduledDispatch, run: typeof routineRuns.$inferSelect) {
     try {
       await logActivity(db, {
         companyId: input.routine.companyId,
@@ -1608,6 +1597,24 @@ export function routineService(
     } catch (err) {
       logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log failed scheduled routine dispatch");
     }
+  }
+
+  async function recordFailedScheduledDispatch(input: FailedScheduledDispatch) {
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
+      );
+      const createdRun = await insertFailedScheduledRun(input, txDb);
+      await updateRoutineTouchedState({
+        routineId: input.routine.id,
+        triggerId: input.trigger.id,
+        triggeredAt: input.triggeredAt,
+        status: "dispatch_failed",
+      }, txDb);
+      return createdRun;
+    });
+    await logFailedScheduledDispatch(input, run);
     return run;
   }
 
@@ -1882,8 +1889,9 @@ export function routineService(
           : input.routine.updatedByAgentId ?? (input.routine.updatedByUserId ? null : input.routine.createdByAgentId));
       const interactionActorCompanyId = interactionActorAgentId ? await tx.select({ companyId: agents.companyId }).from(agents)
         .where(eq(agents.id, interactionActorAgentId)).then(rows => rows[0]?.companyId) : undefined;
-      // issueSvc.create runs on its own connection and locks the parent itself. Holding the
-      // parent row here would block that child insert while this transaction waits for it.
+      // issueSvc.create runs on its own connection and rechecks this actor under its own parent
+      // lock. Holding the parent row here would block that child insert while this
+      // transaction waits for it.
       await assertAgentInteraction(tx, { companyId: input.routine.companyId, actorAgentId: interactionActorAgentId,
         actorCompanyId: interactionActorCompanyId,
         operation: "assign", targetAgentId: assigneeAgentId, parentIssueId: input.routine.parentIssueId,
@@ -2017,6 +2025,9 @@ export function routineService(
             assigneeAgentId,
             createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
             createdByUserId: manualRunnerUserId,
+            interactionActor: interactionActorAgentId
+              ? { agentId: interactionActorAgentId, companyId: interactionActorCompanyId }
+              : null,
             responsibleUserId,
             trustExplicitResponsibleUserId: true,
             originKind: issueOriginKind,
@@ -3380,37 +3391,60 @@ export function routineService(
         // The claim also marks the tick pending, so an advanced trigger is never silent if the
         // dispatch below fails to commit or the process exits before it finishes.
         const claimedAt = new Date();
-        const claimed = await db
-          .update(routineTriggers)
-          .set({
-            nextRunAt: claimedNextRunAt,
-            lastFiredAt: claimedAt,
-            lastResult: SCHEDULE_DISPATCH_PENDING_RESULT,
-            updatedAt: claimedAt,
-          })
-          .where(
-            and(
-              eq(routineTriggers.id, row.trigger.id),
-              eq(routineTriggers.enabled, true),
-              eq(routineTriggers.archived, false),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
-            ),
-          )
-          .returning({ id: routineTriggers.id })
-          .then((rows) => rows[0] ?? null);
-        if (!claimed) continue;
+        const expectedNextRunAt = row.trigger.nextRunAt;
+        let claim: { interrupted: { input: FailedScheduledDispatch; run: typeof routineRuns.$inferSelect } | null } | null = null;
+        try {
+          claim = await db.transaction(async (tx) => {
+            const txDb = tx as unknown as Db;
+            // Routine before trigger, the same lock order as dispatch.
+            await tx.execute(
+              sql`select id from ${routines} where ${routines.id} = ${row.routine.id} and ${routines.companyId} = ${row.routine.companyId} for update`,
+            );
+            const [current] = await txDb
+              .select({ lastFiredAt: routineTriggers.lastFiredAt, lastResult: routineTriggers.lastResult })
+              .from(routineTriggers)
+              .where(
+                and(
+                  eq(routineTriggers.id, row.trigger.id),
+                  eq(routineTriggers.enabled, true),
+                  eq(routineTriggers.archived, false),
+                  eq(routineTriggers.nextRunAt, expectedNextRunAt),
+                ),
+              )
+              .for("update");
+            if (!current) return null;
 
-        if (row.trigger.lastResult === SCHEDULE_DISPATCH_PENDING_RESULT && row.trigger.lastFiredAt) {
-          await recordFailedScheduledDispatch({
-            routine: row.routine,
-            trigger: row.trigger,
-            triggeredAt: row.trigger.lastFiredAt,
-            reason: "Scheduled dispatch was interrupted before it recorded a run",
-            touchTrigger: false,
-          }).catch((err) => {
-            logger.error({ err, routineId: row.routine.id, triggerId: row.trigger.id }, "failed to record interrupted scheduled routine dispatch");
+            // A marker still pending here lost its dispatch to an error or a process exit.
+            // Record that earlier tick in the transaction that replaces its marker, so a failed
+            // insert leaves the marker (and this tick) in place for the next pass.
+            let interrupted: { input: FailedScheduledDispatch; run: typeof routineRuns.$inferSelect } | null = null;
+            if (current.lastResult === SCHEDULE_DISPATCH_PENDING_RESULT && current.lastFiredAt) {
+              const input = {
+                routine: row.routine,
+                trigger: row.trigger,
+                triggeredAt: current.lastFiredAt,
+                reason: "Scheduled dispatch was interrupted before it recorded a run",
+              };
+              interrupted = { input, run: await insertFailedScheduledRun(input, txDb) };
+            }
+            await txDb
+              .update(routineTriggers)
+              .set({
+                nextRunAt: claimedNextRunAt,
+                lastFiredAt: claimedAt,
+                lastResult: SCHEDULE_DISPATCH_PENDING_RESULT,
+                updatedAt: claimedAt,
+              })
+              .where(eq(routineTriggers.id, row.trigger.id));
+            return { interrupted };
           });
+        } catch (err) {
+          // Nothing was claimed; the trigger stays due and is retried on the next pass.
+          logger.error({ err, routineId: row.routine.id, triggerId: row.trigger.id }, "failed to claim scheduled routine tick");
+          continue;
         }
+        if (!claim) continue;
+        if (claim.interrupted) await logFailedScheduledDispatch(claim.interrupted.input, claim.interrupted.run);
 
         try {
           if (projectPaused || worktreeSuppressed) {
@@ -3463,7 +3497,6 @@ export function routineService(
             trigger: row.trigger,
             triggeredAt: claimedAt,
             reason: err instanceof Error ? err.message : String(err),
-            touchTrigger: true,
           }).catch((recordErr) => {
             logger.error({ err: recordErr, routineId: row.routine.id, triggerId: row.trigger.id }, "failed to record scheduled routine dispatch failure");
           });
