@@ -238,12 +238,23 @@ export function classifyCiWait(input: {
         `Workflow run ${run.id} on ${sha} completed with zero jobs. It is not candidate proof; fix the workflow before an explicit retry.`) };
     }
     if (run.status === "completed") {
-      const allSucceeded = run.conclusion === "success" &&
-        snapshot.checkRuns.every(job => job.status === "completed" && job.conclusion === "success");
-      return { action: "wake", observation: observation(allSucceeded ? "passed" : "failed", now,
-        allSucceeded
-          ? `Workflow run ${run.id} at ${sha} succeeded with ${snapshot.checkRuns.length} successful jobs. Recheck the merge gate before merging.`
-          : `Workflow run ${run.id} at ${sha} did not succeed in every job. Keep the candidate blocked and investigate; do not automatically retry.`) };
+      // Change-scoped CI (STA-223) skips jobs a change does not touch, so a successful run
+      // may mix successful and planned skipped jobs (STA-385). A skip is not a pass: the run
+      // proves the candidate only if at least one job actually succeeded, matching the
+      // substantive evidence rule above (STA-336). Named required checks such as `ci / verify`
+      // stay with the merge gate (STA-354). Any other job state (failed, neutral, unfinished)
+      // is not proof.
+      const succeeded = snapshot.checkRuns.filter(job => job.status === "completed" && job.conclusion === "success").length;
+      const skipped = snapshot.checkRuns.filter(job => job.status === "completed" && job.conclusion === "skipped").length;
+      const proven = run.conclusion === "success" && succeeded > 0 && succeeded + skipped === snapshot.checkRuns.length;
+      if (proven) {
+        return { action: "wake", observation: observation("passed", now,
+          `Workflow run ${run.id} at ${sha} succeeded: ${succeeded} jobs passed and ${skipped} planned jobs were skipped. Recheck the merge gate before merging.`) };
+      }
+      const detail = run.conclusion === "success" && succeeded === 0 && skipped === snapshot.checkRuns.length
+        ? `Workflow run ${run.id} at ${sha} skipped all ${skipped} jobs and ran no CI. It is not candidate proof; keep the candidate blocked and investigate.`
+        : `Workflow run ${run.id} at ${sha} did not succeed in every job (run ${run.conclusion ?? "no conclusion"}; ${succeeded} passed, ${skipped} skipped, ${snapshot.checkRuns.length - succeeded - skipped} other). Keep the candidate blocked and investigate; do not automatically retry.`;
+      return { action: "wake", observation: observation("failed", now, detail) };
     }
   }
 
