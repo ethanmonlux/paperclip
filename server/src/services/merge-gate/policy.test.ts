@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  admittedCandidateRun,
+  changedPaths,
   classifyHeadCommits,
   classifyOwnDiffChange,
   decideMerge,
@@ -10,8 +12,10 @@ import {
   modelFamiliesFromRunUsage,
   modelFamily,
   parseMergeReviewDocument,
+  parseVisualReviewDocument,
   repositoryMergePolicy,
   requiredPathScopedChecks,
+  requiresVisualReview,
   type MergeGateCheck,
   type MergeReviewAttestation,
 } from "./policy.js";
@@ -515,6 +519,70 @@ describe("merge-review document", () => {
     expect(parseMergeReviewDocument("reviewedSha: abc123\np0: 0\np1: 0")).toBeNull();
     expect(parseMergeReviewDocument(`reviewedSha: ${HEAD}\np0: 0`)).toBeNull();
     expect(parseMergeReviewDocument(`reviewedSha: ${HEAD}\nscope: partial\np0: 0\np1: 0`)).toBeNull();
+  });
+});
+
+describe("visual review (STA-362)", () => {
+  it("needs a visual verdict exactly where Facette needs the candidate, and nowhere else", () => {
+    const visual = ["shell/faces/osrs/character/kaia/KaiaRive.tsx", "shell/public/assets/osrs/ember-vault/kaia-rive/kaia.riv",
+      "shell/faces/x4/Face.tsx", "shell/src-tauri/src/main.rs", "shell/components/FaceKit/Tile.tsx", "agent/src/server.mjs"];
+    for (const file of visual) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: ["docs/a.md", file] })).toBe(true);
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toContain("candidate");
+    }
+    for (const file of ["account-web/app/page.tsx", "docs/setup.md", "infra/main.tf", ".github/workflows/internal-windows.yml"]) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: [file] })).toBe(false);
+    }
+    // An unknown file list needs everything.
+    expect(requiresVisualReview({ policy: facette, changedFiles: null })).toBe(true);
+    expect(requiresVisualReview({ policy: facette, changedFiles: [] })).toBe(true);
+    for (const policy of [paperclip, unknownRepo]) {
+      expect(requiresVisualReview({ policy, changedFiles: ["shell/app.tsx"] })).toBe(false);
+      expect(requiresVisualReview({ policy, changedFiles: null })).toBe(false);
+    }
+  });
+
+  it("parses the visual reviewer's record and rejects one without an exact SHA, candidate run or pass/fail verdict", () => {
+    expect(parseVisualReviewDocument([
+      "# Visual review", "", "- pullRequest: ethanmonlux/facette#704", `- reviewedSha: \`${HEAD.toUpperCase()}\``,
+      "- candidateRunId: 1234", "- candidateRunAttempt: 2", "- verdict: PASS",
+    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, candidateRunId: 1234, candidateRunAttempt: 2, verdict: "pass" });
+    const run = "candidateRunId: 1234";
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\nverdict: fail`))
+      .toMatchObject({ verdict: "fail", pullRequest: null, candidateRunAttempt: 1 });
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\ncandidateRunId: latest\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\ncandidateRunAttempt: 0\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\nverdict: looks good`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: abc123\n${run}\nverdict: pass`)).toBeNull();
+  });
+
+  it("counts both sides of a rename as changed paths", () => {
+    const file = (filename: string, previousFilename?: string) => ({ filename, previousFilename, status: previousFilename ? "renamed" : "modified", blobSha: null, patch: null });
+    expect(changedPaths([file("docs/Face.tsx", "shell/faces/x4/Face.tsx"), file("docs/a.md")]))
+      .toEqual(["docs/Face.tsx", "shell/faces/x4/Face.tsx", "docs/a.md"]);
+    expect(changedPaths(null)).toBeNull();
+    expect(requiresVisualReview({ policy: facette, changedFiles: changedPaths([file("docs/Face.tsx", "shell/faces/x4/Face.tsx")]) })).toBe(true);
+  });
+
+  it("admits the one finished candidate run at the head with its attempt and timing", () => {
+    const job = (name: string, startedAt: string | null, completedAt: string | null): MergeGateCheck =>
+      ({ kind: "check_run", name, status: "completed", conclusion: "success", headSha: HEAD, checkSuiteId: 7, startedAt, completedAt });
+    const run: MergeGateCheck = { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
+      headSha: HEAD, checkSuiteId: 7, runId: 55, runAttempt: 3, startedAt: "2026-11-13T02:00:00Z", workflowPath: ".github/workflows/internal-windows.yml" };
+    const jobs = [job("frontend", "2026-11-13T02:01:00Z", "2026-11-13T02:10:00Z"), job("candidate", "2026-11-13T02:10:00Z", "2026-11-13T02:40:00Z"),
+      job("browser-evidence", "2026-11-13T02:40:00Z", "2026-11-13T02:50:00Z")];
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: HEAD })).toEqual({
+      workflowPath: ".github/workflows/internal-windows.yml", runId: 55, runAttempt: 3,
+      startedAt: "2026-11-13T02:00:00.000Z", completedAt: "2026-11-13T02:50:00.000Z",
+    });
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1), job("frontend", null, "2026-11-13T02:10:00Z")], headSha: HEAD }))
+      .toMatchObject({ startedAt: null, completedAt: "2026-11-13T02:50:00.000Z" });
+    expect(admittedCandidateRun({ policy: facette, checks: [{ ...run, conclusion: "failure" }, ...jobs], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1)], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: REVIEWED })).toBeNull();
+    expect(admittedCandidateRun({ policy: paperclip, checks: [run, ...jobs], headSha: HEAD })).toBeNull();
   });
 });
 

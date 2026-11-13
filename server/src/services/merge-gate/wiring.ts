@@ -21,13 +21,20 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../i
 import { issueService } from "../issues.js";
 import { withWorkspaceLockKeepalive } from "../native-runtime/native-workspace-lock-keepalive.js";
 import { createMergeGateGitHub } from "./github.js";
-import { modelFamiliesFromRunUsage, parseMergeReviewDocument, type MergeReviewAttestation } from "./policy.js";
+import {
+  modelFamiliesFromRunUsage,
+  parseMergeReviewDocument,
+  parseVisualReviewDocument,
+  type MergeReviewAttestation,
+  type VisualReviewAttestation,
+} from "./policy.js";
 import {
   evaluateAndMerge,
   MERGE_GATE_RED_MAIN_ORIGIN_KIND,
   MERGE_LOCK_BUSY,
   MERGE_REVIEW_DOCUMENT_KEY,
   reportRedMain,
+  VISUAL_REVIEW_DOCUMENT_KEY,
   type MergeGateDependencies,
   type MergeGateRequest,
 } from "./service.js";
@@ -97,6 +104,57 @@ async function withAdvisoryTryLock<T>(db: Db, key: string, action: () => Promise
     if (err instanceof Error && err.message === "dedicated_connection_requires_create_db") return locked(db);
     throw err;
   }
+}
+
+/**
+ * Review documents with `key` on the given review issues (or, when none are
+ * given, naming the pull request), oldest first. The latest revision is the
+ * record: its text, its author, and the run that wrote it.
+ */
+async function latestReviewDocuments<T>(
+  db: Db, companyId: string, key: string,
+  input: { reviewIssueIds: string[]; repo: string; pullNumber: number },
+  parse: (body: string) => T | null,
+) {
+  const reference = `${input.repo}#${input.pullNumber}`;
+  const rows = await db
+    .select({
+      issueId: issues.id,
+      identifier: issues.identifier,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      documentId: documents.id,
+      updatedAt: documents.updatedAt,
+    })
+    .from(issueDocuments)
+    .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
+    .innerJoin(issues, eq(issues.id, issueDocuments.issueId))
+    .where(and(
+      eq(issueDocuments.companyId, companyId),
+      eq(issueDocuments.key, key),
+      input.reviewIssueIds.length > 0
+        ? inArray(issueDocuments.issueId, input.reviewIssueIds)
+        : sql`${documents.latestBody} ilike ${`%${reference}%`}`,
+    ))
+    .orderBy(documents.updatedAt)
+    .limit(20);
+  const found: Array<{
+    row: (typeof rows)[number]; revision: { body: string; agentId: string | null; runId: string | null; createdAt: Date }; parsed: T;
+  }> = [];
+  for (const row of rows) {
+    const [revision] = await db.select({
+      body: documentRevisions.body,
+      agentId: documentRevisions.createdByAgentId,
+      runId: documentRevisions.createdByRunId,
+      createdAt: documentRevisions.createdAt,
+    }).from(documentRevisions)
+      .where(and(eq(documentRevisions.companyId, companyId), eq(documentRevisions.documentId, row.documentId)))
+      .orderBy(desc(documentRevisions.revisionNumber))
+      .limit(1);
+    const parsed = revision ? parse(revision.body) : null;
+    if (revision && parsed) found.push({ row, revision, parsed });
+  }
+  return found;
 }
 
 export function createMergeGateDependencies(db: Db, options: { heartbeat?: IssueAssignmentWakeupDeps } = {}): MergeGateDependencies {
@@ -239,41 +297,8 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
     },
     withMergeLock: (key, action) => withAdvisoryTryLock(db, key, action),
     async loadReviews(companyId, input) {
-      const reference = `${input.repo}#${input.pullNumber}`;
-      const rows = await db
-        .select({
-          issueId: issues.id,
-          identifier: issues.identifier,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          documentId: documents.id,
-          updatedAt: documents.updatedAt,
-        })
-        .from(issueDocuments)
-        .innerJoin(documents, eq(documents.id, issueDocuments.documentId))
-        .innerJoin(issues, eq(issues.id, issueDocuments.issueId))
-        .where(and(
-          eq(issueDocuments.companyId, companyId),
-          eq(issueDocuments.key, MERGE_REVIEW_DOCUMENT_KEY),
-          input.reviewIssueIds.length > 0
-            ? inArray(issueDocuments.issueId, input.reviewIssueIds)
-            : sql`${documents.latestBody} ilike ${`%${reference}%`}`,
-        ))
-        .orderBy(documents.updatedAt)
-        .limit(20);
       const attestations: MergeReviewAttestation[] = [];
-      for (const row of rows) {
-        // The latest revision is the record: its text, its author, and the run that wrote it.
-        const [revision] = await db.select({
-          body: documentRevisions.body,
-          agentId: documentRevisions.createdByAgentId,
-          runId: documentRevisions.createdByRunId,
-        }).from(documentRevisions)
-          .where(and(eq(documentRevisions.companyId, companyId), eq(documentRevisions.documentId, row.documentId)))
-          .orderBy(desc(documentRevisions.revisionNumber))
-          .limit(1);
-        const parsed = revision ? parseMergeReviewDocument(revision.body) : null;
-        if (!revision || !parsed) continue;
+      for (const { row, revision, parsed } of await latestReviewDocuments(db, companyId, MERGE_REVIEW_DOCUMENT_KEY, input, parseMergeReviewDocument)) {
         const [run] = revision.runId
           ? await db.select({ agentId: heartbeatRuns.agentId, usage: heartbeatRuns.usageJson }).from(heartbeatRuns)
             .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, revision.runId)))
@@ -286,6 +311,35 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
           reviewerAgentId: revision.agentId,
           reviewerModelFamilies: run && run.agentId === revision.agentId ? modelFamiliesFromRunUsage(run.usage) : [],
           writtenByReviewer: Boolean(revision.agentId) && revision.agentId === row.assigneeAgentId,
+          recordedAt: revision.createdAt.toISOString(),
+        });
+      }
+      return attestations;
+    },
+    async loadVisualReviews(companyId, input) {
+      const attestations: VisualReviewAttestation[] = [];
+      for (const { row, revision, parsed } of await latestReviewDocuments(db, companyId, VISUAL_REVIEW_DOCUMENT_KEY, input, parseVisualReviewDocument)) {
+        // The writer's own run, and the designation on its agent record: an
+        // operator marks the visual reviewer `runtimeConfig.mergeGate.visualReviewer: true`.
+        const [run] = revision.runId
+          ? await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, revision.runId)))
+          : [];
+        const [writer] = revision.agentId
+          ? await db.select({
+            status: agents.status,
+            designated: sql<boolean>`coalesce(${agents.runtimeConfig} -> 'mergeGate' -> 'visualReviewer' = 'true'::jsonb, false)`,
+          }).from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, revision.agentId)))
+          : [];
+        attestations.push({
+          ...parsed,
+          reviewIssueId: row.issueId,
+          reviewIssueIdentifier: row.identifier,
+          reviewIssueStatus: row.status,
+          reviewerAgentId: revision.agentId,
+          writtenByReviewer: Boolean(revision.agentId) && revision.agentId === row.assigneeAgentId && run?.agentId === revision.agentId,
+          designatedReviewer: Boolean(writer?.designated) && writer?.status !== "terminated",
+          recordedAt: revision.createdAt.toISOString(),
         });
       }
       return attestations;
