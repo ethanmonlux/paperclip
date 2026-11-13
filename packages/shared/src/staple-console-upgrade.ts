@@ -6,7 +6,8 @@
  * lines, the maintenance-hold record and the running build into one read-only status: the
  * stage an attempt has reached, how long it has taken, when the installer last wrote
  * anything, what is held, and what happens next. It never returns a raw log line: only stage
- * names, times, short SHAs, counts and the installer's own one-line outcome.
+ * names, times, short SHAs, counts and the installer's one-line outcome, rewritten to fixed
+ * wording so no path or error text from the host reaches the page.
  *
  * The installer reports no download size, so download and build are one stage and its size is
  * unknown. Nothing here estimates a percent or an ETA.
@@ -113,6 +114,8 @@ export interface StapleUpgradeLogFile {
   name: string;
   text: string;
   modifiedAt: string;
+  /** The text starts inside an attempt whose `==` start line was too far back to read. */
+  startUnread?: boolean;
 }
 
 export interface StapleConsoleUpgradeInput {
@@ -133,7 +136,7 @@ export const STAPLE_UPGRADE_STALE_MS = 10 * 60_000;
 export const STAPLE_UPGRADE_BUILD_STALE_MS = 20 * 60_000;
 
 const LINE_RE = /^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\] (.*)$/;
-const SHORT = (sha: string | null | undefined) => (sha ? sha.slice(0, 8) : null);
+const SHORT = (sha: string | null | undefined) => (sha && /^[0-9a-f]{7,40}$/.test(sha) ? sha.slice(0, 8) : null);
 
 function clip(text: string, max = 160) {
   const flat = text.replace(/\s+/g, " ").trim();
@@ -178,11 +181,19 @@ interface Attempt {
   rawAfter: string[];
   modifiedAt: string;
   isLastInFile: boolean;
+  /** Its start line wasn't read, so its kind, target and stages are unknown. */
+  startUnread: boolean;
 }
 
 function parseAttempts(file: StapleUpgradeLogFile, timeZone: string): Attempt[] {
   const attempts: Attempt[] = [];
   let current: Attempt | null = null;
+  const unread = (at: string): Attempt => ({
+    kind: "upgrade", logName: file.name, quiet: false, dry: false, startedAt: at, lines: [], rawAfter: [],
+    modifiedAt: file.modifiedAt, isLastInFile: false, startUnread: true,
+  });
+  if (file.startUnread) attempts.push((current = unread(file.modifiedAt)));
+  let sawTimestamp = false;
   for (const raw of file.text.split(/\r?\n/)) {
     const match = LINE_RE.exec(raw);
     if (!match) {
@@ -194,6 +205,9 @@ function parseAttempts(file: StapleUpgradeLogFile, timeZone: string): Attempt[] 
       timeZone,
     );
     if (!at) continue;
+    // An attempt that started before the readable text began starts, as far as we know, here.
+    if (!sawTimestamp && current?.startUnread) current.startedAt = at;
+    sawTimestamp = true;
     const text = match[7]!;
     const upgrade = /^== Staple nightly upgrade \(dry=(\d) quiet=(\d)\)/.exec(text);
     const hold = /^== Staple maintenance hold/.test(text);
@@ -208,6 +222,7 @@ function parseAttempts(file: StapleUpgradeLogFile, timeZone: string): Attempt[] 
         rawAfter: [],
         modifiedAt: file.modifiedAt,
         isLastInFile: false,
+        startUnread: false,
       };
       attempts.push(current);
       continue;
@@ -230,6 +245,52 @@ type Terminal = {
 
 const BUSY_RE = /run\(s\) (still )?running (after the drain deadline|at restart time)/;
 
+const SHA = "[0-9a-f]{7,40}";
+/** CI check and context names: no path separators, no free-form error text. */
+const SAFE_NAME = /^[A-Za-z0-9 _.:+,-]{1,80}$/;
+
+/**
+ * The installer's REPORT reasons as fixed public wording. Its reasons can carry host detail
+ * (backup file paths, journalctl or API errors), so only known shapes pass, with SHAs, counts and
+ * check names; anything else becomes a generic line for its kind.
+ */
+const PUBLIC_OUTCOMES: Array<[RegExp, (match: RegExpExecArray) => string]> = [
+  [new RegExp(`^Upgraded Staple (${SHA}) -> (${SHA})$`), (m) => `Upgraded Staple ${SHORT(m[1])} -> ${SHORT(m[2])}`],
+  [new RegExp(`^Rolled back: (${SHA}) failed checks, back on (${SHA})$`), (m) => `Rolled back: ${SHORT(m[1])} failed checks, back on ${SHORT(m[2])}`],
+  [/^NEEDS ETHAN: upgrade and rollback both failed$/, () => "NEEDS ETHAN: upgrade and rollback both failed"],
+  [new RegExp(`^Failed: install of (${SHA}) did not complete$`), (m) => `Failed: install of ${SHORT(m[1])} did not complete`],
+  [/^Skipped: database backup failed \(backup file (missing|empty)\b/, (m) => `Skipped: database backup failed (backup file ${m[1]})`],
+  [/^Skipped: database backup failed \(backup file is \d+ bytes, db:backup reported \d+/, () => "Skipped: database backup failed (backup size mismatch)"],
+  [/^Skipped: database backup failed\b/, () => "Skipped: database backup failed"],
+  [new RegExp(`^Waiting: no certified master commit newer than installed (${SHA})$`), (m) => `Waiting: no certified master commit newer than installed ${SHORT(m[1])}`],
+  [new RegExp(`^Waiting: master (${SHA}) CI still running(?: \\(([^()]*)\\))?$`), (m) => (
+    `Waiting: master ${SHORT(m[1])} CI still running${m[2] && SAFE_NAME.test(m[2]) ? ` (${m[2]})` : ""}`
+  )],
+  [new RegExp(`^Skipped: master (${SHA}) CI is not green\\b`), (m) => `Skipped: master ${SHORT(m[1])} CI is not green`],
+  [/^Skipped: (\d+) run\(s\) still running after the drain deadline$/, (m) => `Skipped: ${m[1]} run(s) still running after the drain deadline`],
+  [/^Skipped: (\d+) run\(s\) running at restart time$/, (m) => `Skipped: ${m[1]} run(s) running at restart time`],
+  [/^Skipped: could not hold admission$/, () => "Skipped: could not hold admission"],
+  [/^Skipped: could not read installed or master commit$/, () => "Skipped: could not read installed or master commit"],
+  [/^Skipped: could not read master history$/, () => "Skipped: could not read master history"],
+  [/^Skipped: no (.+) commit in the last (\d+) master commits$/, (m) => (
+    SAFE_NAME.test(m[1]!) ? `Skipped: no ${m[1]} commit in the last ${m[2]} master commits` : "Skipped: no certified commit in recent master history"
+  )],
+  [/^Skipped: certification unreadable\b/, () => "Skipped: certification unreadable"],
+  [new RegExp(`^Skipped: certified (${SHA}) is not ahead of installed (${SHA})\\b`), (m) => `Skipped: certified ${SHORT(m[1])} is not ahead of installed ${SHORT(m[2])}`],
+];
+
+export function stapleUpgradePublicOutcome(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  for (const [pattern, render] of PUBLIC_OUTCOMES) {
+    const match = pattern.exec(flat);
+    if (match) return render(match);
+  }
+  if (/^Waiting:/.test(flat)) return "Waiting: upgrade deferred";
+  if (/^Failed:/.test(flat)) return "Failed: upgrade did not complete";
+  if (/^Skipped:/.test(flat)) return "Skipped: stopped before installing";
+  return "Installer reported an outcome the Console doesn't recognise";
+}
+
 function classifyOutcome(text: string): Terminal["phase"] {
   if (/^Upgraded /.test(text)) return "verified";
   if (/^Rolled back/.test(text)) return "rolled_back";
@@ -245,15 +306,16 @@ function terminalOf(attempt: Attempt): Terminal | null {
   for (let index = attempt.lines.length - 1; index >= 0; index -= 1) {
     const { at, text } = attempt.lines[index]!;
     const report = /^REPORT: (.*)$/.exec(text);
-    if (report) return { phase: classifyOutcome(report[1]!), text: clip(report[1]!), at };
+    if (report) return { phase: classifyOutcome(report[1]!), text: clip(stapleUpgradePublicOutcome(report[1]!)), at };
     const quietSkip = /^quiet-mode skip \(not reported\): (.*)$/.exec(text);
     if (quietSkip) {
       const phase = classifyOutcome(quietSkip[1]!);
-      return { phase: phase === "skipped" ? "waiting" : phase, text: clip(quietSkip[1]!), at };
+      return { phase: phase === "skipped" ? "waiting" : phase, text: clip(stapleUpgradePublicOutcome(quietSkip[1]!)), at };
     }
     if (/^Already on master\. Nothing to do\./.test(text)) return { phase: "up_to_date", text: "Already on the newest master", at };
     if (/^quiet-mode: busy, not installing now/.test(text)) return { phase: "waiting", text: "Busy: work is running", at };
-    if (/^quiet-mode: tried \w+ within the hour; waiting/.test(text)) return { phase: "waiting", text: clip(text.replace(/^quiet-mode: /, "")), at };
+    const triedRecently = new RegExp(`^quiet-mode: tried (${SHA}) within the hour; waiting`).exec(text);
+    if (triedRecently) return { phase: "waiting", text: `tried ${SHORT(triedRecently[1])} within the hour; waiting`, at };
     if (/^no certified commit to install/.test(text)) return { phase: "waiting", text: "No certified commit to install; no hold placed", at };
   }
   return null;
@@ -270,7 +332,12 @@ interface Progress {
   verifiedOk: boolean;
 }
 
-function progressOf(attempt: Attempt, serverStartedAt: string | null): Progress {
+/**
+ * `serverStartedAt` and `installedNow` describe the running process, so pass them only for the
+ * open attempt. A finished attempt's stages come from its own lines: a later, unrelated restart
+ * must not rewrite where it stopped.
+ */
+function progressOf(attempt: Attempt, live: { serverStartedAt: string | null; installedNow: string | null } | null): Progress {
   const reached = new Map<StapleConsoleUpgradeStageKey, string | null>();
   const result: Progress = {
     installed: null, master: null, target: null, reached, failedStage: null, rollbackAt: null, drainRunning: null, verifiedOk: false,
@@ -315,9 +382,12 @@ function progressOf(attempt: Attempt, serverStartedAt: string | null): Progress 
     payloadDone = true;
   }
   if (payloadDone && !reached.has("restart")) reached.set("restart", null);
-  // Staple came back after the install began: the restart is done and the installer is verifying.
-  const serverMs = serverStartedAt ? Date.parse(serverStartedAt) : NaN;
-  if (installingAt && Number.isFinite(serverMs) && serverMs > Date.parse(installingAt)) {
+  // Staple came back after the install began, on the target if both are known: the restart is
+  // done and the installer is verifying.
+  const serverMs = live?.serverStartedAt ? Date.parse(live.serverStartedAt) : NaN;
+  const onTarget = !live?.installedNow || !result.target
+    || live.installedNow.startsWith(result.target) || result.target.startsWith(live.installedNow);
+  if (installingAt && onTarget && Number.isFinite(serverMs) && serverMs > Date.parse(installingAt)) {
     if (!reached.has("restart")) reached.set("restart", null);
     if (!reached.has("verify")) reached.set("verify", new Date(serverMs).toISOString());
     else if (reached.get("verify") === null) reached.set("verify", new Date(serverMs).toISOString());
@@ -336,8 +406,8 @@ function stageCells(
   stage: StapleConsoleUpgradeStageKey | "rollback" | null,
   terminal: Terminal | null,
 ): StapleConsoleUpgradeStageCell[] {
-  // A rollback happens after verification failed.
-  const pointer = stage === "rollback" ? "verify" : stage;
+  // A rollback happens after verification failed. A stage the attempt failed at is where it stopped.
+  const pointer = stage === "rollback" ? "verify" : progress.failedStage ?? stage;
   const stageIndex = pointer ? STAPLE_UPGRADE_STAGES.indexOf(pointer) : -1;
   return STAPLE_UPGRADE_STAGES.map((key, index) => {
     let state: StapleConsoleUpgradeStageState;
@@ -349,6 +419,14 @@ function stageCells(
     else state = "skipped";
     return { key, label: STAPLE_UPGRADE_STAGE_LABELS[key], state, startedAt: progress.reached.get(key) ?? null };
   });
+}
+
+const HOLD_SLACK_MS = 5 * 60_000;
+
+function holdBelongsTo(hold: StapleConsoleUpgradeHold, attempt: Attempt, terminal: Terminal) {
+  const since = Date.parse(hold.since);
+  if (!Number.isFinite(since) || since > Date.parse(terminal.at) + HOLD_SLACK_MS) return false;
+  return !attempt.quiet || since >= Date.parse(attempt.startedAt) - HOLD_SLACK_MS;
 }
 
 function sortByStart(attempts: Attempt[]) {
@@ -448,7 +526,7 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
   });
 
   const attempts = sortByStart((input.logs ?? []).flatMap((file) => parseAttempts(file, input.timeZone)).filter((attempt) => !attempt.dry));
-  const upgrades = attempts.filter((attempt) => attempt.kind === "upgrade");
+  const upgrades = attempts.filter((attempt) => attempt.kind === "upgrade" && !attempt.startUnread);
 
   let lastInstall: StapleConsoleUpgradeStatus["lastInstall"] = null;
   for (const attempt of [...upgrades].reverse()) {
@@ -472,10 +550,23 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
     return base({ source: { available: false, detail: "installer log not readable", logName: null } });
   }
 
+  // The newest output belongs to an attempt whose start is too far back in its log to read: which
+  // attempt it is, and what it is doing, is unknown. Never pin that output on an older attempt.
+  const newest = attempts[attempts.length - 1] ?? null;
+  if (newest?.startUnread && newest.isLastInFile) {
+    return base({
+      headline: "Upgrade status unknown · installer log too long to read",
+      lastOutputAt: newest.modifiedAt,
+      hold: input.hold,
+      lastInstall,
+      source: { available: true, detail: "installer log too long; the current attempt's start wasn't read", logName: newest.logName },
+    });
+  }
+
   // An open attempt: no terminal line yet.
   const latestTerminal = latest ? terminalOf(latest) : null;
   if (latest && !latestTerminal) {
-    const progress = progressOf(latest, input.serverStartedAt);
+    const progress = progressOf(latest, { serverStartedAt: input.serverStartedAt, installedNow });
     const stage: StapleConsoleUpgradeStageKey | "rollback" | null = progress.rollbackAt ? "rollback" : currentStage(progress);
     const lastOutputAt = latest.isLastInFile ? latest.modifiedAt : latest.lines[latest.lines.length - 1]?.at ?? latest.startedAt;
     const staleAfter = stage === "download_build" ? STAPLE_UPGRADE_BUILD_STALE_MS : STAPLE_UPGRADE_STALE_MS;
@@ -504,7 +595,10 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
   }
 
   // The nightly hold is placed at 02:30, an hour before the upgrade run: the window is draining.
-  if (input.hold) {
+  // A hold still active after the latest attempt ended, placed before or during it, is that
+  // attempt's (a release that failed, or NEEDS ETHAN, where it lifts at its expiry): the result
+  // wins and the hold shows beside it. A quiet-window check doesn't own a hold it found in place.
+  if (input.hold && !(latest && latestTerminal && holdBelongsTo(input.hold, latest, latestTerminal))) {
     const holdAttempt = latestHold && Date.parse(latestHold.startedAt) <= Date.parse(input.hold.since) + 5 * 60_000
       && Date.parse(latestHold.startedAt) >= Date.parse(input.hold.since) - 5 * 60_000 ? latestHold : null;
     const target = holdAttempt?.lines.map((line) => /^certified target: target:([0-9a-f]{7,40})/.exec(line.text)?.[1]).find(Boolean) ?? null;
@@ -539,7 +633,7 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
     });
   }
 
-  const progress = progressOf(latest, input.serverStartedAt);
+  const progress = progressOf(latest, null);
   const phase = latestTerminal.phase;
   const reachedStage = currentStage(progress);
   // The live build is the truth for "installed"; the log's build names what a rollback returned to.
@@ -560,7 +654,7 @@ export function buildStapleConsoleUpgradeStatus(input: StapleConsoleUpgradeInput
     master: progress.master,
     lastOutputAt: latestTerminal.at,
     outcome: latestTerminal.text,
-    nextAction: nextActionFor(phase, reachedStage, input, ctx),
+    nextAction: input.hold && phase !== "needs_ethan" ? "The hold lifts by itself at its expiry" : nextActionFor(phase, reachedStage, input, ctx),
     needsEthan: phase === "needs_ethan"
       ? "Staple may be unhealthy after a failed upgrade and rollback. Check the service, and restore the pre-upgrade backup if the database changed."
       : null,

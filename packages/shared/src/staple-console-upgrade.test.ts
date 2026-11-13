@@ -215,8 +215,127 @@ describe("buildStapleConsoleUpgradeStatus", () => {
     ]));
     expect(status.phase).toBe("failed");
     expect(status.headline).toBe("Upgrade to 92585ac2 failed · still on 69187fe6");
+    expect(status.outcome).toBe("Skipped: database backup failed (backup file empty)");
     expect(status.stages.find((cell) => cell.key === "backup")?.state).toBe("failed");
     expect(status.stages.find((cell) => cell.key === "download_build")?.state).toBe("skipped");
+  });
+
+  it("never shows a backup path or the installer's error text (FAC-943)", () => {
+    const cases: Array<[string, string]> = [
+      ["backup file missing (/home/paperclip/.paperclip/backups/x.sql.gz)", "Skipped: database backup failed (backup file missing)"],
+      ["backup file empty (/private/backup.sql.gz)", "Skipped: database backup failed (backup file empty)"],
+      ["backup file is 12 bytes, db:backup reported 4096 (/srv/b.sql.gz)", "Skipped: database backup failed (backup size mismatch)"],
+      ["db:backup exited 1: could not write /var/tmp/pg.sql", "Skipped: database backup failed"],
+    ];
+    for (const [reason, outcome] of cases) {
+      const status = buildStapleConsoleUpgradeStatus(input([
+        log("upgrade-20261113-0330.log", [
+          ...drained,
+          `[2026-11-13 03:31:40] backup: error:${reason}`,
+          `[2026-11-13 03:31:40] REPORT: Skipped: database backup failed (${reason})`,
+        ], "2026-11-13T10:31:40.000Z"),
+      ]));
+      expect(status.phase).toBe("failed");
+      expect(status.outcome).toBe(outcome);
+      expect(JSON.stringify(status)).not.toMatch(/\/(home|private|srv|var)\//);
+    }
+    const other = buildStapleConsoleUpgradeStatus(input([
+      log("upgrade-20261113-0330.log", [
+        ...start.slice(0, 3),
+        "[2026-11-13 03:30:06] REPORT: Skipped: certification unreadable (gh: open /home/paperclip/.config/gh/hosts.yml: denied)",
+      ], "2026-11-13T10:30:06.000Z"),
+    ]));
+    expect(other.outcome).toBe("Skipped: certification unreadable");
+    expect(JSON.stringify(other)).not.toContain("/home/");
+    const unrecognised = buildStapleConsoleUpgradeStatus(input([
+      log("upgrade-20261113-0330.log", [...start.slice(0, 3), "[2026-11-13 03:30:06] REPORT: Skipped: token rejected at /etc/staple/token"], "2026-11-13T10:30:06.000Z"),
+    ]));
+    expect(unrecognised.outcome).toBe("Skipped: stopped before installing");
+    expect(JSON.stringify(unrecognised)).not.toContain("/etc/");
+  });
+
+  it("keeps a finished install failure where it stopped after a later restart (FAC-944)", () => {
+    const logs = [log("upgrade-20261113-0330.log", [
+      ...installing,
+      "[2026-11-13 03:40:00] REPORT: Failed: install of 92585ac2 did not complete",
+    ], "2026-11-13T10:40:00.000Z")];
+    for (const serverStartedAt of ["2026-11-12T19:00:00.000Z", "2026-11-13T10:50:00.000Z"]) {
+      const status = buildStapleConsoleUpgradeStatus(input(logs, { now: "2026-11-13T11:00:00.000Z", serverStartedAt }));
+      expect(status.phase).toBe("failed");
+      expect(status.stage).toBe("download_build");
+      expect(status.stages.find((cell) => cell.key === "download_build")?.state).toBe("failed");
+      expect(status.stages.find((cell) => cell.key === "restart")?.state).toBe("skipped");
+      expect(status.stages.find((cell) => cell.key === "verify")?.state).toBe("skipped");
+    }
+  });
+
+  it("doesn't count a restart onto another build as the upgrade's restart", () => {
+    const status = buildStapleConsoleUpgradeStatus(input([
+      log("upgrade-20261113-0330.log", installing, "2026-11-13T10:42:00.000Z"),
+    ], { now: "2026-11-13T10:43:40.000Z", serverStartedAt: "2026-11-13T10:43:30.000Z", installedBuild: "69187fe6" }));
+    expect(status.stage).toBe("download_build");
+  });
+
+  it("shows a finished attempt's result over the hold it left active (FAC-942)", () => {
+    const hold = {
+      since: "2026-11-13T09:30:00.000Z", drainDeadlineAt: "2026-11-13T10:15:00.000Z", expiresAt: "2026-11-13T12:00:00.000Z",
+      queuedWakes: 4, runningRuns: 0, parkedRuns: 0,
+    };
+    const needs = [
+      ...installing,
+      "[2026-11-13 03:47:00] verify: health commit unreadable, startup not-checked",
+      "[2026-11-13 03:47:00] upgrade failed verification; rolling back",
+      "[2026-11-13 03:52:00] REPORT: NEEDS ETHAN: upgrade and rollback both failed",
+    ];
+    const status = buildStapleConsoleUpgradeStatus(input([log("upgrade-20261113-0330.log", needs, "2026-11-13T10:52:00.000Z")], { now: "2026-11-13T10:59:00.000Z", hold }));
+    expect(status.phase).toBe("needs_ethan");
+    expect(status.needsEthan).toMatch(/restore the pre-upgrade backup/);
+    expect(status.hold).toEqual(hold);
+
+    const failed = [...installing, "[2026-11-13 03:40:00] REPORT: Failed: install of 92585ac2 did not complete"];
+    const unreleased = buildStapleConsoleUpgradeStatus(input([log("upgrade-20261113-0330.log", failed, "2026-11-13T10:40:00.000Z")], { now: "2026-11-13T10:45:00.000Z", hold }));
+    expect(unreleased.phase).toBe("failed");
+    expect(unreleased.hold).toEqual(hold);
+    expect(unreleased.nextAction).toBe("The hold lifts by itself at its expiry");
+  });
+
+  it("shows a hold placed after the last attempt ended as the next window draining", () => {
+    const yesterday = log("upgrade-20261112-0330.log", [
+      "[2026-11-12 03:30:01] == Staple nightly upgrade (dry=0 quiet=0)",
+      `[2026-11-12 03:30:03] installed=${INSTALLED} master=${INSTALLED}`,
+      "[2026-11-12 03:30:03] Already on master. Nothing to do.",
+    ], "2026-11-12T10:30:03.000Z");
+    // A quiet-window check that ran after the 02:30 hold was placed doesn't own it.
+    const quietCheck = log("quiet-window.log", [
+      "[2026-11-13 02:47:00] == Staple nightly upgrade (dry=0 quiet=1)",
+      `[2026-11-13 02:47:01] installed=${INSTALLED} master=${TARGET}`,
+      `[2026-11-13 02:47:02] certified target: target:${TARGET} installed-in-chain:yes`,
+      "[2026-11-13 02:47:03] quiet-mode check 1: running=1",
+      "[2026-11-13 02:47:03] quiet-mode: busy, not installing now",
+    ], "2026-11-13T09:47:03.000Z");
+    const hold = {
+      since: "2026-11-13T09:30:03.000Z", drainDeadlineAt: "2026-11-13T10:15:03.000Z", expiresAt: "2026-11-13T11:00:03.000Z",
+      queuedWakes: 2, runningRuns: 1, parkedRuns: 0,
+    };
+    for (const logs of [[yesterday], [yesterday, quietCheck]]) {
+      const status = buildStapleConsoleUpgradeStatus(input(logs, { now: "2026-11-13T09:50:00.000Z", hold }));
+      expect(status.phase).toBe("running");
+      expect(status.stage).toBe("draining");
+    }
+  });
+
+  it("says unknown, not an older result, when the current attempt's start wasn't read (FAC-945)", () => {
+    const status = buildStapleConsoleUpgradeStatus(input([
+      log("upgrade-20261112-0330.log", [
+        "[2026-11-12 03:30:01] == Staple nightly upgrade (dry=0 quiet=0)",
+        `[2026-11-12 03:30:03] installed=${INSTALLED} master=${INSTALLED}`,
+        "[2026-11-12 03:30:03] Already on master. Nothing to do.",
+      ], "2026-11-12T10:30:03.000Z"),
+      { ...log("quiet-window.log", ["build output", "[2026-11-13 10:31:00] still building"], "2026-11-13T17:31:00.000Z"), startUnread: true },
+    ], { now: "2026-11-13T17:32:00.000Z" }));
+    expect(status.phase).toBe("unknown");
+    expect(status.headline).toBe("Upgrade status unknown · installer log too long to read");
+    expect(status.source.logName).toBe("quiet-window.log");
   });
 
   it("keeps the last install visible behind a later up-to-date check", () => {
