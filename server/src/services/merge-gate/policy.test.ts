@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  admittedCandidateRun,
+  changedPaths,
   classifyHeadCommits,
   classifyOwnDiffChange,
   decideMerge,
@@ -540,14 +542,47 @@ describe("visual review (STA-362)", () => {
     }
   });
 
-  it("parses the visual reviewer's record and rejects one without an exact SHA or pass/fail verdict", () => {
+  it("parses the visual reviewer's record and rejects one without an exact SHA, candidate run or pass/fail verdict", () => {
     expect(parseVisualReviewDocument([
-      "# Visual review", "", "- pullRequest: ethanmonlux/facette#704", `- reviewedSha: \`${HEAD.toUpperCase()}\``, "- verdict: PASS",
-    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, verdict: "pass" });
-    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: fail`)).toMatchObject({ verdict: "fail", pullRequest: null });
-    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}`)).toBeNull();
-    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: looks good`)).toBeNull();
-    expect(parseVisualReviewDocument("reviewedSha: abc123\nverdict: pass")).toBeNull();
+      "# Visual review", "", "- pullRequest: ethanmonlux/facette#704", `- reviewedSha: \`${HEAD.toUpperCase()}\``,
+      "- candidateRunId: 1234", "- candidateRunAttempt: 2", "- verdict: PASS",
+    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, candidateRunId: 1234, candidateRunAttempt: 2, verdict: "pass" });
+    const run = "candidateRunId: 1234";
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\nverdict: fail`))
+      .toMatchObject({ verdict: "fail", pullRequest: null, candidateRunAttempt: 1 });
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\ncandidateRunId: latest\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\ncandidateRunAttempt: 0\nverdict: pass`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\n${run}\nverdict: looks good`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: abc123\n${run}\nverdict: pass`)).toBeNull();
+  });
+
+  it("counts both sides of a rename as changed paths", () => {
+    const file = (filename: string, previousFilename?: string) => ({ filename, previousFilename, status: previousFilename ? "renamed" : "modified", blobSha: null, patch: null });
+    expect(changedPaths([file("docs/Face.tsx", "shell/faces/x4/Face.tsx"), file("docs/a.md")]))
+      .toEqual(["docs/Face.tsx", "shell/faces/x4/Face.tsx", "docs/a.md"]);
+    expect(changedPaths(null)).toBeNull();
+    expect(requiresVisualReview({ policy: facette, changedFiles: changedPaths([file("docs/Face.tsx", "shell/faces/x4/Face.tsx")]) })).toBe(true);
+  });
+
+  it("admits the one finished candidate run at the head with its attempt and timing", () => {
+    const job = (name: string, startedAt: string | null, completedAt: string | null): MergeGateCheck =>
+      ({ kind: "check_run", name, status: "completed", conclusion: "success", headSha: HEAD, checkSuiteId: 7, startedAt, completedAt });
+    const run: MergeGateCheck = { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
+      headSha: HEAD, checkSuiteId: 7, runId: 55, runAttempt: 3, startedAt: "2026-11-13T02:00:00Z", workflowPath: ".github/workflows/internal-windows.yml" };
+    const jobs = [job("frontend", "2026-11-13T02:01:00Z", "2026-11-13T02:10:00Z"), job("candidate", "2026-11-13T02:10:00Z", "2026-11-13T02:40:00Z"),
+      job("browser-evidence", "2026-11-13T02:40:00Z", "2026-11-13T02:50:00Z")];
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: HEAD })).toEqual({
+      workflowPath: ".github/workflows/internal-windows.yml", runId: 55, runAttempt: 3,
+      startedAt: "2026-11-13T02:00:00.000Z", completedAt: "2026-11-13T02:50:00.000Z",
+    });
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1), job("frontend", null, "2026-11-13T02:10:00Z")], headSha: HEAD }))
+      .toMatchObject({ startedAt: null, completedAt: "2026-11-13T02:50:00.000Z" });
+    expect(admittedCandidateRun({ policy: facette, checks: [{ ...run, conclusion: "failure" }, ...jobs], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1)], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: REVIEWED })).toBeNull();
+    expect(admittedCandidateRun({ policy: paperclip, checks: [run, ...jobs], headSha: HEAD })).toBeNull();
   });
 });
 

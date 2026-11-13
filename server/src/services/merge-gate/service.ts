@@ -10,12 +10,15 @@
  * critical owner issue for that repository branch, assigned to an
  * urgent-capable agent, and parks the refused task on it with a blocker
  * relation, so the task resumes by itself when the fix lands. A change to a
- * repository's visual paths also needs a passing visual review at the exact
- * merge head (STA-362).
+ * repository's visual paths also needs, at the exact merge head, a candidate
+ * run started after its code review and the designated visual reviewer's
+ * passing verdict on that run, recorded after it finished (STA-362).
  */
 import { forbidden, notFound, unprocessable } from "../../errors.js";
 import { GitHubMergeGateError, type MergeGateGitHub } from "./github.js";
 import {
+  admittedCandidateRun,
+  changedPaths,
   modelFamily,
   classifyHeadCommits,
   classifyOwnDiffChange,
@@ -26,6 +29,7 @@ import {
   evaluateVisualReview,
   repositoryMergePolicy,
   requiredPathScopedChecks,
+  reviewCoverage,
   requiresVisualReview,
   type HeadDelta,
   type MergeGateAuthor,
@@ -384,7 +388,8 @@ async function evaluateLocked(
       : `${pr.baseRef} is red${failingDetail}. A merge would open its single owner issue and park this task on it.`,
   };
 
-  const changedFiles = ownDiff ? ownDiff.map(file => file.filename) : null;
+  // A rename counts on both sides: moving a file out of a scoped path changes that path.
+  const changedFiles = changedPaths(ownDiff);
   const requiredChecks = requiredPathScopedChecks({ policy, changedFiles });
   const ciReasons = evaluateHeadCi({ headSha, policy, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
 
@@ -399,18 +404,24 @@ async function evaluateLocked(
       deltas.set(review.reviewedSha, await describeHeadDelta(github, { reviewedSha: review.reviewedSha, headSha, baseSha, currentOwnDiff: ownDiff }));
     }
   }
-  const reviewReasons = evaluateReviewCoverage({
+  const coverage = reviewCoverage({
     pullRequest: label, headSha, author, reviews: independentOfMerger,
     deltaFor: sha => deltas.get(sha) ?? { kind: "source_changed", detail: "unread" },
   });
+  const reviewReasons = coverage.reasons;
 
-  // A visual change also needs a visual review of its candidate evidence at this head.
+  // A visual change also needs, after its code review, a candidate run and a
+  // visual verdict on that run's evidence, all at this head.
   const visualRequired = requiresVisualReview({ policy, changedFiles });
   const visualReviews = visualRequired
     ? (await deps.loadVisualReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber }))
       .filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId)
     : [];
-  const visualReasons = evaluateVisualReview({ pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews });
+  const visualReasons = evaluateVisualReview({
+    pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews,
+    candidate: visualRequired ? admittedCandidateRun({ policy, checks: headChecks.checks, headSha }) : null,
+    codeReviews: coverage.reasons.length === 0 ? coverage.covering : [],
+  });
 
   const decision = decideMerge({
     pullRequest: { ...pr, headSha, behindBy: compareToBase ? compareToBase.behindBy : null },

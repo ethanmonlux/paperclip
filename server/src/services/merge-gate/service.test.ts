@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MergeGateGitHub } from "./github.js";
-import type { MergeGateCheck, MergeReviewAttestation, VisualReviewAttestation } from "./policy.js";
+import type { MergeGateCheck, MergeReviewAttestation, PullRequestFileDiff, VisualReviewAttestation } from "./policy.js";
 import { coAuthorModelFamilies, evaluateAndMerge, MERGE_LOCK_BUSY, reportRedMain, type GateIssue, type MergeGateDependencies } from "./service.js";
 
 const HEAD = "a".repeat(40);
@@ -8,6 +8,11 @@ const REVIEWED = "b".repeat(40);
 const BASE = "c".repeat(40);
 const NEW_BASE = "e".repeat(40);
 const COMPANY = "company-1";
+// Ethan's order for a visual change: code review, candidate run, visual verdict.
+const CODE_REVIEWED_AT = "2026-11-13T01:00:00.000Z";
+const CANDIDATE_STARTED_AT = "2026-11-13T02:00:00.000Z";
+const CANDIDATE_FINISHED_AT = "2026-11-13T02:40:00.000Z";
+const VISUAL_REVIEWED_AT = "2026-11-13T03:00:00.000Z";
 
 const ok = (name: string): MergeGateCheck => ({ kind: "check_run", name, status: "completed", conclusion: "success" });
 
@@ -61,14 +66,15 @@ function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAtt
   return {
     reviewIssueId: "review", reviewIssueIdentifier: "STA-REVIEW", reviewIssueStatus: "done", reviewerAgentId: "codex-reviewer",
     reviewerModelFamilies: ["openai"], writtenByReviewer: true, sourceAuthorAgentIds: null, scope: "full", reviewedSha: HEAD,
-    pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [], ...overrides,
+    pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [], recordedAt: CODE_REVIEWED_AT, ...overrides,
   };
 }
 
 function visualReview(overrides: Partial<VisualReviewAttestation> = {}): VisualReviewAttestation {
   return {
     reviewIssueId: "visual", reviewIssueIdentifier: "STA-VISUAL", reviewIssueStatus: "done", reviewerAgentId: "visual-reviewer",
-    writtenByReviewer: true, reviewedSha: HEAD, pullRequest: "ethanmonlux/facette#704", verdict: "pass", ...overrides,
+    writtenByReviewer: true, designatedReviewer: true, recordedAt: VISUAL_REVIEWED_AT, reviewedSha: HEAD,
+    pullRequest: "ethanmonlux/facette#704", candidateRunId: 1234, candidateRunAttempt: 1, verdict: "pass", ...overrides,
   };
 }
 
@@ -158,16 +164,17 @@ const accountWebCi = [...facetteAlwaysCi,
 describe("merge gate service", () => {
   describe("Facette visual changes (STA-362)", () => {
     const ordinary = [...facetteAlwaysCi, ok("windows-fast"), ok("windows-native")];
-    const candidateAt = (sha: string): MergeGateCheck[] => [
-      ...["frontend", "candidate", "browser-evidence"].map(name => ({ ...ok(name), headSha: sha, checkSuiteId: 91 })),
+    const candidateAt = (sha: string, run: Partial<MergeGateCheck> = {}): MergeGateCheck[] => [
+      ...["frontend", "candidate", "browser-evidence"].map(name => ({ ...ok(name), headSha: sha, checkSuiteId: 91,
+        startedAt: CANDIDATE_STARTED_AT, completedAt: CANDIDATE_FINISHED_AT })),
       { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
-        headSha: sha, checkSuiteId: 91, runId: 1234, workflowPath: ".github/workflows/internal-windows.yml" },
+        headSha: sha, checkSuiteId: 91, runId: 1234, runAttempt: 1, startedAt: CANDIDATE_STARTED_AT,
+        workflowPath: ".github/workflows/internal-windows.yml", ...run },
     ];
-    const visualGitHub = (candidate: MergeGateCheck[]) => {
+    const kaia = { filename: "shell/faces/osrs/character/kaia/KaiaRive.tsx", status: "modified", blobSha: "x", patch: "@@ -1 +1 @@\n-a\n+b" };
+    const visualGitHub = (candidate: MergeGateCheck[], files: PullRequestFileDiff[] = [kaia]) => {
       const fake = fakeGitHub({ headChecks: [...ordinary, ...candidate] });
-      fake.github.pullRequestFiles = async () => [
-        { filename: "shell/faces/osrs/character/kaia/KaiaRive.tsx", status: "modified", blobSha: "x", patch: "@@ -1 +1 @@\n-a\n+b" },
-      ];
+      fake.github.pullRequestFiles = async () => files;
       return fake;
     };
     const codes = (result: { reasons: Array<{ code: string }> }) => result.reasons.map(reason => reason.code);
@@ -205,6 +212,8 @@ describe("merge gate service", () => {
         [[visualReview({ reviewIssueStatus: "in_progress" })], "visual_review_not_independent"],
         [[visualReview({ writtenByReviewer: false })], "visual_review_not_independent"],
         [[visualReview({ reviewerAgentId: "claude-engineer" })], "visual_review_not_independent"],
+        // An independent agent that is not the designated visual reviewer (FAC-939).
+        [[visualReview({ reviewerAgentId: "backend-engineer", designatedReviewer: false })], "visual_review_not_independent"],
         [[visualReview({ pullRequest: "ethanmonlux/facette#705" })], "visual_review_missing"],
       ];
       for (const [visualReviews, code] of cases) {
@@ -214,6 +223,55 @@ describe("merge gate service", () => {
         expect(codes(result)).toEqual([code]);
         expect(merge).not.toHaveBeenCalled();
       }
+    });
+
+    it("binds the visual verdict to the admitted candidate run and Ethan's order (FAC-940)", async () => {
+      const cases: Array<[string, MergeGateCheck[], VisualReviewAttestation, MergeReviewAttestation, string]> = [
+        ["a verdict recorded before the candidate finished", candidateAt(HEAD), visualReview({ recordedAt: "2026-11-13T02:30:00.000Z" }), review(),
+          "review_order_invalid"],
+        ["a verdict on another candidate run at the same head", candidateAt(HEAD), visualReview({ candidateRunId: 999 }), review(),
+          "visual_review_unbound"],
+        ["a verdict on an earlier attempt of the admitted run", candidateAt(HEAD, { runAttempt: 2 }), visualReview(), review(),
+          "visual_review_unbound"],
+        ["a candidate started before the code review was recorded", candidateAt(HEAD), visualReview(),
+          review({ recordedAt: "2026-11-13T02:10:00.000Z" }), "review_order_invalid"],
+        ["a code review with no recorded time", candidateAt(HEAD), visualReview(), review({ recordedAt: null }), "review_order_invalid"],
+        ["a candidate with no recorded start", candidateAt(HEAD, { startedAt: null }), visualReview(), review(), "review_order_invalid"],
+        ["a verdict with no recorded time", candidateAt(HEAD), visualReview({ recordedAt: null }), review(), "review_order_invalid"],
+      ];
+      for (const [name, candidate, visual, code, reason] of cases) {
+        const { github, merge } = visualGitHub(candidate);
+        const result = await evaluateAndMerge(harness({ github, reviews: [code], visualReviews: [visual] }).deps, request());
+        expect({ name, outcome: result.outcome, codes: codes(result) }).toEqual({ name, outcome: "refused", codes: [reason] });
+        expect(merge).not.toHaveBeenCalled();
+      }
+      // A rerun attempt started after the code review, with its verdict naming that attempt, merges.
+      const { github, merge } = visualGitHub(candidateAt(HEAD, { runAttempt: 2 }));
+      await expect(evaluateAndMerge(harness({ github, visualReviews: [visualReview({ candidateRunAttempt: 2 })] }).deps, request()))
+        .resolves.toMatchObject({ outcome: "merged", reasons: [] });
+      expect(merge).toHaveBeenCalledTimes(1);
+    });
+
+    it("classifies a rename by both its old and new path (FAC-941)", async () => {
+      const renamed = (from: string, to: string): PullRequestFileDiff =>
+        ({ filename: to, previousFilename: from, status: "renamed", blobSha: "x", patch: null });
+      for (const file of [renamed("shell/faces/x4/Face.tsx", "docs/Face.tsx"), renamed("docs/Face.tsx", "shell/faces/x4/Face.tsx")]) {
+        // Ordinary CI and a code review only: the candidate and visual verdict are needed.
+        const { github, merge } = visualGitHub([], [file]);
+        const h = harness({ github });
+        const result = await evaluateAndMerge(h.deps, request());
+        expect(result.outcome).toBe("refused");
+        expect(result.requiredChecks).toEqual(expect.arrayContaining(["frontend", "candidate", "browser-evidence"]));
+        expect(codes(result)).toEqual(expect.arrayContaining(["required_check_skipped", "visual_review_missing"]));
+        expect(h.visualQueries).toEqual([true]);
+        expect(merge).not.toHaveBeenCalled();
+      }
+      const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
+      github.pullRequestFiles = async () => [renamed("docs/guide.md", "account-web/guide.md")];
+      const h = harness({ github });
+      await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: [] });
+      expect(h.visualQueries).toEqual([]);
+      expect(merge).toHaveBeenCalledTimes(1);
     });
 
     it("does not count a visual verdict written by the merging coordinator", async () => {

@@ -20,9 +20,11 @@
  * 4. the repository merge bar holds: 0 P0 and 0 P1, and every P2 is tracked;
  * 5. main is green. A red main stops every merge except the fix owned by the
  *    single red-main issue;
- * 6. a change to what the user sees (a repository's visual paths) also has a
- *    passing visual review of its finished-candidate evidence at the exact
- *    merge head, after its code review and candidate run (STA-362).
+ * 6. a change to what the user sees (a repository's visual paths, on either
+ *    side of a rename) also has one finished candidate run at the exact merge
+ *    head, started after its code review, and a passing verdict from the
+ *    designated visual reviewer on that run's evidence, recorded after the
+ *    run finished (STA-362).
  */
 
 export interface RepositoryMergePolicy {
@@ -58,8 +60,9 @@ export interface RepositoryMergePolicy {
   planValidatedSkips: Array<{ validator: string; checks: RegExp[] }>;
   /**
    * Paths that change what the user sees. A change touching one, or with an
-   * unknown file list, needs a passing `visual-review` verdict at the exact
-   * merge head in addition to its code review.
+   * unknown file list, needs a passing `visual-review` verdict on the
+   * `candidate` path scope's run at the exact merge head, in addition to its
+   * code review.
    */
   visualPaths?: RegExp[];
   mergeMethod: "merge" | "squash" | "rebase";
@@ -199,6 +202,10 @@ export interface MergeGateCheck {
   runId?: number | null;
   runAttempt?: number | null;
   createdAt?: string | null;
+  /** Check run `started_at`; workflow run `run_started_at` (the latest attempt's start). */
+  startedAt?: string | null;
+  /** Check run `completed_at`. */
+  completedAt?: string | null;
   checkRunId?: number | null;
 }
 
@@ -224,6 +231,8 @@ export type MergeGateReasonCode =
   | "visual_review_not_independent"
   | "visual_review_stale"
   | "visual_review_failed"
+  | "visual_review_unbound"
+  | "review_order_invalid"
   | "main_red"
   | "merge_in_progress";
 
@@ -302,6 +311,69 @@ function currentWorkflowChecks(input: {
   return checks;
 }
 
+type PathScope = RepositoryMergePolicy["pathScopedChecks"][number];
+
+/**
+ * The one completed, successful `scope.workflowPath` run at the head whose
+ * suite holds exactly one successful job per scope check, from checks already
+ * narrowed to each workflow's latest run (`currentWorkflowChecks`).
+ */
+function provenWorkflowRun(input: { scope: PathScope; checks: readonly MergeGateCheck[]; headSha: string }) {
+  const head = input.headSha.toLowerCase();
+  const workflows = input.checks.filter(run => run.kind === "workflow_run" &&
+    run.workflowPath === input.scope.workflowPath && run.headSha?.toLowerCase() === head);
+  const run = workflows.length === 1 ? workflows[0]! : null;
+  if (!run || run.status !== "completed" || run.conclusion !== "success" || run.runId == null || run.checkSuiteId == null) return null;
+  const jobs: MergeGateCheck[] = [];
+  for (const name of input.scope.checks) {
+    const matching = input.checks.filter(check => check.kind === "check_run" && check.name === name && check.checkSuiteId === run.checkSuiteId);
+    const job = matching.length === 1 ? matching[0]! : null;
+    if (!job || job.headSha?.toLowerCase() !== head || job.status !== "completed" || job.conclusion !== "success") return null;
+    jobs.push(job);
+  }
+  return { run, jobs };
+}
+
+/** The finished candidate run a visual verdict must judge. */
+export interface AdmittedCandidateRun {
+  workflowPath: string;
+  runId: number;
+  runAttempt: number;
+  /** Earliest start of the attempt or any of its jobs; null when one is unrecorded. */
+  startedAt: string | null;
+  /** Latest job completion; null when one is unrecorded. */
+  completedAt: string | null;
+}
+
+function parsedTime(value: string | null | undefined) {
+  const time = Date.parse(value ?? "");
+  return Number.isFinite(time) ? time : null;
+}
+
+/**
+ * The `candidate` path scope's proven run at the exact head, or null when
+ * the policy has none or no single finished, successful run exists there.
+ */
+export function admittedCandidateRun(input: {
+  policy: RepositoryMergePolicy;
+  checks: readonly MergeGateCheck[];
+  headSha: string;
+}): AdmittedCandidateRun | null {
+  const scope = input.policy.pathScopedChecks.find(entry => entry.platform === "candidate" && entry.workflowPath);
+  if (!scope) return null;
+  const proven = provenWorkflowRun({ scope, checks: currentWorkflowChecks(input), headSha: input.headSha });
+  if (!proven) return null;
+  const starts = [proven.run.startedAt, ...proven.jobs.map(job => job.startedAt)].map(parsedTime);
+  const ends = proven.jobs.map(job => parsedTime(job.completedAt));
+  return {
+    workflowPath: scope.workflowPath!,
+    runId: proven.run.runId!,
+    runAttempt: proven.run.runAttempt ?? 1,
+    startedAt: starts.some(time => time === null) ? null : new Date(Math.min(...starts as number[])).toISOString(),
+    completedAt: ends.some(time => time === null) ? null : new Date(Math.max(...ends as number[])).toISOString(),
+  };
+}
+
 /**
  * CI at the exact head: green, complete, at least one check passed, every
  * suite the change needs passed, and nothing skipped that the policy does not
@@ -355,16 +427,7 @@ export function evaluateHeadCi(input: {
   }
   for (const scope of input.policy.pathScopedChecks) {
     if (!scope.workflowPath || !scope.checks.some(name => input.requiredChecks.includes(name))) continue;
-    const workflows = checks.filter(run => run.kind === "workflow_run" &&
-      run.workflowPath === scope.workflowPath && run.headSha?.toLowerCase() === input.headSha.toLowerCase());
-    const proven = workflows.length === 1 && workflows.some(run =>
-      run.status === "completed" && run.conclusion === "success" && run.runId != null && run.checkSuiteId != null &&
-      scope.checks.every(name => {
-        const jobs = checkRuns.filter(check => check.name === name && check.checkSuiteId === run.checkSuiteId);
-        return jobs.length === 1 && jobs[0]!.headSha?.toLowerCase() === input.headSha.toLowerCase() &&
-          jobs[0]!.status === "completed" && jobs[0]!.conclusion === "success";
-      }));
-    if (!proven) reasons.push({ code: "required_check_skipped", detail:
+    if (!provenWorkflowRun({ scope, checks, headSha: input.headSha })) reasons.push({ code: "required_check_skipped", detail:
       `${scope.checks.join(", ")} must all succeed in one completed ${scope.workflowPath} run at ${sha}. Ordinary CI, an older head, skipped jobs or same-named jobs from another workflow do not prove this candidate. The coordinator must reuse or explicitly dispatch the applicable finished-candidate run and record its run ID in a ci wait.` });
   }
   // A skip is allowed only where the policy says so; a path filter that
@@ -416,6 +479,8 @@ export interface MergeReviewAttestation {
   writtenByReviewer: boolean;
   /** Exhaustive source author agents attested by the independent reviewer, when known. */
   sourceAuthorAgentIds: string[] | null;
+  /** When the latest document revision was written; a visual change's candidate must start after it. */
+  recordedAt?: string | null;
   scope: "full" | "conflict_hunks";
   reviewedSha: string;
   pullRequest: string | null;
@@ -443,7 +508,7 @@ function documentField(body: string, name: string) {
 
 /** Parse the `merge-review` document a reviewer writes on its review issue. */
 export function parseMergeReviewDocument(body: string): Omit<MergeReviewAttestation,
-  "reviewIssueId" | "reviewIssueIdentifier" | "reviewIssueStatus" | "reviewerAgentId" | "reviewerModelFamilies" | "writtenByReviewer"> | null {
+  "reviewIssueId" | "reviewIssueIdentifier" | "reviewIssueStatus" | "reviewerAgentId" | "reviewerModelFamilies" | "writtenByReviewer" | "recordedAt"> | null {
   const field = (name: string) => documentField(body, name);
   const reviewedSha = field("reviewedSha")?.toLowerCase() ?? null;
   if (!reviewedSha || !/^[0-9a-f]{40}$/.test(reviewedSha)) return null;
@@ -558,19 +623,24 @@ function independenceProblem(review: MergeReviewAttestation, author: MergeGateAu
  * Review coverage and merge bar for the exact head. `deltaFor` reports how
  * the head relates to each reviewed head.
  */
-export function evaluateReviewCoverage(input: {
+export function evaluateReviewCoverage(input: Parameters<typeof reviewCoverage>[0]): MergeGateReason[] {
+  return reviewCoverage(input).reasons;
+}
+
+/** `evaluateReviewCoverage`, plus the reviews that cover the head (the code review a candidate must follow). */
+export function reviewCoverage(input: {
   pullRequest: string;
   headSha: string;
   author: MergeGateAuthor;
   reviews: readonly MergeReviewAttestation[];
   deltaFor: (reviewedSha: string) => HeadDelta;
-}): MergeGateReason[] {
+}): { reasons: MergeGateReason[]; covering: MergeReviewAttestation[] } {
   const sha = shortSha(input.headSha);
   const forThisPr = input.reviews.filter(review => !review.pullRequest ||
     review.pullRequest.toLowerCase() === input.pullRequest.toLowerCase());
   const full = forThisPr.filter(review => review.scope === "full");
   if (full.length === 0) {
-    return [{ code: "review_missing", detail: `No independent review with a merge-review document (scope full) is linked for ${input.pullRequest}.` }];
+    return { covering: [], reasons: [{ code: "review_missing", detail: `No independent review with a merge-review document (scope full) is linked for ${input.pullRequest}.` }] };
   }
   const reasons: MergeGateReason[] = [];
   const independentFull = full.filter(review => {
@@ -578,7 +648,7 @@ export function evaluateReviewCoverage(input: {
     if (problem) reasons.push({ code: "review_not_independent", detail: problem });
     return !problem;
   });
-  if (independentFull.length === 0) return reasons;
+  if (independentFull.length === 0) return { reasons, covering: [] };
   reasons.length = 0;
 
   // The newest covering full review decides; any covering review's findings count.
@@ -592,7 +662,7 @@ export function evaluateReviewCoverage(input: {
   if (!coverage) {
     const latest = independentFull[independentFull.length - 1]!;
     const delta = input.deltaFor(latest.reviewedSha);
-    return [{ code: "review_stale", detail: `The review covers ${shortSha(latest.reviewedSha)}, but the source changed before ${sha}${delta.kind === "source_changed" ? `: ${delta.detail}` : ""}. Review the new head.` }];
+    return { covering: [], reasons: [{ code: "review_stale", detail: `The review covers ${shortSha(latest.reviewedSha)}, but the source changed before ${sha}${delta.kind === "source_changed" ? `: ${delta.detail}` : ""}. Review the new head.` }] };
   }
   const covering = [coverage.review];
   if (coverage.delta.kind === "conflict_resolution") {
@@ -613,7 +683,17 @@ export function evaluateReviewCoverage(input: {
       reasons.push({ code: "merge_bar_failed", detail: `${reviewLabel(review)} lists P2s without a tracking issue (${untracked.slice(0, 5).join(", ")}); record each P2 as an issue and list its identifier.` });
     }
   }
-  return reasons;
+  return { reasons, covering };
+}
+
+/**
+ * Every path a change touches: each file's name and, for a rename or copy,
+ * its previous name too. Moving a file out of a scoped directory changes
+ * that directory as much as editing it does.
+ */
+export function changedPaths(files: readonly PullRequestFileDiff[] | null): string[] | null {
+  if (!files) return null;
+  return [...new Set(files.flatMap(file => file.previousFilename ? [file.filename, file.previousFilename] : [file.filename]))];
 }
 
 /**
@@ -632,29 +712,47 @@ export interface VisualReviewAttestation {
   reviewIssueIdentifier: string | null;
   reviewIssueStatus: string;
   reviewerAgentId: string | null;
-  /** The document revision was written by the review issue's assignee. */
+  /** The document revision was written by the review issue's assignee, in one of its own runs. */
   writtenByReviewer: boolean;
+  /**
+   * The writer is a designated visual reviewer
+   * (`runtimeConfig.mergeGate.visualReviewer: true`) and not terminated.
+   */
+  designatedReviewer: boolean;
+  /** When the latest document revision was written. */
+  recordedAt: string | null;
   reviewedSha: string;
   pullRequest: string | null;
+  /** The candidate workflow run (and attempt) whose evidence the verdict judges. */
+  candidateRunId: number;
+  candidateRunAttempt: number;
   verdict: "pass" | "fail";
 }
 
 /** Parse the `visual-review` document a visual reviewer writes on its review issue. */
-export function parseVisualReviewDocument(body: string): Pick<VisualReviewAttestation, "reviewedSha" | "pullRequest" | "verdict"> | null {
+export function parseVisualReviewDocument(body: string): Pick<VisualReviewAttestation,
+  "reviewedSha" | "pullRequest" | "verdict" | "candidateRunId" | "candidateRunAttempt"> | null {
   const field = (name: string) => documentField(body, name);
   const reviewedSha = field("reviewedSha")?.toLowerCase() ?? null;
   if (!reviewedSha || !/^[0-9a-f]{40}$/.test(reviewedSha)) return null;
   const verdict = field("verdict")?.toLowerCase() ?? null;
   if (verdict !== "pass" && verdict !== "fail") return null;
-  return { reviewedSha, pullRequest: field("pullRequest"), verdict };
+  const runId = field("candidateRunId");
+  const attempt = field("candidateRunAttempt") ?? "1";
+  if (!runId || !/^[1-9]\d*$/.test(runId) || !/^[1-9]\d*$/.test(attempt)) return null;
+  return { reviewedSha, pullRequest: field("pullRequest"), verdict, candidateRunId: Number(runId), candidateRunAttempt: Number(attempt) };
 }
 
 /**
- * Visual review for the exact merge head: done, written by its assigned
- * reviewer, by an agent that did not work on the task, and passing. Unlike
- * the code review, a clean base update does not carry it forward: it judges
- * the finished-candidate evidence, and the candidate must run on the head
- * that merges. The newest verdict at that head decides.
+ * Visual review for the exact merge head, in Ethan's order: code review, then
+ * one candidate run, then a visual verdict on that run's evidence. The verdict
+ * must be done, written by its assigned reviewer in its own run, that
+ * reviewer a designated visual reviewer who did not work on the task, and
+ * passing. It names the admitted candidate run and attempt and was recorded
+ * after that run finished; the run started after every covering code review
+ * was recorded. Unlike the code review, a clean base update does not carry
+ * the verdict forward: the candidate must run on the head that merges. The
+ * newest verdict at that head decides.
  */
 export function evaluateVisualReview(input: {
   pullRequest: string;
@@ -662,6 +760,10 @@ export function evaluateVisualReview(input: {
   required: boolean;
   author: MergeGateAuthor;
   reviews: readonly VisualReviewAttestation[];
+  /** `admittedCandidateRun` at the head. */
+  candidate: AdmittedCandidateRun | null;
+  /** Code reviews covering the head (`reviewCoverage`); empty when coverage already refused. */
+  codeReviews: readonly MergeReviewAttestation[];
 }): MergeGateReason[] {
   if (!input.required) return [];
   const sha = shortSha(input.headSha);
@@ -669,15 +771,16 @@ export function evaluateVisualReview(input: {
   const forThisPr = input.reviews.filter(review => !review.pullRequest ||
     review.pullRequest.toLowerCase() === input.pullRequest.toLowerCase());
   if (forThisPr.length === 0) {
-    return [{ code: "visual_review_missing", detail: `${input.pullRequest} changes what the user sees, so it needs a visual review of its Internal Windows candidate evidence at ${sha}: a done review issue with a visual-review document (pullRequest, reviewedSha, verdict pass|fail) written by its assigned visual reviewer. Pass that review issue in reviewIssueIds.` }];
+    return [{ code: "visual_review_missing", detail: `${input.pullRequest} changes what the user sees, so it needs a visual review of its Internal Windows candidate evidence at ${sha}: a done review issue assigned to a designated visual reviewer, with a visual-review document (pullRequest, reviewedSha, candidateRunId, candidateRunAttempt, verdict pass|fail) that reviewer wrote after the candidate run finished. Pass that review issue in reviewIssueIds.` }];
   }
   const problems: MergeGateReason[] = [];
   const independent = forThisPr.filter(review => {
     const problem = review.reviewIssueStatus !== "done" ? `${label(review)} is ${review.reviewIssueStatus}, not done.`
-      : !review.writtenByReviewer || !review.reviewerAgentId ? `${label(review)}'s visual-review document was not written by its assigned reviewer.`
-        : !input.author.agentIds ? `The gate could not read which agents worked on this task, so it cannot show ${label(review)} is independent.`
-          : input.author.agentIds.includes(review.reviewerAgentId) ? `${label(review)} was visually reviewed by an agent that worked on this task.`
-            : null;
+      : !review.writtenByReviewer || !review.reviewerAgentId ? `${label(review)}'s visual-review document was not written by its assigned reviewer in one of that reviewer's runs.`
+        : !review.designatedReviewer ? `${label(review)} was written by an agent that is not a designated visual reviewer (runtimeConfig.mergeGate.visualReviewer). Assign the visual review to the Portfolio Visual Reviewer.`
+          : !input.author.agentIds ? `The gate could not read which agents worked on this task, so it cannot show ${label(review)} is independent.`
+            : input.author.agentIds.includes(review.reviewerAgentId) ? `${label(review)} was visually reviewed by an agent that worked on this task.`
+              : null;
     if (problem) problems.push({ code: "visual_review_not_independent", detail: problem });
     return !problem;
   });
@@ -691,7 +794,29 @@ export function evaluateVisualReview(input: {
   if (latest.verdict !== "pass") {
     return [{ code: "visual_review_failed", detail: `The visual review ${label(latest)} failed ${sha} against its visual brief. Fix the findings, then rerun CI, the code review as needed, the candidate and the visual review on the new head.` }];
   }
-  return [];
+  // Without a proven candidate the CI reasons already refuse; the verdict has nothing to bind to.
+  const candidate = input.candidate;
+  if (!candidate) return [];
+  if (latest.candidateRunId !== candidate.runId || latest.candidateRunAttempt !== candidate.runAttempt) {
+    return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges candidate run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but the candidate the gate admits at ${sha} is run ${candidate.runId} attempt ${candidate.runAttempt}. Visually review that run's evidence.` }];
+  }
+  const reasons: MergeGateReason[] = [];
+  const started = parsedTime(candidate.startedAt);
+  const finished = parsedTime(candidate.completedAt);
+  const verdictAt = parsedTime(latest.recordedAt);
+  if (finished === null || verdictAt === null || verdictAt <= finished) {
+    reasons.push({ code: "review_order_invalid", detail: finished === null || verdictAt === null
+      ? `The gate could not read when candidate run ${candidate.runId} finished or when ${label(latest)} was recorded, so it cannot show the visual verdict followed the candidate.`
+      : `The visual review ${label(latest)} was recorded before candidate run ${candidate.runId} finished. Visually review the finished run's evidence and record the verdict again.` });
+  }
+  const reviewTimes = input.codeReviews.map(review => ({ review, at: parsedTime(review.recordedAt) }));
+  if (started === null || reviewTimes.some(entry => entry.at === null)) {
+    reasons.push({ code: "review_order_invalid", detail: `The gate could not read when candidate run ${candidate.runId} started or when its code review was recorded, so it cannot show the candidate followed the code review.` });
+  } else {
+    const early = reviewTimes.filter(entry => entry.at! >= started).map(entry => reviewLabel(entry.review));
+    if (early.length > 0) reasons.push({ code: "review_order_invalid", detail: `Candidate run ${candidate.runId} started before the code review ${early.join(", ")} was recorded. The candidate runs after a clean code review: rerun it on ${sha}, then visually review the new run.` });
+  }
+  return reasons;
 }
 
 /** Normalize a unified diff so line-number shifts from base updates compare equal. */
@@ -701,6 +826,8 @@ export function normalizePatch(patch: string) {
 
 export interface PullRequestFileDiff {
   filename: string;
+  /** A rename's or copy's previous name. */
+  previousFilename?: string | null;
   status: string;
   /** Blob SHA of the file at the compared head. */
   blobSha: string | null;

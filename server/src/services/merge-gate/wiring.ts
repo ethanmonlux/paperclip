@@ -138,12 +138,15 @@ async function latestReviewDocuments<T>(
     ))
     .orderBy(documents.updatedAt)
     .limit(20);
-  const found: Array<{ row: (typeof rows)[number]; revision: { body: string; agentId: string | null; runId: string | null }; parsed: T }> = [];
+  const found: Array<{
+    row: (typeof rows)[number]; revision: { body: string; agentId: string | null; runId: string | null; createdAt: Date }; parsed: T;
+  }> = [];
   for (const row of rows) {
     const [revision] = await db.select({
       body: documentRevisions.body,
       agentId: documentRevisions.createdByAgentId,
       runId: documentRevisions.createdByRunId,
+      createdAt: documentRevisions.createdAt,
     }).from(documentRevisions)
       .where(and(eq(documentRevisions.companyId, companyId), eq(documentRevisions.documentId, row.documentId)))
       .orderBy(desc(documentRevisions.revisionNumber))
@@ -308,20 +311,38 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
           reviewerAgentId: revision.agentId,
           reviewerModelFamilies: run && run.agentId === revision.agentId ? modelFamiliesFromRunUsage(run.usage) : [],
           writtenByReviewer: Boolean(revision.agentId) && revision.agentId === row.assigneeAgentId,
+          recordedAt: revision.createdAt.toISOString(),
         });
       }
       return attestations;
     },
     async loadVisualReviews(companyId, input) {
-      const found = await latestReviewDocuments(db, companyId, VISUAL_REVIEW_DOCUMENT_KEY, input, parseVisualReviewDocument);
-      return found.map(({ row, revision, parsed }): VisualReviewAttestation => ({
-        ...parsed,
-        reviewIssueId: row.issueId,
-        reviewIssueIdentifier: row.identifier,
-        reviewIssueStatus: row.status,
-        reviewerAgentId: revision.agentId,
-        writtenByReviewer: Boolean(revision.agentId) && revision.agentId === row.assigneeAgentId,
-      }));
+      const attestations: VisualReviewAttestation[] = [];
+      for (const { row, revision, parsed } of await latestReviewDocuments(db, companyId, VISUAL_REVIEW_DOCUMENT_KEY, input, parseVisualReviewDocument)) {
+        // The writer's own run, and the designation on its agent record: an
+        // operator marks the visual reviewer `runtimeConfig.mergeGate.visualReviewer: true`.
+        const [run] = revision.runId
+          ? await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, revision.runId)))
+          : [];
+        const [writer] = revision.agentId
+          ? await db.select({
+            status: agents.status,
+            designated: sql<boolean>`coalesce(${agents.runtimeConfig} -> 'mergeGate' -> 'visualReviewer' = 'true'::jsonb, false)`,
+          }).from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, revision.agentId)))
+          : [];
+        attestations.push({
+          ...parsed,
+          reviewIssueId: row.issueId,
+          reviewIssueIdentifier: row.identifier,
+          reviewIssueStatus: row.status,
+          reviewerAgentId: revision.agentId,
+          writtenByReviewer: Boolean(revision.agentId) && revision.agentId === row.assigneeAgentId && run?.agentId === revision.agentId,
+          designatedReviewer: Boolean(writer?.designated) && writer?.status !== "terminated",
+          recordedAt: revision.createdAt.toISOString(),
+        });
+      }
+      return attestations;
     },
     async ensureRedMainIssue(input) {
       const originId = `${input.repo.toLowerCase()}:${input.baseRef}`;
