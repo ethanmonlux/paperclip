@@ -85,6 +85,7 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
     const file = asRecord(raw);
     return {
       filename: readString(file?.filename) ?? "",
+      previousFilename: readString(file?.previous_filename),
       status: readString(file?.status) ?? "modified",
       blobSha: readString(file?.sha),
       patch: readString(file?.patch),
@@ -152,7 +153,8 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
         for (const raw of rows) {
           const run = asRecord(raw);
           checks.push({ kind: "check_run", name: readString(run?.name) ?? "check", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion),
-            headSha: readString(run?.head_sha), checkSuiteId: readNumber(asRecord(run?.check_suite)?.id), checkRunId: readNumber(run?.id) });
+            headSha: readString(run?.head_sha), checkSuiteId: readNumber(asRecord(run?.check_suite)?.id), checkRunId: readNumber(run?.id),
+            startedAt: readString(run?.started_at), completedAt: readString(run?.completed_at) });
         }
         if (rows.length < PAGE_SIZE) break;
         if (page >= MAX_CHECK_PAGES) { complete = false; break; }
@@ -166,7 +168,7 @@ export function createMergeGateGitHub(input: { repo: string; token: string; fetc
           checks.push({ kind: "workflow_run", name: readString(run?.name) ?? "workflow", status: readString(run?.status) ?? "queued", conclusion: readString(run?.conclusion),
             headSha: readString(run?.head_sha), checkSuiteId: readNumber(run?.check_suite_id),
             workflowPath: readString(run?.path)?.split("@", 1)[0] ?? null, runId: readNumber(run?.id),
-            runAttempt: readNumber(run?.run_attempt), createdAt: readString(run?.created_at) });
+            runAttempt: readNumber(run?.run_attempt), createdAt: readString(run?.created_at), startedAt: readString(run?.run_started_at) });
         }
         if (rows.length < PAGE_SIZE) break;
         if (page >= MAX_CHECK_PAGES) { complete = false; break; }

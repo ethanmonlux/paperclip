@@ -9,11 +9,16 @@
  * land on a base its CI never ran against. A red main opens (or reuses) one
  * critical owner issue for that repository branch, assigned to an
  * urgent-capable agent, and parks the refused task on it with a blocker
- * relation, so the task resumes by itself when the fix lands.
+ * relation, so the task resumes by itself when the fix lands. A change to a
+ * repository's visual paths also needs, at the exact merge head, a candidate
+ * run started after its code review and the designated visual reviewer's
+ * passing verdict on that run, recorded after it finished (STA-362).
  */
 import { forbidden, notFound, unprocessable } from "../../errors.js";
 import { GitHubMergeGateError, type MergeGateGitHub } from "./github.js";
 import {
+  admittedCandidateRun,
+  changedPaths,
   modelFamily,
   classifyHeadCommits,
   classifyOwnDiffChange,
@@ -21,16 +26,21 @@ import {
   evaluateBaseCi,
   evaluateHeadCi,
   evaluateReviewCoverage,
+  evaluateVisualReview,
   repositoryMergePolicy,
   requiredPathScopedChecks,
+  reviewCoverage,
+  requiresVisualReview,
   type HeadDelta,
   type MergeGateAuthor,
   type MergeGateReason,
   type MergeReviewAttestation,
+  type VisualReviewAttestation,
 } from "./policy.js";
 
 export const MERGE_GATE_RED_MAIN_ORIGIN_KIND = "merge_gate_red_main";
 export const MERGE_REVIEW_DOCUMENT_KEY = "merge-review";
+export const VISUAL_REVIEW_DOCUMENT_KEY = "visual-review";
 const MAX_ANCESTOR_DEPTH = 8;
 export const MERGE_LOCK_BUSY = Symbol("merge-lock-busy");
 
@@ -129,6 +139,8 @@ export interface MergeGateDependencies {
    */
   withMergeLock: <T>(key: string, action: () => Promise<T>) => Promise<T | typeof MERGE_LOCK_BUSY>;
   loadReviews: (companyId: string, input: { reviewIssueIds: string[]; repo: string; pullNumber: number }) => Promise<MergeReviewAttestation[]>;
+  /** `visual-review` documents on the same review issues (or naming the pull request when none are given). */
+  loadVisualReviews: (companyId: string, input: { reviewIssueIds: string[]; repo: string; pullNumber: number }) => Promise<VisualReviewAttestation[]>;
   /** Open (or return the open) red-main owner issue; at most one per repo branch. */
   ensureRedMainIssue: (input: {
     companyId: string; repo: string; baseRef: string; baseSha: string; failing: string[];
@@ -376,7 +388,8 @@ async function evaluateLocked(
       : `${pr.baseRef} is red${failingDetail}. A merge would open its single owner issue and park this task on it.`,
   };
 
-  const changedFiles = ownDiff ? ownDiff.map(file => file.filename) : null;
+  // A rename counts on both sides: moving a file out of a scoped path changes that path.
+  const changedFiles = changedPaths(ownDiff);
   const requiredChecks = requiredPathScopedChecks({ policy, changedFiles });
   const ciReasons = evaluateHeadCi({ headSha, policy, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
 
@@ -391,15 +404,29 @@ async function evaluateLocked(
       deltas.set(review.reviewedSha, await describeHeadDelta(github, { reviewedSha: review.reviewedSha, headSha, baseSha, currentOwnDiff: ownDiff }));
     }
   }
-  const reviewReasons = evaluateReviewCoverage({
+  const coverage = reviewCoverage({
     pullRequest: label, headSha, author, reviews: independentOfMerger,
     deltaFor: sha => deltas.get(sha) ?? { kind: "source_changed", detail: "unread" },
+  });
+  const reviewReasons = coverage.reasons;
+
+  // A visual change also needs, after its code review, a candidate run and a
+  // visual verdict on that run's evidence, all at this head.
+  const visualRequired = requiresVisualReview({ policy, changedFiles });
+  const visualReviews = visualRequired
+    ? (await deps.loadVisualReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber }))
+      .filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId)
+    : [];
+  const visualReasons = evaluateVisualReview({
+    pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews,
+    candidate: visualRequired ? admittedCandidateRun({ policy, checks: headChecks.checks, headSha }) : null,
+    codeReviews: coverage.reasons.length === 0 ? coverage.covering : [],
   });
 
   const decision = decideMerge({
     pullRequest: { ...pr, headSha, behindBy: compareToBase ? compareToBase.behindBy : null },
     expectedHeadSha: request.expectedHeadSha ?? null,
-    ciReasons, reviewReasons, requiredChecks, redMain,
+    ciReasons, reviewReasons, visualReasons, requiredChecks, redMain,
   });
   const base: Omit<MergeGateResult, "outcome"> = {
     repo, pullNumber: request.pullNumber, headSha, baseRef: pr.baseRef, requiredChecks: decision.requiredChecks, reasons: decision.reasons,
