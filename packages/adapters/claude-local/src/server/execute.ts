@@ -225,6 +225,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent, input.agentIdentity) };
   env.PAPERCLIP_RUN_ID = runId;
+  // A run is one turn, so nothing delivers a background task's result after it
+  // ends. Keep Bash and subagents in the foreground; config env can override.
+  env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
 
   const wakeTaskId =
     (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
@@ -859,6 +862,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       targetIsRemote: executionTargetIsRemote,
       localProcessUid: process.getuid?.() ?? null,
     }));
+    // Monitor reports events after the turn ends, which a one-turn run never sees.
+    // The `=` form keeps the variadic option from taking the arguments after it.
+    args.push("--disallowedTools=Monitor");
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
@@ -1179,6 +1185,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
     const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
+    // The CLI finished its turn, then stayed alive for a background task, so the
+    // terminal-result cleanup stopped it. That stop is not the turn's outcome:
+    // report the finished turn and keep the stop as evidence, so the server
+    // continues the task instead of recording adapter_failed (STA-360).
+    const stoppedAfterFinishedTurn =
+      parsedSucceeded && proc.terminalResultCleanup?.terminalResultSeen === true;
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1286,12 +1298,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
-      ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      ...(proc.terminalResultCleanup
+        ? {
+            unmanagedBackgroundTask: {
+              ...proc.terminalResultCleanup,
+              exitCode: proc.exitCode,
+              liveBackgroundTaskIds: parsedStream.liveBackgroundTaskIds,
+            },
+          }
+        : {}),
     };
 
     return {
-      exitCode: proc.exitCode,
-      signal: proc.signal,
+      exitCode: stoppedAfterFinishedTurn ? 0 : proc.exitCode,
+      signal: stoppedAfterFinishedTurn ? null : proc.signal,
       timedOut: false,
       usageComplete: parsedStream.resultJson !== null || parsed.type === "result",
       errorMessage,

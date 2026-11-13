@@ -72,6 +72,8 @@ export function createClaudeStreamParser() {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
+  // Each background_tasks_changed event lists every task still running.
+  let liveBackgroundTaskIds: string[] = [];
   const assistantTexts: string[] = [];
   const messageUsage = new Map<string, UsageSummary>();
   let anonymousMessage = 0;
@@ -88,6 +90,14 @@ export function createClaudeStreamParser() {
       if (type === "system" && asString(event.subtype, "") === "init") {
         sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
         model = asString(event.model, model);
+        continue;
+      }
+
+      if (type === "system" && asString(event.subtype, "") === "background_tasks_changed") {
+        const tasks = Array.isArray(event.tasks) ? event.tasks : [];
+        liveBackgroundTaskIds = tasks
+          .map((task) => asString(parseObject(task).task_id, ""))
+          .filter(Boolean);
         continue;
       }
 
@@ -135,6 +145,7 @@ export function createClaudeStreamParser() {
         usageBasis: "per_run" as const,
         summary: assistantTexts.join("\n\n").trim(),
         resultJson: null as Record<string, unknown> | null,
+        liveBackgroundTaskIds,
       };
     }
 
@@ -159,6 +170,7 @@ export function createClaudeStreamParser() {
       usageBasis: "per_run" as const,
       summary,
       resultJson: finalResult,
+      liveBackgroundTaskIds,
     };
   };
 }
