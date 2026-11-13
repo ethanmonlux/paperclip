@@ -497,7 +497,7 @@ function AttentionList({
           >
             <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">{ATTENTION_LABEL.unowned_merge}</span>
             <span className="min-w-0 truncate text-foreground">
-              {merges.length} finished {merges.length === 1 ? "task" : "tasks"} with no confirmed merge
+              {merges.length} done, merge not confirmed
             </span>
           </Disclosure>
           {mergesOpen ? (

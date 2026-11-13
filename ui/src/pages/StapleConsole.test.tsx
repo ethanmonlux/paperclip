@@ -124,7 +124,7 @@ describe("Staple Console progressive depth", () => {
     expect(q("[data-testid=staple-console-attention-item]")).toHaveLength(7);
 
     const merges = container.querySelector<HTMLElement>("[data-testid=staple-console-attention-merges]")!;
-    expect(merges.textContent).toContain("3 finished tasks with no confirmed merge");
+    expect(merges.textContent).toContain("3 done, merge not confirmed");
     expect(merges.querySelectorAll("li")).toHaveLength(0);
     await click(merges.querySelector<HTMLElement>("button[aria-expanded]")!);
     expect(merges.querySelectorAll("li")).toHaveLength(3);
