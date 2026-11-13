@@ -93,15 +93,22 @@ up to 10 minutes plus about 10 minutes to back up, build, restart and verify). W
 certified commit there is no card. A Critical change then gets "certify master now".
 
 One report and at most one card exist per (installed build, chosen commit) pair, across hourly
-checks and restarts. The pair is kept in `~/.paperclip/nightly/missed-upgrade-state.json` and
-written as a marker into the report comment, which covers a lost state file. It is also the card's
-idempotency key.
+checks and restarts. The pair is the card's idempotency key and a marker in each report, answer and
+update comment. `~/.paperclip/nightly/missed-upgrade-state.json` is only a cache. Each check first
+rebuilds the pairs from the reporter's cards on the upgrade-log issue. It posts a comment only when
+the comment's marker is not on that issue yet, reading every comment page to check. It adopts an
+existing card by its key instead of raising it again. A lost state file, a crash between a POST and
+its checkpoint, or a moved build therefore never repeats a comment or strands a card.
 
 The answer is followed up once on the same issue:
 - **Upgrade now** hands the install to the qualified operator, who runs
-  `HOLD_DRAIN_MIN=10 ~/.local/bin/staple-nightly-upgrade`.
+  `HOLD_DRAIN_MIN=10 ~/.local/bin/staple-nightly-upgrade`. If Staple has already moved past the
+  card's installed build, the answer is recorded with no handoff.
 - **Wait for tonight** leaves the install to the 03:30 run.
 - A card still pending after Staple moves past its installed build is withdrawn.
+
+If a pair's recommendation changes, one update comment gives the new one. For example, its CI turns
+green and the card follows.
 
 `--dry-run` prints the report and card without writing anything.
 

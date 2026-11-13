@@ -22,6 +22,12 @@
 // report comment, and used as the card's idempotency key. The answer is followed up once on the same issue.
 // "Upgrade now" hands the install to the qualified operator; this script never runs the installer.
 //
+// The state file is only a cache. Staple holds the durable record: every check first rebuilds the pairs
+// from the reporter's cards, and every report, answer or update comment is posted only when its marker is
+// not already on the upgrade-log issue (all comment pages are read). A lost state file, a crash between a
+// POST and its checkpoint, or a moved build therefore never repeats a comment, replays a card or strands one.
+// When a pair's recommendation changes (its CI turned green, say), one update comment says so.
+//
 // Environment: STAPLE_API, STAPLE_COMPANY_ID, STAPLE_REPO, STAPLE_BRANCH, STAPLE_GITHUB_TOKEN as for the
 // installer; STAPLE_UPGRADE_BIN (default ~/.local/bin/staple-nightly-upgrade), STAPLE_NIGHTLY_DIR (default
 // ~/.paperclip/nightly), STAPLE_TZ (default America/Denver), STAPLE_GITHUB_API (tests).
@@ -38,7 +44,13 @@ export const UNINSTALLED_TRIGGER_MS = 2 * 60 * 60 * 1000;
 export const DAYTIME_DRAIN_MIN = 10; // the card's expected drain; the operator passes it as HOLD_DRAIN_MIN
 export const INSTALL_MIN = 10; // backup, build, restart and verify
 const MARKER = "staple-missed-upgrade";
+const MARK_RE = new RegExp(`<!-- ${MARKER}:(\\S+) -->`, "g");
+const CARD_PREFIX = `${MARKER}:card:`;
+const COMMENT_PAGE = 500; // the comments route's page limit
+const COMMENT_PAGES = 200;
 const DONE = new Set(["done", "cancelled"]);
+// The recommendation a report or update gives, by the words it starts with.
+export const VERDICTS = { red: "No upgrade available", certify: "Certify master now", upgrade: "Upgrade now", wait: "Wait for tonight" };
 
 // --- time ---------------------------------------------------------------------------------------
 
@@ -177,10 +189,16 @@ function itemLine(c) {
   return line;
 }
 
+/** The verdict (a VERDICTS key) of a report or update comment body, or null. */
+export function verdictOf(body) {
+  const rec = /\*\*Recommendation:\*\* (.*)/.exec(body || "")?.[1];
+  return rec ? Object.keys(VERDICTS).find((k) => rec.startsWith(VERDICTS[k])) ?? null : null;
+}
+
 /**
  * Decide one hourly check. Pure: every input is read before. Returns
- *   { kind: "silent", reason }                     nothing to report this hour
- *   { kind: "report", key, title, body, card }     post the report; card is null or a confirmation payload
+ *   { kind: "silent", reason }                              nothing to report this hour
+ *   { kind: "report", key, verdict, title, body, card }     post the report; card is null or a confirmation payload
  */
 export function evaluate(x) {
   const short = (s) => (s || "").slice(0, 8);
@@ -219,13 +237,17 @@ export function evaluate(x) {
   const key = reportKey(x.installed, target, target ? [] : criticalLater);
 
   let recommendation;
+  let verdict;
   if (target && !green) {
+    verdict = "red";
     recommendation = `No upgrade available: Gate 0 blocks ${short(target)} because its CI is not green (${x.gate0}). Fix or rerun that CI; the installer does not install a commit with failed CI.`;
   } else if (!target) {
+    verdict = criticalLater.length ? "certify" : "wait";
     recommendation = criticalLater.length
       ? `Certify master now: ${criticalLater.map((p) => (typeof p === "number" ? `PR #${p}` : p)).join(", ")} is Critical but no newer commit is certified. Dispatch \`staple-certify.yml\` on master; once it certifies, the next check offers the upgrade.`
       : "Wait for tonight: the 22:45 certification and the 03:30 run install these changes.";
   } else {
+    verdict = urgent.length ? "upgrade" : "wait";
     recommendation = urgent.length
       ? `Upgrade now to ${short(target)}: ${urgent.length} change${urgent.length > 1 ? "s" : ""} below cannot wait for tonight.`
       : `Wait for tonight: nothing below is Critical or costs a day. The 03:30 run installs ${short(target)}.`;
@@ -286,7 +308,14 @@ export function evaluate(x) {
       },
     };
   }
-  return { kind: "report", key, title, body: lines.join("\n"), card };
+  return { kind: "report", key, verdict, title, body: lines.join("\n"), card };
+}
+
+/** The one update comment for a reported pair whose recommendation changed from `was` to `d.verdict`. */
+export function updateComment(d, was) {
+  const body = d.body.replace(/^<!-- [^\n]* -->\n/, "");
+  const before = was ? `, replacing "${VERDICTS[was]}"` : "";
+  return `<!-- ${MARKER}:update:${d.key}:${d.verdict} -->\n**Update: ${d.title}.** The recommendation changed${before}.\n\n${body}`;
 }
 
 /**
@@ -296,6 +325,12 @@ export function evaluate(x) {
 export function followUpCard(entry, card, installed) {
   const short = (s) => (s || "").slice(0, 8);
   if (!card) return { comment: null, closed: false, withdraw: false };
+  if (card.status === "accepted" && installed && installed !== entry.installed) {
+    return {
+      closed: true, withdraw: false,
+      comment: `<!-- ${MARKER}:answer:${entry.key} -->\n**Upgrade now chosen** for \`${short(entry.target)}\`, but Staple has moved from \`${short(entry.installed)}\` to \`${short(installed)}\` since the card was raised. No handoff: the next check reports again if an upgrade is still due.`,
+    };
+  }
   if (card.status === "accepted") {
     return {
       closed: true, withdraw: false,
@@ -479,19 +514,59 @@ export async function main(argv = process.argv.slice(2)) {
   let installed = "";
   try { installed = (await getJson(`${API}/api/health`, {})).commit || ""; } catch { /* unreadable: silent below */ }
 
-  // Follow up raised cards first: an answer is reported once, a card made stale by an install is withdrawn.
+  // Rebuild every pair that raised a card from Staple's own record, before anything is decided: a lost
+  // state file, a lost cardId checkpoint or a moved build must not strand a card or its answer.
+  let cards;
+  try {
+    const list = await api.get(`/issues/${reportIssue}/interactions`);
+    cards = (Array.isArray(list) ? list : list.items || []).filter((i) => (i.idempotencyKey || "").startsWith(CARD_PREFIX));
+  } catch (e) { say(`upgrade-log cards unreadable (${e.message}); retry`); return 1; }
+  for (const card of cards) {
+    const key = card.idempotencyKey.slice(CARD_PREFIX.length);
+    const [cardInstalled, cardTarget] = key.split(":");
+    const entry = (state.reports[key] ||= { key, installed: cardInstalled, target: cardTarget, commentId: null, cardId: null, at: now.toISOString(), recovered: true });
+    entry.cardId ||= card.id;
+  }
+
+  // Every reporter marker on the upgrade-log issue, oldest first across all comment pages. Read on demand:
+  // a report, answer or update is posted only when its marker is not there yet.
+  let marks = null; let seq = 0;
+  const markers = async () => {
+    if (marks) return marks;
+    const found = new Map(); let after = null;
+    for (let page = 0; ; page++) {
+      if (page >= COMMENT_PAGES) throw new Error(`more than ${COMMENT_PAGES * COMMENT_PAGE} comments`);
+      const res = await api.get(`/issues/${reportIssue}/comments?order=asc&limit=${COMMENT_PAGE}${after ? `&after=${after}` : ""}`);
+      const list = Array.isArray(res) ? res : res.comments || res.items || [];
+      for (const c of list) for (const m of (c.body || "").matchAll(MARK_RE)) found.set(m[1], { id: c.id, body: c.body, n: seq++ });
+      if (list.length < COMMENT_PAGE) break;
+      after = list[list.length - 1].id;
+    }
+    return (marks = found);
+  };
+  const post = async (body) => {
+    const c = await api.send("POST", `/issues/${reportIssue}/comments`, { body });
+    for (const m of body.matchAll(MARK_RE)) marks?.set(m[1], { id: c.id ?? null, body, n: seq++ });
+    return c;
+  };
+
+  // Follow up raised cards: an answer is reported once, a card made stale by an install is withdrawn.
+  const cardById = new Map(cards.map((c) => [c.id, c]));
   for (const entry of Object.values(state.reports)) {
     if (!entry.cardId || entry.cardClosed) continue;
-    let card;
-    try { card = (await api.get(`/issues/${reportIssue}/interactions`)).find((i) => i.id === entry.cardId); }
-    catch (e) { say(`card ${entry.cardId} unreadable (${e.message}); retry`); continue; }
+    const card = cardById.get(entry.cardId);
     const f = followUpCard(entry, card, installed);
     if (dry) { say(`DRY RUN: card ${entry.cardId} ${card?.status}: ${f.comment ?? (f.withdraw ? "withdraw" : "no action")}`); continue; }
     if (f.withdraw) {
       try { await api.send("POST", `/issues/${reportIssue}/interactions/${entry.cardId}/withdraw`, { reason: `Superseded: installed is now ${installed.slice(0, 8)}.` }); }
       catch (e) { say(`withdraw of card ${entry.cardId} failed (${e.message}); retry`); continue; }
     }
-    if (f.comment) await api.send("POST", `/issues/${reportIssue}/comments`, { body: f.comment });
+    if (f.comment) {
+      let m;
+      try { m = await markers(); } catch (e) { say(`upgrade-log comments unreadable (${e.message}); retry`); return 1; }
+      if (m.has(`answer:${entry.key}`)) say(`answer for ${entry.key} already posted (comment ${m.get(`answer:${entry.key}`).id})`);
+      else await post(f.comment);
+    }
     if (f.closed) { entry.cardClosed = card?.status === "pending" ? "withdrawn" : card.status; saveState(stateFile, state); say(`card ${entry.cardId}: ${entry.cardClosed}`); }
   }
 
@@ -541,42 +616,59 @@ export async function main(argv = process.argv.slice(2)) {
   if (d.kind === "silent") { say(`no report: ${d.reason}`); return 0; }
   const target = d.key.split(":")[1];
   let entry = state.reports[d.key];
-  if (!entry) {
-    // A lost state file must not repeat a report or an answer: the comments carry the pair.
-    let list;
-    try {
-      const comments = await api.get(`/issues/${reportIssue}/comments?order=desc&limit=100`);
-      list = Array.isArray(comments) ? comments : comments.comments || comments.items || [];
-    } catch (e) { say(`upgrade-log comments unreadable (${e.message}); retry`); return 1; }
-    const prior = list.find((c) => (c.body || "").includes(`<!-- ${MARKER}:${d.key} -->`));
+  if (!entry?.commentId || entry.verdict === undefined) {
+    // Not known locally (a lost state file, or a pair rebuilt from its card): the comments carry the pair.
+    let m;
+    try { m = await markers(); } catch (e) { say(`upgrade-log comments unreadable (${e.message}); retry`); return 1; }
+    const prior = m.get(d.key);
     if (prior) {
-      const answered = list.some((c) => (c.body || "").includes(`<!-- ${MARKER}:answer:${d.key} -->`));
-      let card = null;
-      try { card = (await api.get(`/issues/${reportIssue}/interactions`)).find((i) => i.idempotencyKey === `${MARKER}:card:${d.key}`) ?? null; }
-      catch (e) { say(`upgrade-log cards unreadable (${e.message}); retry`); return 1; }
-      entry = { key: d.key, installed, target, commentId: prior.id, cardId: card?.id ?? null, cardClosed: answered ? card?.status ?? "answered" : undefined, at: now.toISOString(), recovered: true };
-      if (!dry) { state.reports[d.key] = entry; saveState(stateFile, state); }
+      // The newest of the report and its updates gives the recommendation the issue shows now.
+      const shown = [prior, ...Object.keys(VERDICTS).map((v) => m.get(`update:${d.key}:${v}`))].filter(Boolean).sort((a, b) => b.n - a.n)[0];
+      entry = (state.reports[d.key] ||= { key: d.key, installed, target, cardId: null, at: now.toISOString(), recovered: true });
+      entry.commentId ||= prior.id;
+      entry.verdict = verdictOf(shown.body);
+      if (!dry) saveState(stateFile, state);
       say(`already reported ${d.key} (comment ${prior.id})`);
     }
   } else {
     say(`already reported ${d.key}`);
   }
+  const reported = Boolean(entry?.commentId);
+  const card = cards.find((c) => c.idempotencyKey === d.card?.idempotencyKey);
   if (dry) {
-    if (!entry) say(`DRY RUN: would report ${d.key}\n## ${d.title}\n${d.body}`);
-    if (d.card && !entry?.cardId) say(`DRY RUN: would raise the card ${d.card.idempotencyKey}\n${d.card.payload.detailsMarkdown}`);
+    if (!reported) say(`DRY RUN: would report ${d.key}\n## ${d.title}\n${d.body}`);
+    else if (entry.verdict !== d.verdict) say(`DRY RUN: would post the update ${d.key}:${d.verdict}`);
+    if (d.card && !entry?.cardId && !card) say(`DRY RUN: would raise the card ${d.card.idempotencyKey}\n${d.card.payload.detailsMarkdown}`);
     return 0;
   }
-  if (!entry) {
-    const comment = await api.send("POST", `/issues/${reportIssue}/comments`, { body: `**${d.title}**\n\n${d.body}` });
-    entry = { key: d.key, installed, target, commentId: comment.id ?? null, cardId: null, at: now.toISOString() };
-    state.reports[d.key] = entry; saveState(stateFile, state);
+  if (!reported) {
+    const comment = await post(`**${d.title}**\n\n${d.body}`);
+    entry = state.reports[d.key] = { key: d.key, installed, target, cardId: null, at: now.toISOString(), ...entry, commentId: comment.id ?? null, verdict: d.verdict };
+    saveState(stateFile, state);
     say(`REPORT: ${d.title}`);
+  } else if (entry.verdict !== d.verdict) {
+    // The issue must not keep saying "No upgrade available" next to a new Upgrade now card.
+    const mark = `update:${d.key}:${d.verdict}`;
+    let m;
+    try { m = await markers(); } catch (e) { say(`upgrade-log comments unreadable (${e.message}); retry`); return 1; }
+    if (!m.has(mark)) { await post(updateComment(d, entry.verdict)); say(`UPDATE: ${d.title}: ${VERDICTS[d.verdict]}`); }
+    entry.verdict = d.verdict; saveState(stateFile, state);
   }
   if (d.card && !entry.cardId && !entry.cardClosed) {
-    // The idempotency key makes a retry after a crash return the same card, never a second one.
-    const card = await api.send("POST", `/issues/${reportIssue}/interactions`, d.card);
-    entry.cardId = card.id ?? null; saveState(stateFile, state);
-    say(`card raised: ${entry.cardId}`);
+    // A card already made under this pair's key is adopted, never replayed: Staple refuses a changed request
+    // under the same idempotency key (a new run count changes the details), and a replay would not track it.
+    let raised = card;
+    if (!raised) {
+      try { raised = await api.send("POST", `/issues/${reportIssue}/interactions`, d.card); }
+      catch (e) {
+        if (!/HTTP 409/.test(e.message)) throw e;
+        const list = await api.get(`/issues/${reportIssue}/interactions`);
+        raised = (Array.isArray(list) ? list : list.items || []).find((i) => i.idempotencyKey === d.card.idempotencyKey);
+        if (!raised) throw e;
+      }
+    }
+    entry.cardId = raised.id ?? null; saveState(stateFile, state);
+    say(card ? `card adopted: ${entry.cardId}` : `card raised: ${entry.cardId}`);
   }
   return 0;
 }

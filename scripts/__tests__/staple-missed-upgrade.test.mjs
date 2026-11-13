@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import test from "node:test";
 
 import {
@@ -15,6 +16,8 @@ import {
   inInstallerWindow,
   lastNightly,
   linkedIssueIds,
+  updateComment,
+  verdictOf,
   zonedTime,
 } from "../staple/staple-missed-upgrade.mjs";
 
@@ -189,6 +192,26 @@ test("card follow-up: one answer comment, and a pending card is withdrawn once S
   assert.match(no.comment, /Wait for tonight chosen.*No new card/s);
   assert.deepEqual(followUpCard(entry, { status: "pending" }, I0), { comment: null, closed: false, withdraw: false });
   assert.deepEqual(followUpCard(entry, { status: "pending" }, M2), { comment: null, closed: true, withdraw: true });
+  // An Upgrade now answer read after Staple already moved records the answer without a stale handoff.
+  const moved = followUpCard(entry, { status: "accepted" }, M2);
+  assert.equal(moved.closed, true);
+  assert.match(moved.comment, new RegExp(`^<!-- staple-missed-upgrade:answer:${I0}:${M2} -->`));
+  assert.match(moved.comment, /Staple has moved from `aaaaaaaa` to `cccccccc`.*No handoff/s);
+  assert.doesNotMatch(moved.comment, /HOLD_DRAIN_MIN/);
+});
+
+test("each report carries its verdict, and an update replaces it with one marked comment", () => {
+  const red = evaluate(inputs({ gate0: "red:merge-and-push (failure)" }));
+  const green = evaluate(inputs());
+  assert.deepEqual([red.verdict, verdictOf(red.body)], ["red", "red"]);
+  assert.deepEqual([green.verdict, verdictOf(green.body)], ["upgrade", "upgrade"]);
+  assert.equal(evaluate(inputs({ master: M1, pick: `target:${M1} installed-in-chain:yes`, changes: classified(change(M1, 33)) })).verdict, "wait");
+  assert.equal(evaluate(inputs({ pick: "installed-newest", masterCert: "failure" })).verdict, "certify");
+  const u = updateComment(green, "red");
+  assert.match(u, new RegExp(`^<!-- staple-missed-upgrade:update:${I0}:${M2}:upgrade -->\n\\*\\*Update: Missed upgrade`));
+  assert.match(u, /replacing "No upgrade available"/);
+  assert.equal(u.match(/<!-- staple-missed-upgrade:/g).length, 1);
+  assert.equal(verdictOf(u), "upgrade");
 });
 
 test("history helpers: first-parent range, linked issues, time zone", () => {
@@ -219,6 +242,7 @@ function fakeWorld() {
     certifiedAt: "2026-11-10T12:30:00Z",
     comments: [],
     interactions: [],
+    running: 1,
   };
   const commits = [
     { sha: M1, parents: [{ sha: I0 }], commit: { message: "Merge pull request #33 from ethanmonlux/sta-213-console-sidebar-nav", committer: { date: PRS[33].merged } } },
@@ -247,13 +271,21 @@ function fakeWorld() {
     if (p === "/api/health") return { commit: w.installed };
     if (p === "/api/issues/log/comments") {
       if (method === "POST") { const c = { id: `c${w.comments.length + 1}`, body: body.body }; w.comments.push(c); return c; }
-      return [...w.comments].reverse();
+      // As the comments route: newest first unless order=asc, limit capped at 500, `after` a comment id cursor.
+      const asc = url.searchParams.get("order") === "asc";
+      let list = asc ? [...w.comments] : [...w.comments].reverse();
+      const after = url.searchParams.get("after");
+      if (after) { const at = list.findIndex((c) => c.id === after); list = at < 0 ? [] : list.slice(at + 1); }
+      const limit = Number(url.searchParams.get("limit"));
+      return limit > 0 ? list.slice(0, Math.min(limit, 500)) : list;
     }
     if (p === "/api/issues/log/interactions") {
       if (method === "POST") {
+        // As Staple: the same key returns the existing card only for an equivalent request, else 409.
         const prior = w.interactions.find((i) => i.idempotencyKey === body.idempotencyKey);
+        if (prior && !isDeepStrictEqual(prior.request, body)) return { status: 409, body: { error: "Interaction idempotency key already exists for a different request" } };
         if (prior) return prior;
-        const i = { id: `i${w.interactions.length + 1}`, status: "pending", ...body };
+        const i = { id: `i${w.interactions.length + 1}`, status: "pending", ...body, request: body };
         w.interactions.push(i); return i;
       }
       return w.interactions;
@@ -262,15 +294,17 @@ function fakeWorld() {
     if (wd) { const i = w.interactions.find((x) => x.id === wd); i.status = "cancelled"; return i; }
     const issue = /^\/api\/issues\/(STA-\d+)$/.exec(p)?.[1];
     if (issue) return ISSUES[issue] ?? null;
-    if (/heartbeat-runs$/.test(p)) return [{ status: "running" }];
+    if (/heartbeat-runs$/.test(p)) return Array.from({ length: w.running }, () => ({ status: "running" }));
     return null;
   };
   const server = createServer((req, res) => {
     let data = "";
     req.on("data", (d) => { data += d; });
     req.on("end", () => {
-      const out = routes(new URL(req.url, "http://x"), req.method, data ? JSON.parse(data) : null);
-      res.writeHead(out === null ? 404 : 200, { "Content-Type": "application/json" });
+      let out = routes(new URL(req.url, "http://x"), req.method, data ? JSON.parse(data) : null);
+      let status = out === null ? 404 : 200;
+      if (out?.status === 409) ({ status, body: out } = out);
+      res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(out ?? { message: "Not Found" }));
     });
   });
@@ -380,5 +414,114 @@ test("e2e: a red build reports the failure with no card; --dry-run writes nothin
     assert.match(w.comments[0].body, /No upgrade available/);
     assert.equal(w.interactions.length, 0);
     assert.equal((await run("2026-11-10T14:00:00Z", ["--bogus"])).code, 2);
+  });
+});
+
+const STATE = "missed-upgrade-state.json";
+const reports = (w) => w.comments.filter((c) => c.body.includes(`<!-- staple-missed-upgrade:${I0}:${M2} -->`));
+const answers = (w) => w.comments.filter((c) => c.body.includes(`<!-- staple-missed-upgrade:answer:${I0}:${M2} -->`));
+
+test("e2e: a lost state file never strands a card: it is withdrawn after the install, or its answer followed up once", async () => {
+  await withWorld(async ({ w, run, nightly }) => {
+    await run("2026-11-10T14:00:00Z");
+    rmSync(path.join(nightly, STATE));
+    w.installed = M2;
+    const r = await run("2026-11-10T15:00:00Z");
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /no report: installed is master/);
+    assert.equal(w.interactions[0].status, "cancelled");
+  });
+  await withWorld(async ({ w, run, nightly }) => {
+    await run("2026-11-10T14:00:00Z");
+    rmSync(path.join(nightly, STATE));
+    w.interactions[0].status = "accepted";
+    await run("2026-11-10T15:00:00Z");
+    assert.equal(answers(w).length, 1);
+    assert.match(answers(w)[0].body, /HOLD_DRAIN_MIN=10/);
+    rmSync(path.join(nightly, STATE));
+    const r = await run("2026-11-10T16:00:00Z");
+    assert.match(r.out, /answer for .* already posted/);
+    assert.equal(answers(w).length, 1);
+    assert.equal(reports(w).length, 1);
+  });
+  // Answered, then the build moved before any check saw it, with the state lost too.
+  await withWorld(async ({ w, run, nightly }) => {
+    await run("2026-11-10T14:00:00Z");
+    rmSync(path.join(nightly, STATE));
+    w.interactions[0].status = "rejected";
+    w.installed = M2;
+    await run("2026-11-10T15:00:00Z");
+    assert.equal(answers(w).length, 1);
+    assert.match(answers(w)[0].body, /Wait for tonight chosen/);
+  });
+});
+
+test("e2e: an answer posted before its checkpoint was lost is not posted again", async () => {
+  await withWorld(async ({ w, run, nightly }) => {
+    await run("2026-11-10T14:00:00Z");
+    const before = readFileSync(path.join(nightly, STATE));
+    w.interactions[0].status = "accepted";
+    await run("2026-11-10T15:00:00Z");
+    writeFileSync(path.join(nightly, STATE), before); // the cardClosed checkpoint never reached the disk
+    await run("2026-11-10T16:00:00Z");
+    assert.equal(answers(w).length, 1);
+    assert.equal(JSON.parse(readFileSync(path.join(nightly, STATE), "utf8")).reports[`${I0}:${M2}`].cardClosed, "accepted");
+  });
+});
+
+test("e2e: a report marker beyond the first comment pages is still found after a lost state file", async () => {
+  await withWorld(async ({ w, run, nightly }) => {
+    for (let i = 0; i < 1200; i++) w.comments.push({ id: `old${i}`, body: "earlier upgrade-log entry" });
+    await run("2026-11-10T14:00:00Z");
+    assert.equal(reports(w).length, 1);
+    for (let i = 0; i < 600; i++) w.comments.push({ id: `new${i}`, body: "later upgrade-log entry" });
+    rmSync(path.join(nightly, STATE));
+    const r = await run("2026-11-10T15:00:00Z");
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /already reported .* \(comment c1201\)/);
+    assert.equal(reports(w).length, 1);
+    assert.equal(w.interactions.length, 1);
+  });
+});
+
+test("e2e: a card created before its cardId checkpoint is adopted, not replayed into a 409", async () => {
+  await withWorld(async ({ w, run, nightly }) => {
+    await run("2026-11-10T14:00:00Z");
+    const file = path.join(nightly, STATE);
+    const st = JSON.parse(readFileSync(file, "utf8"));
+    st.reports[`${I0}:${M2}`].cardId = null; // the POST succeeded, its checkpoint did not
+    writeFileSync(file, JSON.stringify(st));
+    w.running = 2; // the details now differ, so a replay under the same key would get a 409
+    for (const now of ["2026-11-10T15:00:00Z", "2026-11-10T16:00:00Z"]) {
+      const r = await run(now);
+      assert.equal(r.code, 0, r.out);
+      assert.doesNotMatch(r.out, /409/);
+    }
+    assert.equal(w.interactions.length, 1);
+    assert.equal(JSON.parse(readFileSync(file, "utf8")).reports[`${I0}:${M2}`].cardId, "i1");
+    w.interactions[0].status = "accepted";
+    await run("2026-11-10T17:00:00Z");
+    assert.equal(answers(w).length, 1);
+  });
+});
+
+test("e2e: a red report whose CI then turns green gets one update before its card", async () => {
+  await withWorld(async ({ w, run, nightly }) => {
+    w.gate0.checks = [{ name: "merge-and-push", status: "completed", conclusion: "failure" }];
+    await run("2026-11-10T14:00:00Z");
+    assert.equal(w.interactions.length, 0);
+    w.gate0.checks = [{ name: "merge-and-push", status: "completed", conclusion: "success" }];
+    const r = await run("2026-11-10T15:00:00Z");
+    assert.equal(r.code, 0, r.out);
+    assert.equal(w.comments.length, 2);
+    assert.match(w.comments[1].body, new RegExp(`^<!-- staple-missed-upgrade:update:${I0}:${M2}:upgrade -->`));
+    assert.match(w.comments[1].body, /\*\*Recommendation:\*\* Upgrade now to cccccccc/);
+    assert.equal(w.interactions.length, 1);
+    await run("2026-11-10T16:00:00Z");
+    rmSync(path.join(nightly, STATE));
+    await run("2026-11-10T17:00:00Z");
+    assert.equal(w.comments.length, 2);
+    assert.equal(reports(w).length, 1);
+    assert.equal(w.interactions.length, 1);
   });
 });
