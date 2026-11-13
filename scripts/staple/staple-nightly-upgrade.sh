@@ -12,6 +12,7 @@
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
 #   staple-nightly-upgrade backup-result OUTPUT RC          print the Gate 2 result for saved db:backup stdout
+#   staple-nightly-upgrade startup-logged SINCE             print whether the service journal shows startup recovery
 #
 # Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
@@ -273,10 +274,20 @@ if not dry: open(E["STATE"],"a").write("%s %s\n"%(key("*"),sha))
 PY
 }
 
+startup_logged() {
+  local out err rc
+  err=$(mktemp)
+  out=$(journalctl --user -u paperclipai --since "$1" --no-pager 2>"$err"); rc=$?
+  if [ $rc != 0 ]; then echo "error:journalctl exited $rc ($(head -c 200 "$err" | tr '\n' ' ' | sed 's/ *$//'))"; rm -f "$err"; return 2; fi
+  rm -f "$err"
+  if grep -qF "startup recovery complete" <<<"$out"; then echo logged; else echo waiting; return 1; fi
+}
+
 case "${1:-}" in
   ci-state) ci_state "${2:?check-runs JSON}" "${3:?workflow-runs JSON}"; exit $? ;;
   certified-pick) certified_pick "${2:?installed SHA}" "${3:?first-parent chain file}"; exit $? ;;
   backup-result) backup_result "${2:?db:backup output file}" "${3:?db:backup exit code}"; exit $? ;;
+  startup-logged) startup_logged "${2:?journalctl --since value}"; exit $? ;;
   certified-target)
     CHAIN=$(mktemp); trap 'rm -f "$CHAIN"' EXIT
     first_parent_chain > "$CHAIN" || { echo "error:could not read $BRANCH history"; exit 1; }
@@ -290,6 +301,7 @@ for a in "$@"; do
     certify-report) MODE=certify-report ;;
     --dry-run) DRY=1 ;;
     [0-9]*) CERT_RUN=$a ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
 API=${STAPLE_API:-http://127.0.0.1:3100}
@@ -516,12 +528,17 @@ if [ "$n" != "0" ]; then
   paperclipai update --rollback --yes
   report "Skipped: $n run(s) running at restart time" "New payload built but not activated; payload rolled back. Still running ${INSTALLED:0:8}. Hold released."; exit 0
 fi
+RESTART_AT=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl --user restart paperclipai
-ok=0
+ok=0; SEEN=; STARTUP=not-checked
 for i in $(seq 1 60); do
   sleep 5
-  if [ "$(health_commit)" = "$TARGET" ] && journalctl --user -u paperclipai --since "-6min" --no-pager | grep -q "startup recovery complete"; then ok=1; break; fi
+  SEEN=$(health_commit)
+  [ "$SEEN" = "$TARGET" ] || continue
+  STARTUP=$(startup_logged "$RESTART_AT")
+  [ "$STARTUP" = logged ] && { ok=1; break; }
 done
+say "verify: health commit ${SEEN:-unreadable}, startup $STARTUP"
 # Gate 3: smoke
 if [ $ok = 1 ]; then
   AG=$(api $API/api/companies/$CID/agents | python3 -c 'import json,sys;d=json.load(sys.stdin);d=d if isinstance(d,list) else d.get("items",[]);print(len(d))' 2>/dev/null)
