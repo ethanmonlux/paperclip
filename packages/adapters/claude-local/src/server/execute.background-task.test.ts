@@ -19,9 +19,10 @@ afterEach(async () => {
 
 async function writeLingeringClaudeCommand(
   commandPath: string,
-  input: { stdout: string; capturePath: string },
+  input: { stdout: string; capturePath: string; onSigterm?: string },
 ): Promise<void> {
   // Prints the stream, then stays alive like a CLI waiting on a background task.
+  // `onSigterm` replaces the default signal exit to simulate a faulty shutdown.
   const script = `#!/usr/bin/env node
 if (process.argv.includes("--version")) { console.log("2.1.312 (Claude Code)"); process.exit(0); }
 const fs = require("node:fs");
@@ -30,20 +31,24 @@ fs.writeFileSync(${JSON.stringify(input.capturePath)}, JSON.stringify({
   disableBackgroundTasks: process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS ?? null,
 }));
 process.stdout.write(${JSON.stringify(input.stdout)});
+${input.onSigterm ? `process.on("SIGTERM", () => { ${input.onSigterm} });` : ""}
 setInterval(() => {}, 1000);
 `;
   await fs.writeFile(commandPath, script, "utf8");
   await fs.chmod(commandPath, 0o755);
 }
 
-async function runLingeringClaude(stdout: string) {
+async function runLingeringClaude(
+  stdout: string,
+  options: { env?: Record<string, string>; onSigterm?: string } = {},
+) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-background-task-"));
   roots.push(root);
   const workspace = path.join(root, "workspace");
   const commandPath = path.join(root, "claude");
   const capturePath = path.join(root, "capture.json");
   await fs.mkdir(workspace, { recursive: true });
-  await writeLingeringClaudeCommand(commandPath, { stdout, capturePath });
+  await writeLingeringClaudeCommand(commandPath, { stdout, capturePath, onSigterm: options.onSigterm });
 
   const previousHome = process.env.HOME;
   process.env.HOME = root;
@@ -64,6 +69,7 @@ async function runLingeringClaude(stdout: string) {
         cwd: workspace,
         promptTemplate: "Follow the paperclip heartbeat.",
         terminalResultCleanupGraceMs: 50,
+        ...(options.env ? { env: options.env } : {}),
       },
       context: {},
       authToken: "run-jwt-token",
@@ -107,6 +113,7 @@ describe("claude_local turn that ends with a live background task", () => {
       terminalResultSeen: true,
       signal: "SIGTERM",
       exitCode: null,
+      processSignal: "SIGTERM",
       liveBackgroundTaskIds: ["bbp6aknwz"],
     });
   });
@@ -120,5 +127,39 @@ describe("claude_local turn that ends with a live background task", () => {
 
     expect(result.signal).toBe("SIGTERM");
     expect(result.errorMessage).not.toBeNull();
+  });
+
+  it.each(["0", ""])("keeps background tasks disabled when config env sets %j", async (value) => {
+    const { capture } = await runLingeringClaude(await fs.readFile(FIXTURE, "utf8"), {
+      env: { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: value },
+    });
+
+    expect(capture.disableBackgroundTasks).toBe("1");
+  });
+
+  it.each([
+    ["exits with its own code", "process.exit(23)", { exitCode: 23, signal: null }],
+    ["dies from a different signal", 'process.kill(process.pid, "SIGABRT")', { exitCode: null, signal: "SIGABRT" }],
+  ])("still reports a failure when the stopped CLI %s", async (_label, onSigterm, expected) => {
+    const { result } = await runLingeringClaude(await fs.readFile(FIXTURE, "utf8"), { onSigterm });
+
+    expect(result.exitCode).toBe(expected.exitCode);
+    expect(result.signal).toBe(expected.signal);
+    expect(result.resultJson?.unmanagedBackgroundTask).toMatchObject({
+      signal: "SIGTERM",
+      exitCode: expected.exitCode,
+      processSignal: expected.signal,
+    });
+  });
+
+  it("does not report a refused turn that the cleanup stopped as finished", async () => {
+    const fixture = await fs.readFile(FIXTURE, "utf8");
+    const refusedTurn = fixture.replace('"stop_reason":"end_turn"', '"stop_reason":"refusal"');
+    expect(refusedTurn).not.toBe(fixture);
+
+    const { result } = await runLingeringClaude(refusedTurn);
+
+    expect(result.errorCode).toBe("claude_refusal");
+    expect(result.signal).toBe("SIGTERM");
   });
 });

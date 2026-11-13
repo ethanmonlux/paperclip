@@ -225,9 +225,6 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent, input.agentIdentity) };
   env.PAPERCLIP_RUN_ID = runId;
-  // A run is one turn, so nothing delivers a background task's result after it
-  // ends. Keep Bash and subagents in the foreground; config env can override.
-  env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
 
   const wakeTaskId =
     (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
@@ -313,6 +310,10 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     if (isPaperclipRuntimeEnvKey(key) && key in env) continue;
     env[key] = value;
   }
+  // A run is one turn, so nothing delivers a background task's result after it
+  // ends. Keep Bash and subagents in the foreground. Set after config env so
+  // config cannot turn it off (STA-360).
+  env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
 
   if (isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
     env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);
@@ -685,6 +686,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // The refresh above re-applies config env; keep the foreground guard.
+  env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
     : null;
@@ -1189,8 +1192,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // terminal-result cleanup stopped it. That stop is not the turn's outcome:
     // report the finished turn and keep the stop as evidence, so the server
     // continues the task instead of recording adapter_failed (STA-360).
+    // Only when the process ended from the cleanup's own signal: a different
+    // exit code or signal is a real shutdown failure and stays one.
     const stoppedAfterFinishedTurn =
-      parsedSucceeded && proc.terminalResultCleanup?.terminalResultSeen === true;
+      parsedSucceeded &&
+      !claudeRefusal &&
+      proc.terminalResultCleanup?.terminalResultSeen === true &&
+      proc.terminalResultCleanup.signal !== null &&
+      proc.exitCode === null &&
+      proc.signal === proc.terminalResultCleanup.signal;
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1303,6 +1313,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             unmanagedBackgroundTask: {
               ...proc.terminalResultCleanup,
               exitCode: proc.exitCode,
+              processSignal: proc.signal,
               liveBackgroundTaskIds: parsedStream.liveBackgroundTaskIds,
             },
           }
