@@ -1291,7 +1291,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         restartSuspendedRunIds.push(run.id);
         return;
       }
-      if (agent.adapterType === "paperclip_runner" && run.runtimeMode === "legacy" && run.scopeKind === "issue" &&
+      // Only an actual shutdown hands an unlaunched portable preparation to the
+      // next controller. A maintenance hold has no next controller until it is
+      // quiet, so it parks the preparation through the stop below instead.
+      if (!parking && agent.adapterType === "paperclip_runner" && run.runtimeMode === "legacy" && run.scopeKind === "issue" &&
           run.issueId && run.executionStage === "preparing" && run.controllerBootId === legacyControllerBootId &&
           await handoffLegacyControllerPreparation(db, run, portableTaskPreparationLeaseId(db, run),
             () => markRunHandedOffForShutdown(run.id))) {

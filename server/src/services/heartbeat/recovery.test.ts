@@ -31,6 +31,7 @@ import { persistHeartbeatRunProcessMetadata } from "./run-lifecycle.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { hasNativeLocalProcessStop, PROCESS_START_REQUESTED, releaseSettledNativeRunProcess } from "../native-local-process-stop.js";
 import { legacyControllerBootId } from "../legacy-controller-lease.js";
+import { isRunHandedOffForShutdown } from "./shutdown-handoff.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 
@@ -1555,6 +1556,42 @@ describePostgres("heartbeat recovery module ownership", () => {
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.status).toBe("running");
     } finally {
       await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    }
+  });
+
+  it.each(["shutdown", "maintenance_hold"] as const)("hands an unlaunched portable preparation to the next controller only on shutdown (%s)", async cause => {
+    const run = await seedRun(), environmentId = randomUUID(), leaseId = randomUUID();
+    await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, run.issueId!));
+    await db.update(heartbeatRuns).set({ scopeKind: "issue", controllerBootId: legacyControllerBootId,
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000), executionStage: "preparing" }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "plugin", config: {} });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: run.companyId, environmentId, heartbeatRunId: run.id,
+      issueId: run.issueId, provider: "plugin:fixture:tasks", providerLeaseId: "portable-task", status: "active",
+      metadata: { agentId: run.agentId, driver: "plugin", runnerTaskLease: true, portableTaskPreviousLeaseId: randomUUID() } });
+    const deps = persistingDeps(), onParked = vi.fn(async (_parked: ParkedRun) => undefined);
+    try {
+      const result = await createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", new Date(), [run.id],
+        cause === "maintenance_hold" ? { cause, onParked } : { cause });
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      if (cause === "shutdown") {
+        expect(result).toMatchObject({ interrupted: 0, restartSuspendedRunIds: [run.id] });
+        expect(current).toMatchObject({ status: "running", executionStage: "preparing", controllerBootId: legacyControllerBootId });
+        expect(current.controllerLeaseExpiresAt!.getTime()).toBeLessThanOrEqual(Date.now());
+        expect(isRunHandedOffForShutdown(run.id)).toBe(true);
+      } else {
+        // The hold cannot become quiet while a handed-off row stays running, and
+        // its next controller only arrives after the hold is quiet.
+        expect(result).toMatchObject({ interrupted: 1, interruptedRunIds: [run.id], restartSuspendedRunIds: [] });
+        expect(current).toMatchObject({ status: "interrupted", errorCode: "maintenance_hold_parked" });
+        expect(isRunHandedOffForShutdown(run.id)).toBe(false);
+        expect(onParked).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: run.id, issueId: run.issueId }));
+        expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledOnce();
+        expect(deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+      }
+    } finally {
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
       await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
     }
   });
