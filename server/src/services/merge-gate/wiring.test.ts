@@ -130,6 +130,45 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
       .resolves.toMatchObject([{ reviewerAgentId: implementer.id, reviewerModelFamilies: [], writtenByReviewer: false }]);
   });
 
+  it("reads a visual-review verdict from its latest revision, separately from the code review (STA-362)", async () => {
+    const f = await fixture();
+    const visualReviewer = await f.agent("Portfolio Visual Reviewer", "codex_local", { mergeGate: { visualReviewer: true } });
+    // Independent of the task, but not the designated visual reviewer.
+    const backend = await f.agent("Backend engineer", "codex_local");
+    const reviewIssue = await f.issue("Visual review", visualReviewer.id, "done");
+    const otherIssue = await f.issue("Other visual review", backend.id, "done");
+    const reviewerRun = await f.run(visualReviewer.id, reviewIssue.id, null);
+    const backendRun = await f.run(backend.id, otherIssue.id, null);
+    const verdict = `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\ncandidateRunId: 1234\nverdict: pass`;
+    const record = async (issueId: string, key: string, body: string, agentId: string, runId: string | null) => {
+      const [document] = await db.insert(documents).values({ companyId: f.company.id, latestBody: body, updatedByAgentId: agentId }).returning();
+      const [revision] = await db.insert(documentRevisions).values({ companyId: f.company.id, documentId: document!.id, revisionNumber: 1, body,
+        createdByAgentId: agentId, createdByRunId: runId }).returning();
+      await db.insert(issueDocuments).values({ companyId: f.company.id, issueId, documentId: document!.id, key });
+      return revision!;
+    };
+    const revision = await record(reviewIssue.id, "visual-review", verdict, visualReviewer.id, reviewerRun.id);
+    await record(otherIssue.id, "visual-review", verdict, backend.id, backendRun.id);
+    const deps = createMergeGateDependencies(db);
+    const query = { reviewIssueIds: [reviewIssue.id], repo: "ethanmonlux/facette", pullNumber: 704 };
+    await expect(deps.loadVisualReviews(f.company.id, query)).resolves.toEqual([{
+      reviewIssueId: reviewIssue.id, reviewIssueIdentifier: reviewIssue.identifier, reviewIssueStatus: "done",
+      reviewerAgentId: visualReviewer.id, writtenByReviewer: true, designatedReviewer: true, recordedAt: revision.createdAt.toISOString(),
+      reviewedSha: HEAD, pullRequest: "ethanmonlux/facette#704", candidateRunId: 1234, candidateRunAttempt: 1, verdict: "pass",
+    }]);
+    await expect(deps.loadVisualReviews(f.company.id, { ...query, reviewIssueIds: [otherIssue.id] }))
+      .resolves.toMatchObject([{ reviewerAgentId: backend.id, writtenByReviewer: true, designatedReviewer: false }]);
+    // A visual verdict is not a code review, and found by reference when no review issue is named.
+    await expect(deps.loadReviews(f.company.id, query)).resolves.toEqual([]);
+    await expect(deps.loadVisualReviews(f.company.id, { ...query, reviewIssueIds: [] })).resolves.toHaveLength(2);
+    await expect(deps.loadVisualReviews(f.company.id, { ...query, reviewIssueIds: [], pullNumber: 705 })).resolves.toEqual([]);
+    // A revision outside the reviewer's own run, or by a terminated reviewer, does not count.
+    await db.update(documentRevisions).set({ createdByRunId: backendRun.id }).where(eq(documentRevisions.id, revision.id));
+    await expect(deps.loadVisualReviews(f.company.id, query)).resolves.toMatchObject([{ writtenByReviewer: false }]);
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, visualReviewer.id));
+    await expect(deps.loadVisualReviews(f.company.id, query)).resolves.toMatchObject([{ designatedReviewer: false }]);
+  });
+
   it("recognizes the STA-293 legacy coordinator handoff only with a recorded engineer run", async () => {
     const f = await fixture();
     const coordinator = await f.agent("Coordinator", "codex_local");
