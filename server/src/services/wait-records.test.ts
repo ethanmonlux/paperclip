@@ -281,6 +281,52 @@ describe("ci wait bound to a candidate run (FAC-151)", () => {
     }))).toMatchObject({ action: "keep_waiting", observation: { state: "started" } });
   });
 
+  describe("planned skipped jobs from change-scoped CI (STA-385)", () => {
+    // Replays run 43413034363 (PR #74 at ee7506e3): run success, 7 jobs passed, 9 planned skips.
+    const passedJobs = ["ci / gate / Select trusted runner", "ci / Affected packages (typecheck)", "ci / policy",
+      "ci / Select Vitest files", "ci / e2e", "ci / General tests (server (1/1))", "ci / verify"];
+    const skippedJobs = ["ci / Canary Dry Run", "ci / Build", "ci / e2e shard", "ci / Verify Paperclip Runner",
+      "ci / Sandbox provider tests", "ci / Typecheck + Release Registry", "ci / Docker context integrity",
+      "ci / Runner support suite", "ci / Verify serialized server suites"];
+    const job = (name: string, conclusion: string | null, status = "completed") => ({ name, status, conclusion, checkSuiteId: 91 });
+    const mixed = [...passedJobs.map(name => job(name, "success")), ...skippedJobs.map(name => job(name, "skipped"))];
+
+    it("passes a successful run with planned skipped jobs and counts passes and skips separately", () => {
+      const result = classify(candidate({ checkRuns: mixed }));
+      expect(result).toMatchObject({ action: "wake", observation: { state: "passed" } });
+      expect(result.observation.detail).toContain("7 jobs passed and 9 planned jobs were skipped");
+    });
+
+    it("does not pass an all-skipped run as verified success", () => {
+      const result = classify(candidate({ checkRuns: skippedJobs.map(name => job(name, "skipped")) }));
+      expect(result).toMatchObject({ action: "wake", observation: { state: "failed" } });
+      expect(result.observation.detail).toContain("skipped all 9 jobs and ran no CI");
+    });
+
+    it("fails a failed job among skipped jobs even when the run says success", () => {
+      for (const conclusion of ["failure", "cancelled", "timed_out"]) {
+        const checkRuns = mixed.map(entry => entry.name === "ci / verify" ? { ...entry, conclusion } : entry);
+        const result = classify(candidate({ checkRuns }));
+        expect(result).toMatchObject({ action: "wake", observation: { state: "failed" } });
+        expect(result.observation.detail).toContain("6 passed, 9 skipped, 1 other");
+      }
+    });
+
+    it("fails a non-success run conclusion despite successful and skipped jobs", () => {
+      for (const conclusion of ["failure", "cancelled", "neutral", null]) {
+        expect(classify(candidate({ checkRuns: mixed, workflowRuns: [{ ...run, conclusion }] })))
+          .toMatchObject({ action: "wake", observation: { state: "failed" } });
+      }
+    });
+
+    it("does not pass when a neutral or unfinished job sits among skipped jobs", () => {
+      for (const extra of [job("ci / extra", "neutral"), job("ci / extra", null, "queued")]) {
+        expect(classify(candidate({ checkRuns: [...mixed, extra] })))
+          .toMatchObject({ action: "wake", observation: { state: "failed" } });
+      }
+    });
+  });
+
   it("does not pass empty, incomplete or unrelated job evidence", () => {
     expect(classify(candidate({ checkRuns: [] }))).toMatchObject({ action: "wake", observation: { state: "startup_failure" } });
     expect(classify(candidate({ checkRunsComplete: false }))).toMatchObject({ action: "fallback", observation: { state: "unobservable" } });
