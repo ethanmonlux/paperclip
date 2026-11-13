@@ -9,6 +9,7 @@ import { actorMiddleware } from "../middleware/auth.js";
 import {
   chainBelongsToAgentRun,
   createLocalAgentProcessBoundary,
+  defaultLocalProcessInspector,
   type LocalProcessInspector,
   findPeerPidInDarwinNetstat,
   findSocketInProcNet,
@@ -16,11 +17,15 @@ import {
 
 const supported = process.platform === "linux" || process.platform === "darwin";
 
-function startServer(serverEnvironment: NodeJS.ProcessEnv, host = "127.0.0.1"): Promise<{ server: Server; url: string }> {
+function startServer(
+  serverEnvironment: NodeJS.ProcessEnv,
+  host = "127.0.0.1",
+  inspector?: LocalProcessInspector,
+): Promise<{ server: Server; url: string }> {
   const app = express();
   app.use(actorMiddleware({} as Db, {
     deploymentMode: "local_trusted",
-    localAgentProcessBoundary: createLocalAgentProcessBoundary({ serverEnvironment }),
+    localAgentProcessBoundary: createLocalAgentProcessBoundary({ serverEnvironment, inspector }),
   }));
   app.get("/api/whoami", (req, res) => {
     res.json({ type: req.actor.type, source: req.actor.source ?? null });
@@ -118,6 +123,29 @@ const launchNonDumpableFetch = [
   "process.stdout.write(execFileSync('python3', ['-c', process.argv[1], process.argv[2]], { env }));",
 ].join("\n");
 
+// The host can run other processes of this user that the server cannot inspect,
+// such as a CI runner's own daemons. The boundary rightly counts them as
+// possible owners of an unidentified connection, which would refuse every
+// uninspectable operator below, so these end-to-end checks only consider the
+// test's own processes. The every-candidate rule is covered with an injected
+// inspector further down.
+function inspectorForTestProcesses(): LocalProcessInspector {
+  const linux = defaultLocalProcessInspector("linux")!;
+  const ownProcess = async (pid: number) => (await linux.ancestorPids(pid))?.includes(process.pid) ?? false;
+  return {
+    ...linux,
+    async findPeerPids(sockets) {
+      const owners = await linux.findPeerPids(sockets);
+      if (owners === "unsupported") return owners;
+      return Promise.all(owners.map(async (owner) => {
+        if (owner === null || typeof owner !== "object") return owner;
+        const own = await Promise.all(owner.candidates.map(ownProcess));
+        return { candidates: owner.candidates.filter((_, index) => own[index]) };
+      }));
+    },
+  };
+}
+
 describe.skipIf(process.platform !== "linux").each(["127.0.0.1", "::1"])(
   "implicit local board access from Linux processes over %s loopback",
   (host) => {
@@ -125,7 +153,7 @@ describe.skipIf(process.platform !== "linux").each(["127.0.0.1", "::1"])(
     let url: string;
 
     beforeAll(async () => {
-      ({ server, url } = await startServer({}, host));
+      ({ server, url } = await startServer({}, host, inspectorForTestProcesses()));
     });
 
     afterAll(async () => {
