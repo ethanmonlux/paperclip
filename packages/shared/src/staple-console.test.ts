@@ -7,7 +7,9 @@ import {
   nextStapleConsoleLocalTime,
   stapleConsoleDefaultRepo,
   stapleConsoleFreshness,
+  stapleConsolePlainText,
   stapleConsolePrStatusText,
+  stapleConsoleSummaryLine,
   stapleConsoleVerdictOfComment,
   stuckBlockedWithoutBlocker,
   stuckCiNotStarted,
@@ -226,13 +228,26 @@ describe("CI never started: an open PR head with no check run after 10 min", () 
 });
 
 describe("PR status text and long questions (STA-205)", () => {
-  it("labels a Paperclip-recorded PR state as recorded with CI unknown, and only a GitHub read as live", () => {
-    expect(stapleConsolePrStatusText({ state: "open", ci: "unknown", source: "work_product" })).toBe("recorded open · CI unknown");
-    expect(stapleConsolePrStatusText({ state: "merged", ci: "unknown", source: "work_product" })).toBe("recorded merged");
-    expect(stapleConsolePrStatusText({ state: "unknown", ci: "unknown", source: "reference" })).toBe("state unknown");
+  it("labels a Paperclip-recorded PR state as not checked live where it shows, and only a GitHub read as live (FAC-929)", () => {
+    expect(stapleConsolePrStatusText({ state: "open", ci: "unknown", source: "work_product" })).toBe("last recorded open · not checked live");
+    expect(stapleConsolePrStatusText({ state: "merged", ci: "unknown", source: "work_product" })).toBe("last recorded merged · not checked live");
+    expect(stapleConsolePrStatusText({ state: "unknown", ci: "unknown", source: "reference" })).toBe("state not checked live");
+    expect(stapleConsolePrStatusText({ state: "unknown", ci: "unknown", source: "github" })).toBe("state unknown");
     expect(stapleConsolePrStatusText({ state: "merged", ci: "unknown", source: "github" })).toBe("merged");
     expect(stapleConsolePrStatusText({ state: "open", ci: "pending", source: "github" })).toBe("open · CI pending");
     expect(stapleConsolePrStatusText({ state: "open", ci: "none", source: "github" })).toBe("open · CI not reported");
+  });
+
+  it("turns a long Markdown question into one plain summary line (FAC-927)", () => {
+    const question = "**What:** live re-check of founder alerts (STA-219). Last time the DM had no tappable link; build `92585ac2` has the fix.\n\n**Do:** tap [the link](https://example.test).";
+    expect(stapleConsolePlainText(question)).toBe("What: live re-check of founder alerts (STA-219). Last time the DM had no tappable link; build 92585ac2 has the fix. Do: tap the link.");
+    expect(stapleConsoleSummaryLine(question)).toBe("What: live re-check of founder alerts (STA-219).");
+    expect(stapleConsoleSummaryLine("Connect Linear")).toBe("Connect Linear");
+    expect(stapleConsoleSummaryLine("Approve v1.2 of the plan? It ships e.g. tomorrow.")).toBe("Approve v1.2 of the plan?");
+    const long = stapleConsoleSummaryLine(`${"After this recovery run ends resume the reviewer ".repeat(4)}now?`);
+    expect(long.length).toBeLessThanOrEqual(120);
+    expect(long.endsWith("…")).toBe(true);
+    expect(stapleConsolePlainText("- one\n- _two_ and snake_case_name")).toBe("one two and snake_case_name");
   });
 
   it("shortens a long question at a word boundary with an ellipsis instead of mid-word", () => {
@@ -302,6 +317,28 @@ describe("buildStapleConsoleBoard", () => {
     expect(asking.needsEthan).toEqual([{ issueIdentifier: "STA-21", question: "Ship the 3x art?", href: "/issues/STA-21#interaction-q1", kind: "interaction" }]);
     expect(board.header.needsEthan).toBe(1);
     expect(cards[0]!.identifier).toBe("STA-21");
+  });
+
+  it("counts each founder question in Needs you, so the tile matches its rows, and lists stuck work first (FAC-927/928)", () => {
+    const board = buildStapleConsoleBoard(boardInput({
+      issues: [
+        issue({ id: "a", identifier: "STA-40", title: "FAC-830: Item art trees", status: "in_progress", assigneeAgentId: "coord" }),
+        issue({ id: "b", identifier: "STA-41", title: "Art frames", status: "in_progress", parentId: "a", assigneeAgentId: "eng" }),
+        issue({ id: "s", identifier: "STA-42", title: "FAC-818: Backpack art", status: "in_progress", startedAt: minutesAgo(300), assigneeAgentId: "coord" }),
+      ],
+      interactions: [
+        { id: "q1", issueId: "a", kind: "ask_user_questions", status: "pending", question: "Ship the 3x art?", addresseeAgentId: null, createdAt: minutesAgo(5) },
+        { id: "q2", issueId: "b", kind: "ask_user_questions", status: "pending", question: "Keep the old frames?", addresseeAgentId: null, createdAt: minutesAgo(4) },
+      ],
+      runs: ["a", "b"].map((issueId) => ({
+        id: `r-${issueId}`, issueId, agentId: issueId === "a" ? "coord" : "eng", status: "running", createdAt: minutesAgo(5), startedAt: minutesAgo(5),
+        finishedAt: null, lastOutputAt: minutesAgo(1), errorCode: null, error: null,
+      })),
+    }));
+    expect(board.lanes.flatMap((lane) => lane.cards).filter((card) => card.needsEthan.length > 0)).toHaveLength(1);
+    expect(board.attention.map((item) => item.kind)).toEqual(["stuck", "needs_you", "needs_you"]);
+    expect(board.header.needsEthan).toBe(2);
+    expect(board.header.stuck).toBe(1);
   });
 
   it("counts merged-today work and lists FAC-50 items without a task as up next", () => {

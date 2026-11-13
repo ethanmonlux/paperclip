@@ -5,7 +5,10 @@ import {
   STAPLE_CONSOLE_POLL_MS,
   formatStapleConsoleDuration,
   stapleConsoleFreshness,
+  stapleConsoleHeaderCounts,
+  stapleConsolePlainText,
   stapleConsolePrStatusText,
+  stapleConsoleSummaryLine,
   type StapleConsoleAttentionItem,
   type StapleConsoleBoard,
   type StapleConsoleCapability,
@@ -15,6 +18,12 @@ import {
   type StapleConsoleClaimState,
   type StapleConsoleProofPullRequest,
   type StapleConsoleStepCell,
+  type StapleConsoleUpgradePhase,
+  type StapleConsoleUpgradeStageCell,
+  type StapleConsoleUpgradeStatus,
+  STAPLE_UPGRADE_STAGE_LABELS,
+  STAPLE_UPGRADE_STAGE_SHORT,
+  stapleUpgradeDrainText,
 } from "@paperclipai/shared/staple-console";
 import { Link } from "@/lib/router";
 import { stapleConsoleApi } from "../api/staple-console";
@@ -169,8 +178,9 @@ function RuntimeLine({ card, now }: { card: StapleConsoleCard; now: number }) {
   );
 }
 
+/** Containment is only checked for Staple's own repository, so it names that build (FAC-929). */
 function installedText(value: boolean | null) {
-  return value === true ? "in the installed build" : value === false ? "not in the installed build yet" : null;
+  return value === true ? "in the installed Staple build" : value === false ? "not in the installed Staple build yet" : null;
 }
 
 function ProofPr({ pr }: { pr: StapleConsoleProofPullRequest | StapleConsoleCard["pullRequests"][number] }) {
@@ -180,7 +190,7 @@ function ProofPr({ pr }: { pr: StapleConsoleProofPullRequest | StapleConsoleCard
       <a href={pr.url} target="_blank" rel="noreferrer" className="underline">{pr.label}</a>
       <span className="text-muted-foreground">
         {" "}{stapleConsolePrStatusText(pr)}
-        {pr.state === "merged" ? ` · CI ${pr.ci === "unknown" || pr.ci === "none" ? "unknown" : pr.ci}` : ""}
+        {pr.state === "merged" && pr.source === "github" ? ` · CI ${pr.ci === "unknown" || pr.ci === "none" ? "unknown" : pr.ci}` : ""}
         {pr.mergeCommitSha ? ` · ${pr.mergeCommitSha.slice(0, 8)}` : ""}
         {installed ? ` · ${installed}` : ""}
       </span>
@@ -276,8 +286,16 @@ function ConsoleCard({
 
 /** Level 4 proof for one card: shared by the lane card and the compact Shipped today row. */
 function CardDetail({ card, now }: { card: StapleConsoleCard; now: number }) {
+  const openTasks = card.members.filter((member) => member.status !== "done" && member.status !== "cancelled").length;
   return (
     <div className="mt-3 space-y-2 border-t border-border pt-2 text-xs" data-testid="staple-console-card-detail">
+      {/* FAC-929: the workstream's own step, apart from each PR's state below it. */}
+      <p data-testid="staple-console-workstream-state">
+        <span className="font-medium text-foreground">Workstream </span>
+        <span className="text-muted-foreground">
+          at {STEP_LABELS[card.step]} · {openTasks === 0 ? "no tasks open" : `${openTasks} of ${card.members.length} tasks open`}
+        </span>
+      </p>
       {card.stuck.map((flag, index) => (
         <p key={`${flag.rule}-${flag.issueIdentifier}-${index}`} className="text-destructive" data-rule={flag.rule}>
           Stuck · {flag.issueIdentifier}: {flag.reason}
@@ -285,7 +303,7 @@ function CardDetail({ card, now }: { card: StapleConsoleCard; now: number }) {
       ))}
       {card.completionNote ? <p className="text-muted-foreground [overflow-wrap:anywhere]">{card.completionNote}</p> : null}
       <div>
-        <h4 className="font-medium text-foreground">PR and CI</h4>
+        <h4 className="font-medium text-foreground">PR and CI <span className="font-normal text-muted-foreground">· each PR's own state</span></h4>
         {card.pullRequests.length > 0 ? (
           <ul className="mt-0.5 space-y-0.5">{card.pullRequests.map((pr) => <ProofPr key={pr.url} pr={pr} />)}</ul>
         ) : (
@@ -323,10 +341,13 @@ function CardDetail({ card, now }: { card: StapleConsoleCard; now: number }) {
               · {card.lastComment.issueIdentifier} · {card.lastComment.authorName ?? "unknown"} · {since(card.lastComment.at, now) ?? "unknown"} ago
             </span>
           </h4>
-          <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{card.lastComment.excerpt}</p>
+          <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{stapleConsolePlainText(card.lastComment.excerpt)}</p>
         </div>
       ) : null}
-      <p className="text-[10px] text-muted-foreground">Lane from {card.laneSource}</p>
+      <details className="text-[10px] text-muted-foreground">
+        <summary className="cursor-pointer">Technical detail</summary>
+        Lane from {card.laneSource}
+      </details>
     </div>
   );
 }
@@ -359,7 +380,70 @@ const ATTENTION_LABEL: Record<StapleConsoleAttentionItem["kind"], string> = {
   unowned_merge: "Merge not owned",
 };
 
-function AttentionList({ items, onJump }: { items: StapleConsoleAttentionItem[]; onJump: (cardId: string) => void }) {
+const ATTENTION_TONE: Record<StapleConsoleAttentionItem["kind"], string> = {
+  needs_you: CORAL,
+  stuck: "border-destructive bg-destructive/5",
+  unowned_merge: "border-amber-500 bg-amber-500/10",
+};
+
+/** Founder questions shown before "more"; stuck rows always all show (FAC-927). */
+const NEEDS_YOU_VISIBLE = 5;
+
+function AttentionLink({ item }: { item: StapleConsoleAttentionItem }) {
+  return /^https?:/.test(item.href) ? (
+    <a href={item.href} target="_blank" rel="noreferrer" className="shrink-0 font-medium underline">{item.linkLabel}</a>
+  ) : (
+    <Link to={item.href} className="shrink-0 font-medium underline">{item.linkLabel}</Link>
+  );
+}
+
+/** One attention row: a one-line summary, with the full plain text one tap away. */
+function AttentionRow({ item, onJump }: { item: StapleConsoleAttentionItem; onJump: (cardId: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const summary = stapleConsoleSummaryLine(item.text);
+  const full = stapleConsolePlainText(item.text);
+  return (
+    <li data-kind={item.kind} data-testid="staple-console-attention-item" className={cn("rounded-md border px-2 py-1.5 text-xs", ATTENTION_TONE[item.kind])}>
+      <div className="flex items-baseline gap-1.5">
+        <span className={cn("shrink-0 whitespace-nowrap font-semibold", item.kind === "stuck" ? "text-destructive" : "text-foreground")}>
+          {ATTENTION_LABEL[item.kind]}
+        </span>
+        <button type="button" onClick={() => onJump(item.cardId)} className="min-w-0 flex-1 truncate text-left font-medium text-foreground underline">
+          {item.name}
+        </button>
+        <span className="shrink-0 text-[11px] text-muted-foreground">{item.identifier}</span>
+        <AttentionLink item={item} />
+      </div>
+      <p className="mt-0.5 line-clamp-2 text-foreground [overflow-wrap:anywhere]" data-testid="staple-console-attention-summary">{summary}</p>
+      {full !== summary ? (
+        <>
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() => setOpen((value) => !value)}
+            className="text-[11px] text-muted-foreground underline"
+            data-testid="staple-console-attention-more"
+          >
+            {open ? "Less" : "Full text"}
+          </button>
+          {open ? <p className="mt-0.5 text-muted-foreground [overflow-wrap:anywhere]">{full}</p> : null}
+        </>
+      ) : null}
+    </li>
+  );
+}
+
+function AttentionList({
+  items,
+  onJump,
+  isOpen,
+  toggle,
+}: {
+  items: StapleConsoleAttentionItem[];
+  onJump: (cardId: string) => void;
+  isOpen: (key: string) => boolean;
+  toggle: (key: string) => void;
+}) {
   if (items.length === 0) {
     return (
       <p
@@ -370,39 +454,67 @@ function AttentionList({ items, onJump }: { items: StapleConsoleAttentionItem[];
       </p>
     );
   }
+  const stuck = items.filter((item) => item.kind === "stuck");
+  const questions = items.filter((item) => item.kind === "needs_you");
+  const merges = items.filter((item) => item.kind === "unowned_merge");
+  const moreQuestions = isOpen("attention:questions");
+  const shownQuestions = moreQuestions ? questions : questions.slice(0, NEEDS_YOU_VISIBLE);
+  const mergesOpen = isOpen("attention:merges");
+  // Every category is counted on the first screen, even the parts behind a tap.
+  const summary = [
+    stuck.length > 0 ? `${stuck.length} stuck` : null,
+    questions.length > 0 ? `${questions.length} ${questions.length === 1 ? "question" : "questions"} for you` : null,
+    merges.length > 0 ? `${merges.length} ${merges.length === 1 ? "merge" : "merges"} nobody owns` : null,
+  ].filter(Boolean).join(" · ");
   return (
-    <section aria-label="Needs attention" className="space-y-2" data-testid="staple-console-attention">
-      <h2 className="text-sm font-semibold text-foreground">Needs attention</h2>
-      <ul className="space-y-2">
-        {items.map((item, index) => (
-          <li
-            key={`${item.kind}-${item.identifier}-${index}`}
-            data-kind={item.kind}
-            className={cn(
-              "rounded-md border p-2 text-xs",
-              item.kind === "needs_you" ? CORAL : item.kind === "stuck" ? "border-destructive bg-destructive/5" : "border-amber-500 bg-amber-500/10",
-            )}
-          >
-            <div className="flex items-baseline gap-1">
-              <span className={cn("font-semibold", item.kind === "stuck" ? "text-destructive" : "text-foreground")}>
-                {ATTENTION_LABEL[item.kind]}
-              </span>
-              <button type="button" onClick={() => onJump(item.cardId)} className="min-w-0 truncate font-medium text-foreground underline">
-                {item.name}
-              </button>
-            </div>
-            <p className="mt-0.5 text-foreground [overflow-wrap:anywhere]">{item.text}</p>
-            <div className="mt-1 flex items-baseline justify-between gap-2">
-              <span className="text-[11px] text-muted-foreground">{item.identifier}</span>
-              {/^https?:/.test(item.href) ? (
-                <a href={item.href} target="_blank" rel="noreferrer" className="font-medium underline">{item.linkLabel}</a>
-              ) : (
-                <Link to={item.href} className="font-medium underline">{item.linkLabel}</Link>
-              )}
-            </div>
-          </li>
+    <section aria-label="Needs attention" className="space-y-1.5" data-testid="staple-console-attention">
+      <h2 className="text-sm font-semibold text-foreground">
+        Needs attention <span className="font-normal text-muted-foreground" data-testid="staple-console-attention-summary-line">· {summary}</span>
+      </h2>
+      <ul className="space-y-1.5">
+        {[...stuck, ...shownQuestions].map((item, index) => (
+          <AttentionRow key={`${item.kind}-${item.identifier}-${index}`} item={item} onJump={onJump} />
         ))}
       </ul>
+      {questions.length > NEEDS_YOU_VISIBLE ? (
+        <button
+          type="button"
+          aria-expanded={moreQuestions}
+          onClick={() => toggle("attention:questions")}
+          className="text-xs text-muted-foreground underline"
+          data-testid="staple-console-attention-more-questions"
+        >
+          {moreQuestions ? "Show fewer questions" : `Show ${questions.length - NEEDS_YOU_VISIBLE} more ${questions.length - NEEDS_YOU_VISIBLE === 1 ? "question" : "questions"}`}
+        </button>
+      ) : null}
+      {merges.length > 0 ? (
+        <div className={cn("rounded-md border px-2 py-1.5 text-xs", ATTENTION_TONE.unowned_merge)} data-testid="staple-console-attention-merges">
+          <Disclosure
+            open={mergesOpen}
+            onToggle={() => toggle("attention:merges")}
+            label={`Merges nobody owns, ${merges.length}, ${mergesOpen ? "collapse" : "expand"}`}
+            className="items-baseline"
+          >
+            <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">{ATTENTION_LABEL.unowned_merge}</span>
+            <span className="min-w-0 truncate text-foreground">
+              {merges.length} done, merge not confirmed
+            </span>
+          </Disclosure>
+          {mergesOpen ? (
+            <ul className="mt-1 space-y-1 border-t border-amber-500/40 pt-1">
+              {merges.map((item, index) => (
+                <li key={`${item.identifier}-${index}`} data-kind={item.kind} className="flex items-baseline gap-1.5">
+                  <button type="button" onClick={() => onJump(item.cardId)} className="min-w-0 flex-1 text-left">
+                    <span className="block truncate font-medium text-foreground underline">{item.name}</span>
+                    <span className="block text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{item.identifier} · {stapleConsolePlainText(item.text)}</span>
+                  </button>
+                  <AttentionLink item={item} />
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -423,8 +535,34 @@ function Counts({ counts }: { counts: StapleConsoleCapability["counts"] }) {
   );
 }
 
-function ClaimProof({ claim, installedBuild, now }: { claim: StapleConsoleClaim; installedBuild: string | null; now: number }) {
-  const { pullRequests, reviews, acceptance } = claim.proof;
+/** A Staple PR is the only kind the installed build can contain; others name their repo. */
+function isStaplePr(pr: StapleConsoleProofPullRequest) {
+  return pr.inInstalledBuild !== null || pr.label.startsWith("paperclip#");
+}
+
+function ClaimProof({
+  claim,
+  installedBuild,
+  staple,
+  now,
+}: {
+  claim: StapleConsoleClaim;
+  installedBuild: string | null;
+  /** Claims in the Staple group: the Console's host build is their installed build. */
+  staple: boolean;
+  now: number;
+}) {
+  const { pullRequests, acceptance } = claim.proof;
+  // One line per task, reviewer and verdict, with the latest time and how many verdicts it covers.
+  const reviews = [...claim.proof.reviews]
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    .reduce<Array<StapleConsoleClaim["proof"]["reviews"][number] & { count: number }>>((rows, review) => {
+      const same = rows.find((row) => row.issueIdentifier === review.issueIdentifier && row.outcome === review.outcome && row.reviewerName === review.reviewerName);
+      if (same) same.count += 1;
+      else rows.push({ ...review, count: 1 });
+      return rows;
+    }, []);
+  const showsStapleBuild = staple || pullRequests.some(isStaplePr);
   return (
     <div className="space-y-1 rounded-md bg-muted/50 p-2 text-[11px]" data-testid="staple-console-proof">
       <h5 className="font-medium text-foreground">Proof</h5>
@@ -436,6 +574,7 @@ function ClaimProof({ claim, installedBuild, now }: { claim: StapleConsoleClaim;
       {reviews.map((review) => (
         <p key={`${review.issueIdentifier}-${review.at}`} className="text-muted-foreground">
           Review {review.outcome === "approved" ? "approved" : "changes requested"} by {review.reviewerName ?? "unknown"} on {review.issueIdentifier}, {since(review.at, now) ?? "unknown"} ago
+          {review.count > 1 ? ` (${review.count} verdicts)` : ""}
         </p>
       ))}
       {claim.needsAcceptance || acceptance ? (
@@ -454,7 +593,11 @@ function ClaimProof({ claim, installedBuild, now }: { claim: StapleConsoleClaim;
           )}
         </p>
       ) : null}
-      <p className="text-muted-foreground">Installed build: {installedBuild ?? <Unknown />}</p>
+      {showsStapleBuild ? (
+        <p className="text-muted-foreground">Installed Staple build: {installedBuild ?? <Unknown />}</p>
+      ) : (
+        <p className="text-muted-foreground">Deployed build: not tracked here (the Console reports Staple's build only)</p>
+      )}
     </div>
   );
 }
@@ -465,6 +608,7 @@ function ClaimRow({
   onToggle,
   renderCard,
   installedBuild,
+  staple,
   now,
 }: {
   claim: StapleConsoleClaim;
@@ -472,6 +616,7 @@ function ClaimRow({
   onToggle: () => void;
   renderCard: (cardId: string) => ReactNode;
   installedBuild: string | null;
+  staple: boolean;
   now: number;
 }) {
   return (
@@ -499,7 +644,7 @@ function ClaimRow({
               ))}
             </ul>
           ) : null}
-          <ClaimProof claim={claim} installedBuild={installedBuild} now={now} />
+          <ClaimProof claim={claim} installedBuild={installedBuild} staple={staple} now={now} />
         </div>
       ) : null}
     </li>
@@ -557,6 +702,7 @@ function Capabilities({
                             onToggle={() => toggle(`claim:${claim.id}`)}
                             renderCard={renderCard}
                             installedBuild={capabilities.installedBuild}
+                            staple={group.key === "staple"}
                             now={now}
                           />
                         ))}
@@ -599,7 +745,276 @@ function MaintenanceHoldBanner({ hold }: { hold: NonNullable<StapleConsoleBoard[
   );
 }
 
-export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoard; now: number }) {
+// ---------------------------------------------------------------------------
+// Managed upgrade (FAC-620 upgrade status)
+
+const UPGRADE_PILL: Record<StapleConsoleUpgradePhase, { label: string; tone: string }> = {
+  running: { label: "Upgrading", tone: "bg-sky-500 text-white" },
+  waiting: { label: "Waiting", tone: "bg-muted text-foreground" },
+  up_to_date: { label: "Up to date", tone: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300" },
+  verified: { label: "Verified", tone: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300" },
+  skipped: { label: "Didn't install", tone: "bg-amber-500/20 text-amber-800 dark:text-amber-300" },
+  failed: { label: "Failed", tone: "bg-red-500 text-white" },
+  rolled_back: { label: "Rolled back", tone: "bg-red-500 text-white" },
+  needs_ethan: { label: "Needs you", tone: "bg-[#f0714f] text-white" },
+  stale: { label: "Not reporting", tone: "bg-amber-500/20 text-amber-800 dark:text-amber-300" },
+  unknown: { label: "Unknown", tone: "bg-muted text-muted-foreground" },
+};
+
+const UPGRADE_BORDER: Partial<Record<StapleConsoleUpgradePhase, string>> = {
+  running: "border-sky-500",
+  failed: "border-red-500",
+  rolled_back: "border-red-500",
+  needs_ethan: CORAL,
+  stale: "border-amber-500",
+};
+
+/** An idle card stays one line once its last install is this old. */
+const UPGRADE_RECENT_MS = 6 * 60 * 60_000;
+/** These stages restart Staple, so a lost connection is expected. */
+const RESTARTING_STAGES = new Set(["download_build", "restart", "verify", "rollback"]);
+
+function UpgradeStageStrip({ stages }: { stages: StapleConsoleUpgradeStageCell[] }) {
+  return (
+    <ol className="grid grid-cols-6 gap-1" aria-label="Upgrade stage">
+      {stages.map((cell) => (
+        <li
+          key={cell.key}
+          aria-current={cell.state === "current" ? "step" : undefined}
+          data-state={cell.state}
+          className={cn(
+            "min-w-0 truncate rounded px-0.5 py-0.5 text-center text-[10px] leading-tight",
+            cell.state === "done" && "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300",
+            cell.state === "current" && "bg-sky-500 font-semibold text-white",
+            cell.state === "failed" && "bg-red-500 font-semibold text-white",
+            cell.state === "pending" && "bg-muted text-muted-foreground",
+            cell.state === "skipped" && "border border-dashed border-muted-foreground/40 text-muted-foreground",
+          )}
+          title={cell.label}
+        >
+          {STAPLE_UPGRADE_STAGE_SHORT[cell.key]}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function UpgradeCard({
+  upgrade,
+  now,
+  open,
+  onToggle,
+  connection,
+}: {
+  upgrade: StapleConsoleUpgradeStatus;
+  now: number;
+  open: boolean;
+  onToggle: () => void;
+  connection?: { lost: boolean; lastLoadedAt: number | null };
+}) {
+  const pill = UPGRADE_PILL[upgrade.phase];
+  const lost = Boolean(connection?.lost);
+  const recentInstall = upgrade.attemptEndedAt !== null && now - Date.parse(upgrade.attemptEndedAt) < UPGRADE_RECENT_MS;
+  const compact = !lost && !upgrade.hold && !open && (
+    upgrade.phase === "up_to_date"
+    || upgrade.phase === "waiting"
+    || upgrade.phase === "unknown"
+    || (upgrade.phase === "verified" && !recentInstall)
+  );
+  const stageLabel = upgrade.stage ? STAPLE_UPGRADE_STAGE_LABELS[upgrade.stage] : null;
+  const stageFor = since(upgrade.stageStartedAt, now);
+  const total = upgrade.attemptEndedAt
+    ? upgrade.attemptStartedAt ? formatStapleConsoleDuration(Date.parse(upgrade.attemptEndedAt) - Date.parse(upgrade.attemptStartedAt)) : null
+    : since(upgrade.attemptStartedAt, now);
+  const lastOutput = since(upgrade.lastOutputAt, now);
+  const drain = upgrade.stage === "draining" ? stapleUpgradeDrainText(upgrade.drainRunning) : null;
+  const lostAt = connection?.lastLoadedAt ? clock(new Date(connection.lastLoadedAt).toISOString()) : null;
+  const restartExpected = lost && upgrade.phase === "running" && upgrade.stage !== null && RESTARTING_STAGES.has(upgrade.stage);
+
+  if (compact) {
+    return (
+      <section aria-label="Upgrades" className="rounded-md border border-border px-2 py-1.5 text-xs" data-testid="staple-console-upgrade" data-phase={upgrade.phase} data-compact="true">
+        <Disclosure open={false} onToggle={onToggle} label="Upgrades, expand" testId="staple-console-upgrade-toggle" className="items-baseline">
+          <span className="font-semibold text-foreground">Upgrades</span>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {upgrade.phase === "unknown" ? <Unknown /> : upgrade.headline}
+            {upgrade.installed && upgrade.phase !== "waiting" ? ` · on ${upgrade.installed}` : ""}
+          </span>
+        </Disclosure>
+      </section>
+    );
+  }
+
+  return (
+    <section
+      aria-label="Upgrades"
+      className={cn("space-y-1.5 rounded-md border p-2 text-xs", UPGRADE_BORDER[upgrade.phase] ?? "border-border", lost && "border-dashed")}
+      data-testid="staple-console-upgrade"
+      data-phase={upgrade.phase}
+      data-compact="false"
+    >
+      <Disclosure open={open} onToggle={onToggle} label={`Upgrades, ${open ? "collapse" : "expand"}`} testId="staple-console-upgrade-toggle" className="items-center">
+        <span className="font-semibold text-foreground">Upgrades</span>
+        <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold", pill.tone)}>{pill.label}</span>
+        {upgrade.quiet ? <span className="text-[10px] text-muted-foreground">daytime</span> : null}
+      </Disclosure>
+      <p className="font-medium text-foreground" data-testid="staple-console-upgrade-headline">{upgrade.headline}</p>
+
+      {lost ? (
+        <p role="status" className="rounded border border-amber-500 bg-amber-500/10 px-1.5 py-1 text-[11px] text-foreground" data-testid="staple-console-upgrade-lost">
+          {restartExpected
+            ? `Can't reach Staple since ${lostAt ?? "the last refresh"}. Expected while it restarts: showing the last known stage.`
+            : `Can't reach Staple since ${lostAt ?? "the last refresh"}. Upgrade state is the last known.`}
+        </p>
+      ) : null}
+
+      {upgrade.stages.length > 0 ? <UpgradeStageStrip stages={upgrade.stages} /> : null}
+
+      <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11px]" data-testid="staple-console-upgrade-facts">
+        {upgrade.phase === "running" || upgrade.phase === "stale" ? (
+          <>
+            <dt className="text-muted-foreground">Stage</dt>
+            <dd className="text-foreground">{stageLabel ?? <Unknown />}{stageFor ? ` · ${stageFor}` : ""}</dd>
+          </>
+        ) : null}
+        <dt className="text-muted-foreground">{upgrade.attemptEndedAt ? "Took" : "Elapsed"}</dt>
+        <dd className="text-foreground">{total ?? <Unknown />}</dd>
+        <dt className="text-muted-foreground">Last output</dt>
+        <dd className={cn("text-foreground", upgrade.phase === "stale" && "font-semibold")}>{lastOutput ? `${lastOutput} ago` : <Unknown />}</dd>
+        {upgrade.download ? (
+          <>
+            <dt className="text-muted-foreground">Download</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-download">
+              {upgrade.download.bytes !== null && upgrade.download.totalBytes
+                ? `${Math.floor((upgrade.download.bytes / upgrade.download.totalBytes) * 100)}%`
+                : <><span className="text-muted-foreground">size unknown</span> · no ETA</>}
+            </dd>
+          </>
+        ) : null}
+        {drain ? (
+          <>
+            <dt className="text-muted-foreground">Drain</dt>
+            <dd className="text-foreground">{drain}</dd>
+          </>
+        ) : null}
+        {upgrade.hold ? (
+          <>
+            <dt className="text-muted-foreground">Held</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-hold">
+              {upgrade.hold.queuedWakes} queued{upgrade.hold.parkedRuns > 0 ? ` · ${upgrade.hold.parkedRuns} parked` : ""} · lifts by {clock(upgrade.hold.expiresAt) ?? "unknown"}
+            </dd>
+          </>
+        ) : null}
+        {/* A founder action replaces "next": nothing automatic follows it. */}
+        {upgrade.needsEthan ? null : (
+          <>
+            <dt className="text-muted-foreground">Next</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-next">{upgrade.nextAction ?? <Unknown />}</dd>
+          </>
+        )}
+      </dl>
+
+      {upgrade.needsEthan ? (
+        <p className={cn("rounded border p-1.5 text-[11px] text-foreground", CORAL)} data-testid="staple-console-upgrade-needs-ethan">
+          <span className="font-semibold">Needs you: </span>{upgrade.needsEthan}
+        </p>
+      ) : null}
+
+      {open ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 border-t border-border pt-1.5 text-[11px]" data-testid="staple-console-upgrade-detail">
+          <dt className="text-muted-foreground">Installed</dt>
+          <dd className="font-mono text-foreground">{upgrade.installed ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Target</dt>
+          <dd className="font-mono text-foreground">{upgrade.target ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Master</dt>
+          <dd className="font-mono text-foreground">{upgrade.master ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Started</dt>
+          <dd className="text-foreground">{clock(upgrade.attemptStartedAt) ?? <Unknown />}</dd>
+          {upgrade.outcome ? (
+            <>
+              <dt className="text-muted-foreground">Result</dt>
+              <dd className="text-foreground">{upgrade.outcome}</dd>
+            </>
+          ) : null}
+          {upgrade.lastInstall ? (
+            <>
+              <dt className="text-muted-foreground">Last install</dt>
+              <dd className="text-foreground">
+                {UPGRADE_PILL[upgrade.lastInstall.phase].label} {upgrade.lastInstall.from ?? "unknown"} → {upgrade.lastInstall.to ?? "unknown"}, {clock(upgrade.lastInstall.at)}
+              </dd>
+            </>
+          ) : null}
+          <dt className="text-muted-foreground">Source</dt>
+          <dd className="text-muted-foreground">{upgrade.source.detail}{upgrade.source.logName ? ` · ${upgrade.source.logName}` : ""}</dd>
+        </dl>
+      ) : null}
+    </section>
+  );
+}
+
+/** ISO times inside a source's detail line, as "N ago" or "in N" (FAC-930 freshness). */
+function relativeTimes(text: string, now: number) {
+  return text.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z\b/g, (iso) => {
+    const at = Date.parse(iso);
+    if (!Number.isFinite(at)) return iso;
+    return at <= now ? `${formatStapleConsoleDuration(now - at)} ago` : `in ${formatStapleConsoleDuration(at - now)}`;
+  });
+}
+
+/**
+ * Scheduled entries (FAC-930). Only Paperclip's own records (monitors, routines, watcher log)
+ * are verified times; a planned job Paperclip does not record shows as planned and unverified,
+ * with its source, never as a definite time.
+ */
+function ScheduleGroup({
+  title,
+  events,
+  now,
+  testId,
+}: {
+  title: string;
+  events: StapleConsoleBoard["scheduled"];
+  now: number;
+  testId: string;
+}) {
+  return (
+    <div className="space-y-1" data-testid={testId}>
+      <h3 className="text-[11px] font-medium text-muted-foreground">{title}</h3>
+      <div className="grid grid-cols-2 gap-2">
+        {events.map((event, index) => (
+          <div
+            key={`${event.label}-${index}`}
+            className={cn("rounded-md border p-2 text-[11px]", event.available ? "border-border" : "border-dashed border-border")}
+            data-testid="staple-console-schedule-event"
+            data-available={event.available ? "true" : "false"}
+          >
+            <div className="font-medium text-foreground">{event.label}</div>
+            <div className="text-muted-foreground">
+              {event.available
+                ? event.at ? clock(event.at) : "not scheduled"
+                : event.at ? `Planned ${clock(event.at)} · not verified` : <Unknown />}
+            </div>
+            {event.available && event.detail ? (
+              <div className="line-clamp-2 text-[10px] text-muted-foreground [overflow-wrap:anywhere]">{relativeTimes(event.detail, now)}</div>
+            ) : null}
+            <div className="line-clamp-2 text-[10px] text-muted-foreground [overflow-wrap:anywhere]">Source: {event.source}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function StapleConsoleBoardView({
+  board,
+  now,
+  connection,
+}: {
+  board: StapleConsoleBoard;
+  now: number;
+  /** A failed refresh while a board is loaded: during an install restart this is expected. */
+  connection?: { lost: boolean; lastLoadedAt: number | null };
+}) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const [highlighted, setHighlighted] = useState<string | null>(null);
   const isOpen = useCallback((key: string) => expanded.has(key), [expanded]);
@@ -640,16 +1055,39 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
       onJump={jump}
     />
   );
-  const shipped = cards.filter((target) => target.shipped);
+  const attention = board.attention ?? [];
+  // FAC-928: tiles count the rows this page lists, so a tile and its list always agree.
+  const header = stapleConsoleHeaderCounts(cards, attention);
+  const shipped = cards.filter((target) => target.shipped)
+    .sort((a, b) => Number(b.mergedToday) - Number(a.mergedToday));
+  const mergedEarlier = shipped.filter((target) => target.completion === "merged" && !target.mergedToday).length;
+  const notMerged = shipped.filter((target) => target.completion !== "merged").length;
+  const finishedBreakdown = [
+    `${header.mergedToday} merged today`,
+    mergedEarlier > 0 ? `${mergedEarlier} merged before today` : null,
+    notMerged > 0 ? `${notMerged} finished without a merge` : null,
+  ].filter(Boolean).join(" · ");
   const upNextOpen = isOpen("upnext");
+  const recordedSchedule = board.scheduled.filter((event) => event.available);
+  const plannedSchedule = board.scheduled.filter((event) => !event.available);
 
   return (
     <div className="space-y-5">
-      {board.maintenanceHold ? <MaintenanceHoldBanner hold={board.maintenanceHold} /> : null}
+      {/* The upgrade card carries the hold; the banner remains for a server without it. */}
+      {board.maintenanceHold && !board.upgrade ? <MaintenanceHoldBanner hold={board.maintenanceHold} /> : null}
 
       {/* Level 1: is anything stalled or waiting on me? */}
-      <HeaderTiles header={board.header} />
-      <AttentionList items={board.attention ?? []} onJump={jump} />
+      <HeaderTiles header={header} />
+      {board.upgrade ? (
+        <UpgradeCard
+          upgrade={board.upgrade}
+          now={now}
+          open={isOpen("upgrade")}
+          onToggle={() => toggle("upgrade")}
+          connection={connection}
+        />
+      ) : null}
+      <AttentionList items={attention} onJump={jump} isOpen={isOpen} toggle={toggle} />
 
       {/* Level 2: what can the system do now? */}
       <Capabilities
@@ -690,10 +1128,12 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
       </section>
 
       {shipped.length > 0 ? (
-        <section aria-label="Shipped today" className="space-y-1" data-testid="staple-console-shipped">
+        <section aria-label="Finished today" className="space-y-1" data-testid="staple-console-shipped">
           <h2 className="text-sm font-semibold text-foreground">
-            Shipped today <span className="font-normal text-muted-foreground">· {shipped.length}</span>
+            Finished today <span className="font-normal text-muted-foreground">· {shipped.length}</span>
           </h2>
+          {/* FAC-928: tasks finished today and PRs merged today are different counts; say how. */}
+          <p className="text-[11px] text-muted-foreground" data-testid="staple-console-finished-breakdown">{finishedBreakdown}</p>
           <ul className="divide-y divide-border rounded-md border border-border text-xs">
             {shipped.map((target) => {
               const merged = target.pullRequests.find((pr) => pr.state === "merged");
@@ -711,7 +1151,7 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
                     <Disclosure
                       open={open}
                       onToggle={() => toggle(`card:${target.id}`)}
-                      label={`${target.name}, ${open ? "collapse" : "expand"}`}
+                      label={`${target.name}, ${target.mergedToday ? "merged today" : target.completion === "merged" ? "merged before today" : "finished without a merge"}, ${open ? "collapse" : "expand"}`}
                       className="min-w-0 flex-1 items-baseline"
                     >
                       <Dot state={target.completion === "merged" ? "green" : "blue"} />
@@ -764,18 +1204,14 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
         </section>
       ) : null}
 
-      <section aria-label="Scheduled and waiting" className="space-y-1">
+      <section aria-label="Scheduled and waiting" className="space-y-1" data-testid="staple-console-scheduled">
         <h2 className="text-sm font-semibold text-foreground">Scheduled and waiting</h2>
-        <div className="grid grid-cols-2 gap-2">
-          {board.scheduled.map((event, index) => (
-            <div key={`${event.label}-${index}`} className="rounded-md border border-border p-2 text-[11px]" title={event.detail ?? undefined}>
-              <div className="font-medium text-foreground">{event.label}</div>
-              <div className="text-muted-foreground">
-                {event.at ? clock(event.at) : event.available ? "not scheduled" : <Unknown />}
-              </div>
-            </div>
-          ))}
-        </div>
+        {recordedSchedule.length > 0 ? (
+          <ScheduleGroup title="Recorded in Paperclip" events={recordedSchedule} now={now} testId="staple-console-schedule-recorded" />
+        ) : null}
+        {plannedSchedule.length > 0 ? (
+          <ScheduleGroup title="Planned, not verified here" events={plannedSchedule} now={now} testId="staple-console-schedule-planned" />
+        ) : null}
       </section>
 
       <p className="text-[10px] text-muted-foreground">
@@ -846,7 +1282,11 @@ export function StapleConsole() {
         <p className="text-sm text-muted-foreground">{query.isLoading ? "Loading the board…" : "No board loaded."}</p>
       ) : (
         <div className={cn("transition", stale && "opacity-60 grayscale")} data-stale={stale ? "true" : "false"}>
-          <StapleConsoleBoardView board={board} now={now} />
+          <StapleConsoleBoardView
+            board={board}
+            now={now}
+            connection={{ lost: Boolean(query.error), lastLoadedAt: query.dataUpdatedAt || null }}
+          />
         </div>
       )}
     </div>
