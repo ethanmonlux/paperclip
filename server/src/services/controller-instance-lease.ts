@@ -1,5 +1,5 @@
 import { and, eq, isNull, sql } from "drizzle-orm";
-import { controllerInstances, type Db } from "@paperclipai/db";
+import { controllerInstances, livenessDb, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
   currentControllerBootId, currentProcessSpaceHash, onControllerStamp,
@@ -88,6 +88,10 @@ function holdsStampedWorkSql(bootId: string) {
  * One statement: create this boot's row on first use, and extend its lease only while the boot
  * holds work (a stamp within the TTL, or an in-progress record stamped with its boot id).
  * Returns whether it still holds work, or that a newer boot fenced it.
+ *
+ * It runs on the private liveness pool: on the shared pool it queued behind busy request and run
+ * work until it timed out, and a single server then stopped itself. The database cancels a
+ * renewal the lease has already given up on, so an abandoned statement cannot occupy that pool.
  */
 function renewInDatabase(db: Db): (stampedRecently: boolean) => Promise<RenewResult> {
   return async stampedRecently => {
@@ -95,14 +99,17 @@ function renewInDatabase(db: Db): (stampedRecently: boolean) => Promise<RenewRes
     const records = holdsStampedWorkSql(bootId);
     const holds = sql`(${stampedRecently} or ${records})`;
     const expires = sql`now() + ${`${CONTROLLER_LEASE_TTL_MS} milliseconds`}::interval`;
-    const rows = await db.execute(sql`
-      insert into controller_instances (boot_id, process_space, pid, lease_expires_at)
-      values (${bootId}, ${currentProcessSpaceHash()}, ${process.pid}, ${expires})
-      on conflict (boot_id) do update set
-        lease_expires_at = case when ${holds} then ${expires} else controller_instances.lease_expires_at end,
-        renewed_at = case when ${holds} then now() else controller_instances.renewed_at end
-      where controller_instances.fenced_at is null and controller_instances.stopped_at is null
-      returning epoch, ${holds} as holds, ${records} as records`) as unknown as Array<{ epoch: string | number; holds: boolean; records: boolean }>;
+    const rows = await livenessDb(db).transaction(async tx => {
+      await tx.execute(sql`select set_config('statement_timeout', ${`${RENEW_TIMEOUT_MS}ms`}, true)`);
+      return tx.execute(sql`
+        insert into controller_instances (boot_id, process_space, pid, lease_expires_at)
+        values (${bootId}, ${currentProcessSpaceHash()}, ${process.pid}, ${expires})
+        on conflict (boot_id) do update set
+          lease_expires_at = case when ${holds} then ${expires} else controller_instances.lease_expires_at end,
+          renewed_at = case when ${holds} then now() else controller_instances.renewed_at end
+        where controller_instances.fenced_at is null and controller_instances.stopped_at is null
+        returning epoch, ${holds} as holds, ${records} as records`);
+    }) as unknown as Array<{ epoch: string | number; holds: boolean; records: boolean }>;
     const row = rows[0];
     if (!row) return "fenced";
     if (state) state.epoch = Number(row.epoch);

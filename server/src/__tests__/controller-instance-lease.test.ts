@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, controllerInstances, createDb, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
+import { agents, closeLivenessDb, companies, controllerInstances, createDb, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
   controllerInstanceLeaseEnabled, proveControllerInstance, registerControllerInstanceDb, registerControllerInstanceLeaseWork,
@@ -37,7 +37,7 @@ suite("controller instance lease: a replaced container's records are provable", 
     await db.delete(controllerInstances);
   });
 
-  afterAll(async () => { await temporary?.cleanup(); });
+  afterAll(async () => { await closeLivenessDb(db, 1); await temporary?.cleanup(); });
 
   const coordinator = { register: () => ({ ready: Promise.resolve(), wake: vi.fn(), stop: async () => {} }) } as unknown as
     ReturnType<typeof createDeliveryWorkCoordinator>;
@@ -404,6 +404,70 @@ suite("controller instance lease: a replaced container's records are provable", 
       expect(lost).toHaveBeenCalledWith("lease_lost");
     } finally { vi.useRealTimers(); }
   });
+
+  it("renews while slow work holds every connection of the shared pool", async () => {
+    // STA-375: under load the renewal queued on the shared pool behind transactions that
+    // waited on row locks, timed out for 60 s, and the only server stopped itself.
+    const shared = createDb(temporary!.connectionString, { maxConnections: 2 });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holders: Promise<unknown>[] = [];
+    try {
+      registerControllerInstanceDb(shared);
+      const lost = vi.fn();
+      registerControllerInstanceLeaseWork(shared, coordinator, { onLost: lost });
+      currentControllerProcessStamp();
+      await tickControllerInstanceLease();
+      await db.update(controllerInstances).set({ leaseExpiresAt: sql`now()` });
+      let held = 0;
+      for (let i = 0; i < 2; i += 1) {
+        holders.push(shared.transaction(async tx => { await tx.execute(sql`select 1`); held += 1; await gate; }));
+      }
+      await vi.waitFor(() => expect(held).toBe(2));
+      const startedAt = performance.now();
+      await tickControllerInstanceLease();
+      expect(performance.now() - startedAt).toBeLessThan(5_000);
+      expect(readTaskDrain(new Date())).toBeNull();
+      expect(await proveControllerInstance(db, currentControllerBootId(), null)).toBe("live");
+      expect(lost).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await Promise.allSettled(holders);
+      resetControllerInstanceLeaseForTests();
+      await closeLivenessDb(shared, 1);
+      await shared.$client.end({ timeout: 1 });
+    }
+  }, 30_000);
+
+  it("has the database cancel a renewal the lease gave up on", async () => {
+    await startHere();
+    const bootId = currentControllerBootId();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let locked!: () => void;
+    const isLocked = new Promise<void>(resolve => { locked = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.execute(sql`select 1 from controller_instances where boot_id = ${bootId} for update`);
+      locked();
+      await gate;
+    });
+    const waitingRenewals = async () => {
+      const rows = await db.execute(sql`select count(*)::int as count from pg_stat_activity
+        where state = 'active' and query like '%insert into controller_instances%' and pid <> pg_backend_pid()`) as unknown as Array<{ count: number }>;
+      return rows[0]?.count ?? 0;
+    };
+    try {
+      await isLocked;
+      currentControllerProcessStamp();
+      await tickControllerInstanceLease();
+      expect(readTaskDrain(new Date())).not.toBeNull();
+      // An abandoned renewal must not keep holding one of the liveness pool's two connections.
+      await vi.waitFor(async () => expect(await waitingRenewals()).toBe(0), { timeout: 5_000, interval: 100 });
+    } finally {
+      release();
+      await holder;
+    }
+  }, 30_000);
 
   it("stops after a 70 s outage while holding work, and the successor recovers its work exactly once", async () => {
     let now = 0;
