@@ -23,7 +23,8 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
-import { resolveAssignedConnectionInstructionsForRun } from "../native-runtime/assigned-mcp-tools.js";
+import { resolveAssignedConnectionInstructionsForRun, resolveMcpConnectionSkillsForRun } from "../native-runtime/assigned-mcp-tools.js";
+import { applyMcpConnectionSkills } from "../mcp-skill-runtime.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
 import { collectRunFailureSecretValues } from "../run-failure-diagnostics.js";
 import { skillVersionSelectionMap } from "../runtime-skill-selections.js";
@@ -70,6 +71,8 @@ export interface HeartbeatExecutionConfigurationInput {
     routineEnvContext: Awaited<ReturnType<ReturnType<typeof createHeartbeatRunPreparation>["getRoutineEnvForExecutionIssue"]>>;
     /** Resolved from the durable Studio test row by task-context, never wake input. */
     pinnedSkillTest?: { key: string; versionId: string } | null;
+    /** Restart recovery is reconnecting to this run's live remote Runner. */
+    adoptingLiveRunner?: boolean;
   };
   config: {
     sourceWorkspaceConfig: Record<string, unknown>;
@@ -290,6 +293,10 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const skillsPrepareStartedAtMs = Date.now();
   let skillsPrepareEndedAtMs = skillsPrepareStartedAtMs;
   let skillDeliveryConfig = effectiveResolvedConfig;
+  // A live remote Runner already holds the files of its admitted skill versions.
+  // Reuse that exact selection instead of re-downloading it on this server.
+  const reuseAdmittedSkills = input.task.adoptingLiveRunner === true && hasStoredVersions
+    && persistedNativeExecutionInput != null && "runtimeContext" in persistedNativeExecutionInput;
   const prepareSkills = async () => {
 
     try {
@@ -302,7 +309,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       // pins and the Beta skills preference. Recovery keeps the admitted map.
       if (!hasStoredVersions && pinnedSkillTest) versionSelections.set(pinnedSkillTest.key, pinnedSkillTest.versionId);
       return await withSkillActor(skillActor, () => companySkills.withRuntimeSkillEntries(agent.companyId, {
-        versionSelections, snapshotLatest: true,
+        versionSelections, ...(reuseAdmittedSkills ? { admittedVersionsOnly: true } : { snapshotLatest: true }),
         ...(hasStoredVersions
           ? { onlyKeys: new Set(Object.keys(storedVersions)) }
           : { selectionConfig: effectiveResolvedConfig, includeLegacy: agent.adapterType !== "paperclip_runner" }),
@@ -361,9 +368,18 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       throw error;
     }
   };
-  const skillsPreparation = (preconfiguredHome ? Promise.resolve([]) : time("configuration_skills", prepareSkills))
+  const skillsPreparation = (preconfiguredHome ? Promise.resolve([])
+    : time(reuseAdmittedSkills ? "configuration_skills_adopted" : "configuration_skills", prepareSkills))
     .finally(() => { skillsPrepareEndedAtMs = Date.now(); });
   const assignmentsPreparation = preconfiguredHome ? Promise.resolve([]) : time("configuration_connector_assignments", () => resolveConnectorAssignments(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id, issueId: typeof context.issueId === "string" ? context.issueId : undefined }));
+  // Approved skills from connected apps load beside company skills. A skill
+  // that cannot load now is left out with a warning; it never fails the run.
+  const mcpSkillsPreparation = preconfiguredHome ? Promise.resolve(null)
+    : time("configuration_mcp_skills", () => resolveMcpConnectionSkillsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }))
+      .catch((error) => {
+        logger.warn({ err: error, runId: run.id }, "Skills from connected apps could not be prepared; the run continues without them");
+        return null;
+      });
   const [preparedSkills, preparedAssignments, preparedInstructions] = await Promise.allSettled([
     skillsPreparation,
     assignmentsPreparation,
@@ -373,6 +389,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   if (preparedAssignments.status === "rejected") throw preparedAssignments.reason;
   if (preparedInstructions.status === "rejected") throw preparedInstructions.reason;
   const runtimeSkillEntries = preparedSkills.value;
+  if (reuseAdmittedSkills) {
+    await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
+      message: "Reconnecting to the running agent with the skills it already has",
+      payload: { skillPreparation: "reused_admitted", skills: runtimeSkillEntries.length } });
+  }
   nativeRunnerPreparationSpans.push({
     name: "skills.prepare",
     parentName: "task.prepare",
@@ -380,7 +401,16 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     endedAtMs: skillsPrepareEndedAtMs,
   });
   const connectorAssignments = preparedAssignments.value;
-  const connectorSkillConfig = await time("configuration_connector_skills", () => applyConnectorSkills(skillDeliveryConfig, runtimeSkillEntries, connectorAssignments));
+  const appliedConnectorSkills = await time("configuration_connector_skills", () => applyConnectorSkills(skillDeliveryConfig, runtimeSkillEntries, connectorAssignments));
+  const mcpSkills = await mcpSkillsPreparation;
+  if (mcpSkills?.skipped.length) {
+    await appendRunEvent(run, { eventType: "skills.mcp_unavailable", stream: "system", level: "warn",
+      message: mcpSkills.skipped.map(({ skillName, appName, reason }) => skillName ? `Skill "${skillName}" from ${appName} was not loaded: ${reason}` : reason).join("\n"),
+      payload: { skipped: mcpSkills.skipped } });
+  }
+  const connectorSkillConfig = mcpSkills?.loaded.length
+    ? await time("configuration_mcp_skill_bundles", () => applyMcpConnectionSkills(appliedConnectorSkills, mcpSkills.loaded))
+    : appliedConnectorSkills;
   // Both CLI adapters and native context materialization use the same resolved set.
   runtimeSkillEntries.splice(0, runtimeSkillEntries.length, ...connectorSkillConfig.paperclipRuntimeSkills);
   const connectorDelivery = await time("configuration_connector_delivery", () => prepareConnectorSkillDelivery(connectorSkillConfig, agent.adapterType));

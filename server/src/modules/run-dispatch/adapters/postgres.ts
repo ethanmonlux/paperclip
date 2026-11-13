@@ -1,6 +1,6 @@
 import { pendingAgentInteractionAddressee } from "../../../services/pending-agent-interaction.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
-import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
+import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
 import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
@@ -45,6 +45,7 @@ import { lockRunBudgetRecoveryOwnerInTransaction, recheckRunBudgetReservationInT
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isUnstartedTaskQuestionAnswer } from "../../../services/unstarted-task-question-answer.js";
 import { isVerifiedDependencyInteractionResponse } from "../../../services/queued-interaction-response.js";
+import { agentBlockingQuestionState } from "../../../services/blocked-question-answer.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
@@ -724,6 +725,9 @@ export function createPostgresRunDispatchAdapter(
         && context.dependencyBlockedInteraction === true
         && await isVerifiedDependencyInteractionResponse(dbOrTx, { companyId: input.companyId, issueId,
           agentId: input.agentId, context })),
+      isAgentBlockingQuestionAnswer: Boolean(isResolvedInteractionContinuation && issue?.status === "blocked"
+        && await agentBlockingQuestionState(dbOrTx, { companyId: input.companyId, issueId,
+          agentId: input.agentId, context })),
       isUnstartedTaskQuestionAnswer: Boolean(isResolvedInteractionContinuation && issue?.status === "todo" &&
         await isUnstartedTaskQuestionAnswer(dbOrTx, { companyId: input.companyId, issueId, interactionId: context.interactionId })),
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
@@ -1261,6 +1265,9 @@ export function createPostgresRunDispatchAdapter(
             eq(issues.executionRunId, row.id),
           ),
         );
+      if (decision.errorCode === "issue_assignee_changed") {
+        await notifyDeferredWakesForIssue(tx, { companyId: row.companyId, issueId });
+      }
 
       await appendHeartbeatRunEvent(tx as unknown as Db, {
         companyId: row.companyId,

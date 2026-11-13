@@ -530,6 +530,7 @@ describe("persisted read cache", () => {
   });
 
   it.each(["build", "expiry"])("discards snapshots after %s changes", kind => {
+    vi.useFakeTimers();
     const startedAt = Date.now();
     const first = setup(undefined, () => startedAt); seed(first.client); first.handle.flush();
     const restored = setup(first.storage, () => kind === "expiry" ? startedAt + QUERY_CACHE_MAX_AGE + 1 : startedAt, undefined, kind === "build" ? "build-two" : "build-one");

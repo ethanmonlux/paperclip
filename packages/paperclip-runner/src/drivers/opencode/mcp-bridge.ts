@@ -342,7 +342,7 @@ async function handleRequest(
         ? "continuation" : errors.some(error => error.instancePath === "") ? "root" : "other";
       context.diagnoseFinishInput({ input: params.arguments, callId, validationCategory });
     }
-    const error = toolInputError(validator);
+    const error = toolInputError(validator, args);
     try { context.onRejectedCall?.({ tool, callId, arguments: args }, error); } catch {}
     outcome = "error";
     writeRpc(response, id, {
@@ -442,7 +442,10 @@ function setSecurityHeaders(response: ServerResponse): void {
 }
 
 function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+    server.closeIdleConnections();
+  });
 }
 
 function withCancellationAndTimeout<T>(
