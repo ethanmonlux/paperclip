@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { BigIntStats } from "node:fs";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_RESTORE_POINT_LIMITS } from "./git-restore-point.js";
@@ -394,6 +395,39 @@ export async function taskDirectoryRemainderUnchanged(root: string, sinceMs: num
 }
 
 const NO_REPLACE = new Set(["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]);
+/** Opening a directory without following a symlink fails with these when
+ * the entry is no longer a directory. */
+const NOT_A_DIRECTORY = new Set(["ELOOP", "ENOTDIR", "ENOENT"]);
+
+type OpenDirectory = { handle: FileHandle; path: string; stat: BigIntStats };
+
+/** Open the directory at `at` without following a final symlink. Its entries
+ * are then reached through `/proc/self/fd`, so every operation stays in the
+ * directory that was opened even if its path is replaced meanwhile. Returns
+ * null when the entry is no longer a directory. Fails closed where that
+ * cannot be guaranteed. */
+async function openDirectory(at: string): Promise<OpenDirectory | null> {
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fsConstants;
+  if (process.platform !== "linux" || O_DIRECTORY === undefined || O_NOFOLLOW === undefined) {
+    throw new TaskDirectoryRestoreFailure("task_directory_containment_unavailable");
+  }
+  const handle = await fs.open(at, O_RDONLY | O_DIRECTORY | O_NOFOLLOW).catch((error: NodeJS.ErrnoException) => {
+    if (NOT_A_DIRECTORY.has(error.code ?? "")) return null;
+    throw error;
+  });
+  if (!handle) return null;
+  try {
+    const stat = await handle.stat({ bigint: true });
+    const by = `/proc/self/fd/${handle.fd}`;
+    if (!stat.isDirectory() || identity(await fs.stat(by, { bigint: true })) !== identity(stat)) {
+      throw new TaskDirectoryRestoreFailure("task_directory_containment_unavailable");
+    }
+    return { handle, path: by, stat };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
 
 /** Link into `target` every entry of `source` that `target` lacks, never
  * replacing anything there: a missing directory is created and filled, and a
@@ -401,41 +435,73 @@ const NO_REPLACE = new Set(["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]);
  * replace an entry made meanwhile. A partly removed folder keeps all it still
  * holds, including work written into it while this runs, and gains the rest
  * of the rebuilt folder. Directories take the mode saved in `source`. Both
- * folders must be on one filesystem. */
+ * folders must be on one filesystem.
+ *
+ * Every directory is worked on through an open handle, never by path, so a
+ * directory replaced by a symlink after it was checked is neither followed
+ * nor written through: an entry that is no longer a directory when opened is
+ * left as it is. Returns the identity of the target directory it filled. */
 export async function fillMissingTaskDirectoryEntries(source: string, target: string, signal?: AbortSignal) {
   const keep = (error: NodeJS.ErrnoException) => {
     if (NO_REPLACE.has(error.code ?? "")) return false;
     throw error;
   };
-  const writable = async (directory: string, mode: number) => {
-    if ((mode & 0o700) !== 0o700) await fs.chmod(directory, (mode & 0o7777) | 0o700);
+  const writable = async (directory: OpenDirectory) => {
+    const mode = Number(directory.stat.mode);
+    if ((mode & 0o700) !== 0o700) await directory.handle.chmod((mode & 0o7777) | 0o700);
   };
-  const visit = async (from: string, to: string) => {
+  const visit = async (from: OpenDirectory, to: OpenDirectory) => {
     signal?.throwIfAborted();
-    for (const name of (await fs.readdir(from)).sort(bySortKey)) {
-      const fromEntry = path.join(from, name);
-      const toEntry = path.join(to, name);
-      const stat = await fs.lstat(fromEntry);
-      if (!stat.isDirectory()) {
+    for (const name of (await fs.readdir(from.path)).sort(bySortKey)) {
+      const fromEntry = path.join(from.path, name);
+      const toEntry = path.join(to.path, name);
+      if (!(await fs.lstat(fromEntry)).isDirectory()) {
         if (!await fs.lstat(toEntry).catch(missing(null))) await fs.link(fromEntry, toEntry).catch(keep);
         continue;
       }
       await fs.mkdir(toEntry, { mode: 0o700 }).catch(keep);
-      const current = await fs.lstat(toEntry).catch(missing(null));
-      if (!current?.isDirectory()) continue;
-      await writable(fromEntry, stat.mode);
-      await writable(toEntry, current.mode);
-      await visit(fromEntry, toEntry);
-      await fs.chmod(toEntry, stat.mode & 0o7777);
+      const fromChild = await openDirectory(fromEntry);
+      if (!fromChild) throw new Error("unsafe_task_directory_staging");
+      try {
+        const toChild = await openDirectory(toEntry);
+        if (!toChild) continue;
+        try {
+          await writable(fromChild);
+          await writable(toChild);
+          await visit(fromChild, toChild);
+          await toChild.handle.chmod(Number(fromChild.stat.mode) & 0o7777);
+        } finally {
+          await toChild.handle.close();
+        }
+      } finally {
+        await fromChild.handle.close();
+      }
     }
   };
-  const targetStat = await fs.lstat(target);
-  if (!targetStat.isDirectory()) throw new Error("unsafe_task_directory_trash");
-  const sourceMode = (await fs.lstat(source)).mode;
-  await writable(source, sourceMode);
-  await writable(target, targetStat.mode);
-  await visit(source, target);
-  await fs.chmod(target, sourceMode & 0o7777);
+  const to = await openDirectory(target);
+  if (!to) throw new Error("unsafe_task_directory_trash");
+  try {
+    const from = await openDirectory(source);
+    if (!from) throw new Error("unsafe_task_directory_staging");
+    try {
+      await writable(from);
+      await writable(to);
+      await visit(from, to);
+      await to.handle.chmod(Number(from.stat.mode) & 0o7777);
+    } finally {
+      await from.handle.close();
+    }
+    return identity(to.stat);
+  } finally {
+    await to.handle.close();
+  }
+}
+
+/** Whether the directory at `target`, without following a symlink, is the
+ * one `fillMissingTaskDirectoryEntries` returned. */
+export async function isTaskDirectory(target: string, expected: string) {
+  const stat = await fs.lstat(target, { bigint: true }).catch(missing(null));
+  return Boolean(stat?.isDirectory()) && identity(stat!) === expected;
 }
 
 export async function removeTaskDirectoryTree(target: string) {

@@ -30,6 +30,7 @@ import {
   captureTaskDirectorySnapshot,
   createEmptyTaskDirectorySnapshot,
   fillMissingTaskDirectoryEntries,
+  isTaskDirectory,
   inspectTaskDirectory,
   materializeTaskDirectorySnapshot,
   newestTaskDirectoryMtime,
@@ -606,8 +607,14 @@ export async function restoreIsolatedTaskDirectory(input: {
       await restoreTaskDirectoryRepositories(staging, repositories, { resolveGitAuth: input.resolveGitAuth!, signal: input.signal });
     }
     if (trash) {
-      await fillMissingTaskDirectoryEntries(staging, state.trash, input.signal);
+      const filled = await fillMissingTaskDirectoryEntries(staging, state.trash, input.signal);
       await fs.rename(state.trash, cwd);
+      // The folder moved into place must be the one filled, not something
+      // put at its path meanwhile.
+      if (!await isTaskDirectory(cwd, filled)) {
+        await fs.rename(cwd, state.trash).catch(() => undefined);
+        throw new TaskDirectoryRestoreFailure("task_directory_identity_changed");
+      }
     } else {
       await fs.rename(staging, cwd);
     }

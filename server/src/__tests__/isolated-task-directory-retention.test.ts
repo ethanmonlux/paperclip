@@ -702,6 +702,105 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(f.delivered.head);
     }, 90_000);
 
+    /** A private directory outside the task folder, and a check that reopen
+     * neither wrote into it nor changed its mode. */
+    async function outsideTarget() {
+      const outside = path.join(root, `outside-${randomUUID()}`);
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "private.txt"), "private\n");
+      await fs.chmod(outside, 0o700);
+      return {
+        path: outside,
+        async expectUntouched() {
+          expect(await fs.readdir(outside)).toEqual(["private.txt"]);
+          expect((await fs.stat(outside)).mode & 0o777).toBe(0o700);
+        },
+      };
+    }
+
+    /** Replace the live checkout with a symlink to `outside` once reopen's
+     * reconcile has created or found `name` in `parent`. */
+    function swapCheckoutAt(trash: string, parent: string, name: string, outside: string) {
+      const held = path.join(root, `held-${randomUUID()}`);
+      const mkdir = fs.mkdir.bind(fs);
+      let swapped = false;
+      const spy = vi.spyOn(fs, "mkdir").mockImplementation((async (target: string, options?: unknown) => {
+        try {
+          return await mkdir(target, options as Parameters<typeof fs.mkdir>[1]);
+        } finally {
+          if (!swapped && path.basename(String(target)) === name
+            && await fs.realpath(path.dirname(String(target))).catch(() => null) === parent) {
+            swapped = true;
+            await fs.rename(path.join(trash, "repo"), held);
+            await fs.symlink(outside, path.join(trash, "repo"));
+          }
+        }
+      }) as typeof fs.mkdir);
+      return { held, swapped: () => swapped, restore: () => spy.mockRestore() };
+    }
+
+    it.each([
+      ["after its check, before reconcile descends into it", "", "repo"],
+      ["while reconcile is filling it", "repo", ".git"],
+    ])("never writes through a checkout replaced by a symlink %s", async (_label, parent, name) => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async trash => {
+        await fs.rm(path.join(trash, "report.md"));
+        await fs.rm(path.join(trash, "vendor"), { recursive: true, force: true });
+      });
+      const outside = await outsideTarget();
+      const swap = swapCheckoutAt(state.trash, path.join(state.trash, parent), name, outside.path);
+      try {
+        // The replacement is live work and is kept as it stands; the rest of
+        // the folder is still filled in.
+        expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      } finally {
+        swap.restore();
+      }
+      expect(swap.swapped()).toBe(true);
+      await outside.expectUntouched();
+      expect((await fs.lstat(f.delivered.checkout)).isSymbolicLink()).toBe(true);
+      expect(await fs.readlink(f.delivered.checkout)).toBe(outside.path);
+      // The checkout moved away is whole, and anything filled in after the
+      // swap went into it rather than outside.
+      expect(git(swap.held, "rev-parse", "HEAD")).toBe(f.delivered.head);
+      expect(git(swap.held, "status", "--porcelain")).toBe("");
+      expect(await fs.readFile(path.join(f.cwd, "report.md"), "utf8")).toBe("final report\n");
+      expect(git(f.library.checkout, "rev-parse", "HEAD")).toBe(f.library.head);
+      expect((await fs.readdir(path.dirname(f.cwd))).filter(entry => entry.startsWith(".restoring-"))).toEqual([]);
+    }, 90_000);
+
+    it("fails closed when the partly removed folder is replaced before it moves into place", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async trash => { await fs.rm(path.join(trash, "report.md")); });
+      const outside = await outsideTarget();
+      const held = path.join(root, `held-${randomUUID()}`);
+      const rename = fs.rename.bind(fs);
+      let swapped = false;
+      const spy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (!swapped && String(from) === state.trash && String(to) === f.cwd) {
+          swapped = true;
+          await rename(state.trash, held);
+          await fs.symlink(outside.path, state.trash);
+        }
+        return rename(from, to);
+      });
+      try {
+        expect(await f.reopen()).toMatchObject({ ok: false, code: "rebuild_failed" });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(swapped).toBe(true);
+      await outside.expectUntouched();
+      // Nothing outside is put in place of the folder, and the filled folder
+      // that was moved away keeps its checkout and the refilled report.
+      expect(await exists(f.cwd)).toBe(false);
+      expect((await fs.lstat(state.trash)).isSymbolicLink()).toBe(true);
+      expect(git(path.join(held, "repo"), "rev-parse", "HEAD")).toBe(f.delivered.head);
+      expect(await fs.readFile(path.join(held, "report.md"), "utf8")).toBe("final report\n");
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: false });
+    }, 90_000);
+
     it("keeps a partly removed folder whose removal record is missing", async () => {
       const f = await codeDeliveredFixture();
       const state = await stopRemoval(f, async trash => { await fs.rm(path.join(trash, "report.md")); });
