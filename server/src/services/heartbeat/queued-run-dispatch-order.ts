@@ -63,7 +63,9 @@ export function createQueuedRunDispatcher<T extends QueuedRunDispatchFacts>(
   return {
     next(): T | null {
       if (!remaining.length) return null;
-      const recoveryIndex = sinceRecovery >= RECOVERY_DISPATCH_SHARE - 1
+      // Ready urgent work sorts first and is never displaced by recovery's
+      // reserved share; the share resumes among the runs after it.
+      const recoveryIndex = sinceRecovery >= RECOVERY_DISPATCH_SHARE - 1 && remaining[0]!.readinessRank >= 0
         ? remaining.findIndex(run => run.readinessRank < NOT_READY_RANK && isSystemRecoveryRun(run))
         : -1;
       return remaining.splice(recoveryIndex < 0 ? 0 : recoveryIndex, 1)[0]!;

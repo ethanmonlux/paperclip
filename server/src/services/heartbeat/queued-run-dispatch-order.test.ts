@@ -120,6 +120,46 @@ describe("queued run dispatch order", () => {
     expect(ordered.map(entry => entry.id)).toEqual([urgent.id, retry.id]);
   });
 
+  it("starts ready urgent work ahead of recovery's reserved share (Staple urgent lane)", () => {
+    const recovery = backlogRecovery();
+    const urgent = run({ wakeReason: "issue_assigned", readinessRank: -1, priorityRank: 0, createdAt: minutesAgo(1) });
+    const due = RECOVERY_DISPATCH_SHARE - 1;
+    // One free slot: the first run offered is the one the queue claims.
+    expect(createQueuedRunDispatcher([recovery, urgent], { now, startsSinceRecovery: due }).next()!.id).toBe(urgent.id);
+    expect(orderQueuedRunsForDispatch([recovery, urgent], { now, startsSinceRecovery: due }).map(entry => entry.id))
+      .toEqual([urgent.id, recovery.id]);
+  });
+
+  it("drains every ready urgent run before recovery's share resumes among ordinary work", () => {
+    const people = Array.from({ length: 6 }, () => personRetry());
+    const recovery = Array.from({ length: 2 }, () => backlogRecovery());
+    const urgent = Array.from({ length: 2 }, () => run({ wakeReason: "issue_assigned", readinessRank: -1, priorityRank: 0 }));
+    const batch = orderQueuedRunsForDispatch([...recovery, ...people, ...urgent], { now, startsSinceRecovery: RECOVERY_DISPATCH_SHARE - 1 });
+    expect(batch.map(entry => entry.readinessRank < 0 ? "U" : entry.wakeReason === "task_retry" ? "P" : "R").join(""))
+      .toBe("UURPPPRPPP");
+  });
+
+  it("does not let unready urgent work hold back recovery's share", () => {
+    const blockedUrgent = run({ wakeReason: "issue_assigned", readinessRank: 3, priorityRank: 0, createdAt: minutesAgo(1) });
+    const people = Array.from({ length: 2 }, () => personRetry());
+    const recovery = backlogRecovery();
+    const ordered = orderQueuedRunsForDispatch([blockedUrgent, ...people, recovery], { now, startsSinceRecovery: RECOVERY_DISPATCH_SHARE - 1 });
+    expect(ordered.map(entry => entry.id)).toEqual([recovery.id, people[0]!.id, people[1]!.id, blockedUrgent.id]);
+  });
+
+  it("offers the next urgent run, then recovery's share, when an urgent claim fails", () => {
+    const stuck = run({ wakeReason: "issue_assigned", readinessRank: -1, priorityRank: 0, createdAt: minutesAgo(9) });
+    const claimable = run({ wakeReason: "issue_assigned", readinessRank: -1, priorityRank: 0, createdAt: minutesAgo(1) });
+    const recovery = backlogRecovery();
+    const person = personRetry();
+    const dispatcher = createQueuedRunDispatcher([person, recovery, claimable, stuck], { now, startsSinceRecovery: RECOVERY_DISPATCH_SHARE - 1 });
+    expect(dispatcher.next()!.id).toBe(stuck.id);
+    const second = dispatcher.next();
+    expect(second!.id).toBe(claimable.id);
+    dispatcher.claimed(second!);
+    expect(dispatcher.next()!.id).toBe(recovery.id);
+  });
+
   it("keeps the existing readiness, priority and age order within a class", () => {
     const later = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(1) });
     const earlier = run({ wakeReason: "issue_assigned", createdAt: minutesAgo(5) });
