@@ -45,8 +45,12 @@ import {
   type StapleConsoleScheduledEvent,
   type StapleConsoleSourceStatus,
   type StapleConsoleMaintenanceHold,
+  type StapleConsoleUpgradeStatus,
+  type StapleUpgradeLogFile,
+  buildStapleConsoleUpgradeStatus,
 } from "@paperclipai/shared/staple-console";
 import { maintenanceHoldService } from "./maintenance-hold.js";
+import { readStapleUpgradeLogs, stapleUpgradeLogTimeZone } from "./staple-upgrade-log.js";
 import { notFound } from "../errors.js";
 import {
   resolveGitHubApiCredential,
@@ -112,6 +116,9 @@ export interface StapleConsoleServiceOptions {
   fetch?: FetchLike;
   credentialProvider?: (companyId: string, actor: AuthorizationActor) => Promise<StapleConsoleGitHubCredential | null>;
   now?: () => Date;
+  /** The managed installer's logs (FAC-620 upgrade card); null when unreadable. */
+  upgradeLogs?: () => Promise<StapleUpgradeLogFile[] | null>;
+  upgradeLogTimeZone?: string;
 }
 
 function iso(value: Date | string | null | undefined): string | null {
@@ -890,7 +897,33 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       scheduled,
       sources: { github },
     });
-    return { ...built, maintenanceHold };
+    const upgradeStatus = await readUpgradeStatus(nowIso, maintenanceHold, {
+      // Full SHA, shortened like the installer's own 8-character SHAs.
+      installedBuild: serverInfo.git.available ? serverInfo.git.fullSha : null,
+      serverStartedAt: serverInfo.processStartedAt ?? null,
+    });
+    return { ...built, maintenanceHold, upgrade: upgradeStatus };
+  }
+
+  async function readUpgradeStatus(
+    nowIso: string,
+    hold: StapleConsoleMaintenanceHold | null,
+    build: { installedBuild: string | null; serverStartedAt: string | null },
+  ): Promise<StapleConsoleUpgradeStatus | null> {
+    try {
+      const logs = await (opts.upgradeLogs ?? readStapleUpgradeLogs)();
+      return buildStapleConsoleUpgradeStatus({
+        now: nowIso,
+        timeZone: opts.upgradeLogTimeZone ?? stapleUpgradeLogTimeZone(),
+        logs,
+        hold,
+        installedBuild: build.installedBuild,
+        serverStartedAt: build.serverStartedAt,
+        nextNightlyAt: nextStapleConsoleLocalTime(nowIso, "03:30"),
+      });
+    } catch {
+      return null;
+    }
   }
 
   async function readMaintenanceHoldBanner(): Promise<StapleConsoleMaintenanceHold | null> {
