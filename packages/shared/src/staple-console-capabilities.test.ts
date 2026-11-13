@@ -161,7 +161,7 @@ describe("parseStapleConsoleCapabilityMap", () => {
 });
 
 describe("Level 1 needs attention and plain names", () => {
-  it("pins founder questions first, then stuck work, then Done work whose PR nobody merges", () => {
+  it("lists stuck work first, then founder questions, then Done work whose PR nobody merges", () => {
     const board = buildStapleConsoleBoard(boardInput({
       issues: [
         issue({ id: "s", identifier: "STA-10", title: "FAC-818: Backpack art", status: "in_progress", startedAt: minutesAgo(120), assigneeAgentId: "eng" }),
@@ -177,11 +177,11 @@ describe("Level 1 needs attention and plain names", () => {
       }],
     }));
     expect(board.attention.map((item) => [item.kind, item.identifier])).toEqual([
-      ["needs_you", "STA-11"],
       ["stuck", "STA-10"],
+      ["needs_you", "STA-11"],
       ["unowned_merge", "STA-12"],
     ]);
-    expect(board.attention[0]).toMatchObject({ text: "Ship the 3x art?", linkLabel: "Answer", href: "/issues/STA-11#interaction-i1" });
+    expect(board.attention[1]).toMatchObject({ text: "Ship the 3x art?", linkLabel: "Answer", href: "/issues/STA-11#interaction-i1" });
     expect(board.attention[2]).toMatchObject({ href: "https://github.com/ethanmonlux/facette/pull/77", linkLabel: "Open PR" });
     const quiet = board.lanes.flatMap((lane) => lane.cards).find((card) => card.identifier === "STA-13")!;
     expect(quiet.name).toBe("Quiet work");

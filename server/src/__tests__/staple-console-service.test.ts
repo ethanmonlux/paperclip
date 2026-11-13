@@ -261,4 +261,34 @@ suite("staple console service", () => {
     expect(board.capabilities.groups[0]!.capabilities[0]!.title).toBe("Canonical map");
     expect(boardText(board)).not.toContain("Scratch copy");
   });
+  it("adds the upgrade card from the installer log, without any raw log line (FAC-620 upgrade status)", async () => {
+    const companyId = await seedCompany();
+    const actor: AuthorizationActor = { type: "board", userId: "reader", authorizingUserId: "reader" };
+    // After this process started, so Staple has not restarted since the install began.
+    const at = (offsetMs: number) => new Date(Date.now() - offsetMs);
+    const stamp = (date: Date) => date.toISOString().slice(0, 19).replace("T", " ");
+    const svc = stapleConsoleService(db, {
+      credentialProvider: async () => null,
+      upgradeLogTimeZone: "UTC",
+      upgradeLogs: async () => [{
+        name: "upgrade-20261113-0330.log",
+        modifiedAt: at(0).toISOString(),
+        text: [
+          `[${stamp(at(3_000))}] == Staple nightly upgrade (dry=0 quiet=0)`,
+          `[${stamp(at(3_000))}] installed=69187fe6aaaa master=92585ac2bbbb`,
+          `[${stamp(at(3_000))}] certified target: target:92585ac2bbbb installed-in-chain:yes`,
+          `[${stamp(at(2_000))}] running or settling work: 0 (queued work is held)`,
+          `[${stamp(at(1_000))}] backup: file:/home/paperclip/private/backup.sql.gz`,
+          `[${stamp(at(0))}] installing 92585ac2`,
+          "Progress: resolved 812",
+        ].join("\n"),
+      }],
+    });
+    const board = await svc.board(companyId, actor);
+    expect(board.upgrade).toMatchObject({ phase: "running", stage: "download_build", target: "92585ac2", download: { bytes: null, totalBytes: null } });
+    expect(boardText(board)).not.toMatch(/private\/backup|Progress: resolved/);
+
+    const unreadable = await stapleConsoleService(db, { credentialProvider: async () => null, upgradeLogs: async () => null }).board(companyId, actor);
+    expect(unreadable.upgrade).toMatchObject({ phase: "unknown", source: { available: false } });
+  });
 });
