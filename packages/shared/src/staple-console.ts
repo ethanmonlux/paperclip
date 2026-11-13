@@ -405,7 +405,7 @@ export interface StapleConsoleCard {
 }
 
 /**
- * Level 1 "Needs attention" (FAC-620 v2): founder questions, stuck work and Done work whose
+ * Level 1 "Needs attention" (FAC-620 v2): stuck work, founder questions and Done work whose
  * PR nobody is merging. Empty means "Nothing needs you; nothing stalled."
  */
 export interface StapleConsoleAttentionItem {
@@ -504,9 +504,30 @@ function earliest(values: Array<string | null | undefined>): string | null {
  * can go stale, so it reads "recorded" with CI unknown (STA-205).
  */
 export function stapleConsolePrStatusText(pr: Pick<StapleConsoleCardPullRequest, "state" | "ci" | "source">): string {
-  if (pr.state === "unknown") return "state unknown";
-  if (pr.source !== "github") return `recorded ${pr.state}${pr.state === "open" || pr.state === "draft" ? " · CI unknown" : ""}`;
+  // FAC-929: a state GitHub did not answer this refresh says so where it is shown.
+  if (pr.state === "unknown") return pr.source === "github" ? "state unknown" : "state not checked live";
+  if (pr.source !== "github") return `last recorded ${pr.state} · not checked live`;
   return `${pr.state}${pr.state === "open" || pr.state === "draft" ? ` · CI ${pr.ci === "none" ? "not reported" : pr.ci}` : ""}`;
+}
+
+/** Markdown and run-on whitespace removed, for text shown as a plain line (FAC-927). */
+export function stapleConsolePlainText(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(^|[\s(])[*_]([^*_\n]+)[*_](?=[\s).,:;!?]|$)/g, "$1$2")
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The first sentence of a question or reason as one plain line, clipped at a word. */
+export function stapleConsoleSummaryLine(text: string, max = 120): string {
+  const plain = stapleConsolePlainText(text);
+  const sentence = /^.+?[.?!](?=\s+[A-Z*"'(]|$)/.exec(plain)?.[0] ?? plain;
+  return clipStapleConsoleText(sentence, max);
 }
 
 /** Shorten long text at a word boundary with a visible ellipsis, never mid-word (STA-205). */
@@ -1274,21 +1295,10 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
     }))
     .sort((a, b) => Number(b.betaGap) - Number(a.betaGap));
 
-  // Level 1: founder questions first, then stuck work, then Done work whose PR nobody merges.
+  // Level 1 (founder direction 2026-11-09 13:50): stuck work with its reason first, then founder
+  // questions, then Done work whose PR nobody merges. Stuck lists stay short, so both reasons
+  // stay on the first screen (FAC-927).
   const attention: StapleConsoleAttentionItem[] = [];
-  for (const card of cards) {
-    for (const item of card.needsEthan) {
-      attention.push({
-        kind: "needs_you",
-        cardId: card.id,
-        identifier: item.issueIdentifier,
-        name: card.name,
-        text: item.question,
-        href: item.href,
-        linkLabel: item.kind === "approval" ? "Open approval" : item.kind === "assigned_to_user" ? "Open task" : "Answer",
-      });
-    }
-  }
   for (const card of cards) {
     const first = card.stuck[0];
     if (!first) continue;
@@ -1301,6 +1311,19 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
       href: `/issues/${first.issueIdentifier}`,
       linkLabel: "Open",
     });
+  }
+  for (const card of cards) {
+    for (const item of card.needsEthan) {
+      attention.push({
+        kind: "needs_you",
+        cardId: card.id,
+        identifier: item.issueIdentifier,
+        name: card.name,
+        text: item.question,
+        href: item.href,
+        linkLabel: item.kind === "approval" ? "Open approval" : item.kind === "assigned_to_user" ? "Open task" : "Answer",
+      });
+    }
   }
   for (const card of cards) {
     if (card.completion !== "task_done" || card.shipped) continue;
@@ -1385,18 +1408,29 @@ export function buildStapleConsoleBoard(input: StapleConsoleInput): StapleConsol
   return {
     generatedAt: input.now,
     issuePrefix: input.issuePrefix,
-    header: {
-      mergedToday: cards.filter((card) => card.mergedToday).length,
-      inFlight: cards.filter((card) => card.step === "build" || card.step === "ci" || card.step === "review").length,
-      needsEthan: cards.filter((card) => card.needsEthan.length > 0).length,
-      stuck: cards.filter((card) => card.stuck.length > 0).length,
-    },
+    header: stapleConsoleHeaderCounts(cards, attention),
     scheduled: input.scheduled,
     lanes,
     attention,
     capabilities,
     upNext,
     sources: input.sources,
+  };
+}
+
+/**
+ * Level 1 tiles, counted from the same lists the page shows (FAC-928): "Needs you" and "Stuck"
+ * count the rows in Needs attention, "Merged today" the Finished today rows merged today.
+ */
+export function stapleConsoleHeaderCounts(
+  cards: StapleConsoleCard[],
+  attention: StapleConsoleAttentionItem[],
+): StapleConsoleBoard["header"] {
+  return {
+    mergedToday: cards.filter((card) => card.mergedToday).length,
+    inFlight: cards.filter((card) => card.step === "build" || card.step === "ci" || card.step === "review").length,
+    needsEthan: attention.filter((item) => item.kind === "needs_you").length,
+    stuck: attention.filter((item) => item.kind === "stuck").length,
   };
 }
 

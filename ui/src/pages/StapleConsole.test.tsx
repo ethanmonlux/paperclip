@@ -79,7 +79,7 @@ describe("Staple Console progressive depth", () => {
       .toEqual(["0Merged today", "0In flight", "0Needs you", "0Stuck"]);
   });
 
-  it("pins founder questions before stuck work in Needs attention", async () => {
+  it("lists stuck work before founder questions in Needs attention, with a summary of every category", async () => {
     await render(board({
       issues: [
         issue({ id: "s", identifier: "STA-10", title: "FAC-818: Backpack art", status: "in_progress", startedAt: minutesAgo(120) }),
@@ -88,11 +88,61 @@ describe("Staple Console progressive depth", () => {
       runs: [{ id: "r", issueId: "q", agentId: "eng", status: "running", createdAt: minutesAgo(5), startedAt: minutesAgo(5), finishedAt: null, lastOutputAt: minutesAgo(1), errorCode: null, error: null }],
       interactions: [{ id: "i1", issueId: "q", kind: "ask_user_questions", status: "pending", question: "Ship the 3x art?", addresseeAgentId: null, createdAt: minutesAgo(5) }],
     }));
-    const items = q("[data-testid=staple-console-attention] li");
-    expect(items.map((item) => item.dataset.kind)).toEqual(["needs_you", "stuck"]);
-    expect(items[0]!.textContent).toContain("Ship the 3x art?");
-    expect(items[0]!.querySelector("a")?.textContent).toBe("Answer");
+    const items = q("[data-testid=staple-console-attention-item]");
+    expect(items.map((item) => item.dataset.kind)).toEqual(["stuck", "needs_you"]);
+    expect(items[1]!.textContent).toContain("Ship the 3x art?");
+    expect(items[1]!.querySelector("a")?.textContent).toBe("Answer");
+    expect(container.querySelector("[data-testid=staple-console-attention-summary-line]")?.textContent).toBe("· 1 stuck · 1 question for you");
     expect(container.querySelector("[data-testid=staple-console-all-clear]")).toBeNull();
+  });
+
+  // FAC-927: Level 1 stays one screen. Questions are one plain line with the full text a tap away,
+  // only five show before "more", and merges nobody owns fold into one counted row.
+  it("keeps Level 1 to one plain line per question, folds extra questions and unowned merges, and drops nothing", async () => {
+    const long = "**What:** live re-check of founder alerts. Last time the DM had no tappable link; `92585ac2` has the fix.";
+    const asks = Array.from({ length: 7 }, (_, index) => issue({ id: `q${index}`, identifier: `STA-${50 + index}`, title: `FAC-830: Ask ${index}`, status: "in_progress" }));
+    const done = Array.from({ length: 3 }, (_, index) => issue({ id: `d${index}`, identifier: `STA-${70 + index}`, title: `FAC-829: Done ${index}`, status: "done", completedAt: minutesAgo(30) }));
+    await render(board({
+      issues: [...asks, ...done],
+      runs: asks.map((ask) => ({ id: `r-${ask.id}`, issueId: ask.id, agentId: "eng", status: "running", createdAt: minutesAgo(5), startedAt: minutesAgo(5), finishedAt: null, lastOutputAt: minutesAgo(1), errorCode: null, error: null })),
+      interactions: asks.map((ask, index) => ({ id: `i${index}`, issueId: ask.id, kind: "ask_user_questions", status: "pending", question: index === 0 ? long : `Ship art ${index}?`, addresseeAgentId: null, createdAt: minutesAgo(5) })),
+      pullRequests: done.map((task, index) => ({
+        issueId: task.id, repo: "ethanmonlux/facette", number: 800 + index, url: `https://github.com/ethanmonlux/facette/pull/${800 + index}`,
+        state: "open", mergedAt: null, ci: "unknown", ciStartedAt: null, source: "work_product",
+      })),
+    }));
+    expect(container.querySelector("[data-testid=staple-console-attention-summary-line]")?.textContent).toBe("· 7 questions for you · 3 merges nobody owns");
+    expect(q("[data-testid=staple-console-attention-item]")).toHaveLength(5);
+    const first = q("[data-testid=staple-console-attention-item]")[0]!;
+    expect(first.querySelector("[data-testid=staple-console-attention-summary]")?.textContent).toBe("What: live re-check of founder alerts.");
+    expect(first.textContent).not.toContain("**");
+    await click(first.querySelector<HTMLElement>("[data-testid=staple-console-attention-more]")!);
+    expect(first.textContent).toContain("92585ac2 has the fix.");
+    expect(first.textContent).not.toContain("`");
+
+    await click(container.querySelector<HTMLElement>("[data-testid=staple-console-attention-more-questions]")!);
+    expect(q("[data-testid=staple-console-attention-item]")).toHaveLength(7);
+
+    const merges = container.querySelector<HTMLElement>("[data-testid=staple-console-attention-merges]")!;
+    expect(merges.textContent).toContain("3 finished tasks with no confirmed merge");
+    expect(merges.querySelectorAll("li")).toHaveLength(0);
+    await click(merges.querySelector<HTMLElement>("button[aria-expanded]")!);
+    expect(merges.querySelectorAll("li")).toHaveLength(3);
+    expect(merges.textContent).toContain("recorded open, merge not confirmed");
+  });
+
+  // FAC-928: a tile counts exactly the rows listed under it.
+  it("counts two questions on one card as two in Needs you, matching the rows", async () => {
+    await render(board({
+      issues: [issue({ id: "q", identifier: "STA-11", title: "FAC-830: Item art trees", status: "in_progress" })],
+      runs: [{ id: "r", issueId: "q", agentId: "eng", status: "running", createdAt: minutesAgo(5), startedAt: minutesAgo(5), finishedAt: null, lastOutputAt: minutesAgo(1), errorCode: null, error: null }],
+      interactions: ["Ship the 3x art?", "Keep the old frames?"].map((question, index) => ({
+        id: `i${index}`, issueId: "q", kind: "ask_user_questions", status: "pending", question, addresseeAgentId: null, createdAt: minutesAgo(5),
+      })),
+    }));
+    const tiles = q("[data-testid=staple-console-tiles] > div").map((tile) => tile.textContent);
+    expect(tiles).toContain("2Needs you");
+    expect(q("[data-testid=staple-console-attention-item][data-kind=needs_you]")).toHaveLength(2);
   });
 
   it("hides empty lanes as one muted line and keeps cards collapsed until tapped", async () => {
@@ -166,6 +216,80 @@ describe("Staple Console progressive depth", () => {
     const detail = rows[0]!.querySelector("[data-testid=staple-console-card-detail]");
     expect(detail?.textContent).toContain("PR and CI");
     expect(detail?.textContent).toContain("STA-30");
+  });
+
+  it("says how Finished today differs from Merged today", async () => {
+    await render(board({
+      issues: [
+        issue({ id: "m", identifier: "STA-30", title: "FAC-832: Self-serve accounts", status: "done", completedAt: minutesAgo(60) }),
+        issue({ id: "e", identifier: "STA-31", title: "FAC-829: Content packs", status: "done", completedAt: minutesAgo(60) }),
+        issue({ id: "n", identifier: "STA-32", title: "FAC-818: Backpack art", status: "done", completedAt: minutesAgo(60) }),
+      ],
+      pullRequests: [
+        { issueId: "m", repo: "ethanmonlux/facette", number: 900, url: "https://github.com/ethanmonlux/facette/pull/900", state: "merged", mergedAt: minutesAgo(70), ci: "success", ciStartedAt: null, source: "github" },
+        { issueId: "e", repo: "ethanmonlux/facette", number: 901, url: "https://github.com/ethanmonlux/facette/pull/901", state: "merged", mergedAt: minutesAgo(60 * 48), ci: "success", ciStartedAt: null, source: "github" },
+      ],
+    }));
+    expect(q("[data-testid=staple-console-tiles] > div")[0]!.textContent).toBe("1Merged today");
+    expect(container.querySelector("[data-testid=staple-console-shipped] h2")?.textContent).toBe("Finished today · 3");
+    expect(container.querySelector("[data-testid=staple-console-finished-breakdown]")?.textContent)
+      .toBe("1 merged today · 1 merged before today · 1 finished without a merge");
+  });
+
+  // FAC-929: the workstream's step is not a PR's; a PR state not read live says so; and the
+  // installed build is Staple's, so a Facette claim does not borrow it.
+  it("separates workstream and PR state, labels recorded PR state, and scopes the installed build to Staple", async () => {
+    const map = {
+      issueIdentifier: "STA-152", revisionNumber: 1, updatedAt: minutesAgo(5),
+      body: JSON.stringify({
+        groups: [
+          { key: "staple", label: "Staple, building itself", capabilities: [{ key: "merge", title: "Merges", claims: [{ text: "Merges land", why: "W.", issues: ["STA-60"] }] }] },
+          { key: "facette", label: "Facette", capabilities: [{ key: "face", title: "Face", claims: [{ text: "Kaia idles", why: "W.", issues: ["STA-61"] }] }] },
+        ],
+      }),
+    };
+    await render(board({
+      issues: [
+        issue({ id: "w", identifier: "STA-60", title: "FAC-829: Content packs", status: "in_progress" }),
+        issue({ id: "w2", identifier: "STA-62", title: "Pack docs", status: "todo", parentId: "w" }),
+        issue({ id: "f", identifier: "STA-61", title: "FAC-818: Kaia idle", status: "done", completedAt: minutesAgo(60 * 48) }),
+      ],
+      pullRequests: [
+        { issueId: "w", repo: "ethanmonlux/paperclip", number: 64, url: "https://github.com/ethanmonlux/paperclip/pull/64", state: "open", mergedAt: null, ci: "unknown", ciStartedAt: null, source: "work_product" },
+        { issueId: "f", repo: "ethanmonlux/facette", number: 720, url: "https://github.com/ethanmonlux/facette/pull/720", state: "merged", mergedAt: minutesAgo(60 * 49), ci: "success", ciStartedAt: null, source: "github" },
+      ],
+      capabilityMap: map,
+      installedBuild: "92585ac",
+    }));
+    const card = container.querySelector<HTMLElement>("[data-testid=staple-console-card]")!;
+    await click(card.querySelector<HTMLElement>("button[aria-expanded]")!);
+    expect(card.querySelector("[data-testid=staple-console-workstream-state]")?.textContent).toBe("Workstream at Build · 2 of 2 tasks open");
+    expect(card.textContent).toContain("paperclip#64 last recorded open · not checked live");
+
+    for (const capability of q("[data-testid=staple-console-capability]")) await click(capability.querySelector<HTMLElement>("button[aria-expanded]")!);
+    for (const claim of q("[data-testid=staple-console-claim]")) await click(claim.querySelector<HTMLElement>("button[aria-expanded]")!);
+    const proofs = q("[data-testid=staple-console-proof]").map((proof) => proof.textContent ?? "");
+    expect(proofs[0]).toContain("Installed Staple build: 92585ac");
+    expect(proofs[1]).not.toContain("92585ac");
+    expect(proofs[1]).toContain("Deployed build: not tracked here");
+  });
+
+  // FAC-930: a planned job Paperclip does not record is never shown as a definite time.
+  it("shows planned schedule entries as unverified with their source, apart from recorded monitors", async () => {
+    await render(board({
+      scheduled: [
+        { label: "2:30 maintenance hold", at: "2026-11-10T09:30:00.000Z", detail: null, source: "Founder schedule in FAC-620; this job is not recorded in Paperclip", available: false },
+        { label: "STA-5 monitor check", at: minutesAgo(-10), detail: "Last log entry " + minutesAgo(30), source: "Paperclip issue monitor", available: true },
+      ],
+    }));
+    const planned = container.querySelector("[data-testid=staple-console-schedule-planned]")!;
+    expect(planned.textContent).toContain("Planned, not verified here");
+    expect(planned.textContent).toMatch(/Planned .* · not verified/);
+    expect(planned.textContent).toContain("Source: Founder schedule in FAC-620");
+    const recorded = container.querySelector("[data-testid=staple-console-schedule-recorded]")!;
+    expect(recorded.textContent).toContain("STA-5 monitor check");
+    expect(recorded.textContent).toContain("Last log entry 30 min ago");
+    expect(recorded.textContent).not.toContain("not verified");
   });
 
   it("collapses Up next behind its count", async () => {
