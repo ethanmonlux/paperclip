@@ -353,18 +353,68 @@ describe("merge gate service", () => {
     expect(h.authorQueries.slice(0, 2)).toEqual([{ issueId: "task", excludeAgentId: null },
       { issueId: "task", excludeAgentId: null, sourceAuthorAgentIds: ["claude-engineer"], attesterAgentId: "codex-reviewer" }]);
 
-    // A commit trailer naming Codex is still Codex authorship, whatever the attestation says.
+    // A commit trailer naming Codex is still Codex authorship, whatever the
+    // attestation says, so the Codex attester is not cross-model.
     const codexCommit = fakeGitHub({ headChecks: accountWebCi,
       commitMessage: "fix: change\n\nCo-Authored-By: GPT-6 Codex <noreply@openai.com>" });
     await expect(evaluateAndMerge(sta287(codexCommit.github, [attested]).deps, request()))
-      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
+      .rejects.toThrow(/STA-300 does not qualify: .*cross-model/);
     // An attesting reviewer that ran on the task is a potential author.
     const ranThere = fakeGitHub({ headChecks: accountWebCi });
     await expect(evaluateAndMerge(sta287(ranThere.github, [attested],
       { "claude-engineer": ["anthropic"], coordinator: ["openai"], "codex-reviewer": ["openai"] }).deps, request()))
-      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent" }] });
+      .rejects.toThrow(/STA-300 does not qualify: .*worked on this task/);
     expect(codexCommit.merge).not.toHaveBeenCalled();
     expect(ranThere.merge).not.toHaveBeenCalled();
+
+    // A newer same-family attestation does not displace a qualifying one.
+    const sameFamily = review({ reviewIssueId: "claude-review", reviewIssueIdentifier: "STA-CLAUDE", reviewerAgentId: "claude-attester",
+      reviewerModelFamilies: ["anthropic"], sourceAuthorAgentIds: ["claude-engineer"] });
+    const both = fakeGitHub({ headChecks: accountWebCi });
+    await expect(evaluateAndMerge(sta287(both.github, [attested, sameFamily]).deps, request()))
+      .resolves.toMatchObject({ outcome: "merged" });
+    expect(both.merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let an ineligible attestation authorize a coordinator through another passing review (STA-364)", async () => {
+    // Codex coordinator created the task and ran on it; commits name no Codex.
+    const sta287 = (github: MergeGateGitHub, reviews: MergeReviewAttestation[], runFamilies?: Record<string, string[]>) => harness({
+      github, reviews, runFamilies: runFamilies ?? { "claude-engineer": ["anthropic"], coordinator: ["openai"] },
+      issues: [issue({ id: "task", createdByAgentId: "coordinator", assigneeAgentId: "claude-engineer", parentId: null })],
+    });
+    const paperclipCommit = { headChecks: accountWebCi, commitMessage: "fix: change\n\nCo-Authored-By: Paperclip <noreply@paperclip.ai>",
+      baseChecks: [{ ...ok("verify"), conclusion: "failure" }] };
+    // An independent Codex review with no attestation, and a newer Claude
+    // review by a non-custodian with no task run that leaves the coordinator out.
+    const unattested = review({ reviewIssueId: "codex-review", reviewIssueIdentifier: "STA-CODEX" });
+    const sameFamily = review({ reviewIssueId: "claude-review", reviewIssueIdentifier: "STA-CLAUDE", reviewerAgentId: "claude-attester",
+      reviewerModelFamilies: ["anthropic"], sourceAuthorAgentIds: ["claude-engineer"] });
+    const cases: Array<[string, MergeReviewAttestation[], RegExp, Record<string, string[]>?]> = [
+      ["same-family attestation plus unattested passing review", [unattested, sameFamily], /STA-CLAUDE does not qualify: .*cross-model/],
+      // An independent review naming the coordinator stands against a newer exclusion.
+      ["adverse independent attestation then same-family exclusion",
+        [review({ ...unattested, sourceAuthorAgentIds: ["claude-engineer", "coordinator"] }), sameFamily], /attests this agent as a source author/],
+      ["attester with no recorded model",
+        [unattested, review({ ...sameFamily, reviewerAgentId: "unknown-attester", reviewerModelFamilies: [] })], /does not qualify: .*recorded no model/],
+      ["attester that ran on the task", [unattested, review({ ...sameFamily, reviewerAgentId: "codex-attester", reviewerModelFamilies: ["openai"] })],
+        /does not qualify: .*worked on this task/, { "claude-engineer": ["anthropic"], coordinator: ["openai"], "codex-attester": ["openai"] }],
+      ["attester outside the merge bar", [unattested, review({ ...sameFamily, reviewerAgentId: "codex-attester", reviewerModelFamilies: ["openai"], p1: 1 })],
+        /does not qualify: .*1 P1/],
+    ];
+    for (const [name, reviews, message, runFamilies] of cases) {
+      const { github, merge } = fakeGitHub(paperclipCommit);
+      const h = sta287(github, reviews, runFamilies);
+      await expect(evaluateAndMerge(h.deps, request()), name).rejects.toThrow(message);
+      expect(h.owners.size, name).toBe(0);
+      expect(merge, name).not.toHaveBeenCalled();
+    }
+    // The board path does not narrow authorship with the ineligible list either.
+    const board = fakeGitHub({ ...paperclipCommit, baseChecks: undefined });
+    const h = sta287(board.github, [unattested, sameFamily]);
+    await expect(evaluateAndMerge(h.deps, request({ actor: { type: "board" }, dryRun: true })))
+      .resolves.toMatchObject({ outcome: "refused", reasons: [{ code: "review_not_independent", detail: expect.stringContaining("openai") },
+        { code: "review_not_independent", detail: expect.stringContaining("anthropic") }] });
+    expect(board.merge).not.toHaveBeenCalled();
   });
 
   it("refuses a coordinator that ran on the task without an attestation that leaves it out", async () => {
@@ -374,7 +424,9 @@ describe("merge gate service", () => {
       // A review of an older head attests nothing about this one.
       [[review({ reviewedSha: REVIEWED, sourceAuthorAgentIds: ["claude-engineer"] })], /ran on the task/],
       // The task's assignee cannot attest the source authors.
-      [[review({ reviewerAgentId: "claude-engineer", sourceAuthorAgentIds: ["coordinator"] })], /ran on the task/],
+      [[review({ reviewerAgentId: "claude-engineer", sourceAuthorAgentIds: ["claude-engineer-2"] })], /ran on the task/],
+      // Its claim that the coordinator authored source still stands against it.
+      [[review({ reviewerAgentId: "claude-engineer", sourceAuthorAgentIds: ["coordinator"] })], /attests this agent as a source author/],
       [[review({ sourceAuthorAgentIds: ["claude-engineer", "coordinator"] })], /attests this agent as a source author/],
     ];
     for (const [reviews, message] of cases) {

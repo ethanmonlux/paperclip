@@ -319,16 +319,44 @@ async function evaluateLocked(
     review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
     review.reviewedSha === headSha && review.sourceAuthorAgentIds?.length &&
     !review.sourceAuthorAgentIds.includes(review.reviewerAgentId));
-  const custodians = attestations.length > 0 ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
-  const sourceReview = custodians
-    ? attestations.reverse().find(review => !custodians.includes(review.reviewerAgentId!))
-    : undefined;
+  // Any exact-head attestation naming this coordinator as a source author
+  // stands, whichever review the gate would otherwise rely on.
+  const attestedAsAuthor = authority === "coordinator_with_task_runs" &&
+    attestations.some(review => review.sourceAuthorAgentIds!.includes(request.actor.agentId!));
+  const custodians = attestations.length > 0 && !attestedAsAuthor ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
+  const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
+  const authorFrom = (authorship: Awaited<ReturnType<MergeGateDependencies["loadTaskAuthorship"]>>, attested: boolean): MergeGateAuthor => ({
+    agentIds: authorship === null ? null
+      : [...new Set([...authorship.agentIds, ...(!attested && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
+    modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
+  });
+  // The attesting review must itself pass at the exact head against the
+  // authorship its list yields: independent, cross-model, with recorded
+  // provenance, and within the merge bar. Otherwise another passing review
+  // could launder an ineligible list. The newest qualifying attestation is used.
+  let sourceReview: MergeReviewAttestation | undefined;
+  let attestedAuthorship: Awaited<ReturnType<MergeGateDependencies["loadTaskAuthorship"]>> = null;
+  let unqualified: string | null = null;
+  for (const review of custodians ? [...attestations].reverse() : []) {
+    if (custodians!.includes(review.reviewerAgentId!)) continue;
+    const authorship = await deps.loadTaskAuthorship(request.companyId, {
+      issueId: issue.id, excludeAgentId: null, sourceAuthorAgentIds: review.sourceAuthorAgentIds!, attesterAgentId: review.reviewerAgentId!,
+    });
+    const problems = evaluateReviewCoverage({ pullRequest: label, headSha, author: authorFrom(authorship, true), reviews: [review],
+      deltaFor: () => ({ kind: "identical" }) });
+    if (problems.length === 0) {
+      sourceReview = review;
+      attestedAuthorship = authorship;
+      break;
+    }
+    unqualified ??= `${review.reviewIssueIdentifier ?? review.reviewIssueId} does not qualify: ${problems[0]!.detail}`;
+  }
   const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
   // Checked before anything below can open a red-main issue for this actor.
-  if (authority === "coordinator_with_task_runs" && (!sourceAuthorAgentIds || sourceAuthorAgentIds.includes(request.actor.agentId!))) {
-    throw forbidden(sourceAuthorAgentIds
-      ? "The implementer cannot merge its own task; the independent review attests this agent as a source author"
-      : `The implementer cannot merge its own task: this coordinator ran on the task, so it may merge only with a completed full review of ${headSha.slice(0, 12)} whose sourceAuthorAgentIds, written by a reviewer that never held or ran on the task, exclude it`);
+  if (authority === "coordinator_with_task_runs" && (attestedAsAuthor || !sourceAuthorAgentIds)) {
+    throw forbidden(attestedAsAuthor
+      ? "The implementer cannot merge its own task; an exact-head review attests this agent as a source author"
+      : `The implementer cannot merge its own task: this coordinator ran on the task, so it may merge only with a completed, passing, cross-model full review of ${headSha.slice(0, 12)} whose sourceAuthorAgentIds, written by a reviewer that never held or ran on the task, exclude it${unqualified ? ` (${unqualified})` : ""}`);
   }
 
   // Main stays green: CI red on the base head, or an open owner issue.
@@ -352,18 +380,11 @@ async function evaluateLocked(
   const requiredChecks = requiredPathScopedChecks({ policy, changedFiles });
   const ciReasons = evaluateHeadCi({ headSha, policy, checks: headChecks.checks, checksComplete: headChecks.complete, requiredChecks, changedFiles });
 
-  const authorship = await deps.loadTaskAuthorship(request.companyId, {
+  const authorship = sourceReview ? attestedAuthorship : await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentId: sourceAuthorAgentIds || authority === "handoff" ? null : request.actor.agentId ?? null,
-    sourceAuthorAgentIds,
-    ...(sourceReview?.reviewerAgentId ? { attesterAgentId: sourceReview.reviewerAgentId } : {}),
+    excludeAgentId: authority === "handoff" ? null : request.actor.agentId ?? null,
   });
-  const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
-  const author: MergeGateAuthor = {
-    agentIds: authorship === null ? null
-      : [...new Set([...authorship.agentIds, ...(!sourceAuthorAgentIds && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
-    modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
-  };
+  const author = authorFrom(authorship, Boolean(sourceReview));
   const deltas = new Map<string, HeadDelta>();
   for (const review of independentOfMerger) {
     if (!deltas.has(review.reviewedSha)) {
