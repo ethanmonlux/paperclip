@@ -12,7 +12,7 @@
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
 #   staple-nightly-upgrade backup-result OUTPUT RC          print the Gate 2 result for saved db:backup stdout
-#   staple-nightly-upgrade startup-logged SINCE             print whether the service journal shows startup recovery
+#   staple-nightly-upgrade startup-logged EPOCH             print whether the service journal shows startup recovery
 #
 # Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
@@ -70,11 +70,6 @@ else: print("green")
 PY
 }
 
-# Gate 2 result (STA-223). $1 = file holding the stdout of `paperclipai db:backup --json`, $2 = its exit code.
-# The CLI prints its banner and progress, then the metadata as pretty-printed JSON, then an outro, all on
-# stdout, so the metadata is found anywhere in the output rather than on one line. Prints one line:
-#   file:<path>        exit 0, metadata names an absolute backupFile that exists, is non-empty and has sizeBytes
-#   error:<reason>     anything else: nonzero exit, no metadata, missing, empty or mismatched file
 backup_result() {
   python3 - "$1" "$2" <<'PY'
 import json,os,re,sys
@@ -82,21 +77,40 @@ path,rc=sys.argv[1],sys.argv[2]
 if rc!="0": print("error:db:backup exited %s"%rc); sys.exit()
 try: text=re.sub(r"\x1b\[[0-9;?]*[A-Za-z]","",open(path,encoding="utf-8",errors="replace").read())
 except OSError as e: print("error:db:backup output unreadable (%s)"%str(e)[:80]); sys.exit()
-dec=json.JSONDecoder(); meta=None; i=text.find("{")
+def extent(i):
+    depth,quoted,esc=0,False,False
+    for j in range(i,len(text)):
+        c=text[j]
+        if quoted:
+            if esc: esc=False
+            elif c=="\\": esc=True
+            elif c=='"': quoted=False
+        elif c=='"': quoted=True
+        elif c=="{": depth+=1
+        elif c=="}":
+            depth-=1
+            if depth==0: return j+1
+    return len(text)
+dec=json.JSONDecoder(); found=[]; i=text.find("{")
 while i>=0:
     try: obj,end=dec.raw_decode(text,i)
-    except ValueError: end=i+1
+    except ValueError:
+        end=extent(i)
+        if '"backupFile"' in text[i:end]: print("error:incomplete backup metadata in db:backup output"); sys.exit()
     else:
-        if isinstance(obj,dict) and "backupFile" in obj: meta=obj
+        if isinstance(obj,dict) and "backupFile" in obj: found.append(obj)
     i=text.find("{",end)
-if meta is None: print("error:no backup metadata in db:backup output"); sys.exit()
+if not found: print("error:no backup metadata in db:backup output"); sys.exit()
+if len(found)>1: print("error:%d backup metadata records in db:backup output"%len(found)); sys.exit()
+meta=found[0]
 f=meta.get("backupFile")
 if not isinstance(f,str) or not os.path.isabs(f): print("error:backupFile is not an absolute path (%r)"%(f,)); sys.exit()
+want=meta.get("sizeBytes")
+if "sizeBytes" in meta and (type(want) is not int or want<0): print("error:sizeBytes is not a byte count (%r)"%(want,)); sys.exit()
 if not os.path.isfile(f): print("error:backup file missing (%s)"%f); sys.exit()
 size=os.path.getsize(f)
 if size<=0: print("error:backup file empty (%s)"%f); sys.exit()
-want=meta.get("sizeBytes")
-if isinstance(want,int) and not isinstance(want,bool) and want!=size:
+if want is not None and want!=size:
     print("error:backup file is %d bytes, db:backup reported %d (%s)"%(size,want,f)); sys.exit()
 print("file:%s"%f)
 PY
@@ -277,7 +291,8 @@ PY
 startup_logged() {
   local out err rc
   err=$(mktemp)
-  out=$(journalctl --user -u paperclipai --since "$1" --no-pager 2>"$err"); rc=$?
+  [[ "$1" =~ ^[0-9]+(\.[0-9]{1,6})?$ ]] || { echo "error:restart time is not epoch seconds ($1)"; rm -f "$err"; return 2; }
+  out=$(journalctl --user -u paperclipai --since "@$1" --no-pager 2>"$err"); rc=$?
   if [ $rc != 0 ]; then echo "error:journalctl exited $rc ($(head -c 200 "$err" | tr '\n' ' ' | sed 's/ *$//'))"; rm -f "$err"; return 2; fi
   rm -f "$err"
   if grep -qF "startup recovery complete" <<<"$out"; then echo logged; else echo waiting; return 1; fi
@@ -287,7 +302,7 @@ case "${1:-}" in
   ci-state) ci_state "${2:?check-runs JSON}" "${3:?workflow-runs JSON}"; exit $? ;;
   certified-pick) certified_pick "${2:?installed SHA}" "${3:?first-parent chain file}"; exit $? ;;
   backup-result) backup_result "${2:?db:backup output file}" "${3:?db:backup exit code}"; exit $? ;;
-  startup-logged) startup_logged "${2:?journalctl --since value}"; exit $? ;;
+  startup-logged) startup_logged "${2:?restart time, epoch seconds}"; exit $? ;;
   certified-target)
     CHAIN=$(mktemp); trap 'rm -f "$CHAIN"' EXIT
     first_parent_chain > "$CHAIN" || { echo "error:could not read $BRANCH history"; exit 1; }
@@ -505,7 +520,7 @@ while :; do
   sleep 60
 done
 
-# Gate 2: backup. Its stderr goes to the log; its stdout is kept whole for backup_result.
+# Gate 2: backup
 BK_OUT=$(mktemp)
 paperclipai db:backup --filename-prefix staple-nightly-pre-${TARGET:0:8} --json > "$BK_OUT"
 BK_RC=$?
@@ -528,7 +543,7 @@ if [ "$n" != "0" ]; then
   paperclipai update --rollback --yes
   report "Skipped: $n run(s) running at restart time" "New payload built but not activated; payload rolled back. Still running ${INSTALLED:0:8}. Hold released."; exit 0
 fi
-RESTART_AT=$(date '+%Y-%m-%d %H:%M:%S')
+RESTART_AT=$(date +%s.%6N)
 systemctl --user restart paperclipai
 ok=0; SEEN=; STARTUP=not-checked
 for i in $(seq 1 60); do

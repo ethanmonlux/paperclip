@@ -251,9 +251,6 @@ test("the 02:30 hold is placed when a newer certified commit is waiting", async 
   assert.equal(holds[0].reason, "nightly maintenance window");
 });
 
-// Gate 2 (STA-223): `paperclipai db:backup --json` prints its banner and progress, the metadata as
-// pretty-printed JSON, then an outro, all on stdout. Reading only the last line found nothing, so a
-// good backup was reported as failed and the certified upgrade stopped at the backup gate.
 const esc = (code, text) => `\x1b[${code}m${text}\x1b[39m`;
 function dbBackupStdout(meta) {
   return [
@@ -267,13 +264,12 @@ function dbBackupStdout(meta) {
   ].join("\n");
 }
 
-/** Saves db:backup stdout (and optionally a backup file) and asks the installer for the Gate 2 result. */
 function backupResult({ stdout, rc = 0, bytes, meta = (file) => ({ backupFile: file, sizeBytes: 12, prunedCount: 0 }) }) {
   const dir = mkdtempSync(path.join(tmpdir(), "staple-backup-"));
   try {
     const file = path.join(dir, "staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
     if (bytes !== undefined) writeFileSync(file, Buffer.alloc(bytes, 1));
-    writeFileSync(path.join(dir, "out"), stdout ?? dbBackupStdout(meta(file)));
+    writeFileSync(path.join(dir, "out"), typeof stdout === "function" ? stdout(file) : stdout ?? dbBackupStdout(meta(file)));
     const result = spawnSync("bash", [script, "backup-result", path.join(dir, "out"), String(rc)], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.trim().replace(dir, "<dir>");
@@ -284,7 +280,6 @@ function backupResult({ stdout, rc = 0, bytes, meta = (file) => ({ backupFile: f
 
 test("Gate 2 reads backupFile from the real db:backup output, not its last line", () => {
   const stdout = dbBackupStdout({ backupFile: "/b/x.sql.gz", sizeBytes: 12 });
-  // The old gate: `tail -1` of this output, grepped for "path or "file, never matched.
   assert.doesNotMatch(stdout.trimEnd().split("\n").at(-1), /"path|"file/);
   assert.equal(backupResult({ bytes: 12 }), "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
 });
@@ -307,12 +302,34 @@ test("Gate 2 fails closed on a nonzero exit even when the metadata looks good", 
 test("Gate 2 fails closed without readable metadata", () => {
   assert.equal(backupResult({ bytes: 12, stdout: "" }), "error:no backup metadata in db:backup output");
   assert.equal(backupResult({ bytes: 12, stdout: dbBackupStdout(undefined) }), "error:no backup metadata in db:backup output");
-  // Truncated JSON: the output stopped mid-object.
   assert.equal(backupResult({ bytes: 12, stdout: '{\n  "backupFile": "/b/x.sql.gz",\n  "sizeBytes": 1' }),
-    "error:no backup metadata in db:backup output");
+    "error:incomplete backup metadata in db:backup output");
   assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: "relative/x.sql.gz" }) }),
     "error:backupFile is not an absolute path ('relative/x.sql.gz')");
   assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: null }) }), "error:backupFile is not an absolute path (None)");
+});
+
+test("Gate 2 compares a supplied sizeBytes and refuses one that is not a byte count", () => {
+  for (const [sizeBytes, shown] of [["12", "'12'"], [12.5, "12.5"], [null, "None"], [true, "True"], [-1, "-1"], [[12], "[12]"]]) {
+    assert.equal(backupResult({ bytes: 7, meta: (file) => ({ backupFile: file, sizeBytes }) }),
+      `error:sizeBytes is not a byte count (${shown})`);
+  }
+  assert.equal(backupResult({ bytes: 12, meta: (file) => ({ backupFile: file, sizeBytes: 12.0 }) }),
+    "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+});
+
+test("Gate 2 refuses competing or incomplete backup metadata and ignores unrelated braces", () => {
+  const record = (file, sizeBytes = 7) => JSON.stringify({ backupFile: file, sizeBytes });
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `${record(file)}\n{"backupFile":"/missing","sizeBytes":` }),
+    "error:incomplete backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `{"incomplete":${record(file)}` }),
+    "error:incomplete backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `${record("/missing", 10)}\n${record(file)}\n` }),
+    "error:2 backup metadata records in db:backup output");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `${record(file)}\n${record(file)}\n` }),
+    "error:2 backup metadata records in db:backup output");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `pid {4242} {"a": "}{"}\n{"wrapped": ${record("/missing")}}\n${record(file)}\n{not json}\n` }),
+    "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
 });
 
 test("Gate 2 fails closed when the named backup file is missing, empty or the wrong size", () => {
@@ -323,24 +340,31 @@ test("Gate 2 fails closed when the named backup file is missing, empty or the wr
     "error:backup file is 7 bytes, db:backup reported 12 (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
 });
 
-function startupLogged(journal, since = "2026-11-13 00:09:45") {
+const RESTART = 1794529785.5;
+const DENVER_FOLD = [1793518200, 1793521800];
+
+function startupLogged(journal, since = String(RESTART)) {
   const dir = mkdtempSync(path.join(tmpdir(), "staple-journal-"));
   try {
-    const lines = Array.from({ length: 20000 }, (_, i) => `Nov 13 00:09:${String(i % 60).padStart(2, "0")} host paperclipai[1]: request ${i} served`).join("\n");
-    const marker = "Nov 13 00:09:57 host paperclipai[1]: Server startup recovery complete";
+    const at = journal.at ?? RESTART;
+    const lines = Array.from({ length: 20000 }, (_, i) => `${(at + 1 + i / 1000).toFixed(6)} host paperclipai[2]: request ${i} served`).join("\n");
+    const marker = (t) => `${t.toFixed(6)} host paperclipai[2]: Server startup recovery complete`;
     const bodies = {
-      early: `${marker}\n${lines}\n`,
-      late: `${lines}\n${marker}\n`,
+      early: `${marker(at + 0.5)}\n${lines}\n`,
+      late: `${lines}\n${marker(at + 30)}\n`,
       missing: `${lines}\n`,
       empty: "",
+      previous: `${marker(at - 3600)}\n${marker(at - 0.25)}\n${lines}\n`,
     };
     writeFileSync(path.join(dir, "journal"), bodies[journal.body] ?? "");
     writeFileSync(path.join(dir, "journalctl"), [
       "#!/usr/bin/env bash",
       `printf '%s\\n' "$@" > "${path.join(dir, "args")}"`,
+      'since=; prev=; for a in "$@"; do [ "$prev" = --since ] && since=$a; prev=$a; done',
       journal.fail
         ? `cat "${path.join(dir, "journal")}"; echo "Failed to open journal: Permission denied" >&2; exit ${journal.fail}`
-        : `exec cat "${path.join(dir, "journal")}"`,
+        : `[[ "$since" == @* ]] || exec cat "${path.join(dir, "journal")}"`,
+      `exec python3 -c 'import sys\nfor l in open(sys.argv[2]):\n    if float(l.split()[0])>=float(sys.argv[1]): sys.stdout.write(l)' "\${since#@}" "${path.join(dir, "journal")}"`,
       "",
     ].join("\n"), { mode: 0o755 });
     const { BASH_ENV, ...inherited } = process.env;
@@ -360,13 +384,42 @@ test("Gate 3 sees startup recovery logged early in a large journal", () => {
   const result = startupLogged({ body: "early" });
   assert.match(result.old, /^141 /);
   assert.deepEqual([result.out, result.status], ["logged", 0]);
-  assert.deepEqual(result.args, ["--user", "-u", "paperclipai", "--since", "2026-11-13 00:09:45", "--no-pager"]);
+  assert.deepEqual(result.args, ["--user", "-u", "paperclipai", "--since", `@${RESTART}`, "--no-pager"]);
   assert.deepEqual([startupLogged({ body: "late" }).out, startupLogged({ body: "late" }).status], ["logged", 0]);
 });
 
 test("Gate 3 keeps waiting while the marker is not in the journal", () => {
   assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "missing" }))), ["waiting", 1]);
   assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "empty" }))), ["waiting", 1]);
+});
+
+test("Gate 3 ignores a startup marker logged before the restart instant", () => {
+  assert.deepEqual([startupLogged({ body: "previous" }).out, startupLogged({ body: "previous" }).status], ["waiting", 1]);
+});
+
+test("Gate 3 keeps the window at the restart through a repeated daylight-saving hour", () => {
+  const [first, second] = DENVER_FOLD;
+  const local = (t) => spawnSync("date", ["-d", `@${t}`, "+%Y-%m-%d %H:%M:%S"], { encoding: "utf8", env: { ...process.env, TZ: "America/Denver" } }).stdout.trim();
+  assert.equal(local(first), local(second));
+  const result = startupLogged({ body: "previous", at: second }, String(second));
+  assert.deepEqual([result.out, result.status], ["waiting", 1]);
+  assert.equal(result.args[4], `@${second}`);
+  assert.deepEqual([startupLogged({ body: "late", at: second }, String(second)).out], ["logged"]);
+});
+
+test("Gate 3 refuses a restart time that is not epoch seconds", () => {
+  for (const since of ["2026-11-01 01:30:00", "-6min", "@1794529785", "1794529785.1234567"]) {
+    const result = spawnSync("bash", [script, "startup-logged", since], { encoding: "utf8" });
+    assert.equal(result.status, 2);
+    assert.equal(result.stdout.trim(), `error:restart time is not epoch seconds (${since})`);
+  }
+});
+
+test("journalctl accepts the restart instant the installer records", { skip: spawnSync("journalctl", ["--version"]).status !== 0 }, () => {
+  const now = spawnSync("date", ["+%s.%6N"], { encoding: "utf8" }).stdout.trim();
+  assert.match(now, /^\d+\.\d{6}$/);
+  const result = spawnSync("journalctl", ["--since", `@${now}`, "--until", `@${now}`, "--no-pager", "-q"], { encoding: "utf8" });
+  assert.doesNotMatch(result.stderr, /Failed to parse/);
 });
 
 test("Gate 3 fails closed when journalctl fails, even after printing the marker", () => {

@@ -49,10 +49,13 @@ classify saved GitHub responses, run `staple-nightly-upgrade ci-state CHECKS.jso
 It has no side effects.
 
 After the restart, Gate 3 waits up to 5 minutes for `/api/health` to report the target commit and for
-the service journal to log `startup recovery complete` since the restart. The journal is read whole
-before the match, because `journalctl | grep -q` under `pipefail` exits 141 when `grep` stops at an
-early match. A journal that cannot be read is an error, never a pass. To check the journal by hand,
-run `staple-nightly-upgrade startup-logged 'YYYY-MM-DD HH:MM:SS'`. It prints `logged`, `waiting` or
+the service journal to log `startup recovery complete` since the restart. The restart instant is
+recorded as Unix epoch seconds with microseconds and passed to `journalctl --since @EPOCH`, so a local
+wall-clock time repeated by a daylight-saving change cannot widen the window to an earlier start. The
+journal is read whole before the match, because `journalctl | grep -q` under `pipefail` exits 141 when
+`grep` stops at an early match. A journal that cannot be read is an error, never a pass. To check the
+journal by hand, run `staple-nightly-upgrade startup-logged EPOCH` (for example
+`$(date -d '10 min ago' +%s)`). It prints `logged`, `waiting` or
 `error:<reason>` and has no side effects. An unknown argument exits 2 before any upgrade step.
 
 Activation is outside agent runs: copy the script to `~/.local/bin/staple-nightly-upgrade`, and add
