@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
 import { DEFAULT_RESTORE_POINT_LIMITS } from "./git-restore-point.js";
 
 export const TASK_DIRECTORY_RETENTION_KEY = "isolatedTaskDirectoryRetention";
@@ -277,7 +277,7 @@ export async function materializeTaskDirectorySnapshot(input: { payload: Buffer;
   }
 }
 
-const MAX_CHANGED_SCAN_ENTRIES = 200_000;
+const MAX_WALK_ENTRIES = 200_000;
 
 function missing<T>(fallback: T) {
   return (error: NodeJS.ErrnoException) => {
@@ -286,74 +286,156 @@ function missing<T>(fallback: T) {
   };
 }
 
-/** Regular files and symlinks under `root` whose status-change time is at or
- * after `sinceMs`. Every write, rename or link advances that time and no
- * process can set it back, so this lists work done since then. Directories
- * are skipped, because removing their entries advances their own times, and
- * so is a regenerable node_modules beside a package.json, which snapshots
- * never save. Returns null when the folder is too large to scan. */
-export async function taskDirectoryFilesChangedSince(root: string, sinceMs: number,
-  options: { signal?: AbortSignal; maxEntries?: number } = {}): Promise<string[] | null> {
-  const maxEntries = options.maxEntries ?? MAX_CHANGED_SCAN_ENTRIES;
-  const changed: string[] = [];
+const REMOVAL_RECORD_SCHEMA = "paperclip.task-directory-removal.v1";
+
+const identity = (stat: BigIntStats) => `${stat.dev}:${stat.ino}`;
+
+/** A regenerable node_modules beside a package.json, which snapshots never
+ * save and checks before removal ignore. */
+async function regenerableDependencies(root: string, relativeDir: string, names: string[]) {
+  if (!names.includes("node_modules") || !names.includes("package.json")) return false;
+  return Boolean((await fs.lstat(path.join(root, relativeDir, "package.json")).catch(missing(null)))?.isFile());
+}
+
+/** Walk `root` in order until `visitEntry` returns false, skipping
+ * dependencies: the regenerable ones, reported to `onSkip`, or only the
+ * `recorded` ones, by path and inode. Returns false when it holds more than
+ * `maxEntries` entries. */
+async function walkTaskDirectory(root: string, visitEntry: (relative: string, stat: BigIntStats) => boolean,
+  options: { signal?: AbortSignal; maxEntries?: number; recorded?: Map<string, string>; onSkip?: (relative: string, stat: BigIntStats) => void }) {
+  const maxEntries = options.maxEntries ?? MAX_WALK_ENTRIES;
   let scanned = 0;
+  let stopped = false;
   const visit = async (relativeDir: string): Promise<boolean> => {
     options.signal?.throwIfAborted();
     const names = (await fs.readdir(relativeDir ? path.join(root, relativeDir) : root).catch(missing<string[]>([]))).sort(bySortKey);
-    const manifest = names.includes("package.json")
-      ? await fs.lstat(path.join(root, relativeDir, "package.json")).catch(missing(null)) : null;
+    const skipDependencies = !options.recorded && await regenerableDependencies(root, relativeDir, names);
     for (const name of names) {
       if (++scanned > maxEntries) return false;
       const relative = relativeDir ? `${relativeDir}/${name}` : name;
-      const stat = await fs.lstat(path.join(root, relative)).catch(missing(null));
+      const stat = await fs.lstat(path.join(root, relative), { bigint: true }).catch(missing(null));
       if (!stat) continue;
-      if (stat.isDirectory()) {
-        if (name === "node_modules" && manifest?.isFile()) continue;
-        if (!await visit(relative)) return false;
-      } else if ((stat.isFile() || stat.isSymbolicLink()) && Math.max(stat.ctimeMs, stat.mtimeMs) >= sinceMs) {
-        changed.push(relative);
+      if (name === "node_modules" && skipDependencies && stat.isDirectory()) {
+        options.onSkip?.(relative, stat);
+        continue;
       }
+      if (stat.isDirectory() && options.recorded?.get(relative) === identity(stat)) continue;
+      if (!visitEntry(relative, stat)) stopped = true;
+      else if (stat.isDirectory() && !await visit(relative)) return false;
+      if (stopped) return true;
     }
     return true;
   };
-  return await visit("") ? changed : null;
+  return visit("");
 }
 
-/** Copy the listed files and symlinks from `source` over the same paths in
- * `target`, replacing whatever is there, so later work wins. */
-export async function overlayTaskDirectoryFiles(source: string, target: string, relatives: string[], signal?: AbortSignal) {
-  const writableDirectory = async (directory: string) => {
-    const stat = await fs.lstat(directory).catch(missing(null));
-    if (stat && !stat.isDirectory()) await fs.rm(directory, { force: true });
-    if (!stat?.isDirectory()) await fs.mkdir(directory, { mode: 0o755 });
-    else if ((stat.mode & 0o700) !== 0o700) await fs.chmod(directory, (stat.mode & 0o777) | 0o700);
-  };
-  for (const relative of relatives) {
-    signal?.throwIfAborted();
-    const parts = relative.split("/");
-    let directory = target;
-    for (const part of parts.slice(0, -1)) {
-      directory = path.join(directory, part);
-      await writableDirectory(directory);
-    }
-    const from = path.join(source, ...parts);
-    const to = path.join(target, ...parts);
-    const stat = await fs.lstat(from).catch(missing(null));
-    if (!stat || !(stat.isFile() || stat.isSymbolicLink())) continue;
-    await fs.rm(to, { recursive: true, force: true });
-    if (stat.isSymbolicLink()) {
-      await fs.symlink(await fs.readlink(from), to);
-      continue;
-    }
-    const input = await fs.open(from, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const output = await fs.open(to, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
-      stat.mode & 0o777).catch(async (error: unknown) => {
-      await input.close();
-      throw error;
-    });
-    // The streams own and close both handles, also when the copy fails.
-    await pipeline(input.createReadStream(), output.createWriteStream(), signal ? { signal } : {});
+/** Every directory in `root` by path and inode, taken before the check that
+ * precedes removal. A restart compares what is left against it: a directory
+ * moved in later keeps its old file times but not an inode from this list.
+ * The regenerable dependencies skipped are listed too, also by inode, so a
+ * restart still skips one whose package.json the removal already deleted but
+ * never one made or moved in later. Null when the folder is too large to
+ * record. */
+export async function recordTaskDirectoryDirectories(root: string, options: { signal?: AbortSignal; maxEntries?: number } = {}) {
+  const rootStat = await fs.lstat(root, { bigint: true });
+  const directories: Array<[string, string]> = [["", identity(rootStat)]];
+  const dependencies: Array<[string, string]> = [];
+  const complete = await walkTaskDirectory(root, (relative, stat) => {
+    if (stat.isDirectory()) directories.push([relative, identity(stat)]);
+    return true;
+  }, { ...options, onSkip: (relative, stat) => dependencies.push([relative, identity(stat)]) });
+  return complete ? JSON.stringify({ schema: REMOVAL_RECORD_SCHEMA, directories, dependencies }) : null;
+}
+
+/** Durably write a removal record and return its digest. */
+export async function writeTaskDirectoryRemovalRecord(file: string, record: string) {
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  const handle = await fs.open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(record);
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
+  await fs.rename(temporary, file);
+  const directory = await fs.open(path.dirname(file), "r");
+  try { await directory.sync(); } finally { await directory.close(); }
+  return createHash("sha256").update(record).digest("hex");
+}
+
+/** The removal record with this digest, or null when it is missing or differs. */
+export async function readTaskDirectoryRemovalRecord(file: string, digest: string) {
+  const record = await fs.readFile(file, "utf8").catch(missing(null));
+  return record !== null && createHash("sha256").update(record).digest("hex") === digest ? record : null;
+}
+
+/** What is left of a partly removed folder holds nothing but what the removal
+ * began with: every directory is one recorded before the check, at the same
+ * path, and no file, symlink or other entry changed since `sinceMs`. Every
+ * write, rename or link advances an entry's status-change time and no process
+ * can set it back. Directory times are not compared, because removing their
+ * entries advances them. */
+export async function taskDirectoryRemainderUnchanged(root: string, sinceMs: number, record: string,
+  options: { signal?: AbortSignal; maxEntries?: number } = {}) {
+  const parsed = JSON.parse(record) as { schema?: string; directories?: Array<[string, string]>; dependencies?: Array<[string, string]> };
+  if (parsed.schema !== REMOVAL_RECORD_SCHEMA || !Array.isArray(parsed.directories) || !Array.isArray(parsed.dependencies)) return false;
+  const directories = new Map(parsed.directories);
+  if (directories.get("") !== identity(await fs.lstat(root, { bigint: true }))) return false;
+  const since = BigInt(Math.floor(sinceMs)) * 1_000_000n;
+  let unchanged = true;
+  const complete = await walkTaskDirectory(root, (relative, stat) => {
+    unchanged = stat.isDirectory() ? directories.get(relative) === identity(stat)
+      : (stat.ctimeNs > stat.mtimeNs ? stat.ctimeNs : stat.mtimeNs) < since;
+    return unchanged;
+  }, { ...options, recorded: new Map(parsed.dependencies) });
+  // The walk stops at the first changed entry, so `unchanged` is final.
+  return complete && unchanged;
+}
+
+const NO_REPLACE = new Set(["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]);
+
+/** Link into `target` every entry of `source` that `target` lacks, never
+ * replacing anything there: a missing directory is created and filled, and a
+ * missing file or symlink is hard-linked, both of which fail rather than
+ * replace an entry made meanwhile. A partly removed folder keeps all it still
+ * holds, including work written into it while this runs, and gains the rest
+ * of the rebuilt folder. Directories take the mode saved in `source`. Both
+ * folders must be on one filesystem. */
+export async function fillMissingTaskDirectoryEntries(source: string, target: string, signal?: AbortSignal) {
+  const keep = (error: NodeJS.ErrnoException) => {
+    if (NO_REPLACE.has(error.code ?? "")) return false;
+    throw error;
+  };
+  const writable = async (directory: string, mode: number) => {
+    if ((mode & 0o700) !== 0o700) await fs.chmod(directory, (mode & 0o7777) | 0o700);
+  };
+  const visit = async (from: string, to: string) => {
+    signal?.throwIfAborted();
+    for (const name of (await fs.readdir(from)).sort(bySortKey)) {
+      const fromEntry = path.join(from, name);
+      const toEntry = path.join(to, name);
+      const stat = await fs.lstat(fromEntry);
+      if (!stat.isDirectory()) {
+        if (!await fs.lstat(toEntry).catch(missing(null))) await fs.link(fromEntry, toEntry).catch(keep);
+        continue;
+      }
+      await fs.mkdir(toEntry, { mode: 0o700 }).catch(keep);
+      const current = await fs.lstat(toEntry).catch(missing(null));
+      if (!current?.isDirectory()) continue;
+      await writable(fromEntry, stat.mode);
+      await writable(toEntry, current.mode);
+      await visit(fromEntry, toEntry);
+      await fs.chmod(toEntry, stat.mode & 0o7777);
+    }
+  };
+  const targetStat = await fs.lstat(target);
+  if (!targetStat.isDirectory()) throw new Error("unsafe_task_directory_trash");
+  const sourceMode = (await fs.lstat(source)).mode;
+  await writable(source, sourceMode);
+  await writable(target, targetStat.mode);
+  await visit(source, target);
+  await fs.chmod(target, sourceMode & 0o7777);
 }
 
 export async function removeTaskDirectoryTree(target: string) {

@@ -380,17 +380,23 @@ leaves the folder under its `.expired-` name, where a process still inside it ca
 working, so the later sweep checks that renamed folder the same way, locally, before
 deleting it. If it changed, it is renamed back, the workspace is made active again and the
 restore point is dropped (`task_directory_changed`). When deletion begins, the intent
-records `removalCheckedAt`: the time the check before it started. A sweep after a stop at
-any point from there no longer compares the remainder with the saved files, because part
-of it may be gone. It finishes the deletion only if no file or symlink left in the folder
-changed since `removalCheckedAt`. A file's change time advances on every write, rename or
-link and cannot be set back. Anything newer is later work by a process still inside the
-folder, so the sweep keeps the folder and the intent (`task_directory_later_work`), and the
-trash sweep never deletes a pending intent's `.expired-` folder. Reopening renames an
-`.expired-` folder whose deletion never began back as it is. A partly deleted one is
-rebuilt from the restore point in staging, the files written since `removalCheckedAt` are
-copied over it, and only then is the remainder deleted, so the later commit or edit is
-kept.
+records `removalCheckedAt`: the time the check before it started. Beside the task folders,
+out of reach of a process inside one, it also keeps a record of every directory the folder
+held when the check began, by path and inode, and the intent holds that record's digest.
+A sweep after a stop at any point from there no longer compares the remainder with the
+saved files, because part of it may be gone. It finishes the deletion only if every
+directory left is one in the record, at the same path, and no file or symlink left changed
+since `removalCheckedAt`. A file's change time advances on every write, rename or link and
+cannot be set back; a directory moved in keeps its files' older times but not an inode from
+the record. Anything else, including a missing or altered record, is later work by a
+process still inside the folder, so the sweep keeps the folder and the intent
+(`task_directory_later_work`), and the trash sweep never deletes a pending intent's
+`.expired-` folder. Reopening renames an `.expired-` folder whose deletion never began back
+as it is. A partly deleted one is rebuilt from the restore point in staging and then filled
+in from staging without replacing or removing anything it holds: a missing directory is
+created, a missing file is hard-linked, and both fail rather than replace an entry made
+meanwhile. The folder is then renamed into place, so later work, including a write during
+the reopen's fetch, is kept.
 
 Reopening the workspace restores the directory before anything uses it: a comment or an
 agent update on an issue bound to a closed `isolated_workspace`, or the next run of the

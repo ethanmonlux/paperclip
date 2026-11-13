@@ -40,11 +40,13 @@ import type { GitRemoteAuthProvider } from "../services/git-credentials.js";
 
 // Reopen and live sweeps resolve repository access through the task's
 // provider; route every fixture GitHub origin to its local upstream instead.
-const gitFixture = vi.hoisted(() => ({ upstreams: new Map<string, string>(), calls: 0 }));
+const gitFixture = vi.hoisted(() => ({ upstreams: new Map<string, string>(), calls: 0,
+  beforeFetch: null as (() => Promise<void>) | null }));
 vi.mock("../services/git-credentials.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/git-credentials.js")>(),
   createIssueGitRemoteAuthProvider: () => async () => {
     gitFixture.calls += 1;
+    await gitFixture.beforeFetch?.();
     return { env: {}, source: "managed_connection" as const, secretName: null,
       configArgs: [...gitFixture.upstreams].flatMap(([remote, upstream]) => ["-c", `url.${upstream}.insteadOf=${remote}`]) };
   },
@@ -135,14 +137,14 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     return { companyId, issueId, workspaceId, agentId, cwd, row, ledger, service, expire, reopen };
   }
 
-  async function expectRestored(cwd: string) {
-    expect(await fs.readFile(path.join(cwd, "report.md"), "utf8")).toBe("final report\n");
+  async function expectRestored(cwd: string, options: { dependencies?: boolean; report?: string } = {}) {
+    expect(await fs.readFile(path.join(cwd, "report.md"), "utf8")).toBe(options.report ?? "final report\n");
     expect(await fs.readFile(path.join(cwd, "nested", "deeper", "data.json"), "utf8")).toBe("{\"value\":1}\n");
     expect((await fs.stat(path.join(cwd, "run.sh"))).mode & 0o777).toBe(0o755);
     expect((await fs.lstat(path.join(cwd, "outside-link"))).isSymbolicLink()).toBe(true);
     expect(await fs.readlink(path.join(cwd, "outside-link"))).toBe(outside);
     expect(await exists(path.join(cwd, "package.json"))).toBe(true);
-    expect(await exists(path.join(cwd, "node_modules"))).toBe(false);
+    expect(await exists(path.join(cwd, "node_modules", "dep", "index.js"))).toBe(options.dependencies ?? false);
   }
 
   it("archives and removes a closed issue's task directory after the delay and restores it on reopen", async () => {
@@ -373,7 +375,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
   }
 
   describe("code-delivered task folders", () => {
-    afterEach(() => { gitFixture.upstreams.clear(); gitFixture.calls = 0; });
+    afterEach(() => { gitFixture.upstreams.clear(); gitFixture.calls = 0; gitFixture.beforeFetch = null; });
 
     it("previews a proven folder as a candidate while routine dry runs stay remote-free", async () => {
       const f = await codeDeliveredFixture();
@@ -537,6 +539,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await expectExactCheckouts(f);
     }, 60_000);
 
+    it("finishes a partial removal that deleted the package.json beside its dependencies", async () => {
+      const f = await codeDeliveredFixture();
+      await fs.mkdir(path.join(f.cwd, "node_modules", "dep", "lib"), { recursive: true });
+      const state = await stopRemoval(f, async trash => { await fs.rm(path.join(trash, "package.json")); });
+      expect(await exists(path.join(state.trash, "node_modules", "dep", "lib"))).toBe(true);
+      gitFixture.calls = 0;
+      expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, skipReason: null });
+      expect(await f.service().sweepTerminalWorkspaces()).toMatchObject({ archived: 1 });
+      expect(gitFixture.calls).toBe(0);
+      expect(await exists(state.trash)).toBe(false);
+      expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: true });
+    }, 60_000);
+
     /** Commit new unpublished work in the delivered checkout inside `folder`. */
     async function commitLateWork(folder: string) {
       const moved = path.join(folder, "repo");
@@ -557,9 +572,8 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       return state;
     }
 
-    /** A restart must keep work made in the trash after its removal began,
-     * then reopen with that work on top of the restored folder. */
-    async function expectLaterWorkKept(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, trash: string, late: string) {
+    /** A restart must keep work made in the trash after its removal began. */
+    async function expectRemainderKept(f: Awaited<ReturnType<typeof codeDeliveredFixture>>) {
       gitFixture.calls = 0;
       expect(await f.expire({ dryRun: true })).toMatchObject({ expired: false, skipReason: "task_directory_later_work" });
       expect(await f.expire()).toMatchObject({ expired: false, skipReason: "task_directory_later_work" });
@@ -568,18 +582,30 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await sweepIsolatedTaskDirectories(db, { dryRun: false, now: new Date(Date.now() + 2 * DAY_MS), orphanGraceMs: 7 * DAY_MS,
         terminalDelayMs: 3 * DAY_MS, restorePoint: { storage: getStorageService(), keyDurable: true } });
       expect(gitFixture.calls).toBe(0);
-      expect(git(path.join(trash, "repo"), "rev-parse", "HEAD")).toBe(late);
       expect(readTaskDirectoryRetention(await f.row())).toMatchObject({ removed: false });
+    }
 
+    /** Reopen keeps the partly removed folder itself, filled in from the
+     * restore point, with its later work and nothing left in staging. */
+    async function expectReopenedWithRemainder(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, trash: string,
+      options: { report?: string } = {}) {
       expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
       expect(await exists(trash)).toBe(false);
-      await expectRestored(f.cwd);
+      expect((await fs.readdir(path.dirname(f.cwd))).filter(name => name.startsWith(".restoring-"))).toEqual([]);
+      await expectRestored(f.cwd, { dependencies: true, report: options.report });
+      expect(git(f.library.checkout, "rev-parse", "HEAD")).toBe(f.library.head);
+      expect(git(f.library.checkout, "status", "--porcelain")).toBe("");
+      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
+    }
+
+    async function expectLaterWorkKept(f: Awaited<ReturnType<typeof codeDeliveredFixture>>, trash: string, late: string) {
+      await expectRemainderKept(f);
+      expect(git(path.join(trash, "repo"), "rev-parse", "HEAD")).toBe(late);
+      await expectReopenedWithRemainder(f, trash);
       expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(late);
       expect(git(f.delivered.checkout, "rev-parse", "HEAD^")).toBe(f.delivered.head);
       expect(git(f.delivered.checkout, "status", "--porcelain")).toBe("");
       expect(await fs.readFile(path.join(f.delivered.checkout, "late.txt"), "utf8")).toBe("late work\n");
-      expect(git(f.library.checkout, "rev-parse", "HEAD")).toBe(f.library.head);
-      expect(readTaskDirectoryRetention(await f.row())).toBeNull();
     }
 
     it("keeps a commit made in the trash after the removal marker but before any deletion", async () => {
@@ -596,6 +622,96 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       });
       expect(await exists(path.join(state.trash, "report.md"))).toBe(false);
       await expectLaterWorkKept(f, state.trash, await commitLateWork(state.trash));
+    }, 90_000);
+
+    it("keeps older directories moved into a partly removed folder", async () => {
+      const f = await codeDeliveredFixture();
+      // Made before the removal check, so every file keeps an older change time.
+      const older = async (name: string) => {
+        const folder = path.join(root, `older-${randomUUID()}`);
+        await fs.mkdir(path.join(folder, "inner"), { recursive: true });
+        await fs.writeFile(path.join(folder, "inner", `${name}.txt`), `${name} work\n`);
+        return folder;
+      };
+      const outer = await older("outer"), inCheckout = await older("checkout");
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const state = await stopRemoval(f, async trash => {
+        await fs.rm(path.join(trash, "report.md"));
+        await fs.rm(path.join(trash, "vendor"), { recursive: true, force: true });
+      });
+      // Only the moved directories themselves change: nothing inside them is
+      // newer than the check, so file times alone cannot reveal them.
+      const checkedAt = Date.parse(state.removalCheckedAt!);
+      for (const folder of [outer, inCheckout]) {
+        for (const entry of [path.join(folder, "inner"), ...(await fs.readdir(path.join(folder, "inner"))).map(name => path.join(folder, "inner", name))]) {
+          const stat = await fs.lstat(entry);
+          expect(Math.max(stat.ctimeMs, stat.mtimeMs)).toBeLessThan(checkedAt);
+        }
+      }
+      await fs.rename(outer, path.join(state.trash, "nested", "moved"));
+      await fs.rename(inCheckout, path.join(state.trash, "repo", "moved"));
+      expect(await fs.readFile(path.join(state.trash, "nested", "moved", "inner", "outer.txt"), "utf8")).toBe("outer work\n");
+      await expectRemainderKept(f);
+      expect(await fs.readFile(path.join(state.trash, "repo", "moved", "inner", "checkout.txt"), "utf8")).toBe("checkout work\n");
+
+      await expectReopenedWithRemainder(f, state.trash);
+      expect(await fs.readFile(path.join(f.cwd, "nested", "moved", "inner", "outer.txt"), "utf8")).toBe("outer work\n");
+      expect(await fs.readFile(path.join(f.delivered.checkout, "moved", "inner", "checkout.txt"), "utf8")).toBe("checkout work\n");
+      expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(f.delivered.head);
+    }, 90_000);
+
+    it("keeps an older directory moved in where removed dependencies were", async () => {
+      const f = await codeDeliveredFixture();
+      await fs.mkdir(path.join(f.cwd, "node_modules", "dep"), { recursive: true });
+      const older = path.join(root, `older-${randomUUID()}`);
+      await fs.mkdir(older);
+      await fs.writeFile(path.join(older, "notes.txt"), "older work\n");
+      await new Promise(resolve => setTimeout(resolve, 250));
+      const state = await stopRemoval(f, async trash => {
+        await fs.rm(path.join(trash, "package.json"));
+        await fs.rm(path.join(trash, "node_modules"), { recursive: true });
+      });
+      // The recorded dependencies are gone, so the moved directory at their
+      // path is not theirs and is later work.
+      await fs.rename(older, path.join(state.trash, "node_modules"));
+      await expectRemainderKept(f);
+      expect(await fs.readFile(path.join(state.trash, "node_modules", "notes.txt"), "utf8")).toBe("older work\n");
+    }, 90_000);
+
+    it("keeps work written in a partly removed folder while its reopen fetches", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async trash => {
+        await fs.rm(path.join(trash, "report.md"));
+        await fs.rm(path.join(trash, "vendor"), { recursive: true, force: true });
+      });
+      let writes = 0;
+      gitFixture.beforeFetch = async () => {
+        writes += 1;
+        await fs.writeFile(path.join(state.trash, `during-fetch-${writes}.txt`), "written during the fetch\n");
+        await fs.writeFile(path.join(state.trash, "repo", `during-fetch-${writes}.txt`), "written in the checkout\n");
+        // Rewrites a saved file the partial removal deleted: the rebuilt copy
+        // must not replace it.
+        await fs.writeFile(path.join(state.trash, "report.md"), "rewritten during the fetch\n");
+      };
+      await expectReopenedWithRemainder(f, state.trash, { report: "rewritten during the fetch\n" });
+      expect(writes).toBeGreaterThan(0);
+      for (let index = 1; index <= writes; index += 1) {
+        expect(await fs.readFile(path.join(f.cwd, `during-fetch-${index}.txt`), "utf8")).toBe("written during the fetch\n");
+        expect(await fs.readFile(path.join(f.delivered.checkout, `during-fetch-${index}.txt`), "utf8")).toBe("written in the checkout\n");
+      }
+      expect(git(f.delivered.checkout, "rev-parse", "HEAD")).toBe(f.delivered.head);
+    }, 90_000);
+
+    it("keeps a partly removed folder whose removal record is missing", async () => {
+      const f = await codeDeliveredFixture();
+      const state = await stopRemoval(f, async trash => { await fs.rm(path.join(trash, "report.md")); });
+      expect(state.removalRecord).toMatch(/^[0-9a-f]{64}$/);
+      const records = path.join(root, "home", "instances", "default", "isolated-workspaces", ".removal-records");
+      expect(await fs.readdir(records)).toEqual([`${f.workspaceId}-${state.restorePoint.id}.json`]);
+      await fs.rm(records, { recursive: true });
+      await expectRemainderKept(f);
+      await expectReopenedWithRemainder(f, state.trash);
+      await expectExactCheckouts(f, { restored: false });
     }, 90_000);
 
     it("keeps the folder closed and whole when a reopen cannot fetch, then restores on retry", async () => {
