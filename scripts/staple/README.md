@@ -23,8 +23,9 @@ and then holds the lull with a short hold.
 
 Gate C installs only a certified commit (STA-223). A push to a pull request runs routine checks
 only (see "Routine checks and nightly certification" below), so the nightly `staple-certify.yml`
-run (22:45 Denver standard time, and `workflow_dispatch` on demand) builds one merged master commit
-and runs the complete suite on it. It records the verdict as the commit status `staple/certified`
+run (01:15 Denver standard time, 02:15 daylight time, and `workflow_dispatch` on demand) builds one
+merged master commit and runs the complete suite on it. Merge by 01:00 local for a change to be
+certified that night and installed at 03:30. It records the verdict as the commit status `staple/certified`
 on that exact commit. The installer walks master's first-parent history,
 newest first, and picks the newest commit certified `success`. A newer commit that is uncertified,
 pending, failed or unreadable is skipped and logged. If the installed build is reached first, nothing

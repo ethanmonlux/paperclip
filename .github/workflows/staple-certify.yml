@@ -8,14 +8,17 @@ name: Staple certification
 # `success`, so a regression outside a PR's scope is caught here and never
 # installed.
 #
-# Schedule: 22:45 America/Denver standard time (23:45 daylight time), after the
-# 20:31 upstream sync has normally merged. An urgent fix re-certifies the same
-# day with a manual dispatch on master; the hourly quiet-window install then
-# picks it up. The watcher on the Staple side reads failed runs and opens the
+# Schedule: 01:15 America/Denver standard time (02:15 daylight time), after the
+# 01:00 local merge cutoff, so it certifies the master that includes that
+# evening's merges, including the 20:31 upstream sync (STA-380). A full run takes
+# about 30 minutes, so it normally finishes before the 03:30 install. GitHub can
+# start a scheduled run late; a commit is installed only once it is certified.
+# An urgent fix re-certifies the same day with a manual dispatch on master; the
+# hourly quiet-window install then picks it up. The watcher on the Staple side reads failed runs and opens the
 # repair tasks, because this cloud runner cannot reach Staple.
 on:
   schedule:
-    - cron: "45 5 * * *"
+    - cron: "15 8 * * *"
   workflow_dispatch:
 
 permissions:

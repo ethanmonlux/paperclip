@@ -21,8 +21,8 @@ const job = (workflow, name) => {
   return end < 0 ? rest : rest.slice(0, end + 1);
 };
 
-test("runs nightly at 22:45 Denver standard time and on demand, after the upgrade-relevant sync", () => {
-  assert.match(certify, /schedule:\n\s+- cron: "45 5 \* \* \*"/);
+test("runs nightly at 01:15 Denver standard time and on demand, after the 01:00 merge cutoff", () => {
+  assert.match(certify, /schedule:\n\s+- cron: "15 8 \* \* \*"/);
   assert.match(certify, /\n  workflow_dispatch:\n/);
   assert.match(certify, /statuses: write/);
   assert.match(certify, /cancel-in-progress: false/);
