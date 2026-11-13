@@ -130,6 +130,29 @@ describe.skipIf(!support.supported)("merge gate wiring", () => {
       .resolves.toMatchObject([{ reviewerAgentId: implementer.id, reviewerModelFamilies: [], writtenByReviewer: false }]);
   });
 
+  it("reads a visual-review verdict from its latest revision, separately from the code review (STA-362)", async () => {
+    const f = await fixture();
+    const visualReviewer = await f.agent("Visual reviewer", "codex_local");
+    const reviewIssue = await f.issue("Visual review", visualReviewer.id, "done");
+    const record = async (key: string, body: string) => {
+      const [document] = await db.insert(documents).values({ companyId: f.company.id, latestBody: body, updatedByAgentId: visualReviewer.id }).returning();
+      await db.insert(documentRevisions).values({ companyId: f.company.id, documentId: document!.id, revisionNumber: 1, body,
+        createdByAgentId: visualReviewer.id, createdByRunId: null });
+      await db.insert(issueDocuments).values({ companyId: f.company.id, issueId: reviewIssue.id, documentId: document!.id, key });
+    };
+    await record("visual-review", `pullRequest: ethanmonlux/facette#704\nreviewedSha: ${HEAD}\nverdict: pass`);
+    const deps = createMergeGateDependencies(db);
+    const query = { reviewIssueIds: [reviewIssue.id], repo: "ethanmonlux/facette", pullNumber: 704 };
+    await expect(deps.loadVisualReviews(f.company.id, query)).resolves.toEqual([{
+      reviewIssueId: reviewIssue.id, reviewIssueIdentifier: reviewIssue.identifier, reviewIssueStatus: "done",
+      reviewerAgentId: visualReviewer.id, writtenByReviewer: true, reviewedSha: HEAD, pullRequest: "ethanmonlux/facette#704", verdict: "pass",
+    }]);
+    // A visual verdict is not a code review, and found by reference when no review issue is named.
+    await expect(deps.loadReviews(f.company.id, query)).resolves.toEqual([]);
+    await expect(deps.loadVisualReviews(f.company.id, { ...query, reviewIssueIds: [] })).resolves.toHaveLength(1);
+    await expect(deps.loadVisualReviews(f.company.id, { ...query, reviewIssueIds: [], pullNumber: 705 })).resolves.toEqual([]);
+  });
+
   it("recognizes the STA-293 legacy coordinator handoff only with a recorded engineer run", async () => {
     const f = await fixture();
     const coordinator = await f.agent("Coordinator", "codex_local");

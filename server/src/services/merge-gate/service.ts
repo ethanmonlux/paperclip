@@ -9,7 +9,9 @@
  * land on a base its CI never ran against. A red main opens (or reuses) one
  * critical owner issue for that repository branch, assigned to an
  * urgent-capable agent, and parks the refused task on it with a blocker
- * relation, so the task resumes by itself when the fix lands.
+ * relation, so the task resumes by itself when the fix lands. A change to a
+ * repository's visual paths also needs a passing visual review at the exact
+ * merge head (STA-362).
  */
 import { forbidden, notFound, unprocessable } from "../../errors.js";
 import { GitHubMergeGateError, type MergeGateGitHub } from "./github.js";
@@ -21,16 +23,20 @@ import {
   evaluateBaseCi,
   evaluateHeadCi,
   evaluateReviewCoverage,
+  evaluateVisualReview,
   repositoryMergePolicy,
   requiredPathScopedChecks,
+  requiresVisualReview,
   type HeadDelta,
   type MergeGateAuthor,
   type MergeGateReason,
   type MergeReviewAttestation,
+  type VisualReviewAttestation,
 } from "./policy.js";
 
 export const MERGE_GATE_RED_MAIN_ORIGIN_KIND = "merge_gate_red_main";
 export const MERGE_REVIEW_DOCUMENT_KEY = "merge-review";
+export const VISUAL_REVIEW_DOCUMENT_KEY = "visual-review";
 const MAX_ANCESTOR_DEPTH = 8;
 export const MERGE_LOCK_BUSY = Symbol("merge-lock-busy");
 
@@ -129,6 +135,8 @@ export interface MergeGateDependencies {
    */
   withMergeLock: <T>(key: string, action: () => Promise<T>) => Promise<T | typeof MERGE_LOCK_BUSY>;
   loadReviews: (companyId: string, input: { reviewIssueIds: string[]; repo: string; pullNumber: number }) => Promise<MergeReviewAttestation[]>;
+  /** `visual-review` documents on the same review issues (or naming the pull request when none are given). */
+  loadVisualReviews: (companyId: string, input: { reviewIssueIds: string[]; repo: string; pullNumber: number }) => Promise<VisualReviewAttestation[]>;
   /** Open (or return the open) red-main owner issue; at most one per repo branch. */
   ensureRedMainIssue: (input: {
     companyId: string; repo: string; baseRef: string; baseSha: string; failing: string[];
@@ -358,10 +366,18 @@ async function evaluateLocked(
     deltaFor: sha => deltas.get(sha) ?? { kind: "source_changed", detail: "unread" },
   });
 
+  // A visual change also needs a visual review of its candidate evidence at this head.
+  const visualRequired = requiresVisualReview({ policy, changedFiles });
+  const visualReviews = visualRequired
+    ? (await deps.loadVisualReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber }))
+      .filter(review => !request.actor.agentId || review.reviewerAgentId !== request.actor.agentId)
+    : [];
+  const visualReasons = evaluateVisualReview({ pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews });
+
   const decision = decideMerge({
     pullRequest: { ...pr, headSha, behindBy: compareToBase ? compareToBase.behindBy : null },
     expectedHeadSha: request.expectedHeadSha ?? null,
-    ciReasons, reviewReasons, requiredChecks, redMain,
+    ciReasons, reviewReasons, visualReasons, requiredChecks, redMain,
   });
   const base: Omit<MergeGateResult, "outcome"> = {
     repo, pullNumber: request.pullNumber, headSha, baseRef: pr.baseRef, requiredChecks: decision.requiredChecks, reasons: decision.reasons,

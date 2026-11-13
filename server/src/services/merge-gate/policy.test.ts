@@ -10,8 +10,10 @@ import {
   modelFamiliesFromRunUsage,
   modelFamily,
   parseMergeReviewDocument,
+  parseVisualReviewDocument,
   repositoryMergePolicy,
   requiredPathScopedChecks,
+  requiresVisualReview,
   type MergeGateCheck,
   type MergeReviewAttestation,
 } from "./policy.js";
@@ -515,6 +517,37 @@ describe("merge-review document", () => {
     expect(parseMergeReviewDocument("reviewedSha: abc123\np0: 0\np1: 0")).toBeNull();
     expect(parseMergeReviewDocument(`reviewedSha: ${HEAD}\np0: 0`)).toBeNull();
     expect(parseMergeReviewDocument(`reviewedSha: ${HEAD}\nscope: partial\np0: 0\np1: 0`)).toBeNull();
+  });
+});
+
+describe("visual review (STA-362)", () => {
+  it("needs a visual verdict exactly where Facette needs the candidate, and nowhere else", () => {
+    const visual = ["shell/faces/osrs/character/kaia/KaiaRive.tsx", "shell/public/assets/osrs/ember-vault/kaia-rive/kaia.riv",
+      "shell/faces/x4/Face.tsx", "shell/src-tauri/src/main.rs", "shell/components/FaceKit/Tile.tsx", "agent/src/server.mjs"];
+    for (const file of visual) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: ["docs/a.md", file] })).toBe(true);
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toContain("candidate");
+    }
+    for (const file of ["account-web/app/page.tsx", "docs/setup.md", "infra/main.tf", ".github/workflows/internal-windows.yml"]) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: [file] })).toBe(false);
+    }
+    // An unknown file list needs everything.
+    expect(requiresVisualReview({ policy: facette, changedFiles: null })).toBe(true);
+    expect(requiresVisualReview({ policy: facette, changedFiles: [] })).toBe(true);
+    for (const policy of [paperclip, unknownRepo]) {
+      expect(requiresVisualReview({ policy, changedFiles: ["shell/app.tsx"] })).toBe(false);
+      expect(requiresVisualReview({ policy, changedFiles: null })).toBe(false);
+    }
+  });
+
+  it("parses the visual reviewer's record and rejects one without an exact SHA or pass/fail verdict", () => {
+    expect(parseVisualReviewDocument([
+      "# Visual review", "", "- pullRequest: ethanmonlux/facette#704", `- reviewedSha: \`${HEAD.toUpperCase()}\``, "- verdict: PASS",
+    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, verdict: "pass" });
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: fail`)).toMatchObject({ verdict: "fail", pullRequest: null });
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}`)).toBeNull();
+    expect(parseVisualReviewDocument(`reviewedSha: ${HEAD}\nverdict: looks good`)).toBeNull();
+    expect(parseVisualReviewDocument("reviewedSha: abc123\nverdict: pass")).toBeNull();
   });
 });
 
