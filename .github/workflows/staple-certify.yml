@@ -1,8 +1,9 @@
 name: Staple certification
 
-# Nightly full-suite certification (STA-223). PRs run change-scoped checks only
-# (.github/staple-ci-scope.json); this runs the complete pr-trusted.yml suite on
-# one commit and records the verdict as the commit status `staple/certified`.
+# Nightly full-suite certification (STA-223). A push to a pull request runs
+# routine checks only (.github/staple-ci-scope.json). This builds one merged
+# master commit, runs the complete pr-trusted.yml suite on it and records the
+# verdict on that exact commit as the commit status `staple/certified`.
 # staple-nightly-upgrade installs only the newest master commit certified
 # `success`, so a regression outside a PR's scope is caught here and never
 # installed.

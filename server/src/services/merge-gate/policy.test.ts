@@ -35,7 +35,7 @@ const greenFacette = [
 function review(overrides: Partial<MergeReviewAttestation> = {}): MergeReviewAttestation {
   return {
     reviewIssueId: "review-1", reviewIssueIdentifier: "STA-900", reviewIssueStatus: "done",
-    reviewerAgentId: "codex-reviewer", reviewerModelFamilies: ["openai"], writtenByReviewer: true,
+    reviewerAgentId: "codex-reviewer", reviewerModelFamilies: ["openai"], writtenByReviewer: true, sourceAuthorAgentIds: null,
     scope: "full", reviewedSha: HEAD, pullRequest: "ethanmonlux/facette#704", p0: 0, p1: 0, p2: [],
     ...overrides,
   };
@@ -58,12 +58,12 @@ describe("conservative path filters", () => {
 
   it("treats an unknown path as needing Windows evidence", () => {
     expect(requiredPathScopedChecks({ policy: facette, changedFiles: ["shell/app/launcher.tsx"] }))
-      .toEqual(["windows-fast", "windows-native"]);
+      .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
     expect(requiredPathScopedChecks({ policy: facette, changedFiles: ["brand/new-logo.svg", "docs/a.md"] }))
       .toEqual(["windows-fast", "windows-native"]);
     // An unreadable or empty file list is unknown too.
-    expect(requiredPathScopedChecks({ policy: facette, changedFiles: null })).toEqual(["windows-fast", "windows-native"]);
-    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [] })).toEqual(["windows-fast", "windows-native"]);
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: null })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [] })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
   });
 
   it("lets a filter skip Windows only when every file is known to be irrelevant", () => {
@@ -91,6 +91,108 @@ describe("conservative path filters", () => {
       requiredChecks: ["windows-fast", "windows-native"], checks: [...greenFacette, check("windows-fast", "success")],
     });
     expect(reasons).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("windows-native did not run") }]);
+  });
+});
+
+describe("staged Facette candidate proof (FAC-151)", () => {
+  const changedFiles = ["shell/src/app.tsx"];
+  const ordinaryCi = [...greenFacette, check("windows-fast", "success"), check("windows-native", "success")];
+  const candidateJobs = ["frontend", "candidate", "browser-evidence"].map(name =>
+    ({ ...check(name, "success"), headSha: HEAD, checkSuiteId: 91 }));
+  const candidateRun: MergeGateCheck = { ...workflow("Internal Windows Candidate", "success"),
+    headSha: HEAD, checkSuiteId: 91, runId: 1234, runAttempt: 1, createdAt: "2026-11-11T12:00:00Z",
+    workflowPath: ".github/workflows/internal-windows.yml" };
+  const evaluate = (candidateChecks: MergeGateCheck[], files: string[] = changedFiles) => evaluateHeadCi({
+    headSha: HEAD, policy: facette, changedFiles: files, checksComplete: true,
+    checks: [...ordinaryCi, ...candidateChecks], requiredChecks: requiredPathScopedChecks({ policy: facette, changedFiles: files }),
+  });
+
+  it("requires the finished-candidate run even when ordinary CI is green", () => {
+    expect(evaluate([]).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("candidate did not run"), expect.stringContaining("one completed .github/workflows/internal-windows.yml run"),
+    ]));
+    expect(evaluate([...candidateJobs, candidateRun])).toEqual([]);
+  });
+
+  it("does not accept an older head, another workflow, mixed suites or unbound same-named jobs", () => {
+    for (const invalid of [
+      [...candidateJobs, { ...candidateRun, headSha: REVIEWED }],
+      [...candidateJobs, { ...candidateRun, workflowPath: ".github/workflows/ci.yml" }],
+      [...candidateJobs.map(job => job.name === "candidate" ? { ...job, checkSuiteId: 92 } : job), candidateRun],
+      [...candidateJobs.map(job => ({ ...job, headSha: REVIEWED })), candidateRun],
+      [...candidateJobs.map(job => ({ ...job, checkSuiteId: null })), candidateRun],
+      [...candidateJobs, { ...candidateRun, runId: null }],
+    ]) expect(evaluate(invalid)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("one completed") }),
+    ]));
+  });
+
+  it("requires actual success for every candidate job and the workflow", () => {
+    for (const conclusion of ["neutral", "skipped", "cancelled", "failure", null]) {
+      expect(evaluate([...candidateJobs.map(job => job.name === "browser-evidence" ? { ...job, conclusion } : job), candidateRun]).length).toBeGreaterThan(0);
+      expect(evaluate([...candidateJobs, { ...candidateRun, conclusion }]).length).toBeGreaterThan(0);
+    }
+    expect(evaluate([...candidateJobs, { ...candidateRun, status: "in_progress", conclusion: null }]))
+      .toMatchObject([{ code: "ci_pending" }]);
+  });
+
+  it("uses the newest candidate run without letting old cancellations or failures poison a successful retry", () => {
+    for (const conclusion of ["cancelled", "failure"]) {
+      const previousRun = { ...candidateRun, runId: 1233, checkSuiteId: 90, createdAt: "2026-11-11T11:00:00Z", conclusion };
+      const previousJobs = candidateJobs.map(job => ({ ...job, checkSuiteId: 90, conclusion }));
+      const checks = [previousRun, ...candidateJobs, ...previousJobs, candidateRun];
+      expect(evaluate(checks)).toEqual([]);
+      expect(evaluateBaseCi({ baseSha: HEAD, policy: facette, checks })).toEqual({ red: false, failing: [] });
+      expect(evaluate([...checks, check("unrelated-linux-test", "failure")])).toMatchObject([{ code: "ci_failed" }]);
+    }
+  });
+
+  it("never cherry-picks an older success over a newer candidate failure, cancellation, pending or empty run", () => {
+    for (const conclusion of ["failure", "cancelled", "skipped", "neutral", "success"]) {
+      const latest = { ...candidateRun, runId: 1235, checkSuiteId: 92, createdAt: "2026-11-11T13:00:00Z", conclusion };
+      expect(evaluate([latest, ...candidateJobs, candidateRun]).length).toBeGreaterThan(0);
+    }
+    expect(evaluate([...candidateJobs, candidateRun, { ...candidateRun, runId: 1235, checkSuiteId: 92,
+      createdAt: "2026-11-11T13:00:00Z", status: "queued", conclusion: null }])).toMatchObject([{ code: "ci_pending" }]);
+    expect(evaluate([...candidateJobs, candidateRun, { ...candidateRun, runId: 1235, checkSuiteId: 92, createdAt: null }]).length).toBeGreaterThan(0);
+  });
+
+  it("uses the latest named job within a rerun attempt and retains a latest job failure", () => {
+    const jobs = candidateJobs.map((job, index) => ({ ...job, checkRunId: 100 + index }));
+    const failedPrior = { ...jobs[1]!, checkRunId: 50, conclusion: "failure" };
+    expect(evaluate([failedPrior, ...jobs, { ...candidateRun, runAttempt: 2 }])).toEqual([]);
+    expect(evaluate([failedPrior, ...jobs, { ...jobs[1]!, checkRunId: 150, conclusion: "failure" }, { ...candidateRun, runAttempt: 3 }]))
+      .toMatchObject([{ code: "ci_failed" }]);
+  });
+
+  it("exempts only the exact whole CI-maintenance diff and still requires ordinary Windows proof", () => {
+    const maintenance = [
+      ".github/workflows/internal-windows.yml",
+      ".github/scripts/detect-changed-paths.sh",
+      ".github/scripts/detect-changed-paths.test.sh",
+      ".github/scripts/internal-windows-workflow.test.mjs",
+    ];
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: maintenance })).toEqual(["windows-fast", "windows-native"]);
+    expect(evaluate([], maintenance)).toEqual([]);
+    for (const extra of ["shell/src/app.tsx", "agent/src/main.mjs", "shell/tests/osrs-internal-windows.test.mjs", ".github/scripts/arbitrary.test.mjs", "docs/a.md"]) {
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [...maintenance, extra] }))
+        .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
+    }
+    expect(evaluateHeadCi({ headSha: HEAD, policy: facette, changedFiles: maintenance, checksComplete: true,
+      requiredChecks: requiredPathScopedChecks({ policy: facette, changedFiles: maintenance }),
+      checks: [...greenFacette, check("windows-fast", "skipped"), check("windows-native", "skipped")],
+    }).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("windows-fast was skipped"), expect.stringContaining("windows-native was skipped"),
+    ]));
+  });
+
+  it("preserves the previous candidate workflow's source scope", () => {
+    for (const file of ["account-web/app/page.tsx", "docs/setup.md", "x4/manifest.json"]) {
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).not.toContain("candidate");
+    }
+    for (const file of ["shell/tests/new.test.ts", "agent/src/server.mjs"]) {
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toContain("candidate");
+    }
   });
 });
 
@@ -133,8 +235,8 @@ describe("required CI coverage", () => {
       checks: [...paperclipGreen.filter(entry => entry.name !== "ci / verify"), check("ci / General tests (server (2/12))", "skipped")] }))
       .toEqual(expect.arrayContaining([expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") })]));
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
-      checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
-      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+      checks: paperclipGreen.filter(entry => entry.name !== "ci / policy") }))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / policy runs on every change") }]);
   });
 });
 
@@ -194,8 +296,29 @@ describe("paperclip CI policy (STA-218)", () => {
   });
 
   it("still refuses a skipped required suite, even with ci / verify green", () => {
-    const skippedBuild = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / Build" ? { ...entry, conclusion: "skipped" } : entry);
-    expect(evaluate(skippedBuild)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+    const skippedPolicy = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / policy" ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(skippedPolicy)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / policy runs on every change") }]);
+  });
+
+  it("accepts a light plan that skipped typecheck and build behind a green ci / verify, and refuses it when ci / verify failed (STA-354)", () => {
+    const lightPlan = [
+      ...PAPERCLIP_ORDINARY_PR.map(entry => /Typecheck|ci \/ Build$|General tests|serialized server|e2e shard|Verify Paperclip Runner|Docker context|Canary|Runner support|Sandbox/.test(entry.name)
+        ? { ...entry, conclusion: "skipped" } : entry),
+      check("ci / Affected packages (typecheck)", "skipped"),
+    ];
+    expect(lightPlan.filter(entry => entry.conclusion === "success").map(entry => entry.name).sort())
+      .toEqual(["ci / e2e", "ci / gate / Select trusted runner", "ci / policy", "ci / verify"]);
+    expect(evaluate(lightPlan)).toEqual([]);
+    expect(evaluate(lightPlan.map(entry => entry.name === "ci / verify" ? { ...entry, conclusion: "failure" } : entry)))
+      .toMatchObject([{ code: "ci_failed", detail: expect.stringContaining("ci / verify (failure)") }]);
+    expect(evaluate(lightPlan.filter(entry => entry.name !== "ci / verify")).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("ci / verify runs on every change"),
+      expect.stringContaining("ci / Typecheck + Release Registry was skipped"),
+      expect.stringContaining("ci / Affected packages (typecheck) was skipped"),
+      expect.stringContaining("ci / Build was skipped"),
+    ]));
+    // A full plan that ran the affected-package typecheck still passes.
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, check("ci / Affected packages (typecheck)", "success")])).toEqual([]);
   });
 
   it("needs the Windows runner check for its trigger paths and for Windows scripts, and not otherwise", () => {
@@ -384,7 +507,7 @@ describe("merge-review document", () => {
     expect(parseMergeReviewDocument([
       "# Review", "", `- pullRequest: ethanmonlux/facette#704`, `- reviewedSha: \`${HEAD.toUpperCase()}\``,
       "- scope: full", "- p0: 0", "- p1: 0", "- p2: FAC-901, FAC-902",
-    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, scope: "full", p0: 0, p1: 0, p2: ["FAC-901", "FAC-902"] });
+    ].join("\n"))).toEqual({ pullRequest: "ethanmonlux/facette#704", reviewedSha: HEAD, scope: "full", p0: 0, p1: 0, p2: ["FAC-901", "FAC-902"], sourceAuthorAgentIds: null });
     expect(parseMergeReviewDocument(`reviewedSha: ${HEAD}\nscope: conflict_hunks\np0: 0\np1: 0\np2: none`))
       .toMatchObject({ scope: "conflict_hunks", p2: [] });
   });
@@ -417,3 +540,4 @@ describe("head delta since review", () => {
       .toEqual({ clean: false, files: ["b.ts"] });
   });
 });
+

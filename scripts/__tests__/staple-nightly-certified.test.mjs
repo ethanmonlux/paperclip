@@ -195,3 +195,199 @@ test("a green or cancelled nightly opens nothing", async () => {
     }
   }
 });
+
+/** Runs the 02:30 `hold` mode against a fake Staple API on `installed`; records hold requests. */
+async function holdRun({ installed, chain, statuses = {} }) {
+  const holds = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const send = (value, code = 200) => { res.statusCode = code; res.setHeader("content-type", "application/json"); res.end(JSON.stringify(value)); };
+      if (req.method === "GET" && req.url === "/api/health") return send({ commit: installed ? sha(installed) : "" });
+      if (req.method === "POST" && req.url === "/api/instance/maintenance-hold") {
+        holds.push(JSON.parse(body));
+        return send({ hold: { startedAt: "s", drainDeadlineAt: "d", expiresAt: "e" }, queuedRuns: 0, runningRuns: 0 }, 201);
+      }
+      send({ error: "not found" }, 404);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const home = mkdtempSync(path.join(tmpdir(), "staple-hold-home-"));
+  const fixtures = path.join(home, "fixtures");
+  mkdirSync(path.join(home, ".paperclip"));
+  mkdirSync(fixtures);
+  writeFileSync(path.join(home, ".paperclip", "auth.json"), JSON.stringify({ token: "staple-test-token" }));
+  if (chain) writeFileSync(path.join(fixtures, "chain"), chain.map(sha).join("\n") + "\n");
+  for (const [name, list] of Object.entries(statuses)) {
+    writeFileSync(path.join(fixtures, `statuses-${sha(name)}.json`), JSON.stringify(list));
+  }
+  try {
+    const { stdout } = await promisify(execFile)("bash", [script, "hold"], { env: {
+      ...process.env, HOME: home, STAPLE_GITHUB_FIXTURES: fixtures, STAPLE_API: `http://127.0.0.1:${server.address().port}`,
+      NO_PROXY: "127.0.0.1", no_proxy: "127.0.0.1",
+    } });
+    return { out: stdout, holds };
+  } finally {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test("the 02:30 hold is not placed when nothing newer than the installed build is certified", async () => {
+  // Red nightly on m2, installed m1: the 03:30 run would skip, so holding would only park work.
+  const red = await holdRun({ installed: "m1", chain: ["m2", "m1"], statuses: { m2: [status("failure")] } });
+  assert.match(red.out, /no certified commit to install \(installed-newest\); not placing the hold/);
+  assert.deepEqual(red.holds, []);
+  const unreadable = await holdRun({ installed: "m1" });
+  assert.match(unreadable.out, /not placing the hold/);
+  assert.deepEqual(unreadable.holds, []);
+});
+
+test("the 02:30 hold is placed when a newer certified commit is waiting", async () => {
+  const { out, holds } = await holdRun({ installed: "m1", chain: ["m3", "m2", "m1"], statuses: { m3: [status("failure")], m2: [status("success")] } });
+  assert.match(out, /certified target: target:m2/);
+  assert.equal(holds.length, 1);
+  assert.equal(holds[0].reason, "nightly maintenance window");
+});
+
+// Gate 2 (STA-223): `paperclipai db:backup --json` prints its banner and progress, the metadata as
+// pretty-printed JSON, then an outro, all on stdout. Reading only the last line found nothing, so a
+// good backup was reported as failed and the certified upgrade stopped at the backup gate.
+const esc = (code, text) => `\x1b[${code}m${text}\x1b[39m`;
+function dbBackupStdout(meta) {
+  return [
+    "", esc(36, "██████╗  █████╗ ██████╗ ███████╗██████╗  ██████╗██╗     ██╗██████╗ "),
+    esc(34, "  ───────────────────────────────────────────────────────"), "",
+    `┌   ${esc(46, " paperclip db:backup ")}`, "│", `│  ${esc(2, "Config: /home/u/.paperclip/instances/default/config.json")}`,
+    `│  ${esc(2, "Connection source: embedded-postgres@54329 {pid 4242}")}`, "│",
+    "◒  Creating database backup...", `◇  Backup saved: ${meta?.backupFile} (907.9 MB)`, "│",
+    ...(meta === undefined ? [] : [JSON.stringify(meta, null, 2)]),
+    "│", `└  ${esc(32, "Backup completed.")}`, "", "",
+  ].join("\n");
+}
+
+/** Saves db:backup stdout (and optionally a backup file) and asks the installer for the Gate 2 result. */
+function backupResult({ stdout, rc = 0, bytes, meta = (file) => ({ backupFile: file, sizeBytes: 12, prunedCount: 0 }) }) {
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-backup-"));
+  try {
+    const file = path.join(dir, "staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+    if (bytes !== undefined) writeFileSync(file, Buffer.alloc(bytes, 1));
+    writeFileSync(path.join(dir, "out"), stdout ?? dbBackupStdout(meta(file)));
+    const result = spawnSync("bash", [script, "backup-result", path.join(dir, "out"), String(rc)], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim().replace(dir, "<dir>");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("Gate 2 reads backupFile from the real db:backup output, not its last line", () => {
+  const stdout = dbBackupStdout({ backupFile: "/b/x.sql.gz", sizeBytes: 12 });
+  // The old gate: `tail -1` of this output, grepped for "path or "file, never matched.
+  assert.doesNotMatch(stdout.trimEnd().split("\n").at(-1), /"path|"file/);
+  assert.equal(backupResult({ bytes: 12 }), "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+});
+
+test("Gate 2 accepts compact metadata and a backup without a reported size", () => {
+  assert.match(backupResult({ bytes: 5, stdout: undefined, meta: (file) => ({ backupFile: file }) }), /^file:/);
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-backup-"));
+  try {
+    const file = path.join(dir, "b.sql.gz"); writeFileSync(file, "x");
+    assert.match(backupResult({ stdout: `noise {not json}\n${JSON.stringify({ backupFile: file, sizeBytes: 1 })}\n` }), /^file:/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Gate 2 fails closed on a nonzero exit even when the metadata looks good", () => {
+  assert.equal(backupResult({ bytes: 12, rc: 1 }), "error:db:backup exited 1");
+});
+
+test("Gate 2 fails closed without readable metadata", () => {
+  assert.equal(backupResult({ bytes: 12, stdout: "" }), "error:no backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 12, stdout: dbBackupStdout(undefined) }), "error:no backup metadata in db:backup output");
+  // Truncated JSON: the output stopped mid-object.
+  assert.equal(backupResult({ bytes: 12, stdout: '{\n  "backupFile": "/b/x.sql.gz",\n  "sizeBytes": 1' }),
+    "error:no backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: "relative/x.sql.gz" }) }),
+    "error:backupFile is not an absolute path ('relative/x.sql.gz')");
+  assert.equal(backupResult({ bytes: 12, meta: () => ({ backupFile: null }) }), "error:backupFile is not an absolute path (None)");
+});
+
+test("Gate 2 fails closed when the named backup file is missing, empty or the wrong size", () => {
+  assert.equal(backupResult({}), "error:backup file missing (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+  assert.equal(backupResult({ bytes: 0, meta: (file) => ({ backupFile: file }) }),
+    "error:backup file empty (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+  assert.equal(backupResult({ bytes: 7 }),
+    "error:backup file is 7 bytes, db:backup reported 12 (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
+});
+
+function startupLogged(journal, since = "2026-11-13 00:09:45") {
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-journal-"));
+  try {
+    const lines = Array.from({ length: 20000 }, (_, i) => `Nov 13 00:09:${String(i % 60).padStart(2, "0")} host paperclipai[1]: request ${i} served`).join("\n");
+    const marker = "Nov 13 00:09:57 host paperclipai[1]: Server startup recovery complete";
+    const bodies = {
+      early: `${marker}\n${lines}\n`,
+      late: `${lines}\n${marker}\n`,
+      missing: `${lines}\n`,
+      empty: "",
+    };
+    writeFileSync(path.join(dir, "journal"), bodies[journal.body] ?? "");
+    writeFileSync(path.join(dir, "journalctl"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$@" > "${path.join(dir, "args")}"`,
+      journal.fail
+        ? `cat "${path.join(dir, "journal")}"; echo "Failed to open journal: Permission denied" >&2; exit ${journal.fail}`
+        : `exec cat "${path.join(dir, "journal")}"`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const { BASH_ENV, ...inherited } = process.env;
+    const env = { ...inherited, PATH: `${dir}:${process.env.PATH}` };
+    const result = spawnSync("bash", [script, "startup-logged", since], { encoding: "utf8", env });
+    const args = readFileSync(path.join(dir, "args"), "utf8").trim().split("\n");
+    const old = spawnSync("bash", ["-o", "pipefail", "-c",
+      'journalctl --user -u paperclipai --since "-6min" --no-pager | grep -q "startup recovery complete"; echo "$? ${PIPESTATUS[*]}"'],
+    { encoding: "utf8", env });
+    return { out: result.stdout.trim(), status: result.status, args, old: old.stdout.trim() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("Gate 3 sees startup recovery logged early in a large journal", () => {
+  const result = startupLogged({ body: "early" });
+  assert.match(result.old, /^141 /);
+  assert.deepEqual([result.out, result.status], ["logged", 0]);
+  assert.deepEqual(result.args, ["--user", "-u", "paperclipai", "--since", "2026-11-13 00:09:45", "--no-pager"]);
+  assert.deepEqual([startupLogged({ body: "late" }).out, startupLogged({ body: "late" }).status], ["logged", 0]);
+});
+
+test("Gate 3 keeps waiting while the marker is not in the journal", () => {
+  assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "missing" }))), ["waiting", 1]);
+  assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "empty" }))), ["waiting", 1]);
+});
+
+test("Gate 3 fails closed when journalctl fails, even after printing the marker", () => {
+  for (const body of ["missing", "early"]) {
+    const result = startupLogged({ body, fail: 1 });
+    assert.equal(result.status, 2);
+    assert.equal(result.out, "error:journalctl exited 1 (Failed to open journal: Permission denied)");
+  }
+});
+
+test("an unknown argument exits before any upgrade step instead of running the upgrade", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "staple-home-"));
+  try {
+    const { BASH_ENV, ...inherited } = process.env;
+    const result = spawnSync("bash", [script, "startup-loged", "x"], {
+      encoding: "utf8", env: { ...inherited, HOME: home, STAPLE_API: "http://127.0.0.1:9" },
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /unknown argument: startup-loged/);
+    assert.equal(spawnSync("ls", ["-A", home], { encoding: "utf8" }).stdout, "");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

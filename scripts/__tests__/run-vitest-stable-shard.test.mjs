@@ -329,6 +329,7 @@ const pluginEvictionSuitePath = "server/src/services/native-runtime/plugin-runne
 const dotRunnerSuitePath = "server/src/__tests__/dot-runner.test.ts";
 const restartRecoverySuitePath =
   "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts";
+const cutTurnStartRetrySuitePath = "server/src/services/native-runtime/native-cut-turn-start-retry.integration.test.ts";
 const restartWaitSuites = ["lease-renewal", "preparation", "checkpoint-cost", "diskless"]
   .map(name => `server/src/services/native-runtime/native-runner-restart-${name}.integration.test.ts`);
 
@@ -372,12 +373,13 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   assert.ok(!files.includes(ingressRetrySuitePath));
   assert.ok(!files.includes(dotRunnerSuitePath));
   assert.ok(!files.includes(restartRecoverySuitePath));
+  assert.ok(!files.includes(cutTurnStartRetrySuitePath));
   assert.ok(!files.includes(usageDeliverySuitePath));
   assert.ok(!files.includes(warmCheckpointOwnershipSuitePath));
   assert.ok(!files.includes(pluginWarmOwnerSuitePath));
   assert.ok(!files.includes(pluginReleaseResumeSuitePath));
   assert.ok(!files.includes(pluginEvictionSuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, ingressRetrySuitePath, dotRunnerSuitePath, restartRecoverySuitePath, ...restartWaitSuites, usageDeliverySuitePath, warmCheckpointOwnershipSuitePath, pluginWarmOwnerSuitePath, pluginReleaseResumeSuitePath, pluginEvictionSuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, ingressRetrySuitePath, dotRunnerSuitePath, restartRecoverySuitePath, ...restartWaitSuites, cutTurnStartRetrySuitePath, usageDeliverySuitePath, warmCheckpointOwnershipSuitePath, pluginWarmOwnerSuitePath, pluginReleaseResumeSuitePath, pluginEvictionSuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
@@ -432,6 +434,7 @@ test("the native-runner lane runs exactly the cargo-dependent suites", () => {
     dotRunnerSuitePath,
     restartRecoverySuitePath,
     ...restartWaitSuites,
+    cutTurnStartRetrySuitePath,
     usageDeliverySuitePath,
     warmCheckpointOwnershipSuitePath,
     pluginWarmOwnerSuitePath,
@@ -443,6 +446,30 @@ test("the native-runner lane runs exactly the cargo-dependent suites", () => {
 test("shard flags are rejected for the native-runner group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-server-native-runner", "--shard-index", "0", "--shard-count", "2"]);
   assert.notEqual(result.status, 0, "the native-runner lane is a single suite and must not accept shard flags");
+});
+
+// Staple certification (staple-certify.yml, STA-223) calls the same
+// pr-trusted.yml on master, whose Rust-cached lane runs the native-runner
+// group. Its general shards must match PR's exactly: under any other caller
+// name they also pick up the cargo-dependent suites, which then fail without a
+// Runner binary (certification run 43024850213).
+test("Staple certification selects exactly the PR server shards", () => {
+  for (let index = 0; index < 12; index += 1) {
+    const args = ["--mode", "general", "--group", "general-server-without-chat",
+      "--shard-index", String(index), "--shard-count", "12"];
+    assert.deepEqual(
+      dryRunJson(args, { GITHUB_WORKFLOW: "Staple certification" }).selectedGeneralServerSuites,
+      dryRunJson(args, { GITHUB_WORKFLOW: "PR" }).selectedGeneralServerSuites,
+      `shard ${index + 1}/12`,
+    );
+  }
+});
+
+test("the Staple certification workflow keeps the PR lane name", () => {
+  const certify = readFileSync(path.join(repoRoot, ".github/workflows/staple-certify.yml"), "utf8");
+  assert.match(certify, /^name: Staple certification$/m,
+    "renaming staple-certify.yml moves the native-runner suites into server shards without a Runner binary; update prLaneWorkflowNames too");
+  assert.match(certify, /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml$/m);
 });
 
 // The PR-side exclusion above is safe only while the wiring it assumes holds:

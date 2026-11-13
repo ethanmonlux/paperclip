@@ -3,15 +3,18 @@
 # Installed as ~/.local/bin/staple-nightly-upgrade. It is the only Staple install path (FAC-840 C1).
 #
 # Usage:
-#   staple-nightly-upgrade hold              02:30: place the maintenance hold (admission held, wakes queue)
+#   staple-nightly-upgrade hold              02:30: place the maintenance hold (admission held, wakes queue),
+#                                            only when a certified commit newer than the installed build exists
 #   staple-nightly-upgrade [--dry-run]       03:30: upgrade under the hold, then release it
 #   QUIET_MODE=1 staple-nightly-upgrade      hourly: opportunistic daytime install, only when already quiet
 #   staple-nightly-upgrade ci-state CHECKS WORKFLOWS   print the Gate 0 state for saved GitHub JSON (no side effects)
 #   staple-nightly-upgrade certified-pick INSTALLED CHAIN   print the certified target for a saved first-parent chain
 #   staple-nightly-upgrade certified-target [INSTALLED]     read GitHub and print the certified target (no side effects)
 #   staple-nightly-upgrade certify-report [--dry-run] [RUN] open repair tasks for a red nightly certification
+#   staple-nightly-upgrade backup-result OUTPUT RC          print the Gate 2 result for saved db:backup stdout
+#   staple-nightly-upgrade startup-logged SINCE             print whether the service journal shows startup recovery
 #
-# Certification (STA-223): PRs run change-scoped checks only. The nightly staple-certify.yml run
+# Certification (STA-223): a push to a pull request runs routine checks only. The nightly staple-certify.yml run
 # certifies one master commit with the full suite and records the commit status `staple/certified`.
 # Only the newest first-parent master commit certified `success` is installed. A missing, pending,
 # failed or unreadable certification blocks that commit, and an older certified one is used instead.
@@ -64,6 +67,38 @@ if red: print("red:"+"; ".join(red[:5]))
 elif pending: print("pending:"+"; ".join(pending[:5]))
 elif not checks: print("none")
 else: print("green")
+PY
+}
+
+# Gate 2 result (STA-223). $1 = file holding the stdout of `paperclipai db:backup --json`, $2 = its exit code.
+# The CLI prints its banner and progress, then the metadata as pretty-printed JSON, then an outro, all on
+# stdout, so the metadata is found anywhere in the output rather than on one line. Prints one line:
+#   file:<path>        exit 0, metadata names an absolute backupFile that exists, is non-empty and has sizeBytes
+#   error:<reason>     anything else: nonzero exit, no metadata, missing, empty or mismatched file
+backup_result() {
+  python3 - "$1" "$2" <<'PY'
+import json,os,re,sys
+path,rc=sys.argv[1],sys.argv[2]
+if rc!="0": print("error:db:backup exited %s"%rc); sys.exit()
+try: text=re.sub(r"\x1b\[[0-9;?]*[A-Za-z]","",open(path,encoding="utf-8",errors="replace").read())
+except OSError as e: print("error:db:backup output unreadable (%s)"%str(e)[:80]); sys.exit()
+dec=json.JSONDecoder(); meta=None; i=text.find("{")
+while i>=0:
+    try: obj,end=dec.raw_decode(text,i)
+    except ValueError: end=i+1
+    else:
+        if isinstance(obj,dict) and "backupFile" in obj: meta=obj
+    i=text.find("{",end)
+if meta is None: print("error:no backup metadata in db:backup output"); sys.exit()
+f=meta.get("backupFile")
+if not isinstance(f,str) or not os.path.isabs(f): print("error:backupFile is not an absolute path (%r)"%(f,)); sys.exit()
+if not os.path.isfile(f): print("error:backup file missing (%s)"%f); sys.exit()
+size=os.path.getsize(f)
+if size<=0: print("error:backup file empty (%s)"%f); sys.exit()
+want=meta.get("sizeBytes")
+if isinstance(want,int) and not isinstance(want,bool) and want!=size:
+    print("error:backup file is %d bytes, db:backup reported %d (%s)"%(size,want,f)); sys.exit()
+print("file:%s"%f)
 PY
 }
 
@@ -140,6 +175,8 @@ PY
 }
 # First-parent history of $BRANCH, newest first, from a commits-only shallow fetch (no API quota).
 first_parent_chain() {
+  # Tests: $STAPLE_GITHUB_FIXTURES/chain holds the first-parent SHAs, newest first.
+  if [ -n "${STAPLE_GITHUB_FIXTURES:-}" ] && [ -f "$STAPLE_GITHUB_FIXTURES/chain" ]; then cat "$STAPLE_GITHUB_FIXTURES/chain"; return; fi
   local dir rc; dir=$(mktemp -d)
   git init -q --bare "$dir" && git -C "$dir" fetch -q --no-tags --filter=tree:0 --depth="$CERT_WINDOW" \
     "https://github.com/$REPO.git" "+refs/heads/$BRANCH:refs/heads/$BRANCH" &&
@@ -222,7 +259,7 @@ for fam,js in sorted(fams.items()):
     body="\n".join(["The nightly full-suite certification failed, so `%s` is not `staple/certified` and will not be installed."%sha,
         "","Run: %s"%run.get("html_url",""),"","Failing jobs (%d):"%len(js),""]+[excerpt(j) for j in js[:3]]+
         (["- and %d more"%(len(js)-3)] if len(js)>3 else [])+
-        ["","**Repair:** merge the fix under the normal bar with its own change-scoped checks. Then run `staple-certify.yml`",
+        ["","**Repair:** merge the fix under the normal bar with its own routine checks. Then run `staple-certify.yml`",
          "with `workflow_dispatch` on master to certify the new head. Until a newer commit is certified, the installer keeps",
          "the last certified build.","","Opened by `staple-nightly-upgrade certify-report` (STA-223)."])
     if dry: print("DRY RUN: would open critical task %r for %s\n%s\n"%(title,who,body)); continue
@@ -237,9 +274,20 @@ if not dry: open(E["STATE"],"a").write("%s %s\n"%(key("*"),sha))
 PY
 }
 
+startup_logged() {
+  local out err rc
+  err=$(mktemp)
+  out=$(journalctl --user -u paperclipai --since "$1" --no-pager 2>"$err"); rc=$?
+  if [ $rc != 0 ]; then echo "error:journalctl exited $rc ($(head -c 200 "$err" | tr '\n' ' ' | sed 's/ *$//'))"; rm -f "$err"; return 2; fi
+  rm -f "$err"
+  if grep -qF "startup recovery complete" <<<"$out"; then echo logged; else echo waiting; return 1; fi
+}
+
 case "${1:-}" in
   ci-state) ci_state "${2:?check-runs JSON}" "${3:?workflow-runs JSON}"; exit $? ;;
   certified-pick) certified_pick "${2:?installed SHA}" "${3:?first-parent chain file}"; exit $? ;;
+  backup-result) backup_result "${2:?db:backup output file}" "${3:?db:backup exit code}"; exit $? ;;
+  startup-logged) startup_logged "${2:?journalctl --since value}"; exit $? ;;
   certified-target)
     CHAIN=$(mktemp); trap 'rm -f "$CHAIN"' EXIT
     first_parent_chain > "$CHAIN" || { echo "error:could not read $BRANCH history"; exit 1; }
@@ -253,6 +301,7 @@ for a in "$@"; do
     certify-report) MODE=certify-report ;;
     --dry-run) DRY=1 ;;
     [0-9]*) CERT_RUN=$a ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
 API=${STAPLE_API:-http://127.0.0.1:3100}
@@ -336,11 +385,25 @@ d=json.load(sys.stdin); d=d if isinstance(d,list) else d.get("items",[])
 print(len([x for x in d if x.get("status")=="running"]))'
 }
 
+health_commit() { curl -s -m 10 $API/api/health | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null; }
+
 if [ "$MODE" = certify-report ]; then certification_repairs "$CERT_RUN"; exit $?; fi
 
 if [ "$MODE" = hold ]; then
   exec 9>"$LOGDIR/upgrade.lock"; flock -n 9 || { say "an upgrade run holds the lock; it manages the hold itself"; exit 0; }
   say "== Staple maintenance hold (drain ${HOLD_DRAIN_MIN} min, max ${HOLD_MAX_MIN} min)"
+  # Hold only when there is a certified commit to install. Without one the 03:30 run skips, so a
+  # hold would drain and park work for nothing. If a commit is certified after this check, the
+  # 03:30 run places its own hold with the same drain before installing.
+  INSTALLED=$(health_commit); CHAIN=$(mktemp)
+  if [ -z "$INSTALLED" ]; then PICK="error:installed build unreadable"
+  elif ! first_parent_chain > "$CHAIN" || [ ! -s "$CHAIN" ]; then PICK="error:could not read $BRANCH history"
+  else PICK=$(certified_pick "$INSTALLED" "$CHAIN"); fi
+  rm -f "$CHAIN"
+  case "$PICK" in
+    target:*) say "certified target: $PICK" ;;
+    *) say "no certified commit to install ($PICK); not placing the hold. Installed stays ${INSTALLED:0:8}."; exit 0 ;;
+  esac
   [ $DRY = 1 ] && { say "DRY RUN: would place the maintenance hold"; exit 0; }
   place_hold "$HOLD_DRAIN_MIN" "$HOLD_MAX_MIN" "nightly maintenance window" || exit 1
   # The 03:30 upgrade releases it; the server's expiry releases it if that never runs.
@@ -348,7 +411,6 @@ if [ "$MODE" = hold ]; then
 fi
 
 exec 9>"$LOGDIR/upgrade.lock"; flock -n 9 || { echo "another upgrade run holds the lock; exiting"; exit 0; }
-health_commit() { curl -s -m 10 $API/api/health | python3 -c 'import json,sys;print(json.load(sys.stdin).get("commit",""))' 2>/dev/null; }
 REPORT_ISSUE_FILE=$LOGDIR/report-issue-id
 report() {  # $1 = one-line outcome, $2 = detail
   if [ "$QUIET_MODE" = 1 ] && [[ "$1" == Skipped:* || "$1" == Waiting:* ]]; then say "quiet-mode skip (not reported): $1"; return; fi
@@ -443,10 +505,17 @@ while :; do
   sleep 60
 done
 
-# Gate 2: backup
-BK=$(paperclipai db:backup --filename-prefix staple-nightly-pre-${TARGET:0:8} --json 2>/dev/null | tail -1)
+# Gate 2: backup. Its stderr goes to the log; its stdout is kept whole for backup_result.
+BK_OUT=$(mktemp)
+paperclipai db:backup --filename-prefix staple-nightly-pre-${TARGET:0:8} --json > "$BK_OUT"
+BK_RC=$?
+BK=$(backup_result "$BK_OUT" "$BK_RC")
 say "backup: $BK"
-echo "$BK" | grep -q '"path\|"file' || { report "Skipped: database backup failed" "Nothing installed. Hold released."; exit 1; }
+if [[ "$BK" != file:* ]]; then
+  tail -n 20 "$BK_OUT" | sed 's/^/  db:backup: /'; rm -f "$BK_OUT"
+  report "Skipped: database backup failed (${BK#error:})" "Nothing installed. Hold released."; exit 1
+fi
+rm -f "$BK_OUT"; BK=${BK#file:}
 
 # Upgrade
 place_hold "$DRAIN_MIN" "$MAX_MIN" "managed upgrade to ${TARGET:0:8}" >/dev/null   # renew before the build
@@ -459,12 +528,17 @@ if [ "$n" != "0" ]; then
   paperclipai update --rollback --yes
   report "Skipped: $n run(s) running at restart time" "New payload built but not activated; payload rolled back. Still running ${INSTALLED:0:8}. Hold released."; exit 0
 fi
+RESTART_AT=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl --user restart paperclipai
-ok=0
+ok=0; SEEN=; STARTUP=not-checked
 for i in $(seq 1 60); do
   sleep 5
-  if [ "$(health_commit)" = "$TARGET" ] && journalctl --user -u paperclipai --since "-6min" --no-pager | grep -q "startup recovery complete"; then ok=1; break; fi
+  SEEN=$(health_commit)
+  [ "$SEEN" = "$TARGET" ] || continue
+  STARTUP=$(startup_logged "$RESTART_AT")
+  [ "$STARTUP" = logged ] && { ok=1; break; }
 done
+say "verify: health commit ${SEEN:-unreadable}, startup $STARTUP"
 # Gate 3: smoke
 if [ $ok = 1 ]; then
   AG=$(api $API/api/companies/$CID/agents | python3 -c 'import json,sys;d=json.load(sys.stdin);d=d if isinstance(d,list) else d.get("items",[]);print(len(d))' 2>/dev/null)

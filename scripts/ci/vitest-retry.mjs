@@ -6,9 +6,19 @@
 // caller's GITHUB_WORKFLOW, so release, cloud-readiness, master and local runs
 // keep retry 0. PAPERCLIP_VITEST_RETRY overrides the default in any context;
 // set it to 0 to switch retries off, or to N for a local reproduction.
+//
+// Staple certification (staple-certify.yml, STA-223) calls the same
+// pr-trusted.yml to certify a master commit, so it gets the same lanes and
+// retry as PR CI. Under any other name its general shards would also run the
+// cargo-dependent native-runner suites without a Runner binary and fail.
 export const vitestRetryEnvName = "PAPERCLIP_VITEST_RETRY";
 export const prWorkflowName = "PR";
+export const prLaneWorkflowNames = Object.freeze([prWorkflowName, "Staple certification"]);
 export const prDefaultVitestRetry = 1;
+
+export function isPrLaneWorkflow(env = process.env) {
+  return prLaneWorkflowNames.includes(env.GITHUB_WORKFLOW);
+}
 
 export function vitestRetryCount(env = process.env) {
   const configured = env[vitestRetryEnvName]?.trim();
@@ -19,7 +29,7 @@ export function vitestRetryCount(env = process.env) {
     }
     return parsed;
   }
-  return env.GITHUB_ACTIONS === "true" && env.GITHUB_WORKFLOW === prWorkflowName ? prDefaultVitestRetry : 0;
+  return env.GITHUB_ACTIONS === "true" && isPrLaneWorkflow(env) ? prDefaultVitestRetry : 0;
 }
 
 export function vitestRetryArgs(env = process.env) {

@@ -44,7 +44,7 @@ test("a published selection controls the matrix and the required aggregate", () 
   const results = Object.fromEntries(names.map((name) => [name, { result:
     ["gate", "policy", "test_selection"].includes(name) || selected.jobs[name]?.run ? "success" : "skipped" }]));
   const run = () => spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8",
-    env: { ...process.env, FULL_CI: "true", CI_PLAN: JSON.stringify(selected), CI_RESULTS: JSON.stringify(results) } });
+    env: { ...process.env, FULL_CI: "true", EVENT_NAME: "pull_request", CI_PLAN: JSON.stringify(selected), CI_RESULTS: JSON.stringify(results) } });
   assert.equal(run().status, 0);
   for (const job of ["general_tests", "test_selection"]) {
     for (const result of ["failure", "cancelled", "skipped"]) {

@@ -22,6 +22,7 @@ import {
 } from "@paperclipai/db";
 import {
   STAPLE_CONSOLE_CAPABILITY_MAP_KEY,
+  STAPLE_CONSOLE_CAPABILITY_MAP_OWNER,
   STAPLE_CONSOLE_LANES,
   buildStapleConsoleBoard,
   clipStapleConsoleText,
@@ -398,8 +399,9 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       return false;
     }).map((row) => row.id);
 
-    // ---- Capability map (Level 2): the newest readable `capability-map` issue document. Its claims'
-    // tasks and their descendants are the proof scope: their PRs and review verdicts load too.
+    // ---- Capability map (Level 2): the `capability-map` document on its owning task (STA-152), when
+    // the viewer can read it. Same-key copies on other tasks are ignored. Its claims' tasks and their
+    // descendants are the proof scope: their PRs and review verdicts load too.
     const [mapRow] = await db
       .select({
         identifier: issues.identifier,
@@ -414,6 +416,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
       .where(and(
         eq(issueDocuments.companyId, companyId),
         eq(issueDocuments.key, STAPLE_CONSOLE_CAPABILITY_MAP_KEY),
+        eq(issues.identifier, STAPLE_CONSOLE_CAPABILITY_MAP_OWNER),
         readableIssue,
       ))
       .orderBy(desc(documents.updatedAt))
@@ -740,7 +743,7 @@ export function stapleConsoleService(db: Db, opts: StapleConsoleServiceOptions =
         available: failures < targets.length || targets.length === 0,
         detail: gaps.length === 0
           ? `Live GitHub read with ${credential.source === "managed_connection"
-            ? `your connected GitHub account${credential.login ? ` (${credential.login})` : ""}`
+            ? `your connected GitHub account${"login" in credential && credential.login ? ` (${credential.login})` : ""}`
             : `the server's existing ${credential.source === "server_env" ? "environment" : "company"} credential`} (cached up to 2 min).`
           : `${gaps.join("; ")}; those show Paperclip's recorded status (not live) with CI unknown.`,
       };

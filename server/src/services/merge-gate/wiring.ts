@@ -1,12 +1,14 @@
 /** Database and GitHub wiring for the protected-main merge gate (FAC-840 B). */
-import { and, desc, eq, inArray, isNotNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   documentRevisions,
   documents,
   heartbeatRuns,
   issueDocuments,
   issueRelations,
+  issueThreadInteractions,
   issues,
   withDedicatedDbConnection,
   type Db,
@@ -65,6 +67,17 @@ async function pickUrgentCapableAgent(db: Db, companyId: string): Promise<string
 }
 
 const MAX_AUTHOR_RUNS = 500;
+const MAX_ASSIGNMENT_EVENTS = 500;
+
+function assignmentChange(details: Record<string, unknown> | null): { from: string | null; to: string | null } | null {
+  const change = (details?.changes as Record<string, unknown> | undefined)?.assigneeAgentId;
+  if (!change || typeof change !== "object") return null;
+  const fields = change as Record<string, unknown>;
+  return {
+    from: typeof fields.from === "string" ? fields.from : null,
+    to: typeof fields.to === "string" ? fields.to : null,
+  };
+}
 
 /** Hold a transaction-scoped advisory lock on its own connection for `action`. */
 async function withAdvisoryTryLock<T>(db: Db, key: string, action: () => Promise<T>): Promise<T | typeof MERGE_LOCK_BUSY> {
@@ -104,15 +117,103 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
       return (await resolveGitHubApiCredential(db, companyId))?.token ?? null;
     },
     loadIssue,
+    async loadLegacyDelegation(companyId, issueId, coordinatorAgentId) {
+      // Legacy tasks were sometimes created for a coordinator by a human,
+      // then reassigned to an engineer and returned after implementation.
+      // A current assignee alone is not evidence of coordinator authority.
+      const events = await db.select({ action: activityLog.action, actorType: activityLog.actorType,
+        actorId: activityLog.actorId, details: activityLog.details, createdAt: activityLog.createdAt })
+        .from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId), inArray(activityLog.action, ["issue.created", "issue.updated"])))
+        .orderBy(asc(activityLog.createdAt)).limit(MAX_ASSIGNMENT_EVENTS + 1);
+      if (events.length > MAX_ASSIGNMENT_EVENTS) return false;
+      const created = events.find(event => event.action === "issue.created");
+      if (created?.details?.assigneeAgentId !== coordinatorAgentId) return false;
+      const transfers = events.filter(event => event.action === "issue.updated")
+        .map(event => ({ ...event, change: assignmentChange(event.details) }))
+        .filter(event => event.change !== null);
+      const returned = transfers.at(-1);
+      const implementerAgentId = returned?.change?.from;
+      if (!returned || !implementerAgentId || implementerAgentId === coordinatorAgentId ||
+        returned.change?.to !== coordinatorAgentId || returned.actorType !== "agent" ||
+        returned.actorId !== implementerAgentId) return false;
+      const delegated = transfers.find(event => event.change?.from === coordinatorAgentId &&
+        event.change.to === implementerAgentId && event.actorType === "agent" &&
+        event.actorId === coordinatorAgentId && event.createdAt < returned.createdAt);
+      if (!delegated) return false;
+      const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId),
+          eq(heartbeatRuns.agentId, implementerAgentId), isNotNull(heartbeatRuns.startedAt),
+          gte(heartbeatRuns.startedAt, delegated.createdAt),
+          lte(heartbeatRuns.startedAt, returned.createdAt))).limit(1);
+      return Boolean(run);
+    },
+    async loadAcceptedCoordinatorRouting(companyId, issueId, implementerAgentId, coordinatorAgentId) {
+      // STA-315: an engineer-created task can retain its engineer assignee while
+      // a separate coordinator accepts the addressed review-routing handoff.
+      // Bind the record to this issue and both actors; ordinary confirmations
+      // cannot grant merge authority.
+      const rows = await db.select({ idempotencyKey: issueThreadInteractions.idempotencyKey,
+        title: issueThreadInteractions.title, payload: issueThreadInteractions.payload })
+        .from(issueThreadInteractions)
+        .where(and(eq(issueThreadInteractions.companyId, companyId), eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.kind, "request_confirmation"), eq(issueThreadInteractions.status, "accepted"),
+          eq(issueThreadInteractions.createdByAgentId, implementerAgentId),
+          eq(issueThreadInteractions.addresseeAgentId, coordinatorAgentId),
+          eq(issueThreadInteractions.resolvedByAgentId, coordinatorAgentId)))
+        .orderBy(desc(issueThreadInteractions.createdAt)).limit(20);
+      return rows.some(row => row.idempotencyKey?.startsWith(`confirmation:${issueId}:route-review:`) &&
+        row.title?.startsWith("Route cross-model review:") &&
+        "target" in row.payload && row.payload.target?.type === "issue_document" &&
+        row.payload.target.issueId === issueId);
+    },
+    async loadTaskCustodians(companyId, issueId) {
+      // Only an assignee can check a task out, and every reassignment is
+      // logged with both sides, so the creator, the current assignee and these
+      // events name every agent that could have executed it.
+      const [issue] = await db.select({ createdByAgentId: issues.createdByAgentId, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).limit(1);
+      if (!issue) return null;
+      const events = await db.select({ action: activityLog.action, agentId: activityLog.agentId, details: activityLog.details })
+        .from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId), or(
+            inArray(activityLog.action, ["issue.created", "issue.child_created", "issue.checked_out"]),
+            and(eq(activityLog.action, "issue.updated"),
+              sql`${activityLog.details} -> 'changes' -> 'assigneeAgentId' is not null`),
+          )))
+        .limit(MAX_ASSIGNMENT_EVENTS + 1);
+      if (events.length > MAX_ASSIGNMENT_EVENTS) return null;
+      const custodians = new Set<string>();
+      const add = (value: unknown) => { if (typeof value === "string" && value) custodians.add(value); };
+      add(issue.createdByAgentId);
+      add(issue.assigneeAgentId);
+      for (const event of events) {
+        add(event.details?.assigneeAgentId);
+        if (event.action === "issue.checked_out") {
+          add(event.agentId);
+          add(event.details?.agentId);
+        }
+        const change = assignmentChange(event.details);
+        add(change?.from);
+        add(change?.to);
+      }
+      return [...custodians].sort();
+    },
     async loadTaskAuthorship(companyId, input) {
-      // Every run that started on the task may have authored part of it,
-      // whatever role its agent holds now.
+      // Without a reviewer-attested source author set, every task run remains
+      // a potential author. An attested set must be backed by started runs,
+      // and never narrows away the attesting reviewer's own runs: nothing
+      // recorded shows a run on the task wrote no source.
+      const sourceIds = input.sourceAuthorAgentIds;
+      if (sourceIds && (sourceIds.length === 0 || sourceIds.length > MAX_AUTHOR_RUNS)) return null;
+      const countedIds = sourceIds && input.attesterAgentId ? [...new Set([...sourceIds, input.attesterAgentId])] : sourceIds;
       const runs = await db.select({ agentId: heartbeatRuns.agentId, usage: heartbeatRuns.usageJson })
         .from(heartbeatRuns)
         .where(and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.issueId, input.issueId),
           isNotNull(heartbeatRuns.startedAt),
+          countedIds ? inArray(heartbeatRuns.agentId, countedIds) : undefined,
           input.excludeAgentId ? ne(heartbeatRuns.agentId, input.excludeAgentId) : undefined,
         ))
         .orderBy(desc(heartbeatRuns.createdAt))
@@ -126,6 +227,7 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
         for (const family of families) entry.families.add(family);
         byAgent.set(run.agentId, entry);
       }
+      if (sourceIds && sourceIds.some(id => !byAgent.has(id))) return null;
       // A run that recorded no model (killed early, say) is attributed to its
       // agent's recorded families on this task; an agent with none is unknown.
       const families = new Set<string>();
@@ -154,7 +256,7 @@ export function createMergeGateDependencies(db: Db, options: { heartbeat?: Issue
           eq(issueDocuments.companyId, companyId),
           eq(issueDocuments.key, MERGE_REVIEW_DOCUMENT_KEY),
           input.reviewIssueIds.length > 0
-            ? sql`(${inArray(issueDocuments.issueId, input.reviewIssueIds)} or ${documents.latestBody} ilike ${`%${reference}%`})`
+            ? inArray(issueDocuments.issueId, input.reviewIssueIds)
             : sql`${documents.latestBody} ilike ${`%${reference}%`}`,
         ))
         .orderBy(documents.updatedAt)

@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { connect, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -197,6 +199,150 @@ process.exit(result.status ?? 98);
     expect(result.stderr).not.toContain(proxyUrl);
     expect(result.stderr).not.toContain("private-capability");
   }, 15_000); // transport retries add at least 1.5s before Node startup and CI scheduling
+
+  // Inside a network sandbox the broker host does not resolve, and the
+  // only route out is the sandbox's HTTP proxy. Without NODE_USE_ENV_PROXY,
+  // Node fetch ignored that proxy and the launcher failed with EAI_AGAIN.
+  it.each(["allowed", "denied"])("reaches the broker through the sandbox proxy when its host does not resolve directly (%s)", async (policy) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-sandbox-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", "-q", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const capabilities: string[] = [];
+    const broker = createServer((req, res) => {
+      capabilities.push(String(req.headers["x-paperclip-github-capability"]));
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: {
+        GH_TOKEN: "managed-token", GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test",
+        GIT_COMMITTER_NAME: "Managed", GIT_COMMITTER_EMAIL: "managed@example.test",
+      } }));
+    });
+    await new Promise<void>(resolve => broker.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => broker.close(() => resolve())));
+    const brokerPort = (broker.address() as { port: number }).port;
+    // Like the sandbox proxy: CONNECT only, resolved on the proxy's side.
+    const tunnels: string[] = [];
+    const sockets = new Set<Socket>();
+    const proxy = createServer((_req, res) => { res.writeHead(400); res.end(); });
+    proxy.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+    proxy.on("connect", (req, client) => {
+      tunnels.push(String(req.url));
+      if (policy === "denied" || req.url !== `broker.invalid:${brokerPort}`) {
+        client.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+      }
+      const upstream = connect(brokerPort, "127.0.0.1", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on("error", () => client.destroy());
+      client.on("error", () => upstream.destroy());
+    });
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => { for (const socket of sockets) socket.destroy(); proxy.close(() => resolve()); }));
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const env: NodeJS.ProcessEnv = { ...process.env,
+      ...githubBrokerEnvironment({}, { url: `http://broker.invalid:${brokerPort}`, token: "private-capability" }),
+      PATH: `${bin}:${process.env.PATH}`, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, http_proxy: proxyUrl, https_proxy: proxyUrl,
+      NO_PROXY: "", no_proxy: "" };
+    delete env.NODE_USE_ENV_PROXY;
+    const result = await exec(path.join(bin, "git"), ["var", "GIT_AUTHOR_IDENT"], { cwd: root, env });
+    expect(result.stderr).not.toMatch(/private-capability|127\.0\.0\.1/);
+    if (policy === "allowed") {
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toMatch(/^Managed <managed@example.test>/);
+      expect(tunnels).toEqual([`broker.invalid:${brokerPort}`]);
+      expect(capabilities).toEqual(["private-capability"]);
+    } else {
+      expect(result.stderr).toContain("broker_transport_unavailable (proxy_tunnel_rejected)");
+      expect(result.stdout).toMatch(/^Paperclip <noreply@paperclip.ing>/);
+      expect(tunnels).toHaveLength(3); // the existing transport retry bound
+      expect(capabilities).toEqual([]);
+    }
+  }, 15_000);
+
+  // The tunnel wraps its own TLS, so it must check the certificate against the
+  // broker's address; an IP broker was checked against 'localhost' instead.
+  it.each([["IP:127.0.0.1", "accepts"], ["DNS:localhost", "rejects"]])("checks an IP broker's certificate through the tunnel (%s %s)", async (subjectAltName, outcome) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-proxy-tls-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", "-q", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const key = path.join(root, "broker.key"), certificate = path.join(root, "broker.crt");
+    await exec("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", certificate,
+      "-days", "1", "-subj", "/CN=paperclip-broker-test", "-addext", `subjectAltName=${subjectAltName}`]);
+    const capabilities: string[] = [];
+    const broker = createHttpsServer({ key: await readFile(key), cert: await readFile(certificate) }, (req, res) => {
+      capabilities.push(String(req.headers["x-paperclip-github-capability"]));
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GIT_AUTHOR_NAME: "Managed", GIT_AUTHOR_EMAIL: "managed@example.test" } }));
+    });
+    broker.on("tlsClientError", () => {});
+    await new Promise<void>(resolve => broker.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => broker.close(() => resolve())));
+    const brokerPort = (broker.address() as { port: number }).port;
+    const sockets = new Set<Socket>();
+    const proxy = createServer((_req, res) => { res.writeHead(400); res.end(); });
+    proxy.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+    proxy.on("connect", (_req, client) => {
+      const upstream = connect(brokerPort, "127.0.0.1", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on("error", () => client.destroy());
+      client.on("error", () => upstream.destroy());
+    });
+    await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => { for (const socket of sockets) socket.destroy(); proxy.close(() => resolve()); }));
+    const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+    const env: NodeJS.ProcessEnv = { ...process.env,
+      ...githubBrokerEnvironment({}, { url: `https://127.0.0.1:${brokerPort}`, token: "private-capability" }),
+      PATH: `${bin}:${process.env.PATH}`, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, http_proxy: proxyUrl, https_proxy: proxyUrl,
+      NO_PROXY: "", no_proxy: "", NODE_EXTRA_CA_CERTS: certificate };
+    delete env.NODE_USE_ENV_PROXY;
+    const result = await exec(path.join(bin, "git"), ["var", "GIT_AUTHOR_IDENT"], { cwd: root, env });
+    expect(result.stderr).not.toContain("private-capability");
+    if (outcome === "accepts") {
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toMatch(/^Managed <managed@example.test>/);
+      expect(capabilities).toEqual(["private-capability"]);
+    } else {
+      expect(result.stderr).toContain("broker_transport_unavailable (unknown)"); // TLS codes are not in the safe list, as with fetch
+      expect(result.stdout).toMatch(/^Paperclip <noreply@paperclip.ing>/);
+      expect(capabilities).toEqual([]);
+    }
+  }, 15_000);
+
+  it("keeps a NO_PROXY broker host on the direct path", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-no-proxy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", "-q", root]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    const broker = createServer((_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ status: "available", env: { GIT_AUTHOR_NAME: "Direct", GIT_AUTHOR_EMAIL: "direct@example.test" } }));
+    });
+    await new Promise<void>(resolve => broker.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => broker.close(() => resolve())));
+    const brokerPort = (broker.address() as { port: number }).port;
+    const unusedProxy = "http://127.0.0.1:9"; // refuses connections if it were used
+    const env: NodeJS.ProcessEnv = { ...process.env,
+      ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${brokerPort}`, token: "private-capability" }),
+      PATH: `${bin}:${process.env.PATH}`, HTTP_PROXY: unusedProxy, HTTPS_PROXY: unusedProxy, http_proxy: unusedProxy, https_proxy: unusedProxy,
+      NO_PROXY: `localhost,127.0.0.1:${brokerPort}`, no_proxy: "" };
+    delete env.NODE_USE_ENV_PROXY;
+    const result = await exec(path.join(bin, "git"), ["var", "GIT_AUTHOR_IDENT"], { cwd: root, env });
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toMatch(/^Direct <direct@example.test>/);
+  });
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));

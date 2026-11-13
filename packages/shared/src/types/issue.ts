@@ -775,6 +775,7 @@ export interface IssueWaitTarget {
   pullNumber?: number | null;
   /** When the SHA was pushed; starts the no-start deadline for `ci`. */
   pushedAt?: string | null;
+  workflowRunId?: number | null;
 }
 
 export type IssueWaitObservationState =
@@ -1216,6 +1217,13 @@ export interface IssueQueuedCommentQueue {
   entries: IssueQueuedCommentEntry[];
   /** Current admission condition for a saved user continuation. */
   executionWait?: { reason: string; message: string } | null;
+  /**
+   * Messages the target run's first provider turn takes: ones it already
+   * sealed into that turn, and ones it will take while it is still starting
+   * (for example while its sandbox boots). They are sent, not waiting for
+   * Steer or Interrupt. Omitted when there are none.
+   */
+  firstTurnCommentIds?: string[];
 }
 
 interface IssueCommentMetadataRowBase {
@@ -1922,3 +1930,4 @@ export interface IssueChatBootstrapItem<TRun = unknown, TLiveRun = unknown, TAct
 export interface IssueChatBootstrap<TRun = unknown, TLiveRun = unknown, TActiveRun = unknown> {
   items: IssueChatBootstrapItem<TRun, TLiveRun, TActiveRun>[];
 }
+

@@ -434,6 +434,7 @@ export const issueWaitTargetSchema = z.object({
     .optional().nullable().default(null),
   pullNumber: z.number().int().positive().optional().nullable().default(null),
   pushedAt: z.string().datetime().optional().nullable().default(null),
+  workflowRunId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional().nullable().default(null),
 }).strict();
 
 export const issueWaitObservationSchema = z.object({
@@ -2424,3 +2425,4 @@ export type UpsertIssueDocument = z.infer<typeof upsertIssueDocumentSchema>;
 export type RestoreIssueDocumentRevision = z.infer<
   typeof restoreIssueDocumentRevisionSchema
 >;
+

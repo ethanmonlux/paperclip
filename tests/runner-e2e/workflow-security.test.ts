@@ -92,9 +92,10 @@ describe("public repository paid workflow security", () => {
 
   // PR #18348 added the ninth pr-trusted bootstrap, in the Vitest selection job.
   // #19533 added the tenth (sandbox provider tests); the eleventh runs this suite.
+  // The twelfth is the Staple affected-packages typecheck job (STA-223).
   const trustedPnpmBootstraps = {
     "runner-full-stack-e2e.yml": 8,
-    "pr-trusted.yml": 11,
+    "pr-trusted.yml": 12,
   } as const;
 
   it("keeps pnpm bootstrap registry telemetry out of trusted workflow setup", async () => {
@@ -154,7 +155,7 @@ describe("public repository paid workflow security", () => {
       expect(pnpmSetupStepIndexes, name).toHaveLength(trustedPnpmBootstraps[name as keyof typeof trustedPnpmBootstraps]);
       for (const pnpmSetupStepIndex of pnpmSetupStepIndexes) {
         const pnpmSetupStep = steps[pnpmSetupStepIndex]!;
-        const nodeBootstrapStep = steps[pnpmSetupStepIndex - 1]!;
+        const nodeBootstrapStep = steps.slice(0, pnpmSetupStepIndex).findLast(step => step.includes("uses: actions/setup-node@"))!;
         expect(nodeBootstrapStep, name).toContain("uses: actions/setup-node@");
         expect(nodeBootstrapStep, name).not.toContain("cache: pnpm");
 

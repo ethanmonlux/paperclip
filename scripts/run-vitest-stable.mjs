@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 import { invocationEnv } from "./ci-profile/record.mjs";
-import { vitestRetryArgs } from "./ci/vitest-retry.mjs";
+import { isPrLaneWorkflow, vitestRetryArgs } from "./ci/vitest-retry.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
 import { loadSelection, selectedShard } from "./ci/test-selection-manifest.mjs";
@@ -103,6 +103,7 @@ const nativeRunnerSuites = [
   "server/src/services/native-runtime/native-runner-restart-preparation.integration.test.ts",
   "server/src/services/native-runtime/native-runner-restart-checkpoint-cost.integration.test.ts",
   "server/src/services/native-runtime/native-runner-restart-diskless.integration.test.ts",
+  "server/src/services/native-runtime/native-cut-turn-start-retry.integration.test.ts",
   "server/src/services/native-runtime/native-usage-delivery.integration.test.ts",
   "server/src/services/native-runtime/native-warm-checkpoint-ownership.integration.test.ts",
   "server/src/services/native-runtime/plugin-runner-task-warm.integration.test.ts",
@@ -110,15 +111,15 @@ const nativeRunnerSuites = [
   "server/src/services/native-runtime/plugin-runner-eviction.integration.test.ts",
 ];
 // In the PR workflow (pr.yml, the caller of pr-trusted.yml — reusable
-// workflows inherit the caller's GITHUB_WORKFLOW), the last Verify Paperclip
+// workflows inherit the caller's GITHUB_WORKFLOW) and in Staple certification,
+// which calls the same pr-trusted.yml, the last Verify Paperclip
 // Runner vitest shard runs the native-runner group instead, because those
 // lanes restore the shared release-runner-v2 Rust cache (see
 // packages/paperclip-runner/scripts/run-pr-vitest-lane.mjs). Every other
 // caller of the same group keeps the suite in the server shards, so a renamed or
 // unknown workflow degrades to today's slower-but-covered behavior rather
 // than dropping the suite.
-const prWorkflowName = "PR";
-const nativeRunnerSuiteRunsInRustCachedLane = process.env.GITHUB_WORKFLOW === prWorkflowName;
+const nativeRunnerSuiteRunsInRustCachedLane = isPrLaneWorkflow();
 const withoutChatExcludedSuites = nativeRunnerSuiteRunsInRustCachedLane
   ? [chatSuite, ...nativeRunnerSuites]
   : [chatSuite];

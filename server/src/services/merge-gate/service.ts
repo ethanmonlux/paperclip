@@ -97,15 +97,32 @@ export interface MergeGateDependencies {
   github: (repo: string, token: string) => MergeGateGitHub;
   resolveToken: (companyId: string, actor: MergeGateActor) => Promise<string | null>;
   loadIssue: (companyId: string, issueId: string) => Promise<GateIssue | null>;
+  /** A recorded coordinator -> implementer -> coordinator handoff with an implementer run. */
+  loadLegacyDelegation: (companyId: string, issueId: string, coordinatorAgentId: string) => Promise<boolean>;
+  /** An implementer's accepted, agent-addressed review-routing handoff to its coordinator. */
+  loadAcceptedCoordinatorRouting: (companyId: string, issueId: string, implementerAgentId: string, coordinatorAgentId: string) => Promise<boolean>;
   /**
    * Who may have authored the task: every agent with a run on it and the
-   * model families those runs recorded. Only the merging coordinator's runs
-   * are left out (`excludeAgentId`). Reviewers are not: a reviewer with a run
+   * model families those runs recorded. A creator or ancestor coordinator's
+   * runs may be left out (`excludeAgentId`) only after its coordinator
+   * authority is checked; a handoff coordinator's runs never are.
+   * Reviewers are not: a reviewer with a run
    * on the task is a potential author. Null when the runs cannot be read, or
    * a potential author recorded no model.
    */
-  loadTaskAuthorship: (companyId: string, input: { issueId: string; excludeAgentId: string | null }) =>
+  loadTaskAuthorship: (companyId: string, input: {
+    issueId: string; excludeAgentId: string | null; sourceAuthorAgentIds?: string[];
+    /** The reviewer that attested `sourceAuthorAgentIds`; its own runs on the task always count. */
+    attesterAgentId?: string;
+  }) =>
     Promise<{ agentIds: string[]; modelFamilies: string[] } | null>;
+  /**
+   * Agents the task's own record ties to it as a possible implementer: its
+   * creator, every agent ever assigned it or that checked it out, and its
+   * current assignee. Read from the issue and its activity log, never from a
+   * review document. Null when that history cannot be read.
+   */
+  loadTaskCustodians: (companyId: string, issueId: string) => Promise<string[] | null>;
   /**
    * Run `action` holding the merge lock for one repository branch, across
    * server instances. Returns `MERGE_LOCK_BUSY` when another merge holds it.
@@ -130,24 +147,48 @@ function normalizeRepo(repo: string) {
 
 /**
  * Coordinator-only: a board operator, or an agent that delegated the task
- * (its creator, or the assignee of an ancestor) and is not its implementer.
+ * (its creator, an ancestor's assignee, or a recorded legacy handoff).
  */
-export async function assertMayMerge(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, actor: MergeGateActor) {
-  if (actor.type === "board") return;
+export async function assertMayMerge(
+  deps: Pick<MergeGateDependencies, "loadIssue" | "loadLegacyDelegation" | "loadAcceptedCoordinatorRouting" | "loadTaskAuthorship">,
+  issue: GateIssue,
+  actor: MergeGateActor,
+) {
+  if (actor.type === "board") return false;
   const agentId = actor.agentId ?? null;
   if (!agentId) throw forbidden("The merge gate needs an authenticated board operator or coordinating agent");
   if (issue.assigneeAgentId === agentId) {
+    if (await deps.loadLegacyDelegation(issue.companyId, issue.id, agentId)) return true;
     throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
   }
-  if (issue.createdByAgentId === agentId) return;
-  let parentId = issue.parentId;
-  for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
-    const parent = await deps.loadIssue(issue.companyId, parentId);
-    if (!parent) break;
-    if (parent.assigneeAgentId === agentId) return;
-    parentId = parent.parentId;
+  // An engineer that created and still holds its task may route review to a
+  // coordinator. That coordinator's runs stay potential authorship.
+  if (issue.assigneeAgentId && issue.createdByAgentId === issue.assigneeAgentId &&
+    await deps.loadAcceptedCoordinatorRouting(issue.companyId, issue.id, issue.assigneeAgentId, agentId)) return true;
+  let coordinatesTask = issue.createdByAgentId === agentId;
+  if (!coordinatesTask) {
+    let parentId = issue.parentId;
+    for (let depth = 0; parentId && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const parent = await deps.loadIssue(issue.companyId, parentId);
+      if (!parent) break;
+      if (parent.assigneeAgentId === agentId) {
+        coordinatesTask = true;
+        break;
+      }
+      parentId = parent.parentId;
+    }
   }
-  throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
+  if (!coordinatesTask) {
+    throw forbidden("Only the coordinator that delegated this task (its creator or an ancestor's assignee) can merge it");
+  }
+  // Either authority path can belong to a former implementer. Never exclude
+  // the coordinator's task runs without first checking the full run history.
+  const authorship = await deps.loadTaskAuthorship(issue.companyId, { issueId: issue.id, excludeAgentId: null });
+  if (!authorship) throw forbidden("Task authorship could not be established; the merge gate cannot authorize this agent");
+  if (authorship.agentIds.includes(agentId)) {
+    throw forbidden("The implementer cannot merge its own task; the coordinator that delegated it merges through the gate");
+  }
+  return false;
 }
 
 async function isRedMainExempt(deps: Pick<MergeGateDependencies, "loadIssue">, issue: GateIssue, ownerIssueId: string) {
@@ -192,7 +233,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
   if (!Number.isSafeInteger(request.pullNumber) || request.pullNumber <= 0) throw unprocessable("pullNumber must be a positive integer");
   const issue = await deps.loadIssue(request.companyId, request.issueId);
   if (!issue) throw notFound("Issue not found");
-  await assertMayMerge(deps, issue, request.actor);
+  const handoffCoordinator = await assertMayMerge(deps, issue, request.actor);
 
   const token = await deps.resolveToken(request.companyId, request.actor);
   if (!token) throw unprocessable("No GitHub credential is available to the merge gate for this actor");
@@ -208,7 +249,7 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
     }
   };
   const first = await readPullRequest();
-  const context = { repo, label, policy, github, issue };
+  const context = { repo, label, policy, github, issue, handoffCoordinator };
   if (request.dryRun) return evaluateLocked(deps, request, context, first);
   // One check-and-merge at a time per repository branch, so two merges
   // cannot both pass against the same base and land one after the other.
@@ -231,10 +272,10 @@ export async function evaluateAndMerge(deps: MergeGateDependencies, request: Mer
 async function evaluateLocked(
   deps: MergeGateDependencies,
   request: MergeGateRequest,
-  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue },
+  context: { repo: string; label: string; policy: ReturnType<typeof repositoryMergePolicy>; github: MergeGateGitHub; issue: GateIssue; handoffCoordinator: boolean },
   pr: Awaited<ReturnType<MergeGateGitHub["pullRequest"]>>,
 ): Promise<MergeGateResult> {
-  const { repo, label, policy, github, issue } = context;
+  const { repo, label, policy, github, issue, handoffCoordinator } = context;
   const headSha = pr.headSha.toLowerCase();
   const baseSha = (await github.branchHead(pr.baseRef)).toLowerCase();
   // Everything below compares against this one base SHA, not the moving ref.
@@ -245,7 +286,7 @@ async function evaluateLocked(
   const [headChecks, baseChecks] = await Promise.all([github.checks(headSha), github.checks(baseSha)]);
 
   // Main stays green: CI red on the base head, or an open owner issue.
-  const baseCi = evaluateBaseCi({ baseSha, checks: baseChecks.checks });
+  const baseCi = evaluateBaseCi({ baseSha, checks: baseChecks.checks, policy });
   const owner = await deps.ensureRedMainIssue({
     companyId: request.companyId, repo, baseRef: pr.baseRef, baseSha, failing: baseCi.failing,
     fallbackAssigneeAgentId: issue.assigneeAgentId, projectId: issue.projectId, evidence: null,
@@ -271,17 +312,39 @@ async function evaluateLocked(
   // Who may have authored the change is read from what the runs recorded,
   // not from the assignee's current adapter configuration. No run says
   // whether it wrote code, so every agent that ran on the task counts,
-  // including one that reviews it now. The merging coordinator is the one
-  // exclusion: it is the accountable party the route already authorized, and
-  // the gate refuses it as the reviewer.
+  // including one that reviews it now. A creator or ancestor coordinator,
+  // already shown to have no runs on the task, is excluded. A handoff
+  // coordinator (legacy return or accepted routing) may have authored code,
+  // so its runs remain potential authorship.
+  // A completed review can attest the exhaustive source author set, so
+  // coordination and review runs on the task stop counting as authorship.
+  // The attestation never narrows away its own reviewer: any started run the
+  // reviewer has on the task still counts, so a reviewer that ran there is a
+  // potential author and its review is not independent. Nothing recorded
+  // shows that such a run wrote no source, and the reviewer's own list cannot
+  // be that evidence. The reviewer must also never have been the task's
+  // creator, assignee or checkout holder. The attested agents must still have
+  // started runs on the task.
+  const attestations = independentOfMerger.filter(review =>
+    review.scope === "full" && review.reviewIssueStatus === "done" && review.writtenByReviewer &&
+    review.reviewerAgentId && review.pullRequest?.toLowerCase() === label.toLowerCase() &&
+    review.reviewedSha === headSha && review.sourceAuthorAgentIds?.length &&
+    !review.sourceAuthorAgentIds.includes(review.reviewerAgentId));
+  const custodians = attestations.length > 0 ? await deps.loadTaskCustodians(request.companyId, issue.id) : null;
+  const sourceReview = custodians
+    ? attestations.reverse().find(review => !custodians.includes(review.reviewerAgentId!))
+    : undefined;
+  const sourceAuthorAgentIds = sourceReview?.sourceAuthorAgentIds ?? undefined;
   const authorship = await deps.loadTaskAuthorship(request.companyId, {
     issueId: issue.id,
-    excludeAgentId: request.actor.agentId ?? null,
+    excludeAgentId: sourceAuthorAgentIds ? null : handoffCoordinator ? null : request.actor.agentId ?? null,
+    sourceAuthorAgentIds,
+    ...(sourceReview?.reviewerAgentId ? { attesterAgentId: sourceReview.reviewerAgentId } : {}),
   });
   const trailerFamilies = compareToBase ? coAuthorModelFamilies(compareToBase.commits.map(commit => commit.message)) : [];
   const author: MergeGateAuthor = {
     agentIds: authorship === null ? null
-      : [...new Set([...authorship.agentIds, ...(issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
+      : [...new Set([...authorship.agentIds, ...(!sourceAuthorAgentIds && issue.assigneeAgentId ? [issue.assigneeAgentId] : [])])].sort(),
     modelFamilies: authorship === null ? null : [...new Set([...authorship.modelFamilies, ...trailerFamilies])].sort(),
   };
   const deltas = new Map<string, HeadDelta>();
@@ -371,3 +434,4 @@ export async function reportRedMain(deps: MergeGateDependencies, input: {
   }
   return { issue: { id: owner.issue.id, identifier: owner.issue.identifier }, created: owner.created };
 }
+

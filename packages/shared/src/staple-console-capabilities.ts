@@ -22,6 +22,8 @@ import type {
 } from "./staple-console.js";
 
 export const STAPLE_CONSOLE_CAPABILITY_MAP_KEY = "capability-map";
+/** The task that owns the registry. A same-key document on any other task never replaces it. */
+export const STAPLE_CONSOLE_CAPABILITY_MAP_OWNER = "STA-152";
 
 export type StapleConsoleClaimState = "green" | "blue" | "red";
 
@@ -322,14 +324,12 @@ export function deriveStapleConsoleClaim(
 
   let state: StapleConsoleClaimState;
   let stateReason: string;
-  // Stuck or waiting-on-Ethan work is red even beside active work: red always means "look at this".
-  const urgent = open.filter((task) => task.needsEthanReason || task.stuckReason).map(claimAttention) as string[];
-  if (urgent.length > 0) {
-    state = "red";
-    stateReason = urgent[0]!;
-  } else if (active.length > 0) {
+  // Blue means someone is actively on the gap, so a healthy fix wins over a stuck or waiting sibling.
+  // Red is left for gaps nothing is fixing; the sibling's own reason stays in the state reason and proof.
+  if (active.length > 0) {
     state = "blue";
     stateReason = `${active.map((task) => task.identifier).join(", ")} ${active.length === 1 ? "is" : "are"} on it`;
+    if (attention.length > 0) stateReason += `; ${attention[0]!}`;
   } else if (attention.length > 0) {
     state = "red";
     stateReason = attention[0]!;
@@ -401,7 +401,7 @@ export function deriveStapleConsoleCapabilities(
     return {
       source: {
         available: false,
-        detail: `No readable ${STAPLE_CONSOLE_CAPABILITY_MAP_KEY} document was found`,
+        detail: `No readable ${STAPLE_CONSOLE_CAPABILITY_MAP_KEY} document on ${STAPLE_CONSOLE_CAPABILITY_MAP_OWNER} was found`,
         issueIdentifier: null,
         revisionNumber: null,
         updatedAt: null,

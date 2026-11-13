@@ -33,7 +33,14 @@ export interface RepositoryMergePolicy {
    * file matches one. Either way, a file a Windows suite executes always
    * needs a Windows check.
    */
-  pathScopedChecks: Array<{ platform: string; checks: string[]; irrelevantPaths?: RegExp[]; relevantPaths?: RegExp[] }>;
+  pathScopedChecks: Array<{
+    platform: string;
+    checks: string[];
+    irrelevantPaths?: RegExp[];
+    relevantPaths?: RegExp[];
+    maintenanceOnlyPaths?: RegExp[];
+    workflowPath?: string;
+  }>;
   /**
    * Check runs that may skip on any change: selectors, and jobs that run
    * only on a label or manual dispatch. Any other skip refuses.
@@ -79,6 +86,18 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
     alwaysRequiredChecks: ["changes", "shell", "agent", "account-web", "pr-status-block"].map(exactly),
     pathScopedChecks: [
       { platform: "windows", checks: ["windows-fast", "windows-native"], irrelevantPaths: FACETTE_WINDOWS_IRRELEVANT },
+      {
+        platform: "candidate",
+        checks: ["frontend", "candidate", "browser-evidence"],
+        workflowPath: ".github/workflows/internal-windows.yml",
+        relevantPaths: [/^shell\//, /^agent\//, /^\.github\/workflows\/internal-windows\.yml$/],
+        maintenanceOnlyPaths: [
+          /^\.github\/workflows\/internal-windows\.yml$/,
+          /^\.github\/scripts\/detect-changed-paths\.sh$/,
+          /^\.github\/scripts\/detect-changed-paths\.test\.sh$/,
+          /^\.github\/scripts\/internal-windows-workflow\.test\.mjs$/,
+        ],
+      },
     ],
     optionalSkips: [],
     planValidatedSkips: [],
@@ -89,15 +108,14 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
   // any test suite, and the nightly staple-certify.yml run certifies the full
   // suite before an install. `ci / verify` is the stable aggregate: it always
   // runs and fails unless every planned suite, e2e included, has the result
-  // the plan chose. `ci / e2e` does the same for the e2e shards. Policy,
-  // typecheck and build pass on every change regardless of the plan.
+  // the plan chose. `ci / e2e` does the same for the e2e shards. Only policy
+  // runs on every change; the plan may skip typecheck, the affected-package
+  // typecheck and build, and `ci / verify` asserts each passed when selected.
   "ethanmonlux/paperclip": {
     alwaysRequiredChecks: [
       exactly("ci / policy"),
       exactly("ci / verify"),
       exactly("ci / e2e"),
-      { label: "ci / Typecheck + Release Registry", pattern: /^ci \/ Typecheck\b/ },
-      exactly("ci / Build"),
     ],
     // runner-windows.yml starts only for these paths (its `paths:` trigger).
     pathScopedChecks: [{
@@ -125,6 +143,9 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       {
         validator: "ci / verify",
         checks: [
+          /^ci \/ Typecheck\b/,
+          /^ci \/ Affected packages \(typecheck\)$/,
+          /^ci \/ Build$/,
           /^ci \/ General tests \(/,
           /^ci \/ Verify serialized server suites\b/,
           /^ci \/ e2e shard \(/,
@@ -155,6 +176,13 @@ export interface MergeGateCheck {
   status: string;
   conclusion: string | null;
   kind: "check_run" | "workflow_run";
+  headSha?: string | null;
+  checkSuiteId?: number | null;
+  workflowPath?: string | null;
+  runId?: number | null;
+  runAttempt?: number | null;
+  createdAt?: string | null;
+  checkRunId?: number | null;
 }
 
 const PASSING_CONCLUSIONS = new Set(["success", "neutral"]);
@@ -205,6 +233,8 @@ export function requiredPathScopedChecks(input: {
   const files = input.changedFiles;
   const required: string[] = [];
   for (const scope of input.policy.pathScopedChecks) {
+    if (files !== null && files.length > 0 && scope.maintenanceOnlyPaths &&
+      files.every(file => matchesAny(file, scope.maintenanceOnlyPaths!))) continue;
     const irrelevant = (file: string) => {
       if (scope.platform === "windows" && matchesAny(file, WINDOWS_EXECUTED_PATHS)) return false;
       if (scope.relevantPaths) return !matchesAny(file, scope.relevantPaths);
@@ -214,6 +244,41 @@ export function requiredPathScopedChecks(input: {
     if (!allIrrelevant) required.push(...scope.checks);
   }
   return required;
+}
+
+function currentWorkflowChecks(input: {
+  policy: RepositoryMergePolicy;
+  checks: readonly MergeGateCheck[];
+  headSha: string;
+}): readonly MergeGateCheck[] {
+  let checks = [...input.checks];
+  for (const scope of input.policy.pathScopedChecks) {
+    if (!scope.workflowPath) continue;
+    const runs = checks.filter(check => check.kind === "workflow_run" && check.workflowPath === scope.workflowPath &&
+      check.headSha?.toLowerCase() === input.headSha.toLowerCase() && check.runId != null && check.checkSuiteId != null);
+    if (runs.length > 1 && runs.some(run => !Number.isFinite(Date.parse(run.createdAt ?? "")))) continue;
+    const created = (run: MergeGateCheck) => Date.parse(run.createdAt ?? "") || 0;
+    runs.sort((left, right) => created(right) - created(left) || right.runId! - left.runId! ||
+      (right.runAttempt ?? 1) - (left.runAttempt ?? 1));
+    const latest = runs[0];
+    if (!latest) continue;
+    const older = new Set(runs.slice(1));
+    const olderSuites = new Set(runs.slice(1).map(run => run.checkSuiteId).filter(id => id !== latest.checkSuiteId));
+    const latestJobs = new Map<string, MergeGateCheck>();
+    for (const job of checks) {
+      if (job.kind !== "check_run" || job.checkSuiteId !== latest.checkSuiteId || job.checkRunId == null) continue;
+      const previous = latestJobs.get(job.name);
+      if (!previous || job.checkRunId > previous.checkRunId!) latestJobs.set(job.name, job);
+    }
+    checks = checks.filter(check => {
+      if (older.has(check)) return false;
+      if (check.kind !== "check_run") return true;
+      if (olderSuites.has(check.checkSuiteId)) return false;
+      const latestJob = check.checkSuiteId === latest.checkSuiteId ? latestJobs.get(check.name) : undefined;
+      return !latestJob || check === latestJob || check.checkRunId == null;
+    });
+  }
+  return checks;
 }
 
 /**
@@ -231,21 +296,22 @@ export function evaluateHeadCi(input: {
   changedFiles: readonly string[] | null;
 }): MergeGateReason[] {
   const sha = shortSha(input.headSha);
+  const checks = currentWorkflowChecks(input);
   if (!input.checksComplete) {
     return [{ code: "ci_incomplete", detail: `GitHub returned only part of the CI for ${sha}; the gate cannot prove it green.` }];
   }
-  if (input.checks.length === 0) {
+  if (checks.length === 0) {
     return [{ code: "ci_absent", detail: `No check run or workflow run exists for ${sha}. Record a ci wait for this head; if CI never starts, re-trigger it once.` }];
   }
-  const active = input.checks.filter(check => check.status !== "completed");
+  const active = checks.filter(check => check.status !== "completed");
   if (active.length > 0) {
     return [{ code: "ci_pending", detail: `CI for ${sha} is still running (${active.length} active: ${active.map(check => check.name).slice(0, 5).join(", ")}). Record a ci wait and merge after it finishes.` }];
   }
-  const failed = input.checks.filter(check => check.conclusion !== "skipped" && !PASSING_CONCLUSIONS.has(check.conclusion ?? ""));
+  const failed = checks.filter(check => check.conclusion !== "skipped" && !PASSING_CONCLUSIONS.has(check.conclusion ?? ""));
   if (failed.length > 0) {
     return [{ code: "ci_failed", detail: `CI for ${sha} did not pass: ${failed.map(check => `${check.name} (${check.conclusion ?? "no conclusion"})`).slice(0, 5).join(", ")}.` }];
   }
-  const checkRuns = input.checks.filter(check => check.kind === "check_run");
+  const checkRuns = checks.filter(check => check.kind === "check_run");
   const passed = checkRuns.filter(check => PASSING_CONCLUSIONS.has(check.conclusion ?? ""));
   if (passed.length === 0) {
     return [{ code: "ci_absent", detail: `No check run passed on ${sha}; skipped or empty CI is not evidence. CI must run and pass.` }];
@@ -265,6 +331,20 @@ export function evaluateHeadCi(input: {
     reasons.push({ code: "required_check_skipped", detail: skipped
       ? `${name} was skipped by a CI path filter, but this change touches paths that check covers or paths not known to be irrelevant to it. It must run and pass on ${sha}.`
       : `${name} did not run on ${sha}, but this change needs it. It must run and pass.` });
+  }
+  for (const scope of input.policy.pathScopedChecks) {
+    if (!scope.workflowPath || !scope.checks.some(name => input.requiredChecks.includes(name))) continue;
+    const workflows = checks.filter(run => run.kind === "workflow_run" &&
+      run.workflowPath === scope.workflowPath && run.headSha?.toLowerCase() === input.headSha.toLowerCase());
+    const proven = workflows.length === 1 && workflows.some(run =>
+      run.status === "completed" && run.conclusion === "success" && run.runId != null && run.checkSuiteId != null &&
+      scope.checks.every(name => {
+        const jobs = checkRuns.filter(check => check.name === name && check.checkSuiteId === run.checkSuiteId);
+        return jobs.length === 1 && jobs[0]!.headSha?.toLowerCase() === input.headSha.toLowerCase() &&
+          jobs[0]!.status === "completed" && jobs[0]!.conclusion === "success";
+      }));
+    if (!proven) reasons.push({ code: "required_check_skipped", detail:
+      `${scope.checks.join(", ")} must all succeed in one completed ${scope.workflowPath} run at ${sha}. Ordinary CI, an older head, skipped jobs or same-named jobs from another workflow do not prove this candidate. The coordinator must reuse or explicitly dispatch the applicable finished-candidate run and record its run ID in a ci wait.` });
   }
   // A skip is allowed only where the policy says so; a path filter that
   // skipped anything else, or a disabled suite, is not a green result.
@@ -292,8 +372,9 @@ const NON_VERDICT_CONCLUSIONS = new Set(["skipped", "cancelled", "stale"]);
  * Red main: a finished check on the base head that failed. A cancelled or
  * superseded run is not a verdict on the code, so it does not make main red.
  */
-export function evaluateBaseCi(input: { baseSha: string; checks: readonly MergeGateCheck[] }): { red: boolean; failing: string[] } {
-  const failing = input.checks
+export function evaluateBaseCi(input: { baseSha: string; checks: readonly MergeGateCheck[]; policy?: RepositoryMergePolicy }): { red: boolean; failing: string[] } {
+  const checks = input.policy ? currentWorkflowChecks({ ...input, policy: input.policy, headSha: input.baseSha }) : input.checks;
+  const failing = checks
     .filter(check => check.status === "completed" && !NON_VERDICT_CONCLUSIONS.has(check.conclusion ?? "") &&
       !PASSING_CONCLUSIONS.has(check.conclusion ?? ""))
     .map(check => check.name);
@@ -312,6 +393,8 @@ export interface MergeReviewAttestation {
   reviewerModelFamilies: string[];
   /** The document revision was written by the review issue's assignee. */
   writtenByReviewer: boolean;
+  /** Exhaustive source author agents attested by the independent reviewer, when known. */
+  sourceAuthorAgentIds: string[] | null;
   scope: "full" | "conflict_hunks";
   reviewedSha: string;
   pullRequest: string | null;
@@ -352,7 +435,11 @@ export function parseMergeReviewDocument(body: string): Omit<MergeReviewAttestat
   if (!scope) return null;
   const p2Value = field("p2") ?? "none";
   const p2 = /^(none|0|-)$/i.test(p2Value) ? [] : p2Value.split(/[,\s]+/).filter(Boolean);
-  return { scope, reviewedSha, pullRequest: field("pullRequest"), p0, p1, p2 };
+  const sourceAuthors = field("sourceAuthorAgentIds");
+  const sourceAuthorAgentIds = sourceAuthors === null ? null : sourceAuthors.split(/[,\s]+/).filter(Boolean);
+  if (sourceAuthorAgentIds !== null && (sourceAuthorAgentIds.length === 0 ||
+    sourceAuthorAgentIds.some(id => !/^[0-9a-f]{8}-[0-9a-f-]{27,}$/.test(id)))) return null;
+  return { scope, reviewedSha, pullRequest: field("pullRequest"), p0, p1, p2, sourceAuthorAgentIds };
 }
 
 const TRACKED_ISSUE = /^[A-Z][A-Z0-9]*-\d+$/;
@@ -598,3 +685,4 @@ export function decideMerge(input: {
   reasons.push(...input.ciReasons, ...input.reviewReasons);
   return { mergeable: reasons.length === 0, reasons, requiredChecks: [...input.requiredChecks] };
 }
+
