@@ -91,12 +91,27 @@ def extent(i):
             depth-=1
             if depth==0: return j+1
     return len(text)
-dec=json.JSONDecoder(); found=[]; i=text.find("{")
+class DuplicateKey(ValueError): pass
+def pairs(items):
+    if len({k for k,_ in items})<len(items): raise DuplicateKey()
+    return dict(items)
+def names_backup(span):
+    for token in re.findall(r'"(?:[^"\\\n]|\\.)*"',span):
+        try:
+            if json.loads(token)=="backupFile": return True
+        except ValueError: pass
+    return False
+dec=json.JSONDecoder(object_pairs_hook=pairs); starts_object=re.compile(r'\{\s*"').match; found=[]; i=text.find("{")
 while i>=0:
     try: obj,end=dec.raw_decode(text,i)
-    except ValueError:
+    except DuplicateKey:
         end=extent(i)
-        if '"backupFile"' in text[i:end]: print("error:incomplete backup metadata in db:backup output"); sys.exit()
+        if names_backup(text[i:end]): print("error:duplicate keys in backup metadata in db:backup output"); sys.exit()
+    except ValueError:
+        if not starts_object(text,i): end=i+1
+        else:
+            end=extent(i)
+            if names_backup(text[i:end]): print("error:incomplete backup metadata in db:backup output"); sys.exit()
     else:
         if isinstance(obj,dict) and "backupFile" in obj: found.append(obj)
     i=text.find("{",end)

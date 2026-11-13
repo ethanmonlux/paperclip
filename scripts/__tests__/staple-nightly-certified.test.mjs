@@ -314,8 +314,8 @@ test("Gate 2 compares a supplied sizeBytes and refuses one that is not a byte co
     assert.equal(backupResult({ bytes: 7, meta: (file) => ({ backupFile: file, sizeBytes }) }),
       `error:sizeBytes is not a byte count (${shown})`);
   }
-  assert.equal(backupResult({ bytes: 12, meta: (file) => ({ backupFile: file, sizeBytes: 12.0 }) }),
-    "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+  assert.equal(backupResult({ bytes: 12, stdout: (file) => `{"backupFile":${JSON.stringify(file)},"sizeBytes":12.0}\n` }),
+    "error:sizeBytes is not a byte count (12.0)");
 });
 
 test("Gate 2 refuses competing or incomplete backup metadata and ignores unrelated braces", () => {
@@ -330,6 +330,21 @@ test("Gate 2 refuses competing or incomplete backup metadata and ignores unrelat
     "error:2 backup metadata records in db:backup output");
   assert.equal(backupResult({ bytes: 7, stdout: (file) => `pid {4242} {"a": "}{"}\n{"wrapped": ${record("/missing")}}\n${record(file)}\n{not json}\n` }),
     "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `${record(file)}\n{"backup\\u0046ile":"/missing","sizeBytes":` }),
+    "error:incomplete backup metadata in db:backup output");
+  assert.equal(backupResult({ bytes: 7, stdout: (file) => `{"backupFile":"/missing","backupFile":${JSON.stringify(file)},"sizeBytes":7}\n` }),
+    "error:duplicate keys in backup metadata in db:backup output");
+});
+
+test("Gate 2 accepts real output whose path or progress lines carry an unmatched brace", () => {
+  const real = (file) => dbBackupStdout({ backupFile: file, sizeBytes: 12 });
+  for (const edit of [
+    (out) => out.replace("{pid 4242}", "{pid 4242"),
+    (out) => out.replace("Config: /home/u/", "Config: /home/u/{draft/"),
+  ]) {
+    assert.equal(backupResult({ bytes: 12, stdout: (file) => edit(real(file)) }),
+      "file:<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz");
+  }
 });
 
 test("Gate 2 fails closed when the named backup file is missing, empty or the wrong size", () => {
