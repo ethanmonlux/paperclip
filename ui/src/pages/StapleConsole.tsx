@@ -15,6 +15,12 @@ import {
   type StapleConsoleClaimState,
   type StapleConsoleProofPullRequest,
   type StapleConsoleStepCell,
+  type StapleConsoleUpgradePhase,
+  type StapleConsoleUpgradeStageCell,
+  type StapleConsoleUpgradeStatus,
+  STAPLE_UPGRADE_STAGE_LABELS,
+  STAPLE_UPGRADE_STAGE_SHORT,
+  stapleUpgradeDrainText,
 } from "@paperclipai/shared/staple-console";
 import { Link } from "@/lib/router";
 import { stapleConsoleApi } from "../api/staple-console";
@@ -599,7 +605,223 @@ function MaintenanceHoldBanner({ hold }: { hold: NonNullable<StapleConsoleBoard[
   );
 }
 
-export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoard; now: number }) {
+// ---------------------------------------------------------------------------
+// Managed upgrade (FAC-620 upgrade status)
+
+const UPGRADE_PILL: Record<StapleConsoleUpgradePhase, { label: string; tone: string }> = {
+  running: { label: "Upgrading", tone: "bg-sky-500 text-white" },
+  waiting: { label: "Waiting", tone: "bg-muted text-foreground" },
+  up_to_date: { label: "Up to date", tone: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300" },
+  verified: { label: "Verified", tone: "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300" },
+  skipped: { label: "Didn't install", tone: "bg-amber-500/20 text-amber-800 dark:text-amber-300" },
+  failed: { label: "Failed", tone: "bg-red-500 text-white" },
+  rolled_back: { label: "Rolled back", tone: "bg-red-500 text-white" },
+  needs_ethan: { label: "Needs you", tone: "bg-[#f0714f] text-white" },
+  stale: { label: "Not reporting", tone: "bg-amber-500/20 text-amber-800 dark:text-amber-300" },
+  unknown: { label: "Unknown", tone: "bg-muted text-muted-foreground" },
+};
+
+const UPGRADE_BORDER: Partial<Record<StapleConsoleUpgradePhase, string>> = {
+  running: "border-sky-500",
+  failed: "border-red-500",
+  rolled_back: "border-red-500",
+  needs_ethan: CORAL,
+  stale: "border-amber-500",
+};
+
+/** An idle card stays one line once its last install is this old. */
+const UPGRADE_RECENT_MS = 6 * 60 * 60_000;
+/** These stages restart Staple, so a lost connection is expected. */
+const RESTARTING_STAGES = new Set(["download_build", "restart", "verify", "rollback"]);
+
+function UpgradeStageStrip({ stages }: { stages: StapleConsoleUpgradeStageCell[] }) {
+  return (
+    <ol className="grid grid-cols-6 gap-1" aria-label="Upgrade stage">
+      {stages.map((cell) => (
+        <li
+          key={cell.key}
+          aria-current={cell.state === "current" ? "step" : undefined}
+          data-state={cell.state}
+          className={cn(
+            "min-w-0 truncate rounded px-0.5 py-0.5 text-center text-[10px] leading-tight",
+            cell.state === "done" && "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300",
+            cell.state === "current" && "bg-sky-500 font-semibold text-white",
+            cell.state === "failed" && "bg-red-500 font-semibold text-white",
+            cell.state === "pending" && "bg-muted text-muted-foreground",
+            cell.state === "skipped" && "border border-dashed border-muted-foreground/40 text-muted-foreground",
+          )}
+          title={cell.label}
+        >
+          {STAPLE_UPGRADE_STAGE_SHORT[cell.key]}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function UpgradeCard({
+  upgrade,
+  now,
+  open,
+  onToggle,
+  connection,
+}: {
+  upgrade: StapleConsoleUpgradeStatus;
+  now: number;
+  open: boolean;
+  onToggle: () => void;
+  connection?: { lost: boolean; lastLoadedAt: number | null };
+}) {
+  const pill = UPGRADE_PILL[upgrade.phase];
+  const lost = Boolean(connection?.lost);
+  const recentInstall = upgrade.attemptEndedAt !== null && now - Date.parse(upgrade.attemptEndedAt) < UPGRADE_RECENT_MS;
+  const compact = !lost && !upgrade.hold && !open && (
+    upgrade.phase === "up_to_date"
+    || upgrade.phase === "waiting"
+    || upgrade.phase === "unknown"
+    || (upgrade.phase === "verified" && !recentInstall)
+  );
+  const stageLabel = upgrade.stage ? STAPLE_UPGRADE_STAGE_LABELS[upgrade.stage] : null;
+  const stageFor = since(upgrade.stageStartedAt, now);
+  const total = upgrade.attemptEndedAt
+    ? upgrade.attemptStartedAt ? formatStapleConsoleDuration(Date.parse(upgrade.attemptEndedAt) - Date.parse(upgrade.attemptStartedAt)) : null
+    : since(upgrade.attemptStartedAt, now);
+  const lastOutput = since(upgrade.lastOutputAt, now);
+  const drain = upgrade.stage === "draining" ? stapleUpgradeDrainText(upgrade.drainRunning) : null;
+  const lostAt = connection?.lastLoadedAt ? clock(new Date(connection.lastLoadedAt).toISOString()) : null;
+  const restartExpected = lost && upgrade.phase === "running" && upgrade.stage !== null && RESTARTING_STAGES.has(upgrade.stage);
+
+  if (compact) {
+    return (
+      <section aria-label="Upgrades" className="rounded-md border border-border px-2 py-1.5 text-xs" data-testid="staple-console-upgrade" data-phase={upgrade.phase} data-compact="true">
+        <Disclosure open={false} onToggle={onToggle} label="Upgrades, expand" testId="staple-console-upgrade-toggle" className="items-baseline">
+          <span className="font-semibold text-foreground">Upgrades</span>
+          <span className="min-w-0 flex-1 truncate text-muted-foreground">
+            {upgrade.phase === "unknown" ? <Unknown /> : upgrade.headline}
+            {upgrade.installed && upgrade.phase !== "waiting" ? ` · on ${upgrade.installed}` : ""}
+          </span>
+        </Disclosure>
+      </section>
+    );
+  }
+
+  return (
+    <section
+      aria-label="Upgrades"
+      className={cn("space-y-1.5 rounded-md border p-2 text-xs", UPGRADE_BORDER[upgrade.phase] ?? "border-border", lost && "border-dashed")}
+      data-testid="staple-console-upgrade"
+      data-phase={upgrade.phase}
+      data-compact="false"
+    >
+      <Disclosure open={open} onToggle={onToggle} label={`Upgrades, ${open ? "collapse" : "expand"}`} testId="staple-console-upgrade-toggle" className="items-center">
+        <span className="font-semibold text-foreground">Upgrades</span>
+        <span className={cn("rounded px-1.5 py-0.5 text-[10px] font-semibold", pill.tone)}>{pill.label}</span>
+        {upgrade.quiet ? <span className="text-[10px] text-muted-foreground">daytime</span> : null}
+      </Disclosure>
+      <p className="font-medium text-foreground" data-testid="staple-console-upgrade-headline">{upgrade.headline}</p>
+
+      {lost ? (
+        <p role="status" className="rounded border border-amber-500 bg-amber-500/10 px-1.5 py-1 text-[11px] text-foreground" data-testid="staple-console-upgrade-lost">
+          {restartExpected
+            ? `Can't reach Staple since ${lostAt ?? "the last refresh"}. Expected while it restarts: showing the last known stage.`
+            : `Can't reach Staple since ${lostAt ?? "the last refresh"}. Upgrade state is the last known.`}
+        </p>
+      ) : null}
+
+      {upgrade.stages.length > 0 ? <UpgradeStageStrip stages={upgrade.stages} /> : null}
+
+      <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-[11px]" data-testid="staple-console-upgrade-facts">
+        {upgrade.phase === "running" || upgrade.phase === "stale" ? (
+          <>
+            <dt className="text-muted-foreground">Stage</dt>
+            <dd className="text-foreground">{stageLabel ?? <Unknown />}{stageFor ? ` · ${stageFor}` : ""}</dd>
+          </>
+        ) : null}
+        <dt className="text-muted-foreground">{upgrade.attemptEndedAt ? "Took" : "Elapsed"}</dt>
+        <dd className="text-foreground">{total ?? <Unknown />}</dd>
+        <dt className="text-muted-foreground">Last output</dt>
+        <dd className={cn("text-foreground", upgrade.phase === "stale" && "font-semibold")}>{lastOutput ? `${lastOutput} ago` : <Unknown />}</dd>
+        {upgrade.download ? (
+          <>
+            <dt className="text-muted-foreground">Download</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-download">
+              {upgrade.download.bytes !== null && upgrade.download.totalBytes
+                ? `${Math.floor((upgrade.download.bytes / upgrade.download.totalBytes) * 100)}%`
+                : <><span className="text-muted-foreground">size unknown</span> · no ETA</>}
+            </dd>
+          </>
+        ) : null}
+        {drain ? (
+          <>
+            <dt className="text-muted-foreground">Drain</dt>
+            <dd className="text-foreground">{drain}</dd>
+          </>
+        ) : null}
+        {upgrade.hold ? (
+          <>
+            <dt className="text-muted-foreground">Held</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-hold">
+              {upgrade.hold.queuedWakes} queued{upgrade.hold.parkedRuns > 0 ? ` · ${upgrade.hold.parkedRuns} parked` : ""} · lifts by {clock(upgrade.hold.expiresAt) ?? "unknown"}
+            </dd>
+          </>
+        ) : null}
+        {/* A founder action replaces "next": nothing automatic follows it. */}
+        {upgrade.needsEthan ? null : (
+          <>
+            <dt className="text-muted-foreground">Next</dt>
+            <dd className="text-foreground" data-testid="staple-console-upgrade-next">{upgrade.nextAction ?? <Unknown />}</dd>
+          </>
+        )}
+      </dl>
+
+      {upgrade.needsEthan ? (
+        <p className={cn("rounded border p-1.5 text-[11px] text-foreground", CORAL)} data-testid="staple-console-upgrade-needs-ethan">
+          <span className="font-semibold">Needs you: </span>{upgrade.needsEthan}
+        </p>
+      ) : null}
+
+      {open ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 border-t border-border pt-1.5 text-[11px]" data-testid="staple-console-upgrade-detail">
+          <dt className="text-muted-foreground">Installed</dt>
+          <dd className="font-mono text-foreground">{upgrade.installed ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Target</dt>
+          <dd className="font-mono text-foreground">{upgrade.target ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Master</dt>
+          <dd className="font-mono text-foreground">{upgrade.master ?? <Unknown />}</dd>
+          <dt className="text-muted-foreground">Started</dt>
+          <dd className="text-foreground">{clock(upgrade.attemptStartedAt) ?? <Unknown />}</dd>
+          {upgrade.outcome ? (
+            <>
+              <dt className="text-muted-foreground">Result</dt>
+              <dd className="text-foreground">{upgrade.outcome}</dd>
+            </>
+          ) : null}
+          {upgrade.lastInstall ? (
+            <>
+              <dt className="text-muted-foreground">Last install</dt>
+              <dd className="text-foreground">
+                {UPGRADE_PILL[upgrade.lastInstall.phase].label} {upgrade.lastInstall.from ?? "unknown"} → {upgrade.lastInstall.to ?? "unknown"}, {clock(upgrade.lastInstall.at)}
+              </dd>
+            </>
+          ) : null}
+          <dt className="text-muted-foreground">Source</dt>
+          <dd className="text-muted-foreground">{upgrade.source.detail}{upgrade.source.logName ? ` · ${upgrade.source.logName}` : ""}</dd>
+        </dl>
+      ) : null}
+    </section>
+  );
+}
+
+export function StapleConsoleBoardView({
+  board,
+  now,
+  connection,
+}: {
+  board: StapleConsoleBoard;
+  now: number;
+  /** A failed refresh while a board is loaded: during an install restart this is expected. */
+  connection?: { lost: boolean; lastLoadedAt: number | null };
+}) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const [highlighted, setHighlighted] = useState<string | null>(null);
   const isOpen = useCallback((key: string) => expanded.has(key), [expanded]);
@@ -645,10 +867,20 @@ export function StapleConsoleBoardView({ board, now }: { board: StapleConsoleBoa
 
   return (
     <div className="space-y-5">
-      {board.maintenanceHold ? <MaintenanceHoldBanner hold={board.maintenanceHold} /> : null}
+      {/* The upgrade card carries the hold; the banner remains for a server without it. */}
+      {board.maintenanceHold && !board.upgrade ? <MaintenanceHoldBanner hold={board.maintenanceHold} /> : null}
 
       {/* Level 1: is anything stalled or waiting on me? */}
       <HeaderTiles header={board.header} />
+      {board.upgrade ? (
+        <UpgradeCard
+          upgrade={board.upgrade}
+          now={now}
+          open={isOpen("upgrade")}
+          onToggle={() => toggle("upgrade")}
+          connection={connection}
+        />
+      ) : null}
       <AttentionList items={board.attention ?? []} onJump={jump} />
 
       {/* Level 2: what can the system do now? */}
@@ -846,7 +1078,11 @@ export function StapleConsole() {
         <p className="text-sm text-muted-foreground">{query.isLoading ? "Loading the board…" : "No board loaded."}</p>
       ) : (
         <div className={cn("transition", stale && "opacity-60 grayscale")} data-stale={stale ? "true" : "false"}>
-          <StapleConsoleBoardView board={board} now={now} />
+          <StapleConsoleBoardView
+            board={board}
+            now={now}
+            connection={{ lost: Boolean(query.error), lastLoadedAt: query.dataUpdatedAt || null }}
+          />
         </div>
       )}
     </div>

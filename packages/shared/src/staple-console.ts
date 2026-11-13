@@ -16,8 +16,10 @@ import {
   type StapleConsoleProofPullRequest,
   type StapleConsoleProofReview,
 } from "./staple-console-capabilities.js";
+import type { StapleConsoleUpgradeStatus } from "./staple-console-upgrade.js";
 
 export * from "./staple-console-capabilities.js";
+export * from "./staple-console-upgrade.js";
 
 export const STAPLE_CONSOLE_STEPS = ["queued", "build", "ci", "review", "merged"] as const;
 export type StapleConsoleStep = (typeof STAPLE_CONSOLE_STEPS)[number];
@@ -440,6 +442,8 @@ export interface StapleConsoleBoard {
   generatedAt: string;
   /** Present while the nightly maintenance hold is active. */
   maintenanceHold?: StapleConsoleMaintenanceHold | null;
+  /** Managed upgrade card (FAC-620 upgrade status): stage, timing, hold and next action. */
+  upgrade?: StapleConsoleUpgradeStatus | null;
   issuePrefix: string;
   header: { mergedToday: number; inFlight: number; needsEthan: number; stuck: number };
   scheduled: StapleConsoleScheduledEvent[];
