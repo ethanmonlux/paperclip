@@ -235,8 +235,8 @@ describe("required CI coverage", () => {
       checks: [...paperclipGreen.filter(entry => entry.name !== "ci / verify"), check("ci / General tests (server (2/12))", "skipped")] }))
       .toEqual(expect.arrayContaining([expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("server (2/12)") })]));
     expect(evaluateHeadCi({ headSha: HEAD, policy: paperclip, checksComplete: true, requiredChecks: [], changedFiles: ["server/src/app.ts"],
-      checks: paperclipGreen.filter(entry => entry.name !== "ci / Build") }))
-      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+      checks: paperclipGreen.filter(entry => entry.name !== "ci / policy") }))
+      .toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / policy runs on every change") }]);
   });
 });
 
@@ -296,8 +296,29 @@ describe("paperclip CI policy (STA-218)", () => {
   });
 
   it("still refuses a skipped required suite, even with ci / verify green", () => {
-    const skippedBuild = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / Build" ? { ...entry, conclusion: "skipped" } : entry);
-    expect(evaluate(skippedBuild)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / Build runs on every change") }]);
+    const skippedPolicy = PAPERCLIP_ORDINARY_PR.map(entry => entry.name === "ci / policy" ? { ...entry, conclusion: "skipped" } : entry);
+    expect(evaluate(skippedPolicy)).toMatchObject([{ code: "required_check_skipped", detail: expect.stringContaining("ci / policy runs on every change") }]);
+  });
+
+  it("accepts a light plan that skipped typecheck and build behind a green ci / verify, and refuses it when ci / verify failed (STA-354)", () => {
+    const lightPlan = [
+      ...PAPERCLIP_ORDINARY_PR.map(entry => /Typecheck|ci \/ Build$|General tests|serialized server|e2e shard|Verify Paperclip Runner|Docker context|Canary|Runner support|Sandbox/.test(entry.name)
+        ? { ...entry, conclusion: "skipped" } : entry),
+      check("ci / Affected packages (typecheck)", "skipped"),
+    ];
+    expect(lightPlan.filter(entry => entry.conclusion === "success").map(entry => entry.name).sort())
+      .toEqual(["ci / e2e", "ci / gate / Select trusted runner", "ci / policy", "ci / verify"]);
+    expect(evaluate(lightPlan)).toEqual([]);
+    expect(evaluate(lightPlan.map(entry => entry.name === "ci / verify" ? { ...entry, conclusion: "failure" } : entry)))
+      .toMatchObject([{ code: "ci_failed", detail: expect.stringContaining("ci / verify (failure)") }]);
+    expect(evaluate(lightPlan.filter(entry => entry.name !== "ci / verify")).map(reason => reason.detail)).toEqual(expect.arrayContaining([
+      expect.stringContaining("ci / verify runs on every change"),
+      expect.stringContaining("ci / Typecheck + Release Registry was skipped"),
+      expect.stringContaining("ci / Affected packages (typecheck) was skipped"),
+      expect.stringContaining("ci / Build was skipped"),
+    ]));
+    // A full plan that ran the affected-package typecheck still passes.
+    expect(evaluate([...PAPERCLIP_ORDINARY_PR, check("ci / Affected packages (typecheck)", "success")])).toEqual([]);
   });
 
   it("needs the Windows runner check for its trigger paths and for Windows scripts, and not otherwise", () => {

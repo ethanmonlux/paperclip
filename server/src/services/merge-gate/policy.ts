@@ -108,15 +108,14 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
   // any test suite, and the nightly staple-certify.yml run certifies the full
   // suite before an install. `ci / verify` is the stable aggregate: it always
   // runs and fails unless every planned suite, e2e included, has the result
-  // the plan chose. `ci / e2e` does the same for the e2e shards. Policy,
-  // typecheck and build pass on every change regardless of the plan.
+  // the plan chose. `ci / e2e` does the same for the e2e shards. Only policy
+  // runs on every change; the plan may skip typecheck, the affected-package
+  // typecheck and build, and `ci / verify` asserts each passed when selected.
   "ethanmonlux/paperclip": {
     alwaysRequiredChecks: [
       exactly("ci / policy"),
       exactly("ci / verify"),
       exactly("ci / e2e"),
-      { label: "ci / Typecheck + Release Registry", pattern: /^ci \/ Typecheck\b/ },
-      exactly("ci / Build"),
     ],
     // runner-windows.yml starts only for these paths (its `paths:` trigger).
     pathScopedChecks: [{
@@ -144,6 +143,9 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
       {
         validator: "ci / verify",
         checks: [
+          /^ci \/ Typecheck\b/,
+          /^ci \/ Affected packages \(typecheck\)$/,
+          /^ci \/ Build$/,
           /^ci \/ General tests \(/,
           /^ci \/ Verify serialized server suites\b/,
           /^ci \/ e2e shard \(/,
