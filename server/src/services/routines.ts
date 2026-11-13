@@ -93,6 +93,9 @@ const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blo
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
+// Written with a schedule claim and replaced by the dispatch outcome. A trigger that still
+// shows it at its next claim lost the previous dispatch to an error or a process exit.
+const SCHEDULE_DISPATCH_PENDING_RESULT = "Dispatch pending";
 const MAX_ROUTINE_REVISIONS = 100;
 const ACTIVITY_GATE_IGNORED_ACTIONS = [
   "issue.read_marked",
@@ -295,6 +298,7 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped") return "Skipped because a live execution issue already exists";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
+  if (status === "dispatch_failed") return "Dispatch failed before an execution issue was created";
   return status;
 }
 
@@ -1326,6 +1330,9 @@ export function routineService(
           eq(routineRuns.companyId, routine.companyId),
           eq(routineRuns.routineId, routine.id),
           sql`${routineRuns.status} not in ('skipped', 'coalesced')`,
+          // A dispatch that failed before linking an issue did no work, so it does not
+          // consume the activity that should still trigger the next run.
+          sql`not (${routineRuns.status} = 'failed' and ${routineRuns.linkedIssueId} is null)`,
         ),
       )
       .orderBy(desc(routineRuns.triggeredAt), desc(routineRuns.id))
@@ -1538,6 +1545,69 @@ export function routineService(
       logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log skipped routine run");
     }
 
+    return run;
+  }
+
+  // Records a claimed schedule tick whose dispatch never committed a run, so an advanced
+  // trigger always leaves a durable outcome.
+  async function recordFailedScheduledDispatch(input: {
+    routine: typeof routines.$inferSelect;
+    trigger: typeof routineTriggers.$inferSelect;
+    triggeredAt: Date;
+    reason: string;
+    touchTrigger: boolean;
+  }) {
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
+      );
+      const [createdRun] = await txDb
+        .insert(routineRuns)
+        .values({
+          companyId: input.routine.companyId,
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          source: "schedule",
+          status: "failed",
+          triggeredAt: input.triggeredAt,
+          failureReason: input.reason,
+          completedAt: new Date(),
+          linkedIssueId: null,
+          routineRevisionId: input.routine.latestRevisionId,
+          responsibleUserId: input.routine.responsibleUserId ?? null,
+        })
+        .returning();
+      if (input.touchTrigger) {
+        await updateRoutineTouchedState({
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          triggeredAt: input.triggeredAt,
+          status: "dispatch_failed",
+        }, txDb);
+      }
+      return createdRun;
+    });
+
+    try {
+      await logActivity(db, {
+        companyId: input.routine.companyId,
+        actorType: "system",
+        actorId: "routine-scheduler",
+        action: "routine.run_triggered",
+        entityType: "routine_run",
+        entityId: run.id,
+        details: {
+          routineId: input.routine.id,
+          triggerId: input.trigger.id,
+          source: "schedule",
+          status: "failed",
+          reason: input.reason,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log failed scheduled routine dispatch");
+    }
     return run;
   }
 
@@ -1812,10 +1882,12 @@ export function routineService(
           : input.routine.updatedByAgentId ?? (input.routine.updatedByUserId ? null : input.routine.createdByAgentId));
       const interactionActorCompanyId = interactionActorAgentId ? await tx.select({ companyId: agents.companyId }).from(agents)
         .where(eq(agents.id, interactionActorAgentId)).then(rows => rows[0]?.companyId) : undefined;
+      // issueSvc.create runs on its own connection and locks the parent itself. Holding the
+      // parent row here would block that child insert while this transaction waits for it.
       await assertAgentInteraction(tx, { companyId: input.routine.companyId, actorAgentId: interactionActorAgentId,
         actorCompanyId: interactionActorCompanyId,
         operation: "assign", targetAgentId: assigneeAgentId, parentIssueId: input.routine.parentIssueId,
-        texts: [title, description ?? ""], lock: true });
+        texts: [title, description ?? ""], lock: true, lockTasks: false });
 
       if (input.trigger && (input.source === "webhook" || input.source === "schedule")) {
         const currentTrigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, input.trigger.id)).then((rows) => rows[0]);
@@ -3305,11 +3377,16 @@ export function routineService(
           }
         }
 
+        // The claim also marks the tick pending, so an advanced trigger is never silent if the
+        // dispatch below fails to commit or the process exits before it finishes.
+        const claimedAt = new Date();
         const claimed = await db
           .update(routineTriggers)
           .set({
             nextRunAt: claimedNextRunAt,
-            updatedAt: new Date(),
+            lastFiredAt: claimedAt,
+            lastResult: SCHEDULE_DISPATCH_PENDING_RESULT,
+            updatedAt: claimedAt,
           })
           .where(
             and(
@@ -3323,46 +3400,73 @@ export function routineService(
           .then((rows) => rows[0] ?? null);
         if (!claimed) continue;
 
-        if (projectPaused || worktreeSuppressed) {
-          await recordSuppressedAutomaticRun({
+        if (row.trigger.lastResult === SCHEDULE_DISPATCH_PENDING_RESULT && row.trigger.lastFiredAt) {
+          await recordFailedScheduledDispatch({
             routine: row.routine,
             trigger: row.trigger,
-            source: "schedule",
-            reason: worktreeSuppressed ? "worktree_execution_cutoff" : "paused",
-            nextRunAt: claimedNextRunAt,
+            triggeredAt: row.trigger.lastFiredAt,
+            reason: "Scheduled dispatch was interrupted before it recorded a run",
+            touchTrigger: false,
+          }).catch((err) => {
+            logger.error({ err, routineId: row.routine.id, triggerId: row.trigger.id }, "failed to record interrupted scheduled routine dispatch");
           });
-          continue;
         }
 
-        const activityGate = row.routine.activityGatePolicy === "require_external_activity"
-          ? await evaluateActivityGate(row.routine, now)
-          : null;
-        if (activityGate && !activityGate.fire) {
-          await recordSuppressedAutomaticRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-            reason: "no_external_activity",
-            nextRunAt: claimedNextRunAt,
-            details: {
-              activityGate: {
-                verdict: "quiet",
-                windowStart: activityGate.windowStart?.toISOString() ?? null,
-                matchedActivityId: null,
+        try {
+          if (projectPaused || worktreeSuppressed) {
+            await recordSuppressedAutomaticRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              source: "schedule",
+              reason: worktreeSuppressed ? "worktree_execution_cutoff" : "paused",
+              nextRunAt: claimedNextRunAt,
+            });
+            continue;
+          }
+
+          const activityGate = row.routine.activityGatePolicy === "require_external_activity"
+            ? await evaluateActivityGate(row.routine, now)
+            : null;
+          if (activityGate && !activityGate.fire) {
+            await recordSuppressedAutomaticRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              source: "schedule",
+              reason: "no_external_activity",
+              nextRunAt: claimedNextRunAt,
+              details: {
+                activityGate: {
+                  verdict: "quiet",
+                  windowStart: activityGate.windowStart?.toISOString() ?? null,
+                  matchedActivityId: null,
+                },
               },
-            },
-          });
-          continue;
-        }
+            });
+            continue;
+          }
 
-        for (let i = 0; i < runCount; i += 1) {
-          await dispatchRoutineRun({
+          for (let i = 0; i < runCount; i += 1) {
+            await dispatchRoutineRun({
+              routine: row.routine,
+              trigger: row.trigger,
+              source: "schedule",
+              nextRunAtOverride: claimedNextRunAt,
+            });
+            triggered += 1;
+          }
+        } catch (err) {
+          // The tick is already claimed. Record why it produced no run and keep serving the
+          // remaining due triggers instead of failing the whole scheduler pass.
+          logger.error({ err, routineId: row.routine.id, triggerId: row.trigger.id }, "scheduled routine dispatch failed after its tick was claimed");
+          await recordFailedScheduledDispatch({
             routine: row.routine,
             trigger: row.trigger,
-            source: "schedule",
-            nextRunAtOverride: claimedNextRunAt,
+            triggeredAt: claimedAt,
+            reason: err instanceof Error ? err.message : String(err),
+            touchTrigger: true,
+          }).catch((recordErr) => {
+            logger.error({ err: recordErr, routineId: row.routine.id, triggerId: row.trigger.id }, "failed to record scheduled routine dispatch failure");
           });
-          triggered += 1;
         }
       }
 

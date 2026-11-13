@@ -19,6 +19,9 @@ export interface AgentInteractionInput {
   parentIssueId?: string | null;
   texts?: readonly string[];
   lock?: boolean | "update";
+  /** With `lock`, also lock the task rows (default). Pass false when the caller's
+   * transaction waits on another connection that writes those tasks or their children. */
+  lockTasks?: boolean;
   lockAgentIds?: readonly string[];
   delivery?: boolean;
 }
@@ -48,7 +51,7 @@ export async function agentInteractionDenial(
   const taskQuery = issueIds.length ? db.select({
     id: issues.id, assigneeAgentId: issues.assigneeAgentId, conversationAgentId: issues.conversationAgentId,
   }).from(issues).where(and(eq(issues.companyId, input.companyId), inArray(issues.id, issueIds))).orderBy(issues.id) : null;
-  const tasks = taskQuery ? await (input.lock ? taskQuery.for("update") : taskQuery) : [];
+  const tasks = taskQuery ? await (input.lock && input.lockTasks !== false ? taskQuery.for("update") : taskQuery) : [];
   if (tasks.length !== issueIds.length) throw notFound("Task not found");
   const issue = tasks.find(task => task.id === input.issueId);
   const parent = tasks.find(task => task.id === input.parentIssueId);
