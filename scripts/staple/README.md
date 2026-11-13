@@ -48,6 +48,13 @@ and an unreadable or truncated GitHub response is `error`. Each of these blocks 
 classify saved GitHub responses, run `staple-nightly-upgrade ci-state CHECKS.json WORKFLOWS.json`.
 It has no side effects.
 
+After the restart, Gate 3 waits up to 5 minutes for `/api/health` to report the target commit and for
+the service journal to log `startup recovery complete` since the restart. The journal is read whole
+before the match, because `journalctl | grep -q` under `pipefail` exits 141 when `grep` stops at an
+early match. A journal that cannot be read is an error, never a pass. To check the journal by hand,
+run `staple-nightly-upgrade startup-logged 'YYYY-MM-DD HH:MM:SS'`. It prints `logged`, `waiting` or
+`error:<reason>` and has no side effects. An unknown argument exits 2 before any upgrade step.
+
 Activation is outside agent runs: copy the script to `~/.local/bin/staple-nightly-upgrade`, and add
 the 02:30 trigger, either the `systemd/` units or an equivalent cron line
 (`30 2 * * * ~/.local/bin/staple-nightly-upgrade hold`).

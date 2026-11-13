@@ -322,3 +322,72 @@ test("Gate 2 fails closed when the named backup file is missing, empty or the wr
   assert.equal(backupResult({ bytes: 7 }),
     "error:backup file is 7 bytes, db:backup reported 12 (<dir>/staple-nightly-pre-6143ccf8-20261112-215518.sql.gz)");
 });
+
+function startupLogged(journal, since = "2026-11-13 00:09:45") {
+  const dir = mkdtempSync(path.join(tmpdir(), "staple-journal-"));
+  try {
+    const lines = Array.from({ length: 20000 }, (_, i) => `Nov 13 00:09:${String(i % 60).padStart(2, "0")} host paperclipai[1]: request ${i} served`).join("\n");
+    const marker = "Nov 13 00:09:57 host paperclipai[1]: Server startup recovery complete";
+    const bodies = {
+      early: `${marker}\n${lines}\n`,
+      late: `${lines}\n${marker}\n`,
+      missing: `${lines}\n`,
+      empty: "",
+    };
+    writeFileSync(path.join(dir, "journal"), bodies[journal.body] ?? "");
+    writeFileSync(path.join(dir, "journalctl"), [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "$@" > "${path.join(dir, "args")}"`,
+      journal.fail
+        ? `cat "${path.join(dir, "journal")}"; echo "Failed to open journal: Permission denied" >&2; exit ${journal.fail}`
+        : `exec cat "${path.join(dir, "journal")}"`,
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const { BASH_ENV, ...inherited } = process.env;
+    const env = { ...inherited, PATH: `${dir}:${process.env.PATH}` };
+    const result = spawnSync("bash", [script, "startup-logged", since], { encoding: "utf8", env });
+    const args = readFileSync(path.join(dir, "args"), "utf8").trim().split("\n");
+    const old = spawnSync("bash", ["-o", "pipefail", "-c",
+      'journalctl --user -u paperclipai --since "-6min" --no-pager | grep -q "startup recovery complete"; echo "$? ${PIPESTATUS[*]}"'],
+    { encoding: "utf8", env });
+    return { out: result.stdout.trim(), status: result.status, args, old: old.stdout.trim() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("Gate 3 sees startup recovery logged early in a large journal", () => {
+  const result = startupLogged({ body: "early" });
+  assert.match(result.old, /^141 /);
+  assert.deepEqual([result.out, result.status], ["logged", 0]);
+  assert.deepEqual(result.args, ["--user", "-u", "paperclipai", "--since", "2026-11-13 00:09:45", "--no-pager"]);
+  assert.deepEqual([startupLogged({ body: "late" }).out, startupLogged({ body: "late" }).status], ["logged", 0]);
+});
+
+test("Gate 3 keeps waiting while the marker is not in the journal", () => {
+  assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "missing" }))), ["waiting", 1]);
+  assert.deepEqual(Object.values((({ out, status }) => ({ out, status }))(startupLogged({ body: "empty" }))), ["waiting", 1]);
+});
+
+test("Gate 3 fails closed when journalctl fails, even after printing the marker", () => {
+  for (const body of ["missing", "early"]) {
+    const result = startupLogged({ body, fail: 1 });
+    assert.equal(result.status, 2);
+    assert.equal(result.out, "error:journalctl exited 1 (Failed to open journal: Permission denied)");
+  }
+});
+
+test("an unknown argument exits before any upgrade step instead of running the upgrade", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "staple-home-"));
+  try {
+    const { BASH_ENV, ...inherited } = process.env;
+    const result = spawnSync("bash", [script, "startup-loged", "x"], {
+      encoding: "utf8", env: { ...inherited, HOME: home, STAPLE_API: "http://127.0.0.1:9" },
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /unknown argument: startup-loged/);
+    assert.equal(spawnSync("ls", ["-A", home], { encoding: "utf8" }).stdout, "");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
