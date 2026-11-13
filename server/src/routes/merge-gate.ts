@@ -2,12 +2,14 @@ import { Router } from "express";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
 import { issues, type Db } from "@paperclipai/db";
+import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 import type { MergeGateActor } from "../services/merge-gate/service.js";
 import type { IssueAssignmentWakeupDeps } from "../services/issue-assignment-wakeup.js";
 import { mergeGateService } from "../services/merge-gate/wiring.js";
 import { assertCompanyAccess, hasCompanyAccess } from "./authz.js";
 
+const issueUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
 const mergeBody = z.object({
   repo: z.string().min(3).max(200),
@@ -30,19 +32,32 @@ function gateActor(actor: Express.Request["actor"]): MergeGateActor {
     : { type: "board", userId: actor.userId ?? null };
 }
 
+/**
+ * The task in the path is a UUID or an identifier ("PAP-39"), as on the
+ * issues routes. Anything else matches no task, rather than reaching
+ * Postgres as an invalid uuid.
+ */
+function issueRouteCondition(rawId: string) {
+  const identifier = normalizeIssueIdentifier(rawId);
+  if (identifier) return eq(issues.identifier, identifier);
+  return issueUuid.test(rawId.trim()) ? eq(issues.id, rawId.trim()) : null;
+}
+
 /** Protected-main merge gate (FAC-840 B): the merge path agents use. */
 export function mergeGateRoutes(db: Db, options: { heartbeat?: IssueAssignmentWakeupDeps } = {}) {
   const router = Router();
   const svc = mergeGateService(db, options);
 
   router.post("/issues/:issueId/merge-gate", async (req, res) => {
-    const issueId = req.params.issueId as string;
-    const [issue] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, issueId));
+    const condition = issueRouteCondition(req.params.issueId as string);
+    const [issue] = condition
+      ? await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(condition)
+      : [];
     if (!issue || !hasCompanyAccess(req, issue.companyId)) throw notFound("Issue not found");
     assertCompanyAccess(req, issue.companyId);
     const body = mergeBody.parse(req.body ?? {});
     res.set("cache-control", "no-store");
-    res.json(await svc.evaluateAndMerge({ ...body, companyId: issue.companyId, issueId, actor: gateActor(req.actor) }));
+    res.json(await svc.evaluateAndMerge({ ...body, companyId: issue.companyId, issueId: issue.id, actor: gateActor(req.actor) }));
   });
 
   router.post("/companies/:companyId/merge-gate/red-main", async (req, res) => {
