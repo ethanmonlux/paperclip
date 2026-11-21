@@ -9,6 +9,7 @@ import {
   evaluateBaseCi,
   evaluateHeadCi,
   evaluateReviewCoverage,
+  evaluateVisualReview,
   modelFamiliesFromRunUsage,
   modelFamily,
   parseMergeReviewDocument,
@@ -18,6 +19,8 @@ import {
   requiresVisualReview,
   type MergeGateCheck,
   type MergeReviewAttestation,
+  type RepositoryMergePolicy,
+  type VisualReviewAttestation,
 } from "./policy.js";
 
 const HEAD = "a".repeat(40);
@@ -61,13 +64,14 @@ describe("conservative path filters", () => {
   });
 
   it("treats an unknown path as needing Windows evidence", () => {
+    // A UI path needs the candidate and, since FAC-1053, the UI browser smoke job.
     expect(requiredPathScopedChecks({ policy: facette, changedFiles: ["shell/app/launcher.tsx"] }))
-      .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
+      .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "smoke"]);
     expect(requiredPathScopedChecks({ policy: facette, changedFiles: ["brand/new-logo.svg", "docs/a.md"] }))
       .toEqual(["windows-fast", "windows-native"]);
-    // An unreadable or empty file list is unknown too.
-    expect(requiredPathScopedChecks({ policy: facette, changedFiles: null })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
-    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [] })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
+    // An unreadable or empty file list is unknown too: every path-scoped check, the smoke job included.
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: null })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "smoke"]);
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [] })).toEqual(["windows-fast", "windows-native", "frontend", "candidate", "smoke"]);
   });
 
   it("lets a filter skip Windows only when every file is known to be irrelevant", () => {
@@ -99,9 +103,11 @@ describe("conservative path filters", () => {
 });
 
 describe("staged Facette candidate proof (FAC-151)", () => {
+  // Under `shell/` but not a UI browser smoke path: the candidate scope alone applies.
   const changedFiles = ["shell/src/app.tsx"];
   const ordinaryCi = [...greenFacette, check("windows-fast", "success"), check("windows-native", "success")];
-  const candidateJobs = ["frontend", "candidate", "browser-evidence"].map(name =>
+  // FAC-1053: the candidate workflow's jobs are `frontend` and `candidate`; `browser-evidence` is gone.
+  const candidateJobs = ["frontend", "candidate"].map(name =>
     ({ ...check(name, "success"), headSha: HEAD, checkSuiteId: 91 }));
   const candidateRun: MergeGateCheck = { ...workflow("Internal Windows Candidate", "success"),
     headSha: HEAD, checkSuiteId: 91, runId: 1234, runAttempt: 1, createdAt: "2026-11-11T12:00:00Z",
@@ -116,6 +122,24 @@ describe("staged Facette candidate proof (FAC-151)", () => {
       expect.stringContaining("candidate did not run"), expect.stringContaining("one completed .github/workflows/internal-windows.yml run"),
     ]));
     expect(evaluate([...candidateJobs, candidateRun])).toEqual([]);
+  });
+
+  it("no longer requires a browser-evidence job anywhere: frontend and candidate alone prove the candidate (FAC-1053)", () => {
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles })).toEqual(["windows-fast", "windows-native", "frontend", "candidate"]);
+    expect(evaluate([...candidateJobs, candidateRun])).toEqual([]);
+    expect(facette.pathScopedChecks.flatMap(scope => scope.checks)).not.toContain("browser-evidence");
+    expect(facette.alwaysRequiredChecks.some(suite => suite.pattern.test("browser-evidence"))).toBe(false);
+    for (const files of [null, [], ["shell/components/x.tsx"], ["agent/src/x.ts"], ["shell/src-tauri/src/main.rs"],
+      [".github/workflows/internal-windows.yml", "docs/a.md"], [".github/workflows/ui-browser-smoke.yml"], ["new-module/engine.ts"]]) {
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: files })).not.toContain("browser-evidence");
+    }
+    // The two remaining jobs are both still needed: neither alone proves the run.
+    for (const name of ["frontend", "candidate"]) {
+      expect(evaluate([...candidateJobs.filter(job => job.name !== name), candidateRun])).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining(`${name} did not run`) }),
+        expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("frontend, candidate must all succeed in one completed .github/workflows/internal-windows.yml run") }),
+      ]));
+    }
   });
 
   it("does not accept an older head, another workflow, mixed suites or unbound same-named jobs", () => {
@@ -133,7 +157,9 @@ describe("staged Facette candidate proof (FAC-151)", () => {
 
   it("requires actual success for every candidate job and the workflow", () => {
     for (const conclusion of ["neutral", "skipped", "cancelled", "failure", null]) {
-      expect(evaluate([...candidateJobs.map(job => job.name === "browser-evidence" ? { ...job, conclusion } : job), candidateRun]).length).toBeGreaterThan(0);
+      for (const name of ["frontend", "candidate"]) {
+        expect(evaluate([...candidateJobs.map(job => job.name === name ? { ...job, conclusion } : job), candidateRun]).length).toBeGreaterThan(0);
+      }
       expect(evaluate([...candidateJobs, { ...candidateRun, conclusion }]).length).toBeGreaterThan(0);
     }
     expect(evaluate([...candidateJobs, { ...candidateRun, status: "in_progress", conclusion: null }]))
@@ -180,8 +206,11 @@ describe("staged Facette candidate proof (FAC-151)", () => {
     expect(evaluate([], maintenance)).toEqual([]);
     for (const extra of ["shell/src/app.tsx", "agent/src/main.mjs", "shell/tests/osrs-internal-windows.test.mjs", ".github/scripts/arbitrary.test.mjs", "docs/a.md"]) {
       expect(requiredPathScopedChecks({ policy: facette, changedFiles: [...maintenance, extra] }))
-        .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "browser-evidence"]);
+        .toEqual(["windows-fast", "windows-native", "frontend", "candidate"]);
     }
+    // A UI path beside the maintenance files needs the smoke job as well.
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [...maintenance, "shell/app/page.tsx"] }))
+      .toEqual(["windows-fast", "windows-native", "frontend", "candidate", "smoke"]);
     expect(evaluateHeadCi({ headSha: HEAD, policy: facette, changedFiles: maintenance, checksComplete: true,
       requiredChecks: requiredPathScopedChecks({ policy: facette, changedFiles: maintenance }),
       checks: [...greenFacette, check("windows-fast", "skipped"), check("windows-native", "skipped")],
@@ -523,23 +552,107 @@ describe("merge-review document", () => {
 });
 
 describe("visual review (STA-362)", () => {
-  it("needs a visual verdict exactly where Facette needs the candidate, and nowhere else", () => {
-    const visual = ["shell/faces/osrs/character/kaia/KaiaRive.tsx", "shell/public/assets/osrs/ember-vault/kaia-rive/kaia.riv",
-      "shell/faces/x4/Face.tsx", "shell/src-tauri/src/main.rs", "shell/components/FaceKit/Tile.tsx", "agent/src/server.mjs"];
-    for (const file of visual) {
+  const WINDOWS = ["windows-fast", "windows-native"];
+
+  it("needs a visual verdict exactly where Facette has a UI browser smoke run, and nowhere else (FAC-1053)", () => {
+    // A UI path: the candidate, the smoke job and a visual verdict.
+    const ui = ["shell/components/x.tsx", "shell/faces/osrs/character/kaia/KaiaRive.tsx", "shell/public/assets/osrs/ember-vault/kaia-rive/kaia.riv",
+      "shell/faces/x4/Face.tsx", "shell/components/FaceKit/Tile.tsx", "shell/app/launcher.tsx"];
+    for (const file of ui) {
       expect(requiresVisualReview({ policy: facette, changedFiles: ["docs/a.md", file] })).toBe(true);
-      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toContain("candidate");
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toEqual([...WINDOWS, "frontend", "candidate", "smoke"]);
     }
+    // The native app, the agent and shell tests still need the candidate, but
+    // have no browser captures: no smoke job and no visual verdict.
+    for (const file of ["shell/src-tauri/src/main.rs", "shell/src-tauri/tauri.conf.json", "agent/src/server.mjs", "agent/src/x.ts", "shell/tests/x.test.mjs"]) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: [file] })).toBe(false);
+      expect(requiresVisualReview({ policy: facette, changedFiles: ["docs/a.md", file] })).toBe(false);
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).toEqual([...WINDOWS, "frontend", "candidate"]);
+    }
+    expect(requiresVisualReview({ policy: facette, changedFiles: ["agent/src/x.ts", "shell/src-tauri/src/main.rs"] })).toBe(false);
+    // One UI path among them is enough.
+    expect(requiresVisualReview({ policy: facette, changedFiles: ["agent/src/x.ts", "shell/src-tauri/src/main.rs", "shell/lib/a.ts"] })).toBe(true);
     for (const file of ["account-web/app/page.tsx", "docs/setup.md", "infra/main.tf", ".github/workflows/internal-windows.yml"]) {
       expect(requiresVisualReview({ policy: facette, changedFiles: [file] })).toBe(false);
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: [file] })).not.toContain("smoke");
     }
-    // An unknown file list needs everything.
-    expect(requiresVisualReview({ policy: facette, changedFiles: null })).toBe(true);
-    expect(requiresVisualReview({ policy: facette, changedFiles: [] })).toBe(true);
+    // The smoke workflow's own file starts a smoke run, so it needs the verdict but not the candidate.
+    expect(requiresVisualReview({ policy: facette, changedFiles: [".github/workflows/ui-browser-smoke.yml"] })).toBe(true);
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: [".github/workflows/ui-browser-smoke.yml"] })).toEqual([...WINDOWS, "smoke"]);
+    // An unknown file list needs everything: fail closed.
+    for (const files of [null, []]) {
+      expect(requiresVisualReview({ policy: facette, changedFiles: files })).toBe(true);
+      expect(requiredPathScopedChecks({ policy: facette, changedFiles: files })).toEqual([...WINDOWS, "frontend", "candidate", "smoke"]);
+    }
     for (const policy of [paperclip, unknownRepo]) {
       expect(requiresVisualReview({ policy, changedFiles: ["shell/app.tsx"] })).toBe(false);
+      expect(requiresVisualReview({ policy, changedFiles: ["shell/components/x.tsx"] })).toBe(false);
       expect(requiresVisualReview({ policy, changedFiles: null })).toBe(false);
     }
+  });
+
+  it("matches the UI browser smoke workflow's paths and nothing broader (FAC-1053)", () => {
+    const smokeAndVerdict = (file: string) => {
+      const smoke = requiredPathScopedChecks({ policy: facette, changedFiles: [file] }).includes("smoke");
+      // The verdict judges the smoke run's captures, so the two always agree.
+      expect(requiresVisualReview({ policy: facette, changedFiles: [file] }), file).toBe(smoke);
+      return smoke;
+    };
+    const directories = ["shell/app/", "shell/components/", "shell/faces/", "shell/games/", "shell/lib/", "shell/public/", "shell/fonts/", "shell/types/"];
+    for (const directory of directories) {
+      for (const rest of ["x.tsx", "a/x.tsx", "a/b/c/d/x.riv", ".hidden", "next.config.ts"]) {
+        expect(smokeAndVerdict(`${directory}${rest}`), `${directory}${rest}`).toBe(true);
+      }
+    }
+    const files = ["shell/next.config.ts", "shell/tailwind.config.ts", "shell/postcss.config.mjs", "shell/package.json", "shell/package-lock.json",
+      "shell/scripts/osrs-ember-vault-visual-qa.mjs", "shell/scripts/osrs-kaia-preview.mjs", "shell/scripts/account-preview.mjs",
+      "shell/scripts/prune-export.mjs", "shell/scripts/lib/osrs-chromium-capture.mjs", "shell/scripts/lib/devtools-websocket.mjs",
+      "shell/scripts/lib/frame-compare.mjs", "shell/scripts/lib/icon-image.mjs", ".github/workflows/ui-browser-smoke.yml"];
+    for (const file of files) {
+      expect(smokeAndVerdict(file), file).toBe(true);
+      // Exactly that file: no suffix, prefix, nesting or wildcard dot.
+      for (const near of [`${file}.bak`, `${file}/x`, `x/${file}`, `x${file}`, file.replace(/\.(?=[^.]*$)/, "x"), file.replace(/\.(?=[^.]*$)/, "/")]) {
+        expect(smokeAndVerdict(near), near).toBe(false);
+      }
+    }
+    expect(directories.length + files.length).toBe(22);
+    const outside = [
+      // The non-matches FAC-1053 names.
+      "shell/tests/x.test.mjs", "shell/src-tauri/src/main.rs", "shell/scripts/other.mjs", "agent/src/x.ts", "docs/x.md",
+      // A directory matches only as a whole path segment directly under shell/.
+      ...directories.flatMap(directory => {
+        const name = directory.slice("shell/".length, -1);
+        return [`shell/${name}`, `shell/${name}s/x.tsx`, `shell/x${name}/x.tsx`, `shell/src/${name}/x.tsx`, `${name}/x.tsx`,
+          `agent/${name}/x.tsx`, `account-web/shell/${name}/x.tsx`, `xshell/${name}/x.tsx`, `shell/${name.toUpperCase()}/x.tsx`];
+      }),
+      // Other shell files and scripts.
+      "shell/x.ts", "shell/tsconfig.json", "shell/next.config.mjs", "shell/tailwind.config.js", "shell/postcss.config.js", "shell/package.json5",
+      "shell/README.md", "shell/src/app.tsx", "shell/scripts/lib/other.mjs", "shell/scripts/lib/nested/icon-image.mjs",
+      "shell/scripts/icon-image.mjs", "shell/scripts/osrs-kaia-preview.test.mjs", "shell/scripts/lib/osrs-ember-vault-visual-qa.mjs",
+      "shell/src-tauri/tauri.conf.json", "shell/src-tauri/icons/icon.png", "agent/package.json", "agent/public/x.png", "package.json", "package-lock.json",
+      // Other workflows.
+      ".github/workflows/internal-windows.yml", ".github/workflows/ci.yml", ".github/workflows/ui-browser-smoke.yaml",
+      ".github/workflows/ui-browser-smoke-2.yml", ".github/scripts/ui-browser-smoke.yml",
+      "account-web/app/page.tsx", "infra/main.tf", "README.md",
+    ];
+    for (const file of outside) expect(smokeAndVerdict(file), file).toBe(false);
+    // None of those is carried in by a neighbour that does not match either.
+    expect(requiresVisualReview({ policy: facette, changedFiles: outside })).toBe(false);
+    expect(requiredPathScopedChecks({ policy: facette, changedFiles: outside })).not.toContain("smoke");
+  });
+
+  it("binds Facette's visual verdict to a path scope that exists and has a workflow (FAC-1053)", () => {
+    // `admittedCandidateRun` returns null for a platform no scope carries,
+    // and a verdict with nothing to bind to is not checked against any run.
+    expect(facette.visualEvidencePlatform).toBe("ui-smoke");
+    expect(facette.visualEvidenceName).toBe("UI browser smoke");
+    const scopes = facette.pathScopedChecks.filter(scope => scope.platform === facette.visualEvidencePlatform);
+    expect(scopes).toHaveLength(1);
+    expect(scopes[0]).toMatchObject({ checks: ["smoke"], workflowPath: ".github/workflows/ui-browser-smoke.yml" });
+    // The scope that needs the smoke job and the paths that need the verdict are the same list.
+    expect(scopes[0]!.relevantPaths).toBe(facette.visualPaths);
+    expect(facette.pathScopedChecks.find(scope => scope.platform === "candidate"))
+      .toMatchObject({ checks: ["frontend", "candidate"], workflowPath: ".github/workflows/internal-windows.yml" });
   });
 
   it("parses the visual reviewer's record and rejects one without an exact SHA, candidate run or pass/fail verdict", () => {
@@ -566,23 +679,215 @@ describe("visual review (STA-362)", () => {
     expect(requiresVisualReview({ policy: facette, changedFiles: changedPaths([file("docs/Face.tsx", "shell/faces/x4/Face.tsx")]) })).toBe(true);
   });
 
-  it("admits the one finished candidate run at the head with its attempt and timing", () => {
-    const job = (name: string, startedAt: string | null, completedAt: string | null): MergeGateCheck =>
-      ({ kind: "check_run", name, status: "completed", conclusion: "success", headSha: HEAD, checkSuiteId: 7, startedAt, completedAt });
-    const run: MergeGateCheck = { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
-      headSha: HEAD, checkSuiteId: 7, runId: 55, runAttempt: 3, startedAt: "2026-11-13T02:00:00Z", workflowPath: ".github/workflows/internal-windows.yml" };
-    const jobs = [job("frontend", "2026-11-13T02:01:00Z", "2026-11-13T02:10:00Z"), job("candidate", "2026-11-13T02:10:00Z", "2026-11-13T02:40:00Z"),
-      job("browser-evidence", "2026-11-13T02:40:00Z", "2026-11-13T02:50:00Z")];
-    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: HEAD })).toEqual({
+  const job = (name: string, startedAt: string | null, completedAt: string | null, checkSuiteId = 7): MergeGateCheck =>
+    ({ kind: "check_run", name, status: "completed", conclusion: "success", headSha: HEAD, checkSuiteId, startedAt, completedAt });
+  const candidateRun: MergeGateCheck = { kind: "workflow_run", name: "Internal Windows Candidate", status: "completed", conclusion: "success",
+    headSha: HEAD, checkSuiteId: 7, runId: 55, runAttempt: 3, startedAt: "2026-11-13T02:00:00Z", workflowPath: ".github/workflows/internal-windows.yml" };
+  const candidateJobs = [job("frontend", "2026-11-13T02:01:00Z", "2026-11-13T02:10:00Z"), job("candidate", "2026-11-13T02:10:00Z", "2026-11-13T02:40:00Z")];
+  const smokeRun: MergeGateCheck = { kind: "workflow_run", name: "UI browser smoke", status: "completed", conclusion: "success",
+    headSha: HEAD, checkSuiteId: 8, runId: 77, runAttempt: 2, startedAt: "2026-11-13T02:05:00Z", workflowPath: ".github/workflows/ui-browser-smoke.yml" };
+  const smokeJob = job("smoke", "2026-11-13T02:06:00Z", "2026-11-13T02:25:00Z", 8);
+
+  it("admits the one finished UI browser smoke run at the head with its attempt and timing, not the candidate (FAC-1053)", () => {
+    const admitted = { workflowPath: ".github/workflows/ui-browser-smoke.yml", runId: 77, runAttempt: 2,
+      startedAt: "2026-11-13T02:05:00.000Z", completedAt: "2026-11-13T02:25:00.000Z" };
+    expect(admittedCandidateRun({ policy: facette, checks: [smokeRun, smokeJob], headSha: HEAD })).toEqual(admitted);
+    // A green candidate beside it changes nothing, and alone it is not the evidence run.
+    expect(admittedCandidateRun({ policy: facette, checks: [candidateRun, ...candidateJobs, smokeRun, smokeJob], headSha: HEAD })).toEqual(admitted);
+    expect(admittedCandidateRun({ policy: facette, checks: [candidateRun, ...candidateJobs], headSha: HEAD })).toBeNull();
+    // A `smoke` job in the candidate's suite, or a candidate run named like the smoke workflow, is not a smoke run.
+    expect(admittedCandidateRun({ policy: facette, checks: [candidateRun, ...candidateJobs, job("smoke", "2026-11-13T02:06:00Z", "2026-11-13T02:25:00Z")], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [smokeRun, { ...smokeJob, checkSuiteId: 7 }], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: facette, checks: [smokeRun, { ...smokeJob, startedAt: null }], headSha: HEAD }))
+      .toMatchObject({ startedAt: null, completedAt: "2026-11-13T02:25:00.000Z" });
+    expect(admittedCandidateRun({ policy: facette, checks: [smokeRun, { ...smokeJob, completedAt: null }], headSha: HEAD }))
+      .toMatchObject({ startedAt: "2026-11-13T02:05:00.000Z", completedAt: null });
+    expect(admittedCandidateRun({ policy: facette, checks: [{ ...smokeRun, runAttempt: null }, smokeJob], headSha: HEAD })).toMatchObject({ runAttempt: 1 });
+    expect(admittedCandidateRun({ policy: paperclip, checks: [smokeRun, smokeJob, candidateRun, ...candidateJobs], headSha: HEAD })).toBeNull();
+  });
+
+  it("does not admit a smoke run that failed, is still running, has no finished job or belongs to another head (FAC-1053)", () => {
+    const admit = (checks: MergeGateCheck[], headSha = HEAD) => admittedCandidateRun({ policy: facette, checks: [candidateRun, ...candidateJobs, ...checks], headSha });
+    expect(admit([smokeRun, smokeJob])).not.toBeNull();
+    expect(admit([])).toBeNull();
+    for (const conclusion of ["failure", "cancelled", "skipped", "neutral", "timed_out", null]) {
+      expect(admit([{ ...smokeRun, conclusion }, smokeJob]), `run ${conclusion}`).toBeNull();
+      expect(admit([smokeRun, { ...smokeJob, conclusion }]), `job ${conclusion}`).toBeNull();
+    }
+    for (const status of ["queued", "in_progress"]) {
+      expect(admit([{ ...smokeRun, status, conclusion: null }, smokeJob]), status).toBeNull();
+      expect(admit([smokeRun, { ...smokeJob, status, conclusion: null }]), status).toBeNull();
+    }
+    expect(admit([smokeRun])).toBeNull();
+    // An older head's run, read at the merge head or asked for at another head.
+    expect(admit([{ ...smokeRun, headSha: REVIEWED }, { ...smokeJob, headSha: REVIEWED }])).toBeNull();
+    expect(admit([smokeRun, { ...smokeJob, headSha: REVIEWED }])).toBeNull();
+    expect(admit([smokeRun, smokeJob], REVIEWED)).toBeNull();
+    // A newer smoke run at the head that failed is not passed over for the older success.
+    const older = { ...smokeRun, createdAt: "2026-11-13T02:00:00Z" };
+    for (const conclusion of ["failure", "cancelled"]) {
+      expect(admit([older, smokeJob, { ...smokeRun, runId: 78, checkSuiteId: 9, conclusion, createdAt: "2026-11-13T03:00:00Z" }]), conclusion).toBeNull();
+    }
+    // A failed first run does not poison the newer successful one.
+    expect(admit([{ ...older, runId: 76, checkSuiteId: 6, conclusion: "failure" }, { ...smokeJob, checkSuiteId: 6, conclusion: "failure" },
+      { ...smokeRun, createdAt: "2026-11-13T03:00:00Z" }, smokeJob])).toMatchObject({ runId: 77, runAttempt: 2 });
+  });
+
+  it("still admits the candidate run for a policy that names no visual-evidence scope", () => {
+    const candidateEvidence: RepositoryMergePolicy = { ...facette, visualEvidencePlatform: undefined, visualEvidenceName: undefined };
+    const checks = [candidateRun, ...candidateJobs, smokeRun, smokeJob];
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks, headSha: HEAD })).toEqual({
       workflowPath: ".github/workflows/internal-windows.yml", runId: 55, runAttempt: 3,
-      startedAt: "2026-11-13T02:00:00.000Z", completedAt: "2026-11-13T02:50:00.000Z",
+      startedAt: "2026-11-13T02:00:00.000Z", completedAt: "2026-11-13T02:40:00.000Z",
     });
-    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1), job("frontend", null, "2026-11-13T02:10:00Z")], headSha: HEAD }))
-      .toMatchObject({ startedAt: null, completedAt: "2026-11-13T02:50:00.000Z" });
-    expect(admittedCandidateRun({ policy: facette, checks: [{ ...run, conclusion: "failure" }, ...jobs], headSha: HEAD })).toBeNull();
-    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs.slice(1)], headSha: HEAD })).toBeNull();
-    expect(admittedCandidateRun({ policy: facette, checks: [run, ...jobs], headSha: REVIEWED })).toBeNull();
-    expect(admittedCandidateRun({ policy: paperclip, checks: [run, ...jobs], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks: [candidateRun, candidateJobs[1]!, job("frontend", null, "2026-11-13T02:10:00Z")], headSha: HEAD }))
+      .toMatchObject({ startedAt: null, completedAt: "2026-11-13T02:40:00.000Z" });
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks: [{ ...candidateRun, conclusion: "failure" }, ...candidateJobs], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks: [candidateRun, ...candidateJobs.slice(1)], headSha: HEAD })).toBeNull();
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks: [candidateRun, ...candidateJobs], headSha: REVIEWED })).toBeNull();
+    expect(admittedCandidateRun({ policy: candidateEvidence, checks: [smokeRun, smokeJob], headSha: HEAD })).toBeNull();
+    // A platform no scope carries admits nothing.
+    expect(admittedCandidateRun({ policy: { ...facette, visualEvidencePlatform: "missing" }, checks, headSha: HEAD })).toBeNull();
+  });
+
+  describe("CI for a UI change (FAC-1053)", () => {
+    const changedFiles = ["shell/components/x.tsx"];
+    const ordinaryCi = [...greenFacette, check("windows-fast", "success"), check("windows-native", "success")];
+    const evaluate = (extra: MergeGateCheck[], files: string[] | null = changedFiles) => evaluateHeadCi({
+      headSha: HEAD, policy: facette, changedFiles: files, checksComplete: true,
+      checks: [...ordinaryCi, ...extra], requiredChecks: requiredPathScopedChecks({ policy: facette, changedFiles: files }),
+    });
+    const candidate = [candidateRun, ...candidateJobs];
+    const smoke = [smokeRun, smokeJob];
+    const smokeUnproven = expect.objectContaining({ code: "required_check_skipped",
+      detail: expect.stringContaining("smoke must all succeed in one completed .github/workflows/ui-browser-smoke.yml run at aaaaaaaaaaaa") });
+
+    it("needs the candidate and the smoke run, each proven in its own workflow run", () => {
+      expect(evaluate([...candidate, ...smoke])).toEqual([]);
+      // A green candidate with no smoke run at the head.
+      const noSmoke = evaluate(candidate);
+      expect(noSmoke.map(reason => reason.code)).toEqual(["required_check_skipped", "required_check_skipped"]);
+      expect(noSmoke[0]!.detail).toBe("smoke did not run on aaaaaaaaaaaa, but this change needs it. It must run and pass.");
+      expect(noSmoke).toEqual(expect.arrayContaining([smokeUnproven]));
+      // The smoke scope's refusal does not send the coordinator to dispatch a candidate.
+      expect(noSmoke.map(reason => reason.detail).join("\n")).not.toMatch(/candidate/i);
+      // A green smoke run with no candidate.
+      const noCandidate = evaluate(smoke);
+      expect(noCandidate.map(reason => reason.detail)).toEqual(expect.arrayContaining([
+        expect.stringContaining("frontend did not run"), expect.stringContaining("candidate did not run"),
+        expect.stringContaining("frontend, candidate must all succeed in one completed .github/workflows/internal-windows.yml run at aaaaaaaaaaaa"),
+      ]));
+      expect(noCandidate.map(reason => reason.detail).join("\n")).toContain("finished-candidate run");
+      expect(noCandidate.map(reason => reason.detail).join("\n")).not.toMatch(/ui-browser-smoke/);
+    });
+
+    it("does not count a smoke run that failed, is still running, was skipped or belongs to an older head", () => {
+      expect(evaluate([...candidate, { ...smokeRun, conclusion: "failure" }, { ...smokeJob, conclusion: "failure" }])).toMatchObject([{ code: "ci_failed" }]);
+      expect(evaluate([...candidate, { ...smokeRun, conclusion: "cancelled" }, smokeJob])).toMatchObject([{ code: "ci_failed" }]);
+      expect(evaluate([...candidate, { ...smokeRun, status: "in_progress", conclusion: null }, { ...smokeJob, status: "in_progress", conclusion: null }]))
+        .toMatchObject([{ code: "ci_pending", detail: expect.stringContaining("smoke") }]);
+      expect(evaluate([...candidate, { ...smokeRun, status: "queued", conclusion: null }])).toMatchObject([{ code: "ci_pending" }]);
+      // A path filter's skip is not a pass for a change that touches a UI path.
+      const skipped = evaluate([...candidate, { ...smokeRun, conclusion: "skipped" }, { ...smokeJob, conclusion: "skipped" }]);
+      expect(skipped).toEqual(expect.arrayContaining([
+        expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("smoke was skipped by a CI path filter") }), smokeUnproven,
+      ]));
+      for (const invalid of [
+        [{ ...smokeRun, headSha: REVIEWED }, { ...smokeJob, headSha: REVIEWED }],
+        [{ ...smokeRun, headSha: REVIEWED }, smokeJob],
+        [smokeRun, { ...smokeJob, headSha: REVIEWED }],
+        // The job in another suite, or a `smoke` job in the candidate's own suite.
+        [smokeRun, { ...smokeJob, checkSuiteId: 99 }],
+        [smokeRun, job("smoke", "2026-11-13T02:06:00Z", "2026-11-13T02:25:00Z")],
+        [job("smoke", "2026-11-13T02:06:00Z", "2026-11-13T02:25:00Z")],
+        [{ ...smokeRun, workflowPath: ".github/workflows/ci.yml" }, smokeJob],
+        [{ ...smokeRun, workflowPath: ".github/workflows/internal-windows.yml", checkSuiteId: 7, runId: 55 }, smokeJob],
+        [{ ...smokeRun, runId: null }, smokeJob],
+        [smokeRun, { ...smokeJob, conclusion: "neutral" }],
+      ]) expect(evaluate([...candidate, ...invalid])).toEqual(expect.arrayContaining([smokeUnproven]));
+    });
+
+    it("leaves an agent or native-app change needing the candidate without the smoke job", () => {
+      for (const files of [["agent/src/x.ts"], ["shell/src-tauri/src/main.rs"], ["agent/src/x.ts", "shell/src-tauri/src/main.rs", "shell/tests/x.test.mjs"]]) {
+        expect(requiredPathScopedChecks({ policy: facette, changedFiles: files })).toEqual([...WINDOWS, "frontend", "candidate"]);
+        expect(evaluate(candidate, files)).toEqual([]);
+        // The path filter leaves the smoke job skipped, or the workflow absent: both are fine here.
+        expect(evaluate([...candidate, { ...smokeRun, conclusion: "skipped" }, { ...smokeJob, conclusion: "skipped" }], files)).toEqual([]);
+        expect(evaluate([], files)).toEqual(expect.arrayContaining([
+          expect.objectContaining({ code: "required_check_skipped", detail: expect.stringContaining("candidate did not run") })]));
+      }
+    });
+
+    it("needs every path-scoped check, the smoke job included, for an unknown or empty file list", () => {
+      for (const files of [null, []]) {
+        expect(evaluate([...candidate, ...smoke], files)).toEqual([]);
+        expect(evaluate(candidate, files)).toEqual(expect.arrayContaining([smokeUnproven]));
+        expect(evaluate(smoke, files).map(reason => reason.detail)).toEqual(expect.arrayContaining([expect.stringContaining("candidate did not run")]));
+      }
+    });
+  });
+
+  describe("visual verdict refusals name the evidence run (FAC-1053)", () => {
+    const PR = "ethanmonlux/facette#704";
+    const verdict = (overrides: Partial<VisualReviewAttestation> = {}): VisualReviewAttestation => ({
+      reviewIssueId: "visual-1", reviewIssueIdentifier: "STA-901", reviewIssueStatus: "done", reviewerAgentId: "visual-reviewer",
+      writtenByReviewer: true, designatedReviewer: true, recordedAt: "2026-11-13T03:00:00Z", reviewedSha: HEAD, pullRequest: PR,
+      candidateRunId: 77, candidateRunAttempt: 2, verdict: "pass", ...overrides,
+    });
+    const admitted = admittedCandidateRun({ policy: facette, checks: [smokeRun, smokeJob], headSha: HEAD })!;
+    const codeReview = review({ recordedAt: "2026-11-13T01:00:00Z" });
+    const evaluate = (overrides: Partial<Parameters<typeof evaluateVisualReview>[0]> = {}, policy: RepositoryMergePolicy = facette) =>
+      evaluateVisualReview({ pullRequest: PR, headSha: HEAD, required: true, author, reviews: [verdict()], candidate: admitted,
+        evidenceName: policy.visualEvidenceName, codeReviews: [codeReview], ...overrides });
+    const refusals: Array<[string, Partial<Parameters<typeof evaluateVisualReview>[0]>, string]> = [
+      ["no verdict", { reviews: [] }, "visual_review_missing"],
+      ["a verdict at an older head", { reviews: [verdict({ reviewedSha: REVIEWED })] }, "visual_review_stale"],
+      ["a failing verdict", { reviews: [verdict({ verdict: "fail" })] }, "visual_review_failed"],
+      ["a verdict naming another run", { reviews: [verdict({ candidateRunId: 55, candidateRunAttempt: 3 })] }, "visual_review_unbound"],
+      ["a verdict naming another attempt", { reviews: [verdict({ candidateRunAttempt: 1 })] }, "visual_review_unbound"],
+      ["a verdict recorded before the run finished", { reviews: [verdict({ recordedAt: "2026-11-13T02:20:00Z" })] }, "review_order_invalid"],
+      ["a verdict recorded the instant the run finished", { reviews: [verdict({ recordedAt: "2026-11-13T02:25:00Z" })] }, "review_order_invalid"],
+      ["a verdict with no recorded time", { reviews: [verdict({ recordedAt: null })] }, "review_order_invalid"],
+      ["a run with no recorded finish", { candidate: { ...admitted, completedAt: null } }, "review_order_invalid"],
+      ["a run started before the code review was recorded", { codeReviews: [review({ recordedAt: "2026-11-13T02:10:00Z" })] }, "review_order_invalid"],
+      ["a run started the instant the code review was recorded", { codeReviews: [review({ recordedAt: "2026-11-13T02:05:00Z" })] }, "review_order_invalid"],
+      ["a run with no recorded start", { candidate: { ...admitted, startedAt: null } }, "review_order_invalid"],
+      ["a code review with no recorded time", { codeReviews: [review({ recordedAt: null })] }, "review_order_invalid"],
+    ];
+
+    it("accepts a passing verdict on the admitted smoke run in order, and asks nothing of a change that needs no verdict", () => {
+      expect(admitted).toMatchObject({ runId: 77, runAttempt: 2 });
+      expect(evaluate()).toEqual([]);
+      expect(evaluate({ required: false, reviews: [] })).toEqual([]);
+    });
+
+    it("says UI browser smoke for Facette and never sends the reviewer to the candidate run", () => {
+      for (const [name, overrides, code] of refusals) {
+        const reasons = evaluate(overrides);
+        expect({ name, codes: reasons.map(reason => reason.code) }).toEqual({ name, codes: [code] });
+        expect(reasons[0]!.detail, name).toContain("UI browser smoke");
+        expect(reasons[0]!.detail, name).not.toMatch(/Internal Windows|candidate run|the candidate\b/i);
+      }
+      // The verdict naming the candidate run's id is told which run the gate admits.
+      expect(evaluate({ reviews: [verdict({ candidateRunId: 55, candidateRunAttempt: 3 })] })[0]!.detail)
+        .toBe("The visual review STA-901 judges run 55 attempt 3, but the UI browser smoke run the gate admits at aaaaaaaaaaaa is run 77 attempt 2. Visually review that run's evidence.");
+      // The document's field names are unchanged; for Facette they hold the smoke run's id and attempt.
+      expect(evaluate({ reviews: [] })[0]!.detail).toContain("candidateRunId and candidateRunAttempt naming that UI browser smoke run");
+    });
+
+    it("says Internal Windows candidate for a policy without visualEvidenceName", () => {
+      const unnamed: RepositoryMergePolicy = { ...facette, visualEvidencePlatform: undefined, visualEvidenceName: undefined };
+      expect(evaluate({}, unnamed)).toEqual([]);
+      for (const [name, overrides, code] of refusals) {
+        const reasons = evaluate(overrides, unnamed);
+        expect({ name, codes: reasons.map(reason => reason.code) }).toEqual({ name, codes: [code] });
+        expect(reasons[0]!.detail, name).toContain("Internal Windows candidate");
+        expect(reasons[0]!.detail, name).not.toContain("UI browser smoke");
+      }
+      // The same holds when the caller passes no name at all.
+      expect(evaluateVisualReview({ pullRequest: PR, headSha: HEAD, required: true, author, reviews: [], candidate: admitted, codeReviews: [codeReview] }))
+        .toMatchObject([{ code: "visual_review_missing", detail: expect.stringContaining("Internal Windows candidate evidence at aaaaaaaaaaaa") }]);
+    });
   });
 });
 
