@@ -10,9 +10,11 @@
  * critical owner issue for that repository branch, assigned to an
  * urgent-capable agent, and parks the refused task on it with a blocker
  * relation, so the task resumes by itself when the fix lands. A change to a
- * repository's visual paths also needs, at the exact merge head, a candidate
- * run started after its code review and the designated visual reviewer's
- * passing verdict on that run, recorded after it finished (STA-362).
+ * repository's visual paths also needs, at the exact merge head, a
+ * visual-evidence run (the candidate; for Facette the UI browser smoke run,
+ * FAC-1053) started after its code review and the designated visual
+ * reviewer's passing verdict on that run, recorded after it finished
+ * (STA-362).
  */
 import { forbidden, notFound, unprocessable } from "../../errors.js";
 import { GitHubMergeGateError, type MergeGateGitHub } from "./github.js";
@@ -410,8 +412,9 @@ async function evaluateLocked(
   });
   const reviewReasons = coverage.reasons;
 
-  // A visual change also needs, after its code review, a candidate run and a
-  // visual verdict on that run's evidence, all at this head.
+  // A visual change also needs, after its code review, a visual-evidence run
+  // (the policy's `visualEvidencePlatform` scope) and a visual verdict on
+  // that run's evidence, all at this head.
   const visualRequired = requiresVisualReview({ policy, changedFiles });
   const visualReviews = visualRequired
     ? (await deps.loadVisualReviews(request.companyId, { reviewIssueIds: request.reviewIssueIds ?? [], repo, pullNumber: request.pullNumber }))
@@ -420,6 +423,8 @@ async function evaluateLocked(
   const visualReasons = evaluateVisualReview({
     pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews,
     candidate: visualRequired ? admittedCandidateRun({ policy, checks: headChecks.checks, headSha }) : null,
+    evidenceName: policy.visualEvidenceName,
+    evidencePlatform: policy.visualEvidencePlatform,
     codeReviews: coverage.reasons.length === 0 ? coverage.covering : [],
   });
 

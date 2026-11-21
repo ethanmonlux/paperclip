@@ -9,9 +9,10 @@
  * 2. CI at that exact head finished green, and every check the change needs
  *    ran and passed. A skipped check counts only when the repository policy
  *    lists it as optional, or as path-scoped with every changed file known to
- *    be irrelevant to it. Windows scripts always need Windows evidence, an
- *    unknown path means the check must run, and CI where nothing passed is
- *    never green;
+ *    be irrelevant to it, or when the same job of the same workflow also ran
+ *    and passed at that head (a draft run's leftover). Windows scripts always
+ *    need Windows evidence, an unknown path means the check must run, and CI
+ *    where nothing passed is never green;
  * 3. an independent review covered the source, from a different model family
  *    than every recorded implementation run. A head that differs from the
  *    reviewed head only by a clean merge from base needs CI only; resolved
@@ -21,10 +22,12 @@
  * 5. main is green. A red main stops every merge except the fix owned by the
  *    single red-main issue;
  * 6. a change to what the user sees (a repository's visual paths, on either
- *    side of a rename) also has one finished candidate run at the exact merge
- *    head, started after its code review, and a passing verdict from the
- *    designated visual reviewer on that run's evidence, recorded after the
- *    run finished (STA-362).
+ *    side of a rename) also has one finished visual-evidence run at the exact
+ *    merge head, started after its code review, and a passing verdict from
+ *    the designated visual reviewer on that run's evidence, recorded after
+ *    the run finished (STA-362). That run is the repository's
+ *    `visualEvidencePlatform` path scope: the Internal Windows candidate by
+ *    default, the UI browser smoke run for Facette (FAC-1053).
  */
 
 export interface RepositoryMergePolicy {
@@ -36,13 +39,28 @@ export interface RepositoryMergePolicy {
    * one of them, so an unknown path needs the check. With `relevantPaths`
    * (a workflow-level `paths:` trigger), the check is needed when any changed
    * file matches one. Either way, a file a Windows suite executes always
-   * needs a Windows check.
+   * needs a Windows check, and an unknown or empty file list needs the check.
+   *
+   * `onlyPaths` is the reverse: a job the repository runs INSTEAD of other
+   * suites for a narrow kind of change. The scope's checks are needed only
+   * when the file list is known, non-empty and every file matches one of
+   * them; for any other change, an unknown or empty list included, they may
+   * be skipped. A scope with `onlyPaths` uses neither of the other two lists.
+   *
+   * `alternativeChecks` names checks that prove at least as much as the
+   * scope's own: when every one of them ran and passed at the head, the
+   * scope's checks are not needed and may be skipped. It exists for a
+   * repository whose own rule can choose the wider suites where the gate,
+   * which sees only paths, expects the narrow job. A check listed by a scope
+   * with `alternativeChecks` must not be listed by another scope.
    */
   pathScopedChecks: Array<{
     platform: string;
     checks: string[];
     irrelevantPaths?: RegExp[];
     relevantPaths?: RegExp[];
+    onlyPaths?: RegExp[];
+    alternativeChecks?: string[];
     maintenanceOnlyPaths?: RegExp[];
     workflowPath?: string;
   }>;
@@ -61,10 +79,18 @@ export interface RepositoryMergePolicy {
   /**
    * Paths that change what the user sees. A change touching one, or with an
    * unknown file list, needs a passing `visual-review` verdict on the
-   * `candidate` path scope's run at the exact merge head, in addition to its
-   * code review.
+   * `visualEvidencePlatform` path scope's run at the exact merge head, in
+   * addition to its code review.
    */
   visualPaths?: RegExp[];
+  /**
+   * The path scope whose run carries the evidence a visual verdict judges,
+   * by its `platform`. The verdict must name that scope's proven run at the
+   * exact merge head. Defaults to `candidate`.
+   */
+  visualEvidencePlatform?: string;
+  /** What that run is called in a refusal, e.g. "UI browser smoke". Defaults to the Internal Windows candidate. */
+  visualEvidenceName?: string;
   mergeMethod: "merge" | "squash" | "rebase";
 }
 
@@ -90,26 +116,101 @@ const FACETTE_WINDOWS_IRRELEVANT: RegExp[] = [
 ];
 
 /**
- * Facette paths that change what the user sees: the shell and agent UI,
- * Faces, Kaia/Rive art and the native app all live under these. Each needs
- * the Internal Windows candidate and a visual review at the merge head.
+ * Facette paths the Internal Windows candidate builds: the shell, the agent
+ * and the native app. Each needs the candidate at the merge head. A visual
+ * review is needed only for the narrower `FACETTE_UI_SMOKE_PATHS` below
+ * (FAC-1053).
  */
-const FACETTE_VISUAL_PATHS: RegExp[] = [/^shell\//, /^agent\//];
+const FACETTE_CANDIDATE_PATHS: RegExp[] = [/^shell\//, /^agent\//];
+
+/**
+ * Facette's own CI path rules, from `.github/scripts/detect-changed-paths.sh`
+ * (its `changes` job). KEEP EACH EQUAL TO THE REGEX OF THE SAME NAME THERE.
+ *
+ * `SAFE_PATHS`: paths no test, build or script reads. When every changed path
+ * is on it, Facette skips `shell`, `agent` and `account-web` and runs
+ * `docs-only-scan` instead. A path Facette adds and this list lacks refuses
+ * (the gate needs suites Facette skipped). A path this list has and Facette
+ * drops still merges, on the suites Facette ran (`alternativeChecks`).
+ * Neither direction merges a change no suite covered.
+ *
+ * `CATALOG` and `CI_GATING`: Facette runs `catalog` when a changed path
+ * (either end of a move) matches one. A path Facette adds and these lack
+ * merges without requiring `catalog`, though a `catalog` that ran and failed
+ * still refuses.
+ */
+const FACETTE_SAFE_PATHS = /^((AGENTS|CLAUDE)\.md|docs\/(backlog|development|foundry|source-captures|vision)\/.+\.md)$/;
+const FACETTE_CATALOG_PATHS = /^(tools\/osrs-item-catalog\/|shell\/faces\/osrs\/catalog\/|shell\/scripts\/osrs-item-tree-extract\.mjs$)/;
+const FACETTE_CI_GATING_PATHS = /^\.github\/(workflows\/(ci|windows-native-cache|internal-windows)\.yml|scripts\/detect-changed-paths\.sh)$/;
+const FACETTE_CODE_SUITES = ["shell", "agent", "account-web"];
+
+/**
+ * Facette paths the `UI browser smoke` workflow runs on (FAC-1053): its own
+ * `paths:` trigger, kept in the same order. Browser captures exist only for a
+ * change touching one of these, so these are the changes a visual verdict can
+ * be given for. A candidate run produces no browser evidence.
+ *
+ * KEEP THIS EQUAL TO `.github/workflows/ui-browser-smoke.yml` IN FACETTE. A
+ * path listed there and missing here merges a UI change with no visual
+ * review. A path listed here and missing there refuses, because no smoke run
+ * exists for the verdict to name.
+ */
+const FACETTE_UI_SMOKE_WORKFLOW = ".github/workflows/ui-browser-smoke.yml";
+const FACETTE_UI_SMOKE_PATHS: RegExp[] = [
+  /^shell\/app\//,
+  /^shell\/components\//,
+  /^shell\/faces\//,
+  /^shell\/games\//,
+  /^shell\/lib\//,
+  /^shell\/public\//,
+  /^shell\/fonts\//,
+  /^shell\/types\//,
+  /^shell\/_disabled-faces\//,
+  /^shell\/tsconfig\.json$/,
+  /^shell\/next\.config\.ts$/,
+  /^shell\/tailwind\.config\.ts$/,
+  /^shell\/postcss\.config\.mjs$/,
+  /^shell\/package\.json$/,
+  /^shell\/package-lock\.json$/,
+  /^shell\/scripts\/osrs-ember-vault-visual-qa\.mjs$/,
+  /^shell\/scripts\/osrs-kaia-preview\.mjs$/,
+  /^shell\/scripts\/account-preview\.mjs$/,
+  /^shell\/scripts\/prune-export\.mjs$/,
+  /^shell\/scripts\/lib\/osrs-chromium-capture\.mjs$/,
+  /^shell\/scripts\/lib\/devtools-websocket\.mjs$/,
+  /^shell\/scripts\/lib\/frame-compare\.mjs$/,
+  /^shell\/scripts\/lib\/icon-image\.mjs$/,
+  /^shell\/scripts\/lib\/retired-export-assets\.mjs$/,
+  /^\.github\/workflows\/ui-browser-smoke\.yml$/,
+];
 
 const exactly = (name: string) => ({ label: name, pattern: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
 
 export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = {
-  // .github/workflows/ci.yml: these five jobs are unconditional; only the
-  // Windows jobs sit behind the `changes` path filter.
+  // .github/workflows/ci.yml. On a ready pull request `changes` and
+  // `pr-status-block` always run, `gate / gate` proves the local check output
+  // is attached for the commit, and `ready / summary` is the repository's one
+  // required aggregate: it passes only when every suite that ran passed.
+  // Everything else sits behind the `changes` path rules, mirrored below.
   "ethanmonlux/facette": {
-    alwaysRequiredChecks: ["changes", "shell", "agent", "account-web", "pr-status-block"].map(exactly),
+    alwaysRequiredChecks: ["changes", "pr-status-block", "gate / gate", "ready / summary"].map(exactly),
     pathScopedChecks: [
+      // The code suites skip only when every changed path is on SAFE_PATHS.
+      { platform: "code", checks: FACETTE_CODE_SUITES, irrelevantPaths: [FACETTE_SAFE_PATHS] },
+      // ...and then `docs-only-scan` runs in their place. Facette also runs
+      // the code suites instead for a deletion, a move, or a symlink or
+      // submodule on a SAFE path, which the gate cannot see in a file list:
+      // the three suites passing is accepted in place of the scan.
+      { platform: "docs-only", checks: ["docs-only-scan"], onlyPaths: [FACETTE_SAFE_PATHS], alternativeChecks: FACETTE_CODE_SUITES },
+      { platform: "catalog", checks: ["catalog"], relevantPaths: [FACETTE_CATALOG_PATHS, FACETTE_CI_GATING_PATHS] },
       { platform: "windows", checks: ["windows-fast", "windows-native"], irrelevantPaths: FACETTE_WINDOWS_IRRELEVANT },
       {
         platform: "candidate",
-        checks: ["frontend", "candidate", "browser-evidence"],
+        // FAC-1053: the candidate builds the Windows app and its native
+        // launch evidence. Its browser-evidence job is gone.
+        checks: ["frontend", "candidate"],
         workflowPath: ".github/workflows/internal-windows.yml",
-        relevantPaths: [...FACETTE_VISUAL_PATHS, /^\.github\/workflows\/internal-windows\.yml$/],
+        relevantPaths: [...FACETTE_CANDIDATE_PATHS, /^\.github\/workflows\/internal-windows\.yml$/],
         maintenanceOnlyPaths: [
           /^\.github\/workflows\/internal-windows\.yml$/,
           /^\.github\/scripts\/detect-changed-paths\.sh$/,
@@ -117,10 +218,34 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
           /^\.github\/scripts\/internal-windows-workflow\.test\.mjs$/,
         ],
       },
+      // FAC-1053: the browser captures. The workflow runs on the ready pull
+      // request head when a UI path changed, and its one job is `smoke`.
+      {
+        platform: "ui-smoke",
+        checks: ["smoke"],
+        workflowPath: FACETTE_UI_SMOKE_WORKFLOW,
+        relevantPaths: FACETTE_UI_SMOKE_PATHS,
+      },
     ],
-    optionalSkips: [],
+    optionalSkips: [
+      // pr-ready.yml is one reusable workflow with three modes. Each call
+      // runs one mode's job and skips the other two; the `failure-loop` call
+      // runs only after a failure, and a skipped call shows as its bare name
+      // (`ready` is skipped that way on a draft). `ready / summary` and
+      // `gate / gate` are required above and never skippable.
+      /^failure-loop$/,
+      /^gate \/ failure-loop$/,
+      /^ready \/ failure-loop$/,
+      /^ready \/ gate$/,
+      /^gate \/ summary$/,
+      /^ready$/,
+    ],
     planValidatedSkips: [],
-    visualPaths: FACETTE_VISUAL_PATHS,
+    // A visual verdict judges the smoke run's captures, so it is required for
+    // exactly the changes that have a smoke run.
+    visualPaths: FACETTE_UI_SMOKE_PATHS,
+    visualEvidencePlatform: "ui-smoke",
+    visualEvidenceName: "UI browser smoke",
     mergeMethod: "merge",
   },
   // .github/workflows/pr.yml calls pr-trusted.yml (`ci / …` jobs). Its PR
@@ -254,7 +379,8 @@ function matchesAny(path: string, patterns: readonly RegExp[]) {
  * changed file is known to be irrelevant to it (or, for a `relevantPaths`
  * scope, no changed file is relevant to it). A file a Windows suite executes
  * always needs the Windows checks. An empty or unreadable file list is
- * unknown, so every path-scoped check is needed.
+ * unknown, so every path-scoped check is needed, except an `onlyPaths`
+ * scope's: those are needed only when every file of a known list matches.
  */
 export function requiredPathScopedChecks(input: {
   policy: RepositoryMergePolicy;
@@ -263,6 +389,10 @@ export function requiredPathScopedChecks(input: {
   const files = input.changedFiles;
   const required: string[] = [];
   for (const scope of input.policy.pathScopedChecks) {
+    if (scope.onlyPaths) {
+      if (files !== null && files.length > 0 && files.every(file => matchesAny(file, scope.onlyPaths!))) required.push(...scope.checks);
+      continue;
+    }
     if (files !== null && files.length > 0 && scope.maintenanceOnlyPaths &&
       files.every(file => matchesAny(file, scope.maintenanceOnlyPaths!))) continue;
     const irrelevant = (file: string) => {
@@ -334,7 +464,7 @@ function provenWorkflowRun(input: { scope: PathScope; checks: readonly MergeGate
   return { run, jobs };
 }
 
-/** The finished candidate run a visual verdict must judge. */
+/** The finished run a visual verdict must judge: the candidate, or the policy's `visualEvidencePlatform` run. */
 export interface AdmittedCandidateRun {
   workflowPath: string;
   runId: number;
@@ -351,15 +481,18 @@ function parsedTime(value: string | null | undefined) {
 }
 
 /**
- * The `candidate` path scope's proven run at the exact head, or null when
- * the policy has none or no single finished, successful run exists there.
+ * The proven run a visual verdict must judge, at the exact head: the run of
+ * the policy's visual-evidence path scope (`visualEvidencePlatform`, by
+ * default `candidate`). Null when the policy has none or no single finished,
+ * successful run exists there.
  */
 export function admittedCandidateRun(input: {
   policy: RepositoryMergePolicy;
   checks: readonly MergeGateCheck[];
   headSha: string;
 }): AdmittedCandidateRun | null {
-  const scope = input.policy.pathScopedChecks.find(entry => entry.platform === "candidate" && entry.workflowPath);
+  const platform = input.policy.visualEvidencePlatform ?? "candidate";
+  const scope = input.policy.pathScopedChecks.find(entry => entry.platform === platform && entry.workflowPath);
   if (!scope) return null;
   const proven = provenWorkflowRun({ scope, checks: currentWorkflowChecks(input), headSha: input.headSha });
   if (!proven) return null;
@@ -417,7 +550,12 @@ export function evaluateHeadCi(input: {
     reasons.push({ code: "required_check_skipped", detail: `${suite.label} runs on every change in this repository but did not pass on ${sha}. It must run and pass.` });
   }
   const ranGreen = new Set(passed.map(check => check.name));
-  for (const name of input.requiredChecks) {
+  // A scope whose `alternativeChecks` all ran and passed needs nothing more.
+  const covered = new Set(input.policy.pathScopedChecks
+    .filter(scope => scope.alternativeChecks && scope.alternativeChecks.length > 0 && scope.alternativeChecks.every(name => ranGreen.has(name)))
+    .flatMap(scope => scope.checks));
+  const requiredChecks = input.requiredChecks.filter(name => !covered.has(name));
+  for (const name of requiredChecks) {
     if (ranGreen.has(name) || reported.has(name)) continue;
     reported.add(name);
     const skipped = checkRuns.some(check => check.name === name && check.conclusion === "skipped");
@@ -426,18 +564,33 @@ export function evaluateHeadCi(input: {
       : `${name} did not run on ${sha}, but this change needs it. It must run and pass.` });
   }
   for (const scope of input.policy.pathScopedChecks) {
-    if (!scope.workflowPath || !scope.checks.some(name => input.requiredChecks.includes(name))) continue;
+    if (!scope.workflowPath || !scope.checks.some(name => requiredChecks.includes(name))) continue;
+    // Only the candidate is dispatched by the coordinator; any other workflow starts from its own trigger.
     if (!provenWorkflowRun({ scope, checks, headSha: input.headSha })) reasons.push({ code: "required_check_skipped", detail:
-      `${scope.checks.join(", ")} must all succeed in one completed ${scope.workflowPath} run at ${sha}. Ordinary CI, an older head, skipped jobs or same-named jobs from another workflow do not prove this candidate. The coordinator must reuse or explicitly dispatch the applicable finished-candidate run and record its run ID in a ci wait.` });
+      `${scope.checks.join(", ")} must all succeed in one completed ${scope.workflowPath} run at ${sha}. Ordinary CI, an older head, skipped jobs or same-named jobs from another workflow do not prove ${scope.platform === "candidate"
+        ? "this candidate. The coordinator must reuse or explicitly dispatch the applicable finished-candidate run and record its run ID in a ci wait."
+        : "it. That workflow must run and pass at this head."}` });
   }
   // A skip is allowed only where the policy says so; a path filter that
   // skipped anything else, or a disabled suite, is not a green result.
   const skippablePathScoped = new Set(input.policy.pathScopedChecks.flatMap(scope => scope.checks)
-    .filter(name => !input.requiredChecks.includes(name)));
+    .filter(name => !requiredChecks.includes(name)));
+  // A draft run leaves its skipped jobs on the head beside the ready run's.
+  // A skipped check run is no refusal when the same job ran and passed at the
+  // same head: same name, and not known to be another head or another
+  // workflow (a check run's workflow is its suite's workflow run). A failed
+  // or unfinished run of that name has already refused above.
+  const workflowOf = (check: MergeGateCheck) => check.checkSuiteId == null ? null
+    : checks.find(run => run.kind === "workflow_run" && run.checkSuiteId === check.checkSuiteId)?.workflowPath ?? null;
+  const known = <T>(left: T | null | undefined, right: T | null | undefined) => left != null && right != null;
+  const alsoPassed = (skipped: MergeGateCheck) => passed.some(run => run.name === skipped.name &&
+    !(known(run.headSha, skipped.headSha) && run.headSha!.toLowerCase() !== skipped.headSha!.toLowerCase()) &&
+    !(known(workflowOf(run), workflowOf(skipped)) && workflowOf(run) !== workflowOf(skipped)));
   const touchesWindowsScripts = (input.changedFiles ?? []).some(file => matchesAny(file, WINDOWS_EXECUTED_PATHS));
   for (const check of checkRuns) {
     if (check.conclusion !== "skipped" || reported.has(check.name)) continue;
     if (skippablePathScoped.has(check.name) || matchesAny(check.name, input.policy.optionalSkips)) continue;
+    if (alsoPassed(check)) continue;
     // A plan skip counts only when the plan's validator ran and passed.
     if (input.policy.planValidatedSkips.some(scope =>
       matchesAny(check.name, scope.checks) && passed.some(run => run.name === scope.validator))) continue;
@@ -479,7 +632,7 @@ export interface MergeReviewAttestation {
   writtenByReviewer: boolean;
   /** Exhaustive source author agents attested by the independent reviewer, when known. */
   sourceAuthorAgentIds: string[] | null;
-  /** When the latest document revision was written; a visual change's candidate must start after it. */
+  /** When the latest document revision was written; a visual change's evidence run must start after it. */
   recordedAt?: string | null;
   scope: "full" | "conflict_hunks";
   reviewedSha: string;
@@ -627,7 +780,7 @@ export function evaluateReviewCoverage(input: Parameters<typeof reviewCoverage>[
   return reviewCoverage(input).reasons;
 }
 
-/** `evaluateReviewCoverage`, plus the reviews that cover the head (the code review a candidate must follow). */
+/** `evaluateReviewCoverage`, plus the reviews that cover the head (the code review a visual-evidence run must follow). */
 export function reviewCoverage(input: {
   pullRequest: string;
   headSha: string;
@@ -723,7 +876,11 @@ export interface VisualReviewAttestation {
   recordedAt: string | null;
   reviewedSha: string;
   pullRequest: string | null;
-  /** The candidate workflow run (and attempt) whose evidence the verdict judges. */
+  /**
+   * The workflow run (and attempt) whose evidence the verdict judges: the
+   * policy's visual-evidence run. For Facette that is the UI browser smoke
+   * run, not the candidate; the field names predate FAC-1053.
+   */
   candidateRunId: number;
   candidateRunAttempt: number;
   verdict: "pass" | "fail";
@@ -745,13 +902,14 @@ export function parseVisualReviewDocument(body: string): Pick<VisualReviewAttest
 
 /**
  * Visual review for the exact merge head, in Ethan's order: code review, then
- * one candidate run, then a visual verdict on that run's evidence. The verdict
- * must be done, written by its assigned reviewer in its own run, that
+ * one evidence run (`input.candidate`: the candidate, or for Facette the UI
+ * browser smoke run), then a visual verdict on that run's evidence. The
+ * verdict must be done, written by its assigned reviewer in its own run, that
  * reviewer a designated visual reviewer who did not work on the task, and
- * passing. It names the admitted candidate run and attempt and was recorded
- * after that run finished; the run started after every covering code review
- * was recorded. Unlike the code review, a clean base update does not carry
- * the verdict forward: the candidate must run on the head that merges. The
+ * passing. It names the admitted run and attempt and was recorded after that
+ * run finished; the run started after every covering code review was
+ * recorded. Unlike the code review, a clean base update does not carry the
+ * verdict forward: the evidence run must run on the head that merges. The
  * newest verdict at that head decides.
  */
 export function evaluateVisualReview(input: {
@@ -760,18 +918,23 @@ export function evaluateVisualReview(input: {
   required: boolean;
   author: MergeGateAuthor;
   reviews: readonly VisualReviewAttestation[];
-  /** `admittedCandidateRun` at the head. */
+  /** `admittedCandidateRun` at the head: the policy's visual-evidence run. */
   candidate: AdmittedCandidateRun | null;
+  /** What the evidence run is called in a refusal (`visualEvidenceName`); the candidate by default. */
+  evidenceName?: string;
+  /** The evidence run's path scope (`visualEvidencePlatform`); `candidate` by default. Only the candidate is dispatched by the coordinator. */
+  evidencePlatform?: string;
   /** Code reviews covering the head (`reviewCoverage`); empty when coverage already refused. */
   codeReviews: readonly MergeReviewAttestation[];
 }): MergeGateReason[] {
   if (!input.required) return [];
   const sha = shortSha(input.headSha);
+  const evidence = input.evidenceName ?? "Internal Windows candidate";
   const label = (review: VisualReviewAttestation) => review.reviewIssueIdentifier ?? review.reviewIssueId;
   const forThisPr = input.reviews.filter(review => !review.pullRequest ||
     review.pullRequest.toLowerCase() === input.pullRequest.toLowerCase());
   if (forThisPr.length === 0) {
-    return [{ code: "visual_review_missing", detail: `${input.pullRequest} changes what the user sees, so it needs a visual review of its Internal Windows candidate evidence at ${sha}: a done review issue assigned to a designated visual reviewer, with a visual-review document (pullRequest, reviewedSha, candidateRunId, candidateRunAttempt, verdict pass|fail) that reviewer wrote after the candidate run finished. Pass that review issue in reviewIssueIds.` }];
+    return [{ code: "visual_review_missing", detail: `${input.pullRequest} changes what the user sees, so it needs a visual review of its ${evidence} evidence at ${sha}: a done review issue assigned to a designated visual reviewer, with a visual-review document (pullRequest, reviewedSha, candidateRunId and candidateRunAttempt naming that ${evidence} run, verdict pass|fail) that reviewer wrote after that run finished. Pass that review issue in reviewIssueIds.` }];
   }
   const problems: MergeGateReason[] = [];
   const independent = forThisPr.filter(review => {
@@ -789,16 +952,21 @@ export function evaluateVisualReview(input: {
   const latest = atHead[atHead.length - 1];
   if (!latest) {
     const newest = independent[independent.length - 1]!;
-    return [{ code: "visual_review_stale", detail: `The visual review ${label(newest)} covers ${shortSha(newest.reviewedSha)}, but the merge head is ${sha}. Run the Internal Windows candidate on ${sha} and visually review that evidence.` }];
+    return [{ code: "visual_review_stale", detail: `The visual review ${label(newest)} covers ${shortSha(newest.reviewedSha)}, but the merge head is ${sha}. Run the ${evidence} on ${sha} and visually review that evidence.` }];
   }
   if (latest.verdict !== "pass") {
-    return [{ code: "visual_review_failed", detail: `The visual review ${label(latest)} failed ${sha} against its visual brief. Fix the findings, then rerun CI, the code review as needed, the candidate and the visual review on the new head.` }];
+    return [{ code: "visual_review_failed", detail: `The visual review ${label(latest)} failed ${sha} against its visual brief. Fix the findings, then rerun CI, the code review as needed, the ${evidence} and the visual review on the new head.` }];
   }
-  // Without a proven candidate the CI reasons already refuse; the verdict has nothing to bind to.
+  // A passing verdict with no proven evidence run binds to nothing. The CI
+  // reasons refuse too when the run is merely missing, but not when the
+  // policy names an evidence scope that does not exist or has no workflow:
+  // refuse here, so a mistyped policy cannot merge an unchecked verdict.
   const candidate = input.candidate;
-  if (!candidate) return [];
+  if (!candidate) {
+    return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but there is no proven ${evidence} run at ${sha} for the verdict to name. That run must finish successfully at ${sha}; then visually review its evidence.` }];
+  }
   if (latest.candidateRunId !== candidate.runId || latest.candidateRunAttempt !== candidate.runAttempt) {
-    return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges candidate run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but the candidate the gate admits at ${sha} is run ${candidate.runId} attempt ${candidate.runAttempt}. Visually review that run's evidence.` }];
+    return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but the ${evidence} run the gate admits at ${sha} is run ${candidate.runId} attempt ${candidate.runAttempt}. Visually review that run's evidence.` }];
   }
   const reasons: MergeGateReason[] = [];
   const started = parsedTime(candidate.startedAt);
@@ -806,15 +974,18 @@ export function evaluateVisualReview(input: {
   const verdictAt = parsedTime(latest.recordedAt);
   if (finished === null || verdictAt === null || verdictAt <= finished) {
     reasons.push({ code: "review_order_invalid", detail: finished === null || verdictAt === null
-      ? `The gate could not read when candidate run ${candidate.runId} finished or when ${label(latest)} was recorded, so it cannot show the visual verdict followed the candidate.`
-      : `The visual review ${label(latest)} was recorded before candidate run ${candidate.runId} finished. Visually review the finished run's evidence and record the verdict again.` });
+      ? `The gate could not read when ${evidence} run ${candidate.runId} finished or when ${label(latest)} was recorded, so it cannot show the visual verdict followed that run.`
+      : `The visual review ${label(latest)} was recorded before ${evidence} run ${candidate.runId} finished. Visually review the finished run's evidence and record the verdict again.` });
   }
   const reviewTimes = input.codeReviews.map(review => ({ review, at: parsedTime(review.recordedAt) }));
   if (started === null || reviewTimes.some(entry => entry.at === null)) {
-    reasons.push({ code: "review_order_invalid", detail: `The gate could not read when candidate run ${candidate.runId} started or when its code review was recorded, so it cannot show the candidate followed the code review.` });
+    reasons.push({ code: "review_order_invalid", detail: `The gate could not read when ${evidence} run ${candidate.runId} started or when its code review was recorded, so it cannot show that run followed the code review.` });
   } else {
     const early = reviewTimes.filter(entry => entry.at! >= started).map(entry => reviewLabel(entry.review));
-    if (early.length > 0) reasons.push({ code: "review_order_invalid", detail: `Candidate run ${candidate.runId} started before the code review ${early.join(", ")} was recorded. The candidate runs after a clean code review: rerun it on ${sha}, then visually review the new run.` });
+    // The candidate is dispatched; any other evidence workflow starts from its own pull-request trigger.
+    const rerun = (input.evidencePlatform ?? "candidate") === "candidate" ? `rerun it on ${sha}`
+      : `re-run the workflow on ${sha}, or set the pull request to draft and ready again`;
+    if (early.length > 0) reasons.push({ code: "review_order_invalid", detail: `${evidence} run ${candidate.runId} started before the code review ${early.join(", ")} was recorded. It runs after a clean code review: ${rerun}, then visually review the new run.` });
   }
   return reasons;
 }

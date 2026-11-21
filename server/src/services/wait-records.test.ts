@@ -241,7 +241,7 @@ describe("ci wait bound to a candidate run (FAC-151)", () => {
   const boundTarget = { ...target, workflowRunId: 1234 };
   const run = { id: 1234, name: "Internal Windows Candidate", status: "completed", conclusion: "success",
     checkSuiteId: 91, createdAt: minutesAgo(20), headSha: sha };
-  const jobs = ["frontend", "candidate", "browser-evidence"].map(name =>
+  const jobs = ["frontend", "candidate"].map(name =>
     ({ name, status: "completed", conclusion: "success", checkSuiteId: 91 }));
   const candidate = (overrides: Partial<GitHubWaitSnapshot> = {}) => snapshot({ checkRuns: jobs, workflowRuns: [run], ...overrides });
   const classify = (reading: GitHubWaitSnapshot) => classifyCiWait({ target: boundTarget, snapshot: reading, now });
