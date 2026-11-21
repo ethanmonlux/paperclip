@@ -9,9 +9,10 @@
  * 2. CI at that exact head finished green, and every check the change needs
  *    ran and passed. A skipped check counts only when the repository policy
  *    lists it as optional, or as path-scoped with every changed file known to
- *    be irrelevant to it. Windows scripts always need Windows evidence, an
- *    unknown path means the check must run, and CI where nothing passed is
- *    never green;
+ *    be irrelevant to it, or when the same job of the same workflow also ran
+ *    and passed at that head (a draft run's leftover). Windows scripts always
+ *    need Windows evidence, an unknown path means the check must run, and CI
+ *    where nothing passed is never green;
  * 3. an independent review covered the source, from a different model family
  *    than every recorded implementation run. A head that differs from the
  *    reviewed head only by a clean merge from base needs CI only; resolved
@@ -38,13 +39,28 @@ export interface RepositoryMergePolicy {
    * one of them, so an unknown path needs the check. With `relevantPaths`
    * (a workflow-level `paths:` trigger), the check is needed when any changed
    * file matches one. Either way, a file a Windows suite executes always
-   * needs a Windows check.
+   * needs a Windows check, and an unknown or empty file list needs the check.
+   *
+   * `onlyPaths` is the reverse: a job the repository runs INSTEAD of other
+   * suites for a narrow kind of change. The scope's checks are needed only
+   * when the file list is known, non-empty and every file matches one of
+   * them; for any other change, an unknown or empty list included, they may
+   * be skipped. A scope with `onlyPaths` uses neither of the other two lists.
+   *
+   * `alternativeChecks` names checks that prove at least as much as the
+   * scope's own: when every one of them ran and passed at the head, the
+   * scope's checks are not needed and may be skipped. It exists for a
+   * repository whose own rule can choose the wider suites where the gate,
+   * which sees only paths, expects the narrow job. A check listed by a scope
+   * with `alternativeChecks` must not be listed by another scope.
    */
   pathScopedChecks: Array<{
     platform: string;
     checks: string[];
     irrelevantPaths?: RegExp[];
     relevantPaths?: RegExp[];
+    onlyPaths?: RegExp[];
+    alternativeChecks?: string[];
     maintenanceOnlyPaths?: RegExp[];
     workflowPath?: string;
   }>;
@@ -101,11 +117,32 @@ const FACETTE_WINDOWS_IRRELEVANT: RegExp[] = [
 
 /**
  * Facette paths the Internal Windows candidate builds: the shell, the agent
- * and the native app. Each needs the candidate at the merge head. Since
- * FAC-1053 a visual review is needed only for the narrower
- * `FACETTE_UI_SMOKE_PATHS` below, despite this constant's name.
+ * and the native app. Each needs the candidate at the merge head. A visual
+ * review is needed only for the narrower `FACETTE_UI_SMOKE_PATHS` below
+ * (FAC-1053).
  */
-const FACETTE_VISUAL_PATHS: RegExp[] = [/^shell\//, /^agent\//];
+const FACETTE_CANDIDATE_PATHS: RegExp[] = [/^shell\//, /^agent\//];
+
+/**
+ * Facette's own CI path rules, from `.github/scripts/detect-changed-paths.sh`
+ * (its `changes` job). KEEP EACH EQUAL TO THE REGEX OF THE SAME NAME THERE.
+ *
+ * `SAFE_PATHS`: paths no test, build or script reads. When every changed path
+ * is on it, Facette skips `shell`, `agent` and `account-web` and runs
+ * `docs-only-scan` instead. A path Facette adds and this list lacks refuses
+ * (the gate needs suites Facette skipped). A path this list has and Facette
+ * drops still merges, on the suites Facette ran (`alternativeChecks`).
+ * Neither direction merges a change no suite covered.
+ *
+ * `CATALOG` and `CI_GATING`: Facette runs `catalog` when a changed path
+ * (either end of a move) matches one. A path Facette adds and these lack
+ * merges without requiring `catalog`, though a `catalog` that ran and failed
+ * still refuses.
+ */
+const FACETTE_SAFE_PATHS = /^((AGENTS|CLAUDE)\.md|docs\/(backlog|development|foundry|source-captures|vision)\/.+\.md)$/;
+const FACETTE_CATALOG_PATHS = /^(tools\/osrs-item-catalog\/|shell\/faces\/osrs\/catalog\/|shell\/scripts\/osrs-item-tree-extract\.mjs$)/;
+const FACETTE_CI_GATING_PATHS = /^\.github\/(workflows\/(ci|windows-native-cache|internal-windows)\.yml|scripts\/detect-changed-paths\.sh)$/;
+const FACETTE_CODE_SUITES = ["shell", "agent", "account-web"];
 
 /**
  * Facette paths the `UI browser smoke` workflow runs on (FAC-1053): its own
@@ -128,6 +165,8 @@ const FACETTE_UI_SMOKE_PATHS: RegExp[] = [
   /^shell\/public\//,
   /^shell\/fonts\//,
   /^shell\/types\//,
+  /^shell\/_disabled-faces\//,
+  /^shell\/tsconfig\.json$/,
   /^shell\/next\.config\.ts$/,
   /^shell\/tailwind\.config\.ts$/,
   /^shell\/postcss\.config\.mjs$/,
@@ -141,17 +180,29 @@ const FACETTE_UI_SMOKE_PATHS: RegExp[] = [
   /^shell\/scripts\/lib\/devtools-websocket\.mjs$/,
   /^shell\/scripts\/lib\/frame-compare\.mjs$/,
   /^shell\/scripts\/lib\/icon-image\.mjs$/,
+  /^shell\/scripts\/lib\/retired-export-assets\.mjs$/,
   /^\.github\/workflows\/ui-browser-smoke\.yml$/,
 ];
 
 const exactly = (name: string) => ({ label: name, pattern: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) });
 
 export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = {
-  // .github/workflows/ci.yml: these five jobs are unconditional; only the
-  // Windows jobs sit behind the `changes` path filter.
+  // .github/workflows/ci.yml. On a ready pull request `changes` and
+  // `pr-status-block` always run, `gate / gate` proves the local check output
+  // is attached for the commit, and `ready / summary` is the repository's one
+  // required aggregate: it passes only when every suite that ran passed.
+  // Everything else sits behind the `changes` path rules, mirrored below.
   "ethanmonlux/facette": {
-    alwaysRequiredChecks: ["changes", "shell", "agent", "account-web", "pr-status-block"].map(exactly),
+    alwaysRequiredChecks: ["changes", "pr-status-block", "gate / gate", "ready / summary"].map(exactly),
     pathScopedChecks: [
+      // The code suites skip only when every changed path is on SAFE_PATHS.
+      { platform: "code", checks: FACETTE_CODE_SUITES, irrelevantPaths: [FACETTE_SAFE_PATHS] },
+      // ...and then `docs-only-scan` runs in their place. Facette also runs
+      // the code suites instead for a deletion, a move, or a symlink or
+      // submodule on a SAFE path, which the gate cannot see in a file list:
+      // the three suites passing is accepted in place of the scan.
+      { platform: "docs-only", checks: ["docs-only-scan"], onlyPaths: [FACETTE_SAFE_PATHS], alternativeChecks: FACETTE_CODE_SUITES },
+      { platform: "catalog", checks: ["catalog"], relevantPaths: [FACETTE_CATALOG_PATHS, FACETTE_CI_GATING_PATHS] },
       { platform: "windows", checks: ["windows-fast", "windows-native"], irrelevantPaths: FACETTE_WINDOWS_IRRELEVANT },
       {
         platform: "candidate",
@@ -159,7 +210,7 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
         // launch evidence. Its browser-evidence job is gone.
         checks: ["frontend", "candidate"],
         workflowPath: ".github/workflows/internal-windows.yml",
-        relevantPaths: [...FACETTE_VISUAL_PATHS, /^\.github\/workflows\/internal-windows\.yml$/],
+        relevantPaths: [...FACETTE_CANDIDATE_PATHS, /^\.github\/workflows\/internal-windows\.yml$/],
         maintenanceOnlyPaths: [
           /^\.github\/workflows\/internal-windows\.yml$/,
           /^\.github\/scripts\/detect-changed-paths\.sh$/,
@@ -176,7 +227,19 @@ export const REPOSITORY_MERGE_POLICIES: Record<string, RepositoryMergePolicy> = 
         relevantPaths: FACETTE_UI_SMOKE_PATHS,
       },
     ],
-    optionalSkips: [],
+    optionalSkips: [
+      // pr-ready.yml is one reusable workflow with three modes. Each call
+      // runs one mode's job and skips the other two; the `failure-loop` call
+      // runs only after a failure, and a skipped call shows as its bare name
+      // (`ready` is skipped that way on a draft). `ready / summary` and
+      // `gate / gate` are required above and never skippable.
+      /^failure-loop$/,
+      /^gate \/ failure-loop$/,
+      /^ready \/ failure-loop$/,
+      /^ready \/ gate$/,
+      /^gate \/ summary$/,
+      /^ready$/,
+    ],
     planValidatedSkips: [],
     // A visual verdict judges the smoke run's captures, so it is required for
     // exactly the changes that have a smoke run.
@@ -316,7 +379,8 @@ function matchesAny(path: string, patterns: readonly RegExp[]) {
  * changed file is known to be irrelevant to it (or, for a `relevantPaths`
  * scope, no changed file is relevant to it). A file a Windows suite executes
  * always needs the Windows checks. An empty or unreadable file list is
- * unknown, so every path-scoped check is needed.
+ * unknown, so every path-scoped check is needed, except an `onlyPaths`
+ * scope's: those are needed only when every file of a known list matches.
  */
 export function requiredPathScopedChecks(input: {
   policy: RepositoryMergePolicy;
@@ -325,6 +389,10 @@ export function requiredPathScopedChecks(input: {
   const files = input.changedFiles;
   const required: string[] = [];
   for (const scope of input.policy.pathScopedChecks) {
+    if (scope.onlyPaths) {
+      if (files !== null && files.length > 0 && files.every(file => matchesAny(file, scope.onlyPaths!))) required.push(...scope.checks);
+      continue;
+    }
     if (files !== null && files.length > 0 && scope.maintenanceOnlyPaths &&
       files.every(file => matchesAny(file, scope.maintenanceOnlyPaths!))) continue;
     const irrelevant = (file: string) => {
@@ -482,7 +550,12 @@ export function evaluateHeadCi(input: {
     reasons.push({ code: "required_check_skipped", detail: `${suite.label} runs on every change in this repository but did not pass on ${sha}. It must run and pass.` });
   }
   const ranGreen = new Set(passed.map(check => check.name));
-  for (const name of input.requiredChecks) {
+  // A scope whose `alternativeChecks` all ran and passed needs nothing more.
+  const covered = new Set(input.policy.pathScopedChecks
+    .filter(scope => scope.alternativeChecks && scope.alternativeChecks.length > 0 && scope.alternativeChecks.every(name => ranGreen.has(name)))
+    .flatMap(scope => scope.checks));
+  const requiredChecks = input.requiredChecks.filter(name => !covered.has(name));
+  for (const name of requiredChecks) {
     if (ranGreen.has(name) || reported.has(name)) continue;
     reported.add(name);
     const skipped = checkRuns.some(check => check.name === name && check.conclusion === "skipped");
@@ -491,7 +564,7 @@ export function evaluateHeadCi(input: {
       : `${name} did not run on ${sha}, but this change needs it. It must run and pass.` });
   }
   for (const scope of input.policy.pathScopedChecks) {
-    if (!scope.workflowPath || !scope.checks.some(name => input.requiredChecks.includes(name))) continue;
+    if (!scope.workflowPath || !scope.checks.some(name => requiredChecks.includes(name))) continue;
     // Only the candidate is dispatched by the coordinator; any other workflow starts from its own trigger.
     if (!provenWorkflowRun({ scope, checks, headSha: input.headSha })) reasons.push({ code: "required_check_skipped", detail:
       `${scope.checks.join(", ")} must all succeed in one completed ${scope.workflowPath} run at ${sha}. Ordinary CI, an older head, skipped jobs or same-named jobs from another workflow do not prove ${scope.platform === "candidate"
@@ -501,11 +574,23 @@ export function evaluateHeadCi(input: {
   // A skip is allowed only where the policy says so; a path filter that
   // skipped anything else, or a disabled suite, is not a green result.
   const skippablePathScoped = new Set(input.policy.pathScopedChecks.flatMap(scope => scope.checks)
-    .filter(name => !input.requiredChecks.includes(name)));
+    .filter(name => !requiredChecks.includes(name)));
+  // A draft run leaves its skipped jobs on the head beside the ready run's.
+  // A skipped check run is no refusal when the same job ran and passed at the
+  // same head: same name, and not known to be another head or another
+  // workflow (a check run's workflow is its suite's workflow run). A failed
+  // or unfinished run of that name has already refused above.
+  const workflowOf = (check: MergeGateCheck) => check.checkSuiteId == null ? null
+    : checks.find(run => run.kind === "workflow_run" && run.checkSuiteId === check.checkSuiteId)?.workflowPath ?? null;
+  const known = <T>(left: T | null | undefined, right: T | null | undefined) => left != null && right != null;
+  const alsoPassed = (skipped: MergeGateCheck) => passed.some(run => run.name === skipped.name &&
+    !(known(run.headSha, skipped.headSha) && run.headSha!.toLowerCase() !== skipped.headSha!.toLowerCase()) &&
+    !(known(workflowOf(run), workflowOf(skipped)) && workflowOf(run) !== workflowOf(skipped)));
   const touchesWindowsScripts = (input.changedFiles ?? []).some(file => matchesAny(file, WINDOWS_EXECUTED_PATHS));
   for (const check of checkRuns) {
     if (check.conclusion !== "skipped" || reported.has(check.name)) continue;
     if (skippablePathScoped.has(check.name) || matchesAny(check.name, input.policy.optionalSkips)) continue;
+    if (alsoPassed(check)) continue;
     // A plan skip counts only when the plan's validator ran and passed.
     if (input.policy.planValidatedSkips.some(scope =>
       matchesAny(check.name, scope.checks) && passed.some(run => run.name === scope.validator))) continue;
@@ -837,6 +922,8 @@ export function evaluateVisualReview(input: {
   candidate: AdmittedCandidateRun | null;
   /** What the evidence run is called in a refusal (`visualEvidenceName`); the candidate by default. */
   evidenceName?: string;
+  /** The evidence run's path scope (`visualEvidencePlatform`); `candidate` by default. Only the candidate is dispatched by the coordinator. */
+  evidencePlatform?: string;
   /** Code reviews covering the head (`reviewCoverage`); empty when coverage already refused. */
   codeReviews: readonly MergeReviewAttestation[];
 }): MergeGateReason[] {
@@ -870,9 +957,14 @@ export function evaluateVisualReview(input: {
   if (latest.verdict !== "pass") {
     return [{ code: "visual_review_failed", detail: `The visual review ${label(latest)} failed ${sha} against its visual brief. Fix the findings, then rerun CI, the code review as needed, the ${evidence} and the visual review on the new head.` }];
   }
-  // Without a proven evidence run the CI reasons already refuse; the verdict has nothing to bind to.
+  // A passing verdict with no proven evidence run binds to nothing. The CI
+  // reasons refuse too when the run is merely missing, but not when the
+  // policy names an evidence scope that does not exist or has no workflow:
+  // refuse here, so a mistyped policy cannot merge an unchecked verdict.
   const candidate = input.candidate;
-  if (!candidate) return [];
+  if (!candidate) {
+    return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but there is no proven ${evidence} run at ${sha} for the verdict to name. That run must finish successfully at ${sha}; then visually review its evidence.` }];
+  }
   if (latest.candidateRunId !== candidate.runId || latest.candidateRunAttempt !== candidate.runAttempt) {
     return [{ code: "visual_review_unbound", detail: `The visual review ${label(latest)} judges run ${latest.candidateRunId} attempt ${latest.candidateRunAttempt}, but the ${evidence} run the gate admits at ${sha} is run ${candidate.runId} attempt ${candidate.runAttempt}. Visually review that run's evidence.` }];
   }
@@ -890,7 +982,10 @@ export function evaluateVisualReview(input: {
     reasons.push({ code: "review_order_invalid", detail: `The gate could not read when ${evidence} run ${candidate.runId} started or when its code review was recorded, so it cannot show that run followed the code review.` });
   } else {
     const early = reviewTimes.filter(entry => entry.at! >= started).map(entry => reviewLabel(entry.review));
-    if (early.length > 0) reasons.push({ code: "review_order_invalid", detail: `${evidence} run ${candidate.runId} started before the code review ${early.join(", ")} was recorded. It runs after a clean code review: rerun it on ${sha}, then visually review the new run.` });
+    // The candidate is dispatched; any other evidence workflow starts from its own pull-request trigger.
+    const rerun = (input.evidencePlatform ?? "candidate") === "candidate" ? `rerun it on ${sha}`
+      : `re-run the workflow on ${sha}, or set the pull request to draft and ready again`;
+    if (early.length > 0) reasons.push({ code: "review_order_invalid", detail: `${evidence} run ${candidate.runId} started before the code review ${early.join(", ")} was recorded. It runs after a clean code review: ${rerun}, then visually review the new run.` });
   }
   return reasons;
 }

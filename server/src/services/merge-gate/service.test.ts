@@ -165,7 +165,10 @@ const coordinator = { type: "agent" as const, agentId: "coordinator", runId: "ru
 const request = (overrides: Partial<Parameters<typeof evaluateAndMerge>[1]> = {}) => ({
   companyId: COMPANY, issueId: "task", repo: "ethanmonlux/facette", pullNumber: 704, actor: coordinator, ...overrides,
 });
-const facetteAlwaysCi = [ok("changes"), ok("shell"), ok("agent"), ok("account-web"), ok("pr-status-block")];
+// A ready Facette code pull request: the four always-run checks and the three code suites.
+const facetteAlwaysCi = [ok("changes"), ok("shell"), ok("agent"), ok("account-web"), ok("pr-status-block"), ok("gate / gate"), ok("ready / summary")];
+/** Facette's code suites: needed unless every changed file is on its SAFE_PATHS list. */
+const CODE = ["shell", "agent", "account-web"];
 const accountWebCi = [...facetteAlwaysCi,
   { kind: "check_run" as const, name: "windows-fast", status: "completed", conclusion: "skipped" }];
 
@@ -212,21 +215,25 @@ describe("merge gate service", () => {
 
     it("refuses a UI change with a green candidate but no smoke run at the head (FAC-1053)", async () => {
       // With a verdict, and with none: the missing run is a CI refusal either way.
+      // A passing verdict is refused as well: there is no proven smoke run for it to name.
       for (const [visualReviews, expected] of [
-        [[visualReview()], ["required_check_skipped", "required_check_skipped"]],
+        [[visualReview()], ["required_check_skipped", "required_check_skipped", "visual_review_unbound"]],
         // A verdict that names the candidate run finds no smoke run to bind to.
-        [[visualReview({ candidateRunId: CANDIDATE_RUN_ID })], ["required_check_skipped", "required_check_skipped"]],
+        [[visualReview({ candidateRunId: CANDIDATE_RUN_ID })], ["required_check_skipped", "required_check_skipped", "visual_review_unbound"]],
         [[], ["required_check_skipped", "required_check_skipped", "visual_review_missing"]],
       ] as const) {
         const { github, merge } = visualGitHub(candidateAt(HEAD));
         const result = await evaluateAndMerge(harness({ github, visualReviews: [...visualReviews] }).deps, request());
         expect(result.outcome).toBe("refused");
         expect(codes(result)).toEqual(expected);
-        expect(result.requiredChecks).toEqual([...WINDOWS, "frontend", "candidate", "smoke"]);
+        expect(result.requiredChecks).toEqual([...CODE, ...WINDOWS, "frontend", "candidate", "smoke"]);
         expect(result.reasons[0]!.detail).toBe("smoke did not run on aaaaaaaaaaaa, but this change needs it. It must run and pass.");
         expect(result.reasons[1]!.detail).toMatch(/^smoke must all succeed in one completed \.github\/workflows\/ui-browser-smoke\.yml run at aaaaaaaaaaaa\./);
         // It does not send the coordinator to dispatch another candidate.
         expect(result.reasons[1]!.detail).not.toMatch(/candidate/i);
+        if (visualReviews.length > 0) {
+          expect(result.reasons[2]!.detail).toBe(`The visual review STA-VISUAL judges run ${visualReviews[0]!.candidateRunId} attempt 1, but there is no proven UI browser smoke run at aaaaaaaaaaaa for the verdict to name. That run must finish successfully at aaaaaaaaaaaa; then visually review its evidence.`);
+        }
         expect(merge).not.toHaveBeenCalled();
       }
     });
@@ -261,7 +268,9 @@ describe("merge gate service", () => {
         // The verdict names the smoke run's id and attempt, and the candidate is green: only the smoke run is wrong.
         const { github, merge } = visualGitHub([...candidateAt(HEAD), ...smoke]);
         const result = await evaluateAndMerge(harness({ github, visualReviews: [visualReview()] }).deps, request());
-        expect({ name, outcome: result.outcome, codes: codes(result) }).toEqual({ name, outcome: "refused", codes: expected });
+        // The CI reason, and in every case the passing verdict has no proven smoke run to name.
+        expect({ name, outcome: result.outcome, codes: codes(result) }).toEqual({ name, outcome: "refused", codes: [...expected, "visual_review_unbound"] });
+        expect(result.reasons.at(-1)!.detail, name).toContain("there is no proven UI browser smoke run at aaaaaaaaaaaa for the verdict to name");
         expect(details(result), name).toMatch(/smoke/i);
         expect(merge, name).not.toHaveBeenCalled();
       }
@@ -344,6 +353,12 @@ describe("merge gate service", () => {
       const refused = await evaluateAndMerge(harness({ github: unbound.github, visualReviews: [visualReview({ candidateRunId: CANDIDATE_RUN_ID })] }).deps, request());
       expect(refused.reasons).toEqual([{ code: "visual_review_unbound",
         detail: `The visual review STA-VISUAL judges run ${CANDIDATE_RUN_ID} attempt 1, but the UI browser smoke run the gate admits at aaaaaaaaaaaa is run ${SMOKE_RUN_ID} attempt 1. Visually review that run's evidence.` }]);
+      // A smoke run that started too early names both ways to get one that follows the review.
+      const early = visualGitHub(evidenceAt(HEAD));
+      const tooEarly = await evaluateAndMerge(harness({ github: early.github, reviews: [review({ recordedAt: "2026-11-13T02:15:00.000Z" })],
+        visualReviews: [visualReview()] }).deps, request());
+      expect(tooEarly.reasons).toEqual([{ code: "review_order_invalid",
+        detail: `UI browser smoke run ${SMOKE_RUN_ID} started before the code review STA-REVIEW was recorded. It runs after a clean code review: re-run the workflow on aaaaaaaaaaaa, or set the pull request to draft and ready again, then visually review the new run.` }]);
       // A rerun attempt started after the code review, with its verdict naming that attempt, merges.
       const { github, merge } = visualGitHub([...candidateAt(HEAD), ...smokeAt(HEAD, { runAttempt: 2 })]);
       await expect(evaluateAndMerge(harness({ github, visualReviews: [visualReview({ candidateRunAttempt: 2 })] }).deps, request()))
@@ -370,7 +385,7 @@ describe("merge gate service", () => {
         const h = harness({ github });
         const result = await evaluateAndMerge(h.deps, request());
         expect(result.outcome).toBe("refused");
-        expect(result.requiredChecks).toEqual([...WINDOWS, "frontend", "candidate", "smoke"]);
+        expect(result.requiredChecks).toEqual([...CODE, ...WINDOWS, "frontend", "candidate", "smoke"]);
         expect(codes(result)).toEqual(expect.arrayContaining(["required_check_skipped", "visual_review_missing"]));
         expect(details(result)).toMatch(/internal-windows\.yml run at aaaaaaaaaaaa/);
         expect(details(result)).toMatch(/ui-browser-smoke\.yml run at aaaaaaaaaaaa/);
@@ -383,7 +398,7 @@ describe("merge gate service", () => {
         const h = harness({ github });
         const result = await evaluateAndMerge(h.deps, request());
         expect(result.outcome).toBe("refused");
-        expect(result.requiredChecks).toEqual([...WINDOWS, "frontend", "candidate"]);
+        expect(result.requiredChecks).toEqual([...CODE, ...WINDOWS, "frontend", "candidate"]);
         expect(codes(result)).toEqual(["required_check_skipped", "required_check_skipped", "required_check_skipped"]);
         expect(h.visualQueries).toEqual([]);
         expect(merge).not.toHaveBeenCalled();
@@ -391,7 +406,7 @@ describe("merge gate service", () => {
       const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
       github.pullRequestFiles = async () => [renamed("docs/guide.md", "account-web/guide.md")];
       const h = harness({ github });
-      await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: [] });
+      await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: CODE });
       expect(h.visualQueries).toEqual([]);
       expect(merge).toHaveBeenCalledTimes(1);
     });
@@ -407,7 +422,7 @@ describe("merge gate service", () => {
     it("merges a visual change with code review, candidate, smoke run and a passing visual verdict all on the exact head", async () => {
       const { github, merge } = visualGitHub(evidenceAt(HEAD));
       const result = await evaluateAndMerge(harness({ github, visualReviews: [visualReview({ verdict: "fail" }), visualReview()] }).deps, request());
-      expect(result).toMatchObject({ outcome: "merged", reasons: [], requiredChecks: [...WINDOWS, "frontend", "candidate", "smoke"] });
+      expect(result).toMatchObject({ outcome: "merged", reasons: [], requiredChecks: [...CODE, ...WINDOWS, "frontend", "candidate", "smoke"] });
       expect(merge).toHaveBeenCalledWith(704, expect.objectContaining({ sha: HEAD }));
     });
 
@@ -419,7 +434,7 @@ describe("merge gate service", () => {
         const noVerdict = harness({ github: missing.github });
         const refused = await evaluateAndMerge(noVerdict.deps, request());
         expect({ filename, outcome: refused.outcome, codes: codes(refused), requiredChecks: refused.requiredChecks }).toEqual({
-          filename, outcome: "refused", codes: ["visual_review_missing"], requiredChecks: [...WINDOWS, "frontend", "candidate", "smoke"] });
+          filename, outcome: "refused", codes: ["visual_review_missing"], requiredChecks: [...CODE, ...WINDOWS, "frontend", "candidate", "smoke"] });
         expect(noVerdict.visualQueries).toEqual([true]);
         expect(missing.merge).not.toHaveBeenCalled();
         const { github, merge } = visualGitHub(evidenceAt(HEAD), files);
@@ -437,7 +452,7 @@ describe("merge gate service", () => {
         const h = harness({ github });
         const result = await evaluateAndMerge(h.deps, request());
         expect({ filenames, outcome: result.outcome, reasons: result.reasons, requiredChecks: result.requiredChecks })
-          .toEqual({ filenames, outcome: "merged", reasons: [], requiredChecks: [...WINDOWS, "frontend", "candidate"] });
+          .toEqual({ filenames, outcome: "merged", reasons: [], requiredChecks: [...CODE, ...WINDOWS, "frontend", "candidate"] });
         expect(h.visualQueries).toEqual([]);
         expect(merge).toHaveBeenCalledTimes(1);
         // The candidate is still needed.
@@ -454,7 +469,8 @@ describe("merge gate service", () => {
     it("fails closed on an unknown or empty changed-file list: every check, the smoke run and a visual verdict (FAC-1053)", async () => {
       const unreadable = async (): Promise<PullRequestFileDiff[]> => { throw new Error("GitHub 502"); };
       for (const [name, files] of [["empty", async (): Promise<PullRequestFileDiff[]> => []], ["unreadable", unreadable]] as const) {
-        const everything = [...WINDOWS, "frontend", "candidate", "smoke"];
+        // `docs-only-scan` is the one path-scoped check an unknown list does not need: the code suites are needed instead.
+        const everything = [...CODE, "catalog", ...WINDOWS, "frontend", "candidate", "smoke"];
         // Ordinary CI only.
         const bare = visualGitHub([]);
         bare.github.pullRequestFiles = files;
@@ -466,12 +482,13 @@ describe("merge gate service", () => {
         expect(details(nothing)).toMatch(/ui-browser-smoke\.yml run at aaaaaaaaaaaa/);
         expect(bareHarness.visualQueries).toEqual([true]);
         // The candidate without the smoke run, then both without a verdict.
-        const noSmoke = visualGitHub(candidateAt(HEAD));
+        // (From here CI also carries Facette's `catalog` job, which an unknown list needs.)
+        const noSmoke = visualGitHub([...candidateAt(HEAD), ok("catalog")]);
         noSmoke.github.pullRequestFiles = files;
         const withoutSmoke = await evaluateAndMerge(harness({ github: noSmoke.github, visualReviews: [visualReview()] }).deps, request());
         expect({ name, outcome: withoutSmoke.outcome, codes: codes(withoutSmoke) })
-          .toEqual({ name, outcome: "refused", codes: ["required_check_skipped", "required_check_skipped"] });
-        const noVerdict = visualGitHub(evidenceAt(HEAD));
+          .toEqual({ name, outcome: "refused", codes: ["required_check_skipped", "required_check_skipped", "visual_review_unbound"] });
+        const noVerdict = visualGitHub([...evidenceAt(HEAD), ok("catalog")]);
         noVerdict.github.pullRequestFiles = files;
         const withoutVerdict = await evaluateAndMerge(harness({ github: noVerdict.github }).deps, request());
         expect({ name, outcome: withoutVerdict.outcome, codes: codes(withoutVerdict), requiredChecks: withoutVerdict.requiredChecks })
@@ -486,7 +503,7 @@ describe("merge gate service", () => {
       for (const [visualReviews, evidence, outcome, expected] of [
         [[visualReview({ reviewedSha: REVIEWED })], evidenceAt(HEAD), "refused", ["visual_review_stale"]],
         // The smoke run of the reviewed head does not carry over either.
-        [[visualReview()], [...candidateAt(HEAD), ...smokeAt(REVIEWED)], "refused", ["required_check_skipped"]],
+        [[visualReview()], [...candidateAt(HEAD), ...smokeAt(REVIEWED)], "refused", ["required_check_skipped", "visual_review_unbound"]],
         [[visualReview()], evidenceAt(HEAD), "merged", []],
       ] as const) {
         const { github, merge } = visualGitHub([...evidence]);
@@ -504,10 +521,62 @@ describe("merge gate service", () => {
       }
     });
 
+    it("merges an ordinary ready Facette pull request whose CI skipped the jobs it never runs, draft leftovers included (FAC-1053)", async () => {
+      const skipped = (name: string): MergeGateCheck => ({ kind: "check_run", name, status: "completed", conclusion: "skipped" });
+      // The check runs observed on such a head: the ready run, then what its earlier draft run left behind.
+      const readyRun = [
+        ...["changes", "shell", "agent", "account-web", "pr-status-block", "gate / gate", "ready / summary", "worker",
+          "windows-account-contract", "Vercel Preview Comments"].map(ok),
+        ...["failure-loop", "failure-loop", "ready / gate", "ready / failure-loop", "gate / failure-loop", "gate / summary",
+          "docs-only-scan", "catalog", "windows-fast", "windows-native"].map(skipped),
+      ];
+      const draftLeftovers = ["changes", "shell", "agent", "account-web", "ready", "docs-only-scan", "gate / gate", "gate / failure-loop",
+        "windows-account-contract", "failure-loop"].map(skipped);
+      const files = ["infra/account-service/scripts/seed-sandbox.mjs", "infra/account-service/test/ledger.test.mjs", "docs/ops/ACCOUNT_E2E_SANDBOX.md"].map(changed);
+      for (const headChecks of [readyRun, [...readyRun, ...draftLeftovers]]) {
+        const { github, merge } = fakeGitHub({ headChecks });
+        github.pullRequestFiles = async () => files;
+        const h = harness({ github });
+        await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: CODE });
+        expect(h.visualQueries).toEqual([]);
+        expect(merge).toHaveBeenCalledTimes(1);
+      }
+      // The same head with `ready / summary` or `gate / gate` only skipped does not merge.
+      for (const name of ["ready / summary", "gate / gate"]) {
+        const { github, merge } = fakeGitHub({ headChecks: [...readyRun.filter(entry => entry.name !== name), skipped(name), ...draftLeftovers] });
+        github.pullRequestFiles = async () => files;
+        const result = await evaluateAndMerge(harness({ github }).deps, request());
+        expect({ name, outcome: result.outcome, reasons: result.reasons }).toEqual({ name, outcome: "refused", reasons: [
+          { code: "required_check_skipped", detail: `${name} runs on every change in this repository but did not pass on aaaaaaaaaaaa. It must run and pass.` }] });
+        expect(merge).not.toHaveBeenCalled();
+      }
+    });
+
+    it("merges a docs-only Facette pull request on its docs-only-scan, and refuses it when neither the scan nor the code suites ran (FAC-1053)", async () => {
+      const skipped = (name: string): MergeGateCheck => ({ kind: "check_run", name, status: "completed", conclusion: "skipped" });
+      const always = ["changes", "pr-status-block", "gate / gate", "ready / summary"].map(ok);
+      const rest = ["catalog", "windows-fast", "windows-native", "failure-loop", "ready / gate", "ready / failure-loop", "gate / failure-loop", "gate / summary"].map(skipped);
+      const cases: Array<[string, MergeGateCheck[], string, string[]]> = [
+        ["scan passed, suites skipped", [...always, ok("docs-only-scan"), ...CODE.map(skipped), ...rest], "merged", []],
+        // Facette ran the suites instead (a deleted SAFE file): accepted in place of the scan.
+        ["suites passed, scan skipped", [...always, skipped("docs-only-scan"), ...CODE.map(ok), ...rest], "merged", []],
+        ["neither ran", [...always, skipped("docs-only-scan"), ...CODE.map(skipped), ...rest], "refused", ["required_check_skipped"]],
+      ];
+      for (const [name, headChecks, outcome, expected] of cases) {
+        const { github, merge } = fakeGitHub({ headChecks });
+        github.pullRequestFiles = async () => [changed("docs/vision/x.md")];
+        const result = await evaluateAndMerge(harness({ github }).deps, request());
+        expect({ name, outcome: result.outcome, codes: codes(result), requiredChecks: result.requiredChecks })
+          .toEqual({ name, outcome, codes: expected, requiredChecks: ["docs-only-scan"] });
+        if (outcome === "refused") expect(details(result)).toMatch(/^docs-only-scan was skipped by a CI path filter/);
+        expect(merge).toHaveBeenCalledTimes(outcome === "merged" ? 1 : 0);
+      }
+    });
+
     it("leaves a non-visual Facette change needing neither the candidate, the smoke run nor a visual verdict", async () => {
       const { github, merge } = fakeGitHub({ headChecks: accountWebCi });
       const h = harness({ github });
-      await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: [] });
+      await expect(evaluateAndMerge(h.deps, request())).resolves.toMatchObject({ outcome: "merged", reasons: [], requiredChecks: CODE });
       expect(h.visualQueries).toEqual([]);
       expect(merge).toHaveBeenCalledTimes(1);
     });

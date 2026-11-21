@@ -424,6 +424,7 @@ async function evaluateLocked(
     pullRequest: label, headSha, required: visualRequired, author, reviews: visualReviews,
     candidate: visualRequired ? admittedCandidateRun({ policy, checks: headChecks.checks, headSha }) : null,
     evidenceName: policy.visualEvidenceName,
+    evidencePlatform: policy.visualEvidencePlatform,
     codeReviews: coverage.reasons.length === 0 ? coverage.covering : [],
   });
 
